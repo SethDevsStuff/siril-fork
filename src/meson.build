@@ -224,6 +224,7 @@ src_files = [
   'gui/mouse_action_preferences.c',
   'gui/newdeconv.c',
   'gui/nina_light_curve.c',
+  'gui/occultation.c',
   'gui/open_dialog.c',
   'gui/photometric_cc.c',
   'gui/plot.c',
