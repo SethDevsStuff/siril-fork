@@ -5,7 +5,7 @@
 #include "algos/PSF.h"
 #include "core/processing.h"
 
-#define NUMBER_OF_METHODS 7
+#define NUMBER_OF_METHODS 8
 
 struct registration_args;
 typedef int (*registration_function)(struct registration_args *);
@@ -29,6 +29,7 @@ typedef enum {
 	REG_PAGE_COMET,
 	REG_PAGE_3_STARS,
 	REG_PAGE_KOMBAT,
+	REG_PAGE_LENA,
 	REG_PAGE_APPLYREG,
 	REG_PAGE_MISC
 } reg_notebook_page;
@@ -67,7 +68,7 @@ struct registration_args {
 	int min_pairs;			// Minimum number of star pairs for success
 	int max_stars_candidates;	// Max candidates after psf fitting for global reg
 	transformation_type type;	// Use affine transform  or homography
-	float percent_moved;		// for KOMBAT algorithm
+	float percent_moved;		// for KOMBAT & LENA algorithms
 	gboolean two_pass;		// use the two-pass computation to find a good ref image
 	seq_image_filter filtering_criterion; // the filter, (seqapplyreg only)
 	double filtering_parameter;	// and its parameter (seqapplyreg only)
@@ -112,6 +113,7 @@ int register_comet(struct registration_args *regargs);
 int register_3stars(struct registration_args *regargs);
 int register_apply_reg(struct registration_args *regargs);
 int register_kombat(struct registration_args *args);
+int register_lena(struct registration_args *args);
 int register_manual(struct registration_args *regargs); // defined in compositing/compositing.c
 
 void reset_3stars();
