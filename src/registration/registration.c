@@ -46,6 +46,7 @@
 #include "registration/matching/misc.h"
 #include "registration/matching/match.h"
 #include "registration/matching/atpmatch.h"
+#include "registration/lena.h"
 #include "stacking/stacking.h"
 #include "algos/PSF.h"
 #include "gui/PSF_list.h"
@@ -80,6 +81,9 @@ static char *tooltip_text[] = {
 		"Shifts at pixel precision are saved in seq file."),
 	N_("<b>KOMBAT</b>: This simple algorithm tries to locate a single pattern on images and to "
 		"align them accordingly. Only translation is taken into account yet."),
+	N_("<b>LENA</b>: More accurate (and slower) than KOMBAT. Use the cut slider - second slider, "
+	    "under preview window - to see only brightest parts. Use this to select a zone with noticeable "
+		"patterns that will be used for alignment. Only translation is taken into account yet."),
 	N_("<b>Comet/Asteroid Registration</b>: This algorithm is dedicated to the comet and asteroid "
 		"registration. It is necessary to have timestamps stored in FITS header and to load a "
 		"sequence of star aligned images. This methods makes a translation of a certain number "
@@ -102,6 +106,7 @@ static char *reg_frame_registration[] = {
 /*Possible values for max stars combo box
 Needs to be consistent with list in comboreg_maxstars*/
 static int maxstars_values[] = { 100, 200, 500, 1000, 2000 };
+
 
 /* Values for seq filtering for % or k value*/
 static float filter_initvals[] = {90., 3.}; // max %, max k
@@ -147,6 +152,8 @@ void initialize_registration_methods() {
 			&register_shift_dft, REQUIRES_SQUARED_SELECTION, REGTYPE_PLANETARY);
 	reg_methods[i++] = new_reg_method(_("KOMBAT (planetary surfaces or full disk)"),
 			&register_kombat, REQUIRES_ANY_SELECTION, REGTYPE_PLANETARY);
+	reg_methods[i++] = new_reg_method(_("LENA (planetary surfaces or full disk)"),
+			&register_lena, REQUIRES_ANY_SELECTION, REGTYPE_PLANETARY);
 	reg_methods[i++] = new_reg_method(_("Comet/Asteroid Registration"),
 			&register_comet, REQUIRES_NO_SELECTION, REGTYPE_DEEPSKY);
 	reg_methods[i++] = new_reg_method(_("Apply Existing Registration"),
@@ -678,6 +685,218 @@ int register_kombat(struct registration_args *args) {
 
 	gettimeofday(&t_end, NULL);
 	show_time(t_start, t_end);
+	return 0;
+}
+
+int register_lena(struct registration_args *args) {
+	int ref_idx;
+	int ret;
+	fits fit_templ = { 0 };
+    fits fit_ref = { 0 };
+    struct timeval t_start, t_end;
+    regdata *current_regdata;
+    float nb_frames;
+    int cur_nb = 0;
+	double q_max = 0, q_min = DBL_MAX;
+	double qual;
+	int frame;
+    int abort = 0;
+    rectangle full = { 0 };
+    int q_index = -1;
+
+    if (args->seq->regparam[args->layer]) {
+	    	siril_log_message(
+		    		_("Recomputing already existing registration for this layer\n"));
+		    current_regdata = args->seq->regparam[args->layer];
+		    /* we reset all values as we may register different images */
+		    memset(current_regdata, 0, args->seq->number * sizeof(regdata));
+	} else {
+		    current_regdata = (regdata*) calloc(args->seq->number, sizeof(regdata));
+		    if (current_regdata == NULL) {
+    			PRINT_ALLOC_ERR;
+	    		return 1;
+    		}
+	    	args->seq->regparam[args->layer] = current_regdata;
+	}
+
+
+	if (args->filters.filter_included)
+		nb_frames = (float) args->seq->selnum;
+	else
+		nb_frames = (float) args->seq->number;
+
+    gettimeofday(&t_start, NULL);
+	ref_idx = sequence_find_refimage(args->seq);
+    set_shifts(args->seq, ref_idx, args->layer, 0.0, 0.0, FALSE);
+	
+	seq_read_frame(args->seq, ref_idx, &fit_ref, FALSE, -1);
+
+	full.x = full.y = 0;
+	full.w = fit_ref.rx;
+	full.h = fit_ref.ry;
+
+    if (args->seq->type == SEQ_INTERNAL) {
+		fit_ref.data = NULL;
+		fit_ref.fdata = NULL;
+		clearfits(&fit_ref);
+	}
+
+	ret = seq_read_frame_part(args->seq, args->layer, ref_idx, &fit_templ,
+			&full, FALSE, -1);
+
+	printf("ret=%d ry=%d\n", ret, fit_templ.ry);
+    lena_fingerprint hz_a = { 0 };
+	lena_fingerprint vt_a = { 0 };
+	
+	lena_fingerprint_set_max(&fit_templ, args->layer, &hz_a, &vt_a);
+
+	GtkAdjustment *adj2 = GTK_ADJUSTMENT(gtk_builder_get_object(gui.builder, "adjustmentscalemin"));
+	float thr_pc = gtk_adjustment_get_value(adj2) / hz_a.pdata_max;
+
+	if (thr_pc<=0.6) {
+		WORD min_v = (WORD) ((hz_a.pdata_max*0.6)+1);
+		siril_log_color_message(_("Please move the cut slider to at least %u.\n"), "red", min_v);
+		return(1);
+	}
+
+	lena_set_thr_pc(thr_pc);
+
+    
+	set_progress_bar_data(
+			_("Register using LENA: loading and processing reference frame"),
+			PROGRESS_NONE);
+
+	siril_log_message("top_down=%d\n", fit_ref.top_down);
+	// int invert_y = 1;
+
+	int y0 = args->selection.y;
+
+	// y0 = invert_y ? full.h - args->selection.y : args->selection.y; 
+
+
+	lena_fingerprint_hz(
+        &fit_templ,
+		hz_a.pdata_max,
+		args->layer,
+        args->selection.x,
+        y0,
+        args->selection.w,
+        args->selection.h, &hz_a);
+	
+	lena_fingerprint_vt(
+        &fit_templ,
+		vt_a.pdata_max,
+		args->layer,
+        args->selection.x,
+        y0,
+        args->selection.w,
+        args->selection.h, &vt_a);
+
+    lena_fingerprint_set_thr(&fit_templ, args->layer, &hz_a, &vt_a);
+
+	siril_log_message(
+		    		_("MAX=%d\n"), hz_a.pdata_max);
+
+	#ifdef _OPENMP
+	#pragma omp parallel for num_threads(com.max_thread) schedule(guided) if (args->seq->type == SEQ_SER || ((args->seq->type == SEQ_REGULAR || args->seq->type == SEQ_FITSEQ || args->seq->type == SEQ_INTERNAL) && fits_is_reentrant()))
+	#endif
+	for (frame = 0; frame < args->seq->number; frame++) {
+		if (abort)
+			continue;
+		if (args->run_in_thread && !get_thread_run()) {
+			abort = 1;
+			continue;
+		}
+
+		if (args->filters.filter_included && !args->seq->imgparam[frame].incl)
+			continue;
+
+		fits cur_fit = { 0 };
+        char tmpmsg[1024], tmpfilename[256];
+
+		seq_get_image_filename(args->seq, frame, tmpfilename);
+		g_snprintf(tmpmsg, 1024, _("Register: processing image %s"),
+					tmpfilename);
+		set_progress_bar_data(tmpmsg, PROGRESS_NONE);
+		int thread_id = -1;
+
+        #ifdef _OPENMP
+		thread_id = omp_get_thread_num();
+        #endif
+
+		if (seq_read_frame_part(args->seq, args->layer, frame, &cur_fit, &full, FALSE, thread_id)) {
+			siril_log_message(_("Cannot perform KOMBAT alignment for frame %d\n"), frame + 1);
+			/* we exclude this frame */
+			_register_kombat_disable_frame(args, current_regdata, frame);
+			continue;
+		} else {
+			qual = QualityEstimate(&cur_fit, args->layer);
+			current_regdata[frame].quality = qual;
+		}
+
+		if (frame == ref_idx) {
+			set_shifts(args->seq, frame, args->layer, 0.0, 0.0, FALSE);
+			continue;
+		}
+
+
+        reg_lena cur_align = { 0 };
+
+        cur_align.vt_a = &vt_a;;
+        cur_align.hz_a = &hz_a;
+        cur_align.l_b = &cur_fit;
+        cur_align.layer = args->layer;
+        cur_align.x0 = args->selection.x;
+        cur_align.y0 = y0;
+        cur_align.w = args->selection.w;
+        cur_align.h = args->selection.h;
+        cur_align.scope_x = 100; // (int)(cur_align.w * 0.3f);
+		cur_align.scope_y = 100;
+        cur_align.best_dt = -1;
+        cur_align.best_dx = -1;
+        cur_align.best_dy = -1;
+        cur_align.valid = 0;
+
+        lena_register_one(&cur_align);
+        if (!cur_align.valid) {
+            siril_log_color_message(_("Register: LENA could not find alignment pattern on image #%d.\n"),
+                                    "red", frame);
+			/* we exclude this frame too */
+			_register_kombat_disable_frame(args, current_regdata, frame); 
+        } else {
+            set_shifts(args->seq, frame, args->layer,
+						-cur_align.best_dx,
+						-cur_align.best_dy, cur_fit.top_down);
+        }
+        g_atomic_int_inc(&cur_nb);
+		set_progress_bar_data(NULL, (float)cur_nb / nb_frames);
+
+			// We don't need fit anymore, we can destroy it.
+		clearfits(&cur_fit);
+    }
+
+    siril_log_message(_("Registration finished.\n"));
+
+	for (frame = 0; frame < args->seq->number; frame++) {
+		if (args->seq->imgparam[frame].incl) {
+			qual = current_regdata[frame].quality;
+			q_min = min(q_min, qual);
+			if (qual>q_max) {
+				q_max = qual;
+				q_index = frame;
+			}
+		}
+	}
+	normalizeQualityData(args, q_min, q_max);
+
+	clearfits(&fit_templ);
+	clearfits(&fit_ref);
+
+	siril_log_color_message(_("Best frame: #%d.\n"), "bold", q_index + 1);
+
+    gettimeofday(&t_end, NULL);
+	show_time(t_start, t_end);
+
 	return 0;
 }
 

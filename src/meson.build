@@ -238,6 +238,7 @@ src_files = [
 
   'registration/3stars.c',
   'registration/comet.c',
+  'registration/lena.c',
   'registration/global.c',
   'registration/matching/match.c',
   'registration/matching/atpmatch.c',
