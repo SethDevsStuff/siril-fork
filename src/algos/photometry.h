@@ -53,6 +53,8 @@ struct light_curve_args {
 	char *target_descr;	// the description to put in the data file and graph
 	gboolean display_graph;	// if true, show it, if false, generate png
 	gboolean force_rad;	// if true, fixed aperture radius, if false, dynamic aperture radius
+	gboolean time_offset;	// is the time offset used?
+	double JD_offset; 		// value of the offset (in ms)
 
 	// metadata from the NINA file created by Siril
 	struct compstars_arg *metadata;
@@ -70,6 +72,8 @@ int new_light_curve(const char *filename, struct light_curve_args *lcargs);
 void free_occultation_args(struct light_curve_args *args);
 
 gpointer occultation_worker(gpointer arg);
+
+int occult_curve(struct light_curve_args *lcargs);
 
 
 #endif /* SRC_ALGOS_PHOTOMETRY_H_ */
