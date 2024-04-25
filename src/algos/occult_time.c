@@ -306,7 +306,8 @@ int occult_curve(struct light_curve_args *lcargs) {
 
 	// Does it match the forseen value
 	siril_log_color_message(_("Detected pulses= %i vs Expected pulses= %i\n"), "salmon", timing->det_pulses, timing->th_pls_nbr - 1);
-	if (timing->det_pulses < (timing->th_pls_nbr / 2)) {
+//	if (timing->det_pulses < (timing->th_pls_nbr / 2)) {
+	if (timing->det_pulses < 3) {
 		siril_log_color_message(_("Not enought pulses detected. Enlarge the selection.\n"), "red");
 		return 0;
 	}
