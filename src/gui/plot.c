@@ -616,9 +616,11 @@ static void build_photometry_dataset(sequence *seq, int dataset, int ref_image, 
 			}
 			if (julian0 && force_Julian) {
 				xlabel = malloc(XLABELSIZE * sizeof(char));
-				g_snprintf(xlabel, XLABELSIZE, "(JD) %d +", julian0);
+//				g_snprintf(xlabel, XLABELSIZE, "(JD) %d +", julian0);
+				g_snprintf(xlabel, XLABELSIZE, "%s %d +", com.pref.phot_set.t_delayed ? "(JD shifted)" : "(JD)", julian0);
 			} else {
-				xlabel = _("Frames");
+//				xlabel = _("Frames");
+				xlabel = com.pref.phot_set.t_delayed ? _("Frames shifted") : _("Frames");
 			}
 		}
 		set_x_photometry_values(seq, plot, i, j);
