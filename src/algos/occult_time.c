@@ -153,6 +153,7 @@ static int time_offset_calc (struct occultation_args *pulse, double *vmag, seque
 
 		pulse[i].delay_comp = 1000.0 * timediff_in_s(end_frame2, pps_time);	// delay after the real PPS timestamp
 		if (verbose) siril_log_color_message(_("diff time (ms) %lf\n\n"), "salmon", pulse[i].delay_comp);
+		if (pulse[i].delay_comp <= 0.0) siril_log_color_message(_("Warning: Huge PC clock offset\n\n"), "red");
 
 		g_date_time_unref(begin_frame);
 		g_date_time_unref(end_frame);
