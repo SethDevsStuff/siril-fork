@@ -51,7 +51,8 @@ enum {
 static GtkToggleButton *flipbutton = NULL, *automagbutton = NULL, *DEC_S = NULL, 
 	*manualbutton = NULL, *downsamplebutton = NULL, *autocropbutton = NULL, *autocatbutton = NULL,
 	*nonearbutton = NULL, *blindposbutton = NULL, *blindresbutton = NULL,
-	*seqsolvebutton = NULL, *seqnocache = NULL, *seqskipsolved = NULL;
+	*seqsolvebutton = NULL, *seqnocache = NULL, *seqskipsolved = NULL,
+	*sequseheadercoords = NULL, *sequseheaderpixel = NULL, *sequseheaderfocal = NULL;
 static GtkSpinButton *magspin = NULL, *RA_h = NULL, *RA_m = NULL, *DEC_d = NULL, *DEC_m = NULL, *radiusspin = NULL;
 static GtkComboBox *catalogbox = NULL, *orderbox = NULL, *solverbox = NULL, *serverbox = NULL;
 static GtkLabel *cataloglabel = NULL, *radiuslabel = NULL;
@@ -100,6 +101,9 @@ static void load_all_ips_statics() {
 		seqsolvebutton = GTK_TOGGLE_BUTTON(lookup_widget("checkbutton_IPS_seqsolve"));
 		seqnocache = GTK_TOGGLE_BUTTON(lookup_widget("checkbutton_IPS_nocache"));
 		seqskipsolved = GTK_TOGGLE_BUTTON(lookup_widget("checkbutton_IPS_skipsolved"));
+		sequseheadercoords = GTK_TOGGLE_BUTTON(lookup_widget("checkbutton_IPS_sequseheadercoords"));
+		sequseheaderpixel = GTK_TOGGLE_BUTTON(lookup_widget("checkbutton_IPS_sequseheaderpixel"));
+		sequseheaderfocal = GTK_TOGGLE_BUTTON(lookup_widget("checkbutton_IPS_sequseheaderfocal"));
 		// combos
 		catalogbox = GTK_COMBO_BOX(lookup_widget("ComboBoxIPSCatalog"));
 		orderbox = GTK_COMBO_BOX(lookup_widget("ComboBoxIPS_order"));
@@ -152,8 +156,16 @@ void initialize_ips_dialog() {
 	gtk_expander_set_expanded(sequenceexp, isseq);
 	gtk_widget_set_visible(GTK_WIDGET(sequenceexp), isseq);
 	gtk_widget_set_visible(GTK_WIDGET(stardetectionexp), !isseq);
-	gtk_toggle_button_set_active(seqsolvebutton, FALSE);
+	gtk_toggle_button_set_active(seqsolvebutton, isseq);
 	on_GtkCheckButton_solveseq_toggled(NULL, NULL);
+	if (isseq) {
+		gtk_toggle_button_set_active(sequseheadercoords, has_coords);
+		gtk_toggle_button_set_active(sequseheaderpixel, has_pixel);
+		gtk_toggle_button_set_active(sequseheaderfocal, has_focal);
+		gtk_widget_set_sensitive(GTK_WIDGET(sequseheadercoords), has_coords);
+		gtk_widget_set_sensitive(GTK_WIDGET(sequseheaderpixel), has_pixel);
+		gtk_widget_set_sensitive(GTK_WIDGET(sequseheaderfocal), has_focal);
+	}
 	// solver-related controls
 	on_comboastro_catalog_changed(NULL, NULL);
 }
@@ -217,12 +229,12 @@ static void get_mag_settings_from_GUI(limit_mag_mode *mag_mode, double *magnitud
 }
 
 gboolean has_any_keywords() {
-	return (gfit.focal_length > 0.0 ||
-			gfit.pixel_size_x > 0.f ||
-			gfit.pixel_size_y > 0.f ||
-			(has_wcs(&gfit) && gfit.wcslib->crval[0] != 0.0 && gfit.wcslib->crval[1] != 0.0) ||
-			(gfit.wcsdata.objctra[0] != '\0' && gfit.wcsdata.objctdec[0] != '\0') ||
-			(gfit.wcsdata.ra != 0.0 && gfit.wcsdata.dec != 0.0));
+	return (gfit.keywords.focal_length > 0.0 ||
+			gfit.keywords.pixel_size_x > 0.f ||
+			gfit.keywords.pixel_size_y > 0.f ||
+			(has_wcs(&gfit) && gfit.keywords.wcslib->crval[0] != 0.0 && gfit.keywords.wcslib->crval[1] != 0.0) ||
+			(gfit.keywords.wcsdata.objctra[0] != '\0' && gfit.keywords.wcsdata.objctdec[0] != '\0') ||
+			(gfit.keywords.wcsdata.ra != 0.0 && gfit.keywords.wcsdata.dec != 0.0));
 }
 
 /* effective focal length in mm */
@@ -277,13 +289,13 @@ static gboolean is_autocrop_activated() {
 }
 
 static void update_pixel_size() {
-	float pixel = gfit.pixel_size_x > gfit.pixel_size_y ? gfit.pixel_size_x : gfit.pixel_size_y;
-	if (com.pref.binning_update && gfit.binning_x > 1) {
-		pixel *= gfit.binning_x;
+	double pixel = gfit.keywords.pixel_size_x > gfit.keywords.pixel_size_y ? gfit.keywords.pixel_size_x : gfit.keywords.pixel_size_y;
+	if (com.pref.binning_update && gfit.keywords.binning_x > 1) {
+		pixel *= gfit.keywords.binning_x;
 	}
 
-	if (pixel > 0.f) {
-		gchar *cpixels = g_strdup_printf("%.2lf", (double) pixel);
+	if (pixel > 0.0) {
+		gchar *cpixels = g_strdup_printf("%.2lf", pixel);
 		gtk_entry_set_text(pixelentry, cpixels);
 		g_free(cpixels);
 		has_pixel = gfit.pixelkey;
@@ -296,7 +308,7 @@ static void update_pixel_size() {
 }
 
 static void update_focal() {
-	double focal = gfit.focal_length;
+	double focal = gfit.keywords.focal_length;
 
 	if (focal > 0.0) {
 		gchar *cfocal = g_strdup_printf("%.1lf", focal);
@@ -556,6 +568,7 @@ static void add_object_in_tree_view(const gchar *object) {
 			gtk_tree_selection_select_iter(selection, &iter);
 			g_signal_emit_by_name(GTK_TREE_VIEW(treeviewIPS), "cursor-changed");
 		}
+		gtk_toggle_button_set_active(sequseheadercoords, FALSE);
 	}
 	if (local_obj) {
 		siril_catalog_free_item(local_obj);
@@ -573,12 +586,14 @@ void on_GtkEntry_IPS_focal_changed(GtkEditable *editable, gpointer user_data) {
 	update_resolution_field();
 	has_focal = FALSE;
 	remove_style_class(GTK_WIDGET(focalentry), "header_unset");
+	gtk_toggle_button_set_active(sequseheaderfocal, FALSE);
 }
 
 void on_GtkEntry_IPS_pixels_changed(GtkEditable *editable, gpointer user_data) {
 	update_resolution_field();
 	has_pixel = FALSE;
 	remove_style_class(GTK_WIDGET(pixelentry), "header_unset");
+	gtk_toggle_button_set_active(sequseheaderpixel, FALSE);
 }
 
 void on_GtkEntry_IPS_insert_text(GtkEntry *entry, const gchar *text, gint length,
@@ -691,6 +706,9 @@ void on_GtkCheckButton_solveseq_toggled(GtkToggleButton *button, gpointer user) 
 	}
 	gtk_widget_set_visible(GTK_WIDGET(seqnocache), solveseq && shownocache);
 	gtk_widget_set_visible(GTK_WIDGET(seqskipsolved), solveseq);
+	gtk_widget_set_visible(GTK_WIDGET(sequseheadercoords), solveseq);
+	gtk_widget_set_visible(GTK_WIDGET(sequseheaderpixel), solveseq);
+	gtk_widget_set_visible(GTK_WIDGET(sequseheaderfocal), solveseq);
 }
 
 void on_GtkCheckButton_nonear_toggled(GtkToggleButton *button, gpointer user) {
@@ -778,9 +796,9 @@ int fill_plate_solver_structure_from_GUI(struct astrometry_data *args) {
 			// - we use local catalogues
 			// - or user has selected nocache and there's at least one of the 3 metadata present in gfit header
 			args->nocache = uselocal || (gtk_toggle_button_get_active(seqnocache) && (has_coords || has_focal || has_pixel));
-			args->forced_metadata[FORCED_CENTER] = !has_coords;
-			args->forced_metadata[FORCED_PIXEL] = !has_pixel;
-			args->forced_metadata[FORCED_FOCAL] = !has_focal;
+			args->forced_metadata[FORCED_CENTER] = !gtk_toggle_button_get_active(sequseheadercoords);
+			args->forced_metadata[FORCED_PIXEL] = !gtk_toggle_button_get_active(sequseheaderpixel);
+			args->forced_metadata[FORCED_FOCAL] = !gtk_toggle_button_get_active(sequseheaderfocal);
 		}
 	} else { //SOLVER_LOCALASNET
 		args->asnet_checked = TRUE;

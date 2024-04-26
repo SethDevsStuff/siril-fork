@@ -50,6 +50,7 @@ struct seqpsf_args {
 	gboolean for_occultation;
 	super_bool allow_use_as_regdata;
 	framing_mode framing;
+	char bayer_pattern[FLEN_VALUE];
 
 	/* The seqpsf result for each image, list of seqpsf_data */
 	GSList *list;

@@ -135,8 +135,8 @@ int stack_open_all_files(struct stacking_args *args, int *bitpix, int *naxis, lo
 		}
 		if (stackcnt <= 0)
 			stackcnt = nb_frames;
-		fit->stackcnt = stackcnt;
-		fit->livetime = livetime;
+		fit->keywords.stackcnt = stackcnt;
+		fit->keywords.livetime = livetime;
 		// keeping exposure of the reference frame
 
 		if (naxes[2] == 0)
@@ -166,8 +166,8 @@ int stack_open_all_files(struct stacking_args *args, int *bitpix, int *naxis, lo
 			if (dt)
 				*list_date = g_list_prepend(*list_date,	new_date_item(dt, 0.0));
 		}
-		fit->stackcnt = nb_frames;
-		fit->livetime = fit->exposure * nb_frames;
+		fit->keywords.stackcnt = nb_frames;
+		fit->keywords.livetime = fit->keywords.exposure * nb_frames;
 		// keeping the fallacious exposure based on fps from the header
 	} else {
 		siril_log_message(_("Rejection stacking is only supported for FITS images/sequences and SER sequences.\nUse \"Sum Stacking\" instead.\n"));
@@ -175,7 +175,7 @@ int stack_open_all_files(struct stacking_args *args, int *bitpix, int *naxis, lo
 	}
 
 	set_progress_bar_data(NULL, PROGRESS_DONE);
-	siril_debug_print("stack count: %u, livetime: %f\n", fit->stackcnt, fit->livetime);
+	siril_debug_print("stack count: %u, livetime: %f\n", fit->keywords.stackcnt, fit->keywords.livetime);
 	return ST_OK;
 }
 
@@ -313,7 +313,7 @@ static int stack_read_block_data(struct stacking_args *args,
 #ifdef STACK_DEBUG
 				fprintf(stdout, "shifty for image %d: %d\n", args->image_indices[frame], shifty);
 #endif
-				if (area.y + area.h - 1 + shifty < 0 || area.y + shifty >= naxes[1]) {
+				if (area.y + area.h + shifty < 0 || area.y + shifty >= naxes[1]) {
 					// entirely outside image below or above: all black pixels
 					clear = TRUE; readdata = FALSE;
 				} else if (area.y + shifty < 0) {
@@ -321,9 +321,9 @@ static int stack_read_block_data(struct stacking_args *args,
 					 * requires an offset in pix */
 					clear = TRUE;
 					area.h += area.y + shifty;	// cropping the height
-					offset = naxes[0] * (area.y - shifty);	// positive
+					offset = -naxes[0] * (area.y + shifty);	// positive
 					area.y = 0;
-				} else if (area.y + area.h - 1 + shifty >= naxes[1]) {
+				} else if (area.y + area.h + shifty >= naxes[1]) {
 					/* we read only the upper part of the area here */
 					clear = TRUE;
 					area.y += shifty;
