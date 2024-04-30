@@ -35,8 +35,11 @@
 
 static GtkWidget *dialog = NULL;	// the window, a GtkDialog
 static GtkWidget *delay_cam = NULL;
+static GtkWidget *std_delay = NULL;
 static GtkWidget *sep = NULL;
 static GtkWidget *apply_offset = NULL;
+static GtkWidget *data_grp, *res_data_grp, *label_data_grp;
+static GtkWidget *ms_unit, *min_unit;
 static double delay = 0.0;
 
 static void on_occult_response(GtkDialog* self, gint response_id, gpointer user_data);
@@ -46,7 +49,6 @@ static void build_the_dialog() {
 	dialog = gtk_dialog_new_with_buttons(_("Calibrate Timestamps over PPS"), NULL,
 			0, _("_OK"), GTK_RESPONSE_ACCEPT, _("_Close"), GTK_RESPONSE_REJECT, NULL);
 
-
 	// If the user clicks one of these dialog buttons, GtkDialog will emit
 	// the GtkDialog::response signal with the corresponding response ID
 	gtk_window_set_default_size(GTK_WINDOW(dialog), 400, 400);
@@ -54,34 +56,81 @@ static void build_the_dialog() {
 	g_signal_connect(G_OBJECT(dialog), "delete-event", G_CALLBACK(gtk_widget_hide_on_delete), NULL);
 	g_signal_connect(G_OBJECT(dialog), "response", G_CALLBACK(on_occult_response), NULL);
 
+	// Definition of all the graphical items
+	// Top label
 	GtkWidget *label = gtk_label_new(_("Calibration of a camera setup with a 1PPS signal trigger"));
 	gtk_label_set_line_wrap(GTK_LABEL(label), TRUE);
 	g_object_set(G_OBJECT(label), "margin", 15, NULL);
 
-
+	// Explanation text
 	GtkWidget *label2 = gtk_label_new(_("The first step aimes at finding the necessary delay to re-time\nand synchronize the timestamps to a 1PPS signal from a GPS module.\n\nTo get this parameter, you need:\n -a loaded sequence (from a .ser file)\n -this sequence must have a pseudo-star blinking at a beat of 1 pulse per second\n -make a selection around this pseudo-star, including enough background\n\nThen you can either click on Find delay or write your own delay if you know it\n"));
 	gtk_label_set_line_wrap(GTK_LABEL(label2), TRUE);
 	g_object_set(G_OBJECT(label2), "margin-left", 15, NULL);
 	g_object_set(G_OBJECT(label2), "margin-top", 15, NULL);
+	g_object_set(G_OBJECT(label2), "margin-right", 15, NULL);
 
-	GtkWidget *label_delay_cam = gtk_label_new(_("Camera delay to handle (ms):"));
-	gtk_widget_set_halign(label_delay_cam, GTK_ALIGN_CENTER);
-//	g_object_set(G_OBJECT(label_delay_cam), "margin-left", 15, NULL);
-	g_object_set(G_OBJECT(label_delay_cam), "margin-top", 5, NULL);
-	g_object_set(G_OBJECT(label_delay_cam), "margin-bottom", 0, NULL);
+	// The relevant data
+	// Defines the results box, 3 lines
+	res_data_grp = gtk_box_new(GTK_ORIENTATION_VERTICAL, 3);
+	gtk_box_set_homogeneous(GTK_BOX(res_data_grp), TRUE);
+	gtk_widget_set_tooltip_text(res_data_grp, _("Data to to resync"));
 
+// Line#1: The title line, with 2 items
+	label_data_grp = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 2);
+	gtk_box_set_homogeneous(GTK_BOX(label_data_grp), TRUE);
+	//// Item #1, left side
+	GtkWidget *label_delay_cam = gtk_label_new(_("Delay to handle"));
+	gtk_widget_set_halign(label_delay_cam, GTK_ALIGN_START);
+	g_object_set(G_OBJECT(label_delay_cam), "margin-left", 15, NULL);
+	//// Item #2, right side
+	GtkWidget *label_std_cam = gtk_label_new(_("Standard déviation:"));
+	g_object_set(G_OBJECT(label_std_cam), "margin-right", 15, NULL);
+	gtk_widget_set_halign(label_std_cam, GTK_ALIGN_END);
+	gtk_container_add(GTK_CONTAINER(label_data_grp), label_delay_cam);
+	gtk_container_add(GTK_CONTAINER(label_data_grp), label_std_cam);
+	g_object_set(G_OBJECT(label_data_grp), "margin-left", 15, NULL);
+	g_object_set(G_OBJECT(label_data_grp), "margin-top", 0, NULL);
+	g_object_set(G_OBJECT(label_data_grp), "margin-bottom", 0, NULL);
+	gtk_container_add(GTK_CONTAINER(res_data_grp), label_data_grp);	// Final Add to the upper container
+// Line#2: The result fields
+	//// A line with 5 elements
+	data_grp = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
+	gtk_box_set_homogeneous(GTK_BOX(data_grp), TRUE);
+	gtk_widget_set_tooltip_text(data_grp, _("Data to resync"));
+	//// Item#1: the Delay field
 	delay_cam = gtk_entry_new();
 	gtk_entry_set_text(GTK_ENTRY(delay_cam), "0.0");
-//	delay_cam.props.xalign = 0.5;
 	gtk_entry_set_alignment (GTK_ENTRY (delay_cam), 0.5);
-	gtk_widget_set_tooltip_text(delay_cam, _("Camera delay"));
+	gtk_widget_set_tooltip_text(delay_cam, _("Delay"));
 	gtk_widget_set_halign(delay_cam, GTK_ALIGN_CENTER);
-//	g_object_set(G_OBJECT(delay_cam), "margin-left", 35, NULL);
-//	g_object_set(G_OBJECT(delay_cam), "margin-right", 40, NULL);
-//	g_object_set(G_OBJECT(delay_cam), "margin-top", 0, NULL);
-
+	gtk_container_add(GTK_CONTAINER(data_grp), delay_cam);
+	//// Item#2: the unit button, ms or min
+	GtkWidget *unit_box;
+	GtkWidget *ms_unit, *min_unit;
+	unit_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+	gtk_box_set_homogeneous(GTK_BOX(unit_box), TRUE);
+	gtk_widget_set_tooltip_text(unit_box, _("(ms) is usefull for occultation resync whereas (min) is usefull for transit resync"));
+	ms_unit = gtk_radio_button_new_with_label_from_widget(NULL, _("ms"));
+	min_unit = gtk_radio_button_new_with_label_from_widget (GTK_RADIO_BUTTON(ms_unit), _("min"));
+	gtk_container_add(GTK_CONTAINER(unit_box), ms_unit);
+	gtk_container_add(GTK_CONTAINER(unit_box), min_unit);
+	gtk_container_add(GTK_CONTAINER(data_grp), unit_box);
+	//// Item#3: the Standard Deviation field
+	std_delay = gtk_entry_new();
+	gtk_entry_set_text(GTK_ENTRY(std_delay), "0.0");
+	gtk_entry_set_alignment (GTK_ENTRY (std_delay), 0.5);
+	gtk_widget_set_tooltip_text(std_delay, _("Computed Standard Déviation"));
+	gtk_widget_set_halign(std_delay, GTK_ALIGN_CENTER);
+	gtk_widget_set_sensitive (std_delay, FALSE);
+	gtk_container_add(GTK_CONTAINER(data_grp), std_delay);
+	g_object_set(G_OBJECT(data_grp), "margin-left", 15, NULL);
+	g_object_set(G_OBJECT(data_grp), "margin-top", 0, NULL);
+	g_object_set(G_OBJECT(data_grp), "margin-bottom", 10, NULL);
+	gtk_container_add(GTK_CONTAINER(res_data_grp), data_grp);	// Final Add to the upper container
+// Line#3: The button
 	GtkWidget *find_delay = gtk_button_new_with_mnemonic (_("Find Delay"));
 	g_signal_connect (find_delay, "clicked", G_CALLBACK (on_find_clicked), NULL);
+	gtk_container_add(GTK_CONTAINER(res_data_grp), find_delay);	// Final Add to the upper container
 
 	sep = gtk_separator_new (GTK_ORIENTATION_HORIZONTAL);
 	gtk_widget_set_size_request (sep, 1, 5);
@@ -99,13 +148,11 @@ static void build_the_dialog() {
 	g_object_set(G_OBJECT(apply_offset), "margin-bottom", 35, NULL);
 	g_object_set(G_OBJECT(apply_offset), "margin-top", 5, NULL);
 
-
+// Gather the graphic items
 	GtkWidget *content_area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
 	gtk_container_add(GTK_CONTAINER(content_area), label);
 	gtk_container_add(GTK_CONTAINER(content_area), label2);
-	gtk_container_add(GTK_CONTAINER(content_area), label_delay_cam);
-	gtk_container_add(GTK_CONTAINER(content_area), delay_cam);
-	gtk_container_add(GTK_CONTAINER(content_area), find_delay);
+	gtk_container_add(GTK_CONTAINER(content_area), res_data_grp);
 	gtk_container_add(GTK_CONTAINER(content_area), sep);
 	gtk_container_add(GTK_CONTAINER(content_area), label3);
 	gtk_container_add(GTK_CONTAINER(content_area), apply_offset);
@@ -157,10 +204,14 @@ static void on_find_clicked(GtkDialog* self, gint response_id, gpointer user_dat
 
 	struct light_curve_args *args = calloc(1, sizeof(struct light_curve_args));
 	args->seq = &com.seq;
+
+
 	start_in_new_thread(occultation_worker, args);
 
 	delay = 0.0;
 	gtk_entry_set_text(GTK_ENTRY(delay_cam), g_strdup_printf("%0.3lf", delay));
+	gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(min_unit), FALSE);			// CHELOU!!! a verifier pourquoi on repasse pas en ms
+	gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ms_unit), TRUE);
 	control_window_switch_to_tab(OUTPUT_LOGS);
 }
 
@@ -170,6 +221,7 @@ gboolean end_occultation_worker(gpointer p) {
 		args->seq = &com.seq;
 		delay = com.pref.phot_set.time_offset;
 		gtk_entry_set_text(GTK_ENTRY(delay_cam), g_strdup_printf("%0.3lf", delay));
+		gtk_entry_set_text(GTK_ENTRY(std_delay), g_strdup_printf("%0.3lf", 2.654));		// Comment recuperer la std???
 		control_window_switch_to_tab(OUTPUT_LOGS);
 		free_light_curve_args(args);
 	}
