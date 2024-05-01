@@ -106,7 +106,7 @@ static void build_the_dialog() {
 	gtk_container_add(GTK_CONTAINER(data_grp), delay_cam);
 	//// Item#2: the unit button, ms or min
 	GtkWidget *unit_box;
-	GtkWidget *ms_unit, *min_unit;
+//	GtkWidget *ms_unit, *min_unit;
 	unit_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
 	gtk_box_set_homogeneous(GTK_BOX(unit_box), TRUE);
 	gtk_widget_set_tooltip_text(unit_box, _("(ms) is usefull for occultation resync whereas (min) is usefull for transit resync"));
@@ -242,12 +242,14 @@ static void on_occult_response(GtkDialog* self, gint response_id, gpointer user_
 
 	control_window_switch_to_tab(OUTPUT_LOGS);
 	gboolean use_offset = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(apply_offset));
+	gboolean use_ms = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(ms_unit));
 	struct light_curve_args *args = calloc(1, sizeof(struct light_curve_args));
 	args->seq = &com.seq;
 	if (use_offset) {
 		com.pref.phot_set.t_delayed = TRUE;
-		com.pref.phot_set.time_offset = g_strtod(gtk_entry_get_text(GTK_ENTRY(delay_cam)), NULL);
-		siril_log_message(_("Applied offset: %0.3lf (ms) \n"), com.pref.phot_set.time_offset);
+		double dbl_offset= g_strtod(gtk_entry_get_text(GTK_ENTRY(delay_cam)), NULL);
+		com.pref.phot_set.time_offset = use_ms ? dbl_offset : 60000.0 * dbl_offset;	// Converted in (ms)
+		siril_log_message(_("Applied offset: %0.3lf (%s) \n"), dbl_offset, use_ms ? "ms" : "min");
 	}
 	else {
 		siril_log_message(_("No offset applied \n"));
