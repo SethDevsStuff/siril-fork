@@ -437,35 +437,23 @@ int new_light_curve(const char *filename, struct light_curve_args *lcargs) {
 			double julian;
 			GDateTime *tsi = g_date_time_ref(seq->imgparam[i].date_obs);
 			julian = date_time_to_Julian(tsi);
-			siril_log_color_message(_("julian-0= %lf\n"), "salmon", julian);
 			gchar *str = NULL;
 			str = date_time_to_FITS_date(tsi);
-			siril_log_color_message(_("tsi= %s\n"), "salmon", str);
-			siril_log_color_message(_("time_offset= %lf\n"), "salmon", com.pref.phot_set.time_offset);
 			if (seq->exposure > 0.0) {
 //				GDateTime *new_dt = g_date_time_add_seconds(tsi, seq->exposure * 0.5);
 				GDateTime *new_dt = g_date_time_add_seconds(tsi, com.pref.phot_set.t_delayed ? seq->exposure * 0.5 + com.pref.phot_set.time_offset / 1000.0 : seq->exposure * 0.5);
 				str = date_time_to_FITS_date(new_dt);
-				siril_log_color_message(_("expo= %s\n"), "salmon", str);
 				julian = date_time_to_Julian(new_dt);
-				siril_log_color_message(_("julian= %lf\n"), "salmon", julian);
 				g_date_time_unref(new_dt);
-				//g_date_time_unref(new_dt);
 			} else {
 				GDateTime *new_dt = g_date_time_add_seconds(tsi, com.pref.phot_set.t_delayed ? com.pref.phot_set.time_offset / 1000.0 : 0.0);
 				str = date_time_to_FITS_date(new_dt);
-				siril_log_color_message(_("!expo= %s\n"), "salmon", str);
 				julian = date_time_to_Julian(new_dt);
-				siril_log_color_message(_("julian= %lf\n"), "salmon", julian);
 				g_date_time_unref(new_dt);
-				//g_date_time_unref(new_dt);
 			}
 			free(str);
-			//g_date_time_unref(new_dt);
-
 			g_date_time_unref(tsi);
 			date[j] = julian;
-//			date[j] = com.pref.phot_set.t_delayed ? julian + com.pref.phot_set.time_offset : julian;
 			if (julian < min_date)
 				min_date = julian;
 		} else {
