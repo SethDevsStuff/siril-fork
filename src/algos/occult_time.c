@@ -89,14 +89,14 @@ static int pulse_detection (struct occultation_args *pulse, double *vmag, int *o
 				pulse[k].pls_nbr = j;
 				pulse[k].sum_flux = sum;
 				if (sum == 0.0) return 0;
-				if (verbose) siril_log_color_message(_("Stoppic= %i, Vmag(%lf), Startpic= %i, nbr_pic= %i, sum= %lf\n"), "salmon", orig_ind[i + 1], vmag[orig_ind[i +1]], orig_ind[i +1] - pulse[k].pls_nbr +1, pulse[k].pls_nbr, pulse[k].sum_flux);
+				if (verbose) siril_log_color_message(_("Stoppic= %i, Vmag(%lf), Startpic= %i, nbr_pic= %i, sum= %lf\n"), "salmon", orig_ind[i + 1], vmag[orig_ind[i + 1]], orig_ind[i + 1] - pulse[k].pls_nbr + 1, pulse[k].pls_nbr, pulse[k].sum_flux);
 				k++;	// Index of the pulse
 				j = 0;
 				sum = 0.0;
 			}
 		}
 	}	
-	return (k - 1);		// number of detected PPS in the sequence
+	return k;		// number of detected PPS in the sequence
 }
 
 static GDateTime *round_date (GDateTime *date){
@@ -120,7 +120,7 @@ static GDateTime *round_date (GDateTime *date){
 }
 
 static int time_offset_calc (struct occultation_args *pulse, double *vmag, sequence *seq, struct occ_res *timing) {
-	gboolean verbose = FALSE;
+	gboolean verbose = TRUE;
 	double *unity_flux = malloc(timing->th_pls_nbr * sizeof(double));
 	double *first_p = malloc(timing->th_pls_nbr * sizeof(double));
 	double exposure = timing->exposure;
@@ -137,22 +137,23 @@ static int time_offset_calc (struct occultation_args *pulse, double *vmag, seque
 		GDateTime *pps_time = round_date (end_frame2);	// (Observed) Timestamp of the precise PPS time the pulse refers to
 
 		if (verbose) {
-			siril_log_color_message(_("unit_flux[%i] %lf, sum_flux(%i) = %lf\n"), "red", i, unity_flux[i], i, pulse[i].sum_flux);
-			siril_log_color_message(_("Vmag(%i)= %lf, first_p[%i] %lf (ms)\n"), "salmon", pulse[i].start_ind_inseq, vmag[pulse[i].start_ind], i, first_p[i]);
+			siril_log_color_message(_("Pulse # %i\n"), "red", i);
+			siril_log_color_message(_("unit_flux[%i] %0.2lf, sum_flux(%i) = %0.2lf\n"), "salmon", i, unity_flux[i], i, pulse[i].sum_flux);
+			siril_log_color_message(_("Vmag(%i)= %0.2lf, first_p[%i]= %0.2lf(ms)\n"), "salmon", pulse[i].start_ind_inseq, vmag[pulse[i].start_ind], i, first_p[i]);
 
 			gchar *str = date_time_to_FITS_date(begin_frame);
-			siril_log_color_message(_("begin_frame %s, exposure= %lf (ms)\n"), "salmon", str, 1000.0 * exposure);
+			siril_log_color_message(_("Begin_frame: %s, exposure= %0.3lf(ms)\n"), "salmon", str, exposure);
 			str = date_time_to_FITS_date(end_frame);
-			siril_log_color_message(_("end_frame %s\n"), "salmon", str);
+			siril_log_color_message(_("End_frame: %s\n"), "salmon", str);
 			str = date_time_to_FITS_date(end_frame2);
-			siril_log_color_message(_("end_frame2 (supposed PPS) %s, with first_p[%i]= %lf (ms)\n"), "salmon", str, i, first_p[i]);
+			siril_log_color_message(_("Supposed PPS: %s, with first_p[%i]= %0.3lf(ms)\n"), "salmon", str, i, first_p[i]);
 			str = date_time_to_FITS_date(pps_time);
-			siril_log_color_message(_("Real pps_time %s\n"), "salmon", str);
+			siril_log_color_message(_("Real pps_time: %s\n"), "salmon", str);
 			free(str);
 		}
 
 		pulse[i].delay_comp = 1000.0 * timediff_in_s(end_frame2, pps_time);	// delay after the real PPS timestamp
-		if (verbose) siril_log_color_message(_("diff time (ms) %lf\n\n"), "salmon", pulse[i].delay_comp);
+		if (verbose) siril_log_color_message(_("Delay time %0.2lf(ms)\n\n"), "red", pulse[i].delay_comp);
 		if (pulse[i].delay_comp <= 0.0) siril_log_color_message(_("Warning: Huge PC clock offset\n\n"), "red");
 
 		g_date_time_unref(begin_frame);
@@ -306,7 +307,7 @@ int occult_curve(struct light_curve_args *lcargs) {
 	timing->det_pulses = pulse_detection (pulse, vmag, orig_ind, timing);
 
 	// Does it match the forseen value
-	siril_log_color_message(_("Detected pulses= %i vs Expected pulses= %i\n"), "salmon", timing->det_pulses, timing->th_pls_nbr - 1);
+	siril_log_color_message(_("Detected pulses= %i vs max Pulse Count= %i\n"), "salmon", timing->det_pulses, timing->th_pls_nbr - 1);
 //	if (timing->det_pulses < (timing->th_pls_nbr / 2)) {
 	if (timing->det_pulses < 3) {
 		siril_log_color_message(_("Not enought pulses detected. Enlarge the selection.\n"), "red");

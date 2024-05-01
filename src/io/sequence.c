@@ -1718,7 +1718,7 @@ int seqpsf_image_hook(struct generic_seq_args *args, int out_index, int index, f
 	free(ps);
 	if (data->psf) {
 		/* for photometry ? */
-		if (spsfargs->for_photometry && !spsfargs->for_occultation) {
+		if (spsfargs->for_photometry && !com.pref.phot_set.t_delayed) {			// Not really nice, but need help here
 			if (data->psf->s_mag > 9.0 || !data->psf->phot_is_valid) {
 				siril_log_color_message(_("Photometry analysis failed for image %d (%s)\n"),
 						"salmon", index, psf_error_to_string(error));
@@ -1744,12 +1744,12 @@ int seqpsf_image_hook(struct generic_seq_args *args, int out_index, int index, f
 		args->seq->imgparam[index].airmass = fit->keywords.airmass;
 	}
 	else {
-		if (spsfargs->framing == FOLLOW_STAR_FRAME && !spsfargs->for_occultation) {
+		if (spsfargs->framing == FOLLOW_STAR_FRAME && !com.pref.phot_set.t_delayed) {
 			siril_log_color_message(_("No star found in the area image %d around %d,%d:"
 						" error %s (use a larger area?)\n"),
 					"red", index, area->x, area->y, psf_error_to_string(error));
 		} else {
-			if (!spsfargs->for_occultation)
+			if (!com.pref.phot_set.t_delayed)
 				siril_log_color_message(_("No star found in the area image %d around %d,%d:"
 						" error %s (use 'follow star' option?)\n"),
 					"red", index, area->x, area->y, psf_error_to_string(error));
