@@ -83,18 +83,18 @@ static void build_the_dialog() {
 	gtk_widget_set_halign(label_delay_cam, GTK_ALIGN_START);
 	g_object_set(G_OBJECT(label_delay_cam), "margin-left", 15, NULL);
 	//// Item #2, right side
-	GtkWidget *label_std_cam = gtk_label_new(_("Standard déviation:"));
-	g_object_set(G_OBJECT(label_std_cam), "margin-right", 15, NULL);
-	gtk_widget_set_halign(label_std_cam, GTK_ALIGN_END);
+//	GtkWidget *label_std_cam = gtk_label_new(_("Standard déviation:"));
+//	g_object_set(G_OBJECT(label_std_cam), "margin-right", 15, NULL);
+//	gtk_widget_set_halign(label_std_cam, GTK_ALIGN_END);
 	gtk_container_add(GTK_CONTAINER(label_data_grp), label_delay_cam);
-	gtk_container_add(GTK_CONTAINER(label_data_grp), label_std_cam);
+//	gtk_container_add(GTK_CONTAINER(label_data_grp), label_std_cam);
 	g_object_set(G_OBJECT(label_data_grp), "margin-left", 15, NULL);
 	g_object_set(G_OBJECT(label_data_grp), "margin-top", 0, NULL);
 	g_object_set(G_OBJECT(label_data_grp), "margin-bottom", 0, NULL);
 	gtk_container_add(GTK_CONTAINER(res_data_grp), label_data_grp);	// Final Add to the upper container
 // Line#2: The result fields
 	//// A line with 5 elements
-	data_grp = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
+	data_grp = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
 	gtk_box_set_homogeneous(GTK_BOX(data_grp), TRUE);
 	gtk_widget_set_tooltip_text(data_grp, _("Data to resync"));
 	//// Item#1: the Delay field
@@ -116,13 +116,13 @@ static void build_the_dialog() {
 	gtk_container_add(GTK_CONTAINER(unit_box), min_unit);
 	gtk_container_add(GTK_CONTAINER(data_grp), unit_box);
 	//// Item#3: the Standard Deviation field
-	std_delay = gtk_entry_new();
+/*	std_delay = gtk_entry_new();
 	gtk_entry_set_text(GTK_ENTRY(std_delay), "0.0");
 	gtk_entry_set_alignment (GTK_ENTRY (std_delay), 0.5);
 	gtk_widget_set_tooltip_text(std_delay, _("Computed Standard Déviation"));
 	gtk_widget_set_halign(std_delay, GTK_ALIGN_CENTER);
 	gtk_widget_set_sensitive (std_delay, FALSE);
-	gtk_container_add(GTK_CONTAINER(data_grp), std_delay);
+	gtk_container_add(GTK_CONTAINER(data_grp), std_delay);	*/
 	g_object_set(G_OBJECT(data_grp), "margin-left", 15, NULL);
 	g_object_set(G_OBJECT(data_grp), "margin-top", 0, NULL);
 	g_object_set(G_OBJECT(data_grp), "margin-bottom", 10, NULL);
