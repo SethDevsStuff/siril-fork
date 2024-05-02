@@ -473,6 +473,122 @@ gpointer run_nlbayes_on_fit(gpointer p) {
 	return GINT_TO_POINTER(retval | CMD_NOTIFY_GFIT_MODIFIED);
 }
 
+static gboolean hasFlag(char **words, int nb, const char* optionName)
+{
+	for (int i = 1; i < nb; i++) {
+		if (g_str_has_prefix(words[i], optionName)) {
+			return TRUE;
+		}
+	}
+	return FALSE;
+}
+
+static gboolean hasOptionf(char** words, int nb, const char* optionPrefix, float* value, gboolean* error)
+{
+	*error = FALSE;
+	for (int i = 1; i < nb; i++) {
+		if (g_str_has_prefix(words[i], optionPrefix)) {
+			const char* start = words[i] + strlen(optionPrefix);
+			char* end;
+			float parsed = (float)g_ascii_strtod(start, &end);
+			if (start != end)
+				*value = parsed;
+			else 
+				*error = TRUE;
+			return TRUE;
+		}
+	}
+	return FALSE;
+}
+static gboolean hasOptioni(char** words, int nb, const char* optionPrefix, int* value, gboolean* error)
+{
+	float fvalue = 0.f;
+	if(hasOptionf(words, nb, optionPrefix, &fvalue, error))
+	{
+		if (!error)
+			*value = (int)fvalue;
+	}
+	return FALSE;
+}
+ 
+// static gboolean inbounds_ii(float value, float lowi, float highi)
+// {
+// 	return lowi <= value && value <= highi;
+// }
+// static gboolean inbounds_ie(float value, float lowi, float highe)
+// {
+// 	return lowi <= value && value < highe;
+// }
+static gboolean inbounds_ei(float value, float lowe, float highi)
+{
+	return lowe < value && value <= highi;
+}
+static gboolean inbounds_ee(float value, float lowe, float highe)
+{
+	return lowe < value && value < highe;
+}
+
+int process_denoise_newstyle(int nb){
+	gboolean error = FALSE;
+
+	denoise_args args;
+	args.sos = 1;
+	args.rho = 0.2f;
+	args.modulation = 1.f;
+	args.da3d = 0;
+	args.previewing = FALSE;
+	args.fit = &gfit;
+	args.do_anscombe = hasFlag(word, nb, "-vst");
+	args.da3d = hasFlag(word, nb, "-da3d") ? 1 : 0;
+	args.suppress_artefacts = hasFlag(word, nb, "-indep");
+	args.do_cosme = hasFlag(word, nb, "-vst") ? FALSE : TRUE;
+
+	if (hasOptionf(word, nb, "-mod=", &args.modulation, &error)){			
+		if (!inbounds_ei(args.modulation, 0.f, 1.f)) {
+			siril_log_message(_("Error: modulation must be > 0.0 and <= 1.0.\n"));
+			return CMD_ARG_ERROR;
+		}
+	}
+
+	if (hasOptionf(word, nb, "-rho=", &args.rho, &error)){			
+		if (!inbounds_ee(args.rho, 0.f, 1.f)) {
+			siril_log_message(_("Error in rho parameter: must be strictly > 0 and < 1, aborting.\n"));
+			return CMD_ARG_ERROR;
+		}
+	}
+
+	if (hasOptioni(word, nb, "-sos=", &args.sos, &error))
+	{			
+		if (args.sos < 1) {
+			siril_log_message(_("Error: SOS iterations must be >= 1. Defaulting to 1.\n"));
+			args.sos = 1;
+		} else if (args.sos > 10)
+			siril_log_message(_("Note: high number of SOS iterations. Processing time may be lengthy...\n"));
+	}
+
+	if (args.do_anscombe && (args.sos != 1 || args.da3d)) {
+		siril_log_color_message(_("Error: will not carry out DA3D or SOS iterations with Anscombe transform VST selected. aborting.\n"), "red");
+		return CMD_ARG_ERROR;
+	}
+	if (args.do_anscombe)
+		siril_log_message(_("Will apply generalised Anscombe variance stabilising transform.\n"));
+	if (args.da3d) {
+		siril_log_message(_("Will carry out final stage DA3D denoising.\n"));
+		if (args.sos != 1) {
+			siril_log_message(_("Will not carry out both DA3D and SOS. SOS iterations set to 1.\n"));
+			args.sos = 1;
+		}
+	}
+	
+	denoise_args *_args = calloc(1, sizeof(denoise_args));
+	memcpy(_args, &args, sizeof(denoise_args));
+	image_cfa_warning_check();
+	set_cursor_waiting(TRUE);
+	start_in_new_thread(run_nlbayes_on_fit, _args);
+
+	return CMD_OK;
+}
+
 int process_denoise(int nb){
 	gboolean error = FALSE;
 	set_cursor_waiting(TRUE);
