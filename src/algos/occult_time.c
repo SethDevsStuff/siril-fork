@@ -120,24 +120,25 @@ static GDateTime *round_date (GDateTime *date){
 }
 
 static int time_offset_calc (struct occultation_args *pulse, double *vmag, sequence *seq, struct occ_res *timing) {
-	gboolean verbose = TRUE;
+	gboolean verbose = FALSE;
 	double *unity_flux = malloc(timing->th_pls_nbr * sizeof(double));
 	double *first_p = malloc(timing->th_pls_nbr * sizeof(double));
 	double exposure = timing->exposure;
 
-	for (int i = 0; i < timing->th_pls_nbr; i++) {
+	for (int i = 0; i < timing->th_pls_nbr + 1; i++) {
 		if (i >= timing->det_pulses) continue;	// Avoid an overflow, even if it should not occur here...
 		unity_flux[i] = pulse[i].sum_flux / PULSE_WIDTH;	// in ADU/ms, assuming the pulse duration = 100ms
 		first_p[i] = vmag[pulse[i].start_ind] / unity_flux[i];	// Lenght of the first pulse (ms)
 
 		GDateTime *begin_frame = g_date_time_ref(seq->imgparam[pulse[i].start_ind_inseq - 1].date_obs);	// Timestamp at the beginning of the frame
+		if (!begin_frame) continue;	// Sometimes this pointer is void for an unexplained reason.
 		GDateTime *end_frame = g_date_time_add_seconds (begin_frame, exposure / 1000.0);	// (computed) Timestamp at the end of the frame
 		GDateTime *end_frame2 = g_date_time_add_seconds (end_frame, -1.0 * first_p[i] / 1000.0);	// (Computed) Timestamp of the PPS
 //		GDateTime *end_frame2 = g_date_time_add_seconds (begin_frame, -1.0 * first_p[i] / 1000.0);	// (Computed) Timestamp of the PPS
 		GDateTime *pps_time = round_date (end_frame2);	// (Observed) Timestamp of the precise PPS time the pulse refers to
 
+		siril_log_color_message(_("Pulse # %i\n"), "plum", i);
 		if (verbose) {
-			siril_log_color_message(_("Pulse # %i\n"), "red", i);
 			siril_log_color_message(_("unit_flux[%i] %0.2lf, sum_flux(%i) = %0.2lf\n"), "salmon", i, unity_flux[i], i, pulse[i].sum_flux);
 			siril_log_color_message(_("Vmag(%i)= %0.2lf, first_p[%i]= %0.2lf(ms)\n"), "salmon", pulse[i].start_ind_inseq, vmag[pulse[i].start_ind], i, first_p[i]);
 
@@ -152,9 +153,9 @@ static int time_offset_calc (struct occultation_args *pulse, double *vmag, seque
 			free(str);
 		}
 
-		pulse[i].delay_comp = 1000.0 * timediff_in_s(end_frame2, pps_time);	// delay after the real PPS timestamp
-		if (verbose) siril_log_color_message(_("Delay time %0.2lf(ms)\n\n"), "red", pulse[i].delay_comp);
-		if (pulse[i].delay_comp <= 0.0) siril_log_color_message(_("Warning: Huge PC clock offset\n\n"), "red");
+		pulse[i].delay_comp = 1000.0 * timediff_in_s(pps_time, end_frame2);	// delay after the real PPS timestamp
+		if (pulse[i].delay_comp <= 0.0) siril_log_color_message(_("Warning: Huge PC clock offset\n"), "red");
+		siril_log_color_message(_("Delay time %0.2lf(ms)\n"), "blue", pulse[i].delay_comp);
 
 		g_date_time_unref(begin_frame);
 		g_date_time_unref(end_frame);
@@ -173,8 +174,9 @@ static int time_offset_calc (struct occultation_args *pulse, double *vmag, seque
 	gsl_stats_minmax (&lo_val, &hi_val, tmp_dbl, 1, timing->det_pulses);
 	free(tmp_dbl);
 
+	siril_log_color_message(_("Detected pulses= %i vs max Pulse Count= %i\n"), "green", timing->det_pulses, timing->th_pls_nbr);
 	siril_log_color_message(_("Time Offset: %0.3lf(ms), Std= %0.3lf(ms)\n"), "green", timing->median_seq, timing->std_seq);
-	if (verbose) siril_log_color_message(_("mini diff time %0.3lf(ms), maxi diff time %0.3lf(ms)\n"), "green", lo_val, hi_val);
+	siril_log_color_message(_("mini Time Offset %0.3lf(ms), maxi Time Offset %0.3lf(ms)\n"), "green", lo_val, hi_val);
 
 	free(unity_flux);
 	free(first_p);
@@ -307,7 +309,7 @@ int occult_curve(struct light_curve_args *lcargs) {
 	timing->det_pulses = pulse_detection (pulse, vmag, orig_ind, timing);
 
 	// Does it match the forseen value
-	siril_log_color_message(_("Detected pulses= %i vs max Pulse Count= %i\n"), "salmon", timing->det_pulses, timing->th_pls_nbr - 1);
+//	siril_log_color_message(_("Detected pulses= %i vs max Pulse Count= %i\n"), "salmon", timing->det_pulses, timing->th_pls_nbr);
 //	if (timing->det_pulses < (timing->th_pls_nbr / 2)) {
 	if (timing->det_pulses < 3) {
 		siril_log_color_message(_("Not enought pulses detected. Enlarge the selection.\n"), "red");
