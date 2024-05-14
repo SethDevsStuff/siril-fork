@@ -48,7 +48,7 @@
 //#include "opencv/opencv.h"
 
 
-#define PULSE_WIDTH	100.0	// Pulse width (ms)
+#define PULSE_WIDTH	400.0	// Pulse width (ms)
 
 ////////////////////////////////////////
 // All the stuff for occultation
@@ -61,20 +61,22 @@ static int pulse_detection (struct occultation_args *pulse, double *vmag, int *o
 	gboolean start_pulse = FALSE;
 	gboolean stop_pulse = FALSE;
 
+	siril_log_color_message(_("Pulses detection routine...\n"), "green");
+
 	/* Loop over the valid images */
 	for (int i = 1, j = 0; i + 1 < timing->valid_images; i++) {
-		if (verbose) siril_log_color_message(_("1- Valid_images= %i, Vmag= %lf\n"), "red", orig_ind[i + 1], vmag[i]);
+		if (verbose) siril_log_color_message(_("Frame #%i, Ampl= %0.2lf\n"), "red", orig_ind[i + 1], vmag[i]);
 		if (!start_pulse && (vmag[i-1] < 0.5 * vmag[i]) && (vmag[i-1] < 0.5 * vmag[i + 1]) && (vmag[i + 1] > 0.55 * timing->hi_val)) {		// Identify raising edges
 			start_pulse = TRUE;
 			stop_pulse = FALSE;
 			pulse[k].start_ind_inseq = orig_ind[i + 1];
 			pulse[k].start_ind = i;
-			if (verbose) siril_log_color_message(_("Raise!!\n"), "salmon");
+			if (verbose) siril_log_color_message(_("Raising Edge of pulse#%i\n"), "salmon", k);
 		}
 
 		if (start_pulse && (vmag[i-1] > 1.06 * vmag[i]) && (vmag[i-1] > 20.0 * vmag[i + 1]) && (vmag[i + 1] < 0.05 * timing->hi_val)) {		// Identify falling edges
 			stop_pulse = TRUE;
-			if (verbose) siril_log_color_message(_("Fall!!\n"), "salmon");
+			if (verbose) siril_log_color_message(_("Falling Edge of pulse#%i\n"), "salmon", k);
 		}
 
 		if (start_pulse) {
@@ -89,7 +91,8 @@ static int pulse_detection (struct occultation_args *pulse, double *vmag, int *o
 				pulse[k].pls_nbr = j;
 				pulse[k].sum_flux = sum;
 				if (sum == 0.0) return 0;
-				if (verbose) siril_log_color_message(_("Stoppic= %i, Vmag(%lf), Startpic= %i, nbr_pic= %i, sum= %lf\n"), "salmon", orig_ind[i + 1], vmag[orig_ind[i + 1]], orig_ind[i + 1] - pulse[k].pls_nbr + 1, pulse[k].pls_nbr, pulse[k].sum_flux);
+//				if (verbose) siril_log_color_message(_("Stoppic= %i, Vmag(%lf), Startpic= %i, nbr_pic= %i, sum= %lf\n"), "salmon", orig_ind[i + 1], vmag[orig_ind[i + 1]], orig_ind[i + 1] - pulse[k].pls_nbr + 1, pulse[k].pls_nbr, pulse[k].sum_flux);
+				if (verbose) siril_log_color_message(_("Start #%i @ %0.2lfADU, Stop #%i, Nbr frames= %i, Sum/pulse(ADU)= %0.2lf\n"), "salmon", orig_ind[i + 1] - pulse[k].pls_nbr + 1, vmag[pulse[k].start_ind], orig_ind[i + 1], pulse[k].pls_nbr, pulse[k].sum_flux);
 				k++;	// Index of the pulse
 				j = 0;
 				sum = 0.0;
@@ -125,6 +128,8 @@ static int time_offset_calc (struct occultation_args *pulse, double *vmag, seque
 	double *first_p = malloc(timing->th_pls_nbr * sizeof(double));
 	double exposure = timing->exposure;
 
+	siril_log_color_message(_("Pulses analysis routine...\n"), "green");
+
 	for (int i = 0; i < timing->th_pls_nbr + 1; i++) {
 		if (i >= timing->det_pulses) continue;	// Avoid an overflow, even if it should not occur here...
 		unity_flux[i] = pulse[i].sum_flux / PULSE_WIDTH;	// in ADU/ms, assuming the pulse duration = 100ms
@@ -139,17 +144,17 @@ static int time_offset_calc (struct occultation_args *pulse, double *vmag, seque
 
 		siril_log_color_message(_("Pulse # %i\n"), "plum", i);
 		if (verbose) {
-			siril_log_color_message(_("unit_flux[%i] %0.2lf, sum_flux(%i) = %0.2lf\n"), "salmon", i, unity_flux[i], i, pulse[i].sum_flux);
-			siril_log_color_message(_("Vmag(%i)= %0.2lf, first_p[%i]= %0.2lf(ms)\n"), "salmon", pulse[i].start_ind_inseq, vmag[pulse[i].start_ind], i, first_p[i]);
+			siril_log_color_message(_("Unity_flux[ADU/ms]= %0.2lf, Sum over the pulse(ADU) = %0.2lf\n"), "salmon", unity_flux[i], pulse[i].sum_flux);
+			siril_log_color_message(_("First Frame ADU(#%i)= %0.2lf, Time-to-End-Frame(ms)= %0.2lf\n"), "salmon", pulse[i].start_ind_inseq, vmag[pulse[i].start_ind], first_p[i]);
 
 			gchar *str = date_time_to_FITS_date(begin_frame);
 			siril_log_color_message(_("Begin_frame: %s, exposure= %0.3lf(ms)\n"), "salmon", str, exposure);
 			str = date_time_to_FITS_date(end_frame);
 			siril_log_color_message(_("End_frame: %s\n"), "salmon", str);
 			str = date_time_to_FITS_date(end_frame2);
-			siril_log_color_message(_("Supposed PPS: %s, with first_p[%i]= %0.3lf(ms)\n"), "salmon", str, i, first_p[i]);
+			siril_log_color_message(_("Supposed PPS: %s\n"), "salmon", str);
 			str = date_time_to_FITS_date(pps_time);
-			siril_log_color_message(_("Real pps_time: %s\n"), "salmon", str);
+			siril_log_color_message(_("Real PPS_time: %s\n"), "salmon", str);
 			free(str);
 		}
 
@@ -175,7 +180,7 @@ static int time_offset_calc (struct occultation_args *pulse, double *vmag, seque
 	free(tmp_dbl);
 
 	siril_log_color_message(_("Detected pulses= %i vs max Pulse Count= %i\n"), "green", timing->det_pulses, timing->th_pls_nbr);
-	siril_log_color_message(_("Time Offset: %0.3lf(ms), Std= %0.3lf(ms)\n"), "green", timing->median_seq, timing->std_seq);
+	siril_log_color_message(_("Median Time Offset: %0.3lf(ms), Std= %0.3lf(ms)\n"), "green", timing->median_seq, timing->std_seq);
 	siril_log_color_message(_("mini Time Offset %0.3lf(ms), maxi Time Offset %0.3lf(ms)\n"), "green", lo_val, hi_val);
 
 	free(unity_flux);
@@ -228,6 +233,7 @@ int occult_curve(struct light_curve_args *lcargs) {
 
 	double min_date = DBL_MAX;
 	// i is index in dataset, j is index in output
+	siril_log_color_message(_("Fill arrays...\n"), "green");
 	for (i = 0, j = 0; i < seq->number; i++) {
 		if (!seq->photometry[0][i] || !seq->photometry[0][i]->phot_is_valid)	// Discard unusable images
 			continue;
@@ -258,13 +264,14 @@ int occult_curve(struct light_curve_args *lcargs) {
 		// Y value: the the PSF amplitude
 		double target_amp = seq->photometry[0][i]->A;
 		double target_bck = seq->photometry[0][i]->B;
+//		vmag[j] = target_amp;
 		vmag[j] = target_amp - target_bck;
 		orig_ind[j] = i;	// Keep trace of the original index 
 		j++;	// Count for usable images
 	
 	}
 
-	// Retrieve the fps, the expopsition time and expected number of pulses in the sequence
+	// Retrieve the fps, the exposition time and expected number of pulses in the sequence
 	// Depends on the sequnece type, from .ser or from fits sequence
 	double fps, expos;	// fps, exposition time
 	int exp_pls_nbr;	// expected pulses number
