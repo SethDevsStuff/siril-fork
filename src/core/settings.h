@@ -147,6 +147,7 @@ struct phot_config {
 				// b2 sets (or not) the Varisum catologue
 	gboolean t_delayed;	// force the cuve to be time delayed
 	double time_offset;	// The offset in time to use in the light curve
+	int debug_mask;	// force the cuve to be time delayed
 };
 
 struct analysis_config {

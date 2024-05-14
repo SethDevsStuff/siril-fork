@@ -55,7 +55,7 @@
 ////////////////////////////////////////
 
 static int pulse_detection (struct occultation_args *pulse, double *vmag, int *orig_ind, struct occ_res *timing) {
-	gboolean verbose = FALSE;
+	int verbose = com.pref.phot_set.debug_mask & ( 1 << 0 );
 	int k = 0;
 	double sum = 0.0;
 	gboolean start_pulse = FALSE;
@@ -123,7 +123,7 @@ static GDateTime *round_date (GDateTime *date){
 }
 
 static int time_offset_calc (struct occultation_args *pulse, double *vmag, sequence *seq, struct occ_res *timing) {
-	gboolean verbose = FALSE;
+	int verbose = com.pref.phot_set.debug_mask & ( 1 << 1 );
 	double *unity_flux = malloc(timing->th_pls_nbr * sizeof(double));
 	double *first_p = malloc(timing->th_pls_nbr * sizeof(double));
 	double exposure = timing->exposure;
@@ -142,7 +142,7 @@ static int time_offset_calc (struct occultation_args *pulse, double *vmag, seque
 //		GDateTime *end_frame2 = g_date_time_add_seconds (begin_frame, -1.0 * first_p[i] / 1000.0);	// (Computed) Timestamp of the PPS
 		GDateTime *pps_time = round_date (end_frame2);	// (Observed) Timestamp of the precise PPS time the pulse refers to
 
-		siril_log_color_message(_("Pulse # %i\n"), "plum", i);
+		if (com.pref.phot_set.debug_mask & ( 1 << 1 ) || com.pref.phot_set.debug_mask & ( 1 << 2 )) siril_log_color_message(_("Pulse # %i\n"), "plum", i);
 		if (verbose) {
 			siril_log_color_message(_("Unity_flux[ADU/ms]= %0.2lf, Sum over the pulse(ADU) = %0.2lf\n"), "salmon", unity_flux[i], pulse[i].sum_flux);
 			siril_log_color_message(_("First Frame ADU(#%i)= %0.2lf, Time-to-End-Frame(ms)= %0.2lf\n"), "salmon", pulse[i].start_ind_inseq, vmag[pulse[i].start_ind], first_p[i]);
@@ -160,7 +160,7 @@ static int time_offset_calc (struct occultation_args *pulse, double *vmag, seque
 
 		pulse[i].delay_comp = 1000.0 * timediff_in_s(pps_time, end_frame2);	// delay after the real PPS timestamp
 		if (pulse[i].delay_comp <= 0.0) siril_log_color_message(_("Warning: Huge PC clock offset\n"), "red");
-		siril_log_color_message(_("Delay time %0.2lf(ms)\n"), "blue", pulse[i].delay_comp);
+		if (com.pref.phot_set.debug_mask & ( 1 << 2 )) siril_log_color_message(_("Delay time %0.2lf(ms)\n"), "blue", pulse[i].delay_comp);
 
 		g_date_time_unref(begin_frame);
 		g_date_time_unref(end_frame);
@@ -340,6 +340,8 @@ gpointer occultation_worker(gpointer arg) {
 	struct light_curve_args *args = (struct light_curve_args *)arg;
 	siril_log_color_message(_("Entering the Occulation Time precedure.\n"), "green");
 	framing_mode framing = REGISTERED_FRAME;
+
+	siril_log_color_message(_("PSF of blinking-star...\n"), "green");
 
 	if (seqpsf(args->seq, args->layer, FALSE, FALSE, framing, FALSE, TRUE)) {
 		siril_log_color_message(_("Something went wrong with the PSF analisys. Try to enlarge the selection or check the blinking star is not too faint\n"), "red");

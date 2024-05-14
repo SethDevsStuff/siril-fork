@@ -180,6 +180,7 @@ preferences pref_init = {
 		.discard_var_catalogues = 4,
 		.t_delayed = FALSE,
 		.time_offset = 0.0,
+		.debug_mask = 0,
 	},
 	.astrometry = {
 		.update_default_scale = TRUE,
@@ -377,6 +378,7 @@ struct settings_access all_settings[] = {
 	{ "photometry", "discard_var_catalogues", STYPE_INT, N_("catalogues to be used to discard the variable stars from the comparison stars list"), &com.pref.phot_set.discard_var_catalogues, { .range_int = { 0, 7 } } },
 	{ "photometry", "time_offset", STYPE_DOUBLE, N_("time delay wrt GPS time"), &com.pref.phot_set.time_offset, { .range_double = { -999999., 999999 } } },
 	{ "photometry", "t_delayed", STYPE_BOOL, N_("use of a delay in light cirves"), &com.pref.phot_set.t_delayed },
+	{ "photometry", "debug_mask", STYPE_INT, N_("mask for occultattion PPS delay debug"), &com.pref.phot_set.debug_mask, { .range_int = { 0, 7 } }},
 	{ "photometry", "redpref", STYPE_STR, N_("preferred SPCC red filter"), &com.pref.spcc.redpref },
 	{ "photometry", "greenpref", STYPE_STR, N_("preferred SPCC green filter"), &com.pref.spcc.greenpref },
 	{ "photometry", "bluepref", STYPE_STR, N_("preferred SPCC blue filter"), &com.pref.spcc.bluepref },
