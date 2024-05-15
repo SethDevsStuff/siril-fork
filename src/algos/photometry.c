@@ -49,8 +49,6 @@
 
 #define MIN_SKY    5	// min number of backgroun pixels for valid photometry
 
-#define PULSE_WIDTH	100.0	// Pulse width (ms)
-
 static double getMagnitude(double intensity) {
 	return -2.5 * log10(intensity);
 }

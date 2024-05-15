@@ -63,7 +63,7 @@ static void build_the_dialog() {
 	g_object_set(G_OBJECT(label), "margin", 15, NULL);
 
 	// Explanation text
-	GtkWidget *label2 = gtk_label_new(_("The first step aimes at finding the necessary delay to re-time\nand synchronize the timestamps to a 1PPS signal from a GPS module.\n\nTo get this parameter, you need:\n -a loaded sequence (from a .ser file)\n -this sequence must have a pseudo-star blinking at a beat of 1 pulse per second\n -make a selection around this pseudo-star, including enough background\n\nThen you can either click on Find delay or write your own delay if you know it\n"));
+	GtkWidget *label2 = gtk_label_new(_("The first step aims at finding the necessary delay to re-time\nand synchronize the timestamps to a 1PPS signal from a GPS module.\n\nTo get this parameter, you need:\n -a loaded sequence (from a .ser file)\n -this sequence must have a pseudo-star blinking at a beat of 1 pulse per second\n -make a selection around this pseudo-star, including enough background\n\nThen you can either click on Find delay or write your own delay if you know it\n"));
 	gtk_label_set_line_wrap(GTK_LABEL(label2), TRUE);
 	g_object_set(G_OBJECT(label2), "margin-left", 15, NULL);
 	g_object_set(G_OBJECT(label2), "margin-top", 15, NULL);
