@@ -58,7 +58,7 @@ static void build_the_dialog() {
 
 	// Definition of all the graphical items
 	// Top label
-	GtkWidget *label = gtk_label_new(_("Calibration of a camera setup with a 1PPS signal trigger"));
+	GtkWidget *label = gtk_label_new(_("Time re-Calibration of dataset a 1PPS signal trigger"));
 	gtk_label_set_line_wrap(GTK_LABEL(label), TRUE);
 	g_object_set(G_OBJECT(label), "margin", 15, NULL);
 
@@ -73,7 +73,7 @@ static void build_the_dialog() {
 	// Defines the results box, 3 lines
 	res_data_grp = gtk_box_new(GTK_ORIENTATION_VERTICAL, 3);
 	gtk_box_set_homogeneous(GTK_BOX(res_data_grp), TRUE);
-	gtk_widget_set_tooltip_text(res_data_grp, _("Data to to resync"));
+	gtk_widget_set_tooltip_text(res_data_grp, _("Data to resync"));
 
 // Line#1: The title line, with 2 items
 	label_data_grp = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 2);
@@ -83,11 +83,7 @@ static void build_the_dialog() {
 	gtk_widget_set_halign(label_delay_cam, GTK_ALIGN_START);
 	g_object_set(G_OBJECT(label_delay_cam), "margin-left", 15, NULL);
 	//// Item #2, right side
-//	GtkWidget *label_std_cam = gtk_label_new(_("Standard déviation:"));
-//	g_object_set(G_OBJECT(label_std_cam), "margin-right", 15, NULL);
-//	gtk_widget_set_halign(label_std_cam, GTK_ALIGN_END);
 	gtk_container_add(GTK_CONTAINER(label_data_grp), label_delay_cam);
-//	gtk_container_add(GTK_CONTAINER(label_data_grp), label_std_cam);
 	g_object_set(G_OBJECT(label_data_grp), "margin-left", 15, NULL);
 	g_object_set(G_OBJECT(label_data_grp), "margin-top", 0, NULL);
 	g_object_set(G_OBJECT(label_data_grp), "margin-bottom", 0, NULL);
@@ -115,14 +111,7 @@ static void build_the_dialog() {
 	gtk_container_add(GTK_CONTAINER(unit_box), ms_unit);
 	gtk_container_add(GTK_CONTAINER(unit_box), min_unit);
 	gtk_container_add(GTK_CONTAINER(data_grp), unit_box);
-	//// Item#3: the Standard Deviation field
-/*	std_delay = gtk_entry_new();
-	gtk_entry_set_text(GTK_ENTRY(std_delay), "0.0");
-	gtk_entry_set_alignment (GTK_ENTRY (std_delay), 0.5);
-	gtk_widget_set_tooltip_text(std_delay, _("Computed Standard Déviation"));
-	gtk_widget_set_halign(std_delay, GTK_ALIGN_CENTER);
-	gtk_widget_set_sensitive (std_delay, FALSE);
-	gtk_container_add(GTK_CONTAINER(data_grp), std_delay);	*/
+	//// Item#3: the Standard Deviation field	(not used, because not returned)
 	g_object_set(G_OBJECT(data_grp), "margin-left", 15, NULL);
 	g_object_set(G_OBJECT(data_grp), "margin-top", 0, NULL);
 	g_object_set(G_OBJECT(data_grp), "margin-bottom", 10, NULL);
@@ -137,7 +126,6 @@ static void build_the_dialog() {
 	g_object_set(G_OBJECT(sep), "margin-top", 15, NULL);
 
 	GtkWidget *label3 = gtk_label_new(_("Once the delay is set, you can choose to apply it or not \n"));
-//	gtk_label_set_line_wrap(GTK_LABEL(label3), TRUE);
 	gtk_widget_set_halign(label3, GTK_ALIGN_START);
 	g_object_set(G_OBJECT(label3), "margin-left", 15, NULL);
 	g_object_set(G_OBJECT(label3), "margin-right", 15, NULL);
@@ -169,7 +157,6 @@ GtkWidget *get_occult_dialog() {
 }
 
 static void on_find_clicked(GtkDialog* self, gint response_id, gpointer user_data){
-//	struct phot_config *args = calloc(1, sizeof(struct phot_config));
 	if (com.seq.photometry[0] != NULL) free_photometry_set(&com.seq, 0);
 	control_window_switch_to_tab(OUTPUT_LOGS);
 
@@ -204,7 +191,6 @@ static void on_find_clicked(GtkDialog* self, gint response_id, gpointer user_dat
 
 	struct light_curve_args *args = calloc(1, sizeof(struct light_curve_args));
 	args->seq = &com.seq;
-
 
 	start_in_new_thread(occultation_worker, args);
 
