@@ -181,6 +181,7 @@ preferences pref_init = {
 		.t_delayed = FALSE,
 		.time_offset = 0.0,
 		.time_disp_mask = 0,
+		.pulse_width = 400.0,
 	},
 	.astrometry = {
 		.update_default_scale = TRUE,
@@ -379,6 +380,7 @@ struct settings_access all_settings[] = {
 	{ "photometry", "time_offset", STYPE_DOUBLE, N_("time delay wrt GPS time"), &com.pref.phot_set.time_offset, { .range_double = { -999999., 999999 } } },
 	{ "photometry", "t_delayed", STYPE_BOOL, N_("use of a delay in light cirves"), &com.pref.phot_set.t_delayed },
 	{ "photometry", "time_disp_mask", STYPE_INT, N_("mask for occultattion PPS delay debug"), &com.pref.phot_set.time_disp_mask, { .range_int = { 0, 7 } }},
+	{ "photometry", "pulse_width", STYPE_DOUBLE, N_("pulse width of the 1PPS"), &com.pref.phot_set.pulse_width, { .range_double = { 100.0, 500.0 } } },
 	{ "photometry", "redpref", STYPE_STR, N_("preferred SPCC red filter"), &com.pref.spcc.redpref },
 	{ "photometry", "greenpref", STYPE_STR, N_("preferred SPCC green filter"), &com.pref.spcc.greenpref },
 	{ "photometry", "bluepref", STYPE_STR, N_("preferred SPCC blue filter"), &com.pref.spcc.bluepref },

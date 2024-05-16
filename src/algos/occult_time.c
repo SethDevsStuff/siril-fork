@@ -32,7 +32,7 @@
 #include "io/ser.h"
 
 
-#define PULSE_WIDTH	400.0	// Pulse width (ms)
+#define PULSE_WIDTH	com.pref.phot_set.pulse_width	// Pulse width (ms). Standard is 400ms
 
 ////////////////////////////////////////
 // All the stuff for occultation
