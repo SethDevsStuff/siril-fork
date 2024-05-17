@@ -35,7 +35,7 @@
 
 static GtkWidget *dialog = NULL;	// the window, a GtkDialog
 static GtkWidget *delay_cam = NULL;
-static GtkWidget *std_delay = NULL;
+//static GtkWidget *std_delay = NULL;
 static GtkWidget *sep = NULL;
 static GtkWidget *apply_offset = NULL;
 static GtkWidget *data_grp, *res_data_grp, *label_data_grp;
@@ -207,7 +207,7 @@ gboolean end_occultation_worker(gpointer p) {
 		args->seq = &com.seq;
 		delay = com.pref.phot_set.time_offset;
 		gtk_entry_set_text(GTK_ENTRY(delay_cam), g_strdup_printf("%0.3lf", delay));
-		gtk_entry_set_text(GTK_ENTRY(std_delay), g_strdup_printf("%0.3lf", 2.654));		// Comment recuperer la std???
+//		gtk_entry_set_text(GTK_ENTRY(std_delay), g_strdup_printf("%0.3lf", 2.654));		// Comment recuperer la std???
 		control_window_switch_to_tab(OUTPUT_LOGS);
 		free_light_curve_args(args);
 	}
