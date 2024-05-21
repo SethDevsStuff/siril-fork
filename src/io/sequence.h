@@ -46,7 +46,6 @@ typedef enum {
 
 struct seqpsf_args {
 	gboolean for_photometry;
-	gboolean for_occultation;
 	super_bool allow_use_as_regdata;
 	framing_mode framing;
 	char bayer_pattern[FLEN_VALUE];

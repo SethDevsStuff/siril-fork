@@ -39,7 +39,7 @@
 ////////////////////////////////////////
 
 static int pulse_detection (struct occultation_args *pulse, double *amplitude, int *orig_ind, struct occ_res *timing) {
-	int verbose = com.pref.phot_set.time_disp_mask & ( 1 << 0 );
+	int verbose0 = com.pref.phot_set.time_disp_mask & ( 1 << 0 );
 	int k = 0;
 	double sum = 0.0;
 	gboolean start_pulse = FALSE;
@@ -49,18 +49,18 @@ static int pulse_detection (struct occultation_args *pulse, double *amplitude, i
 
 	/* Loop over the valid images */
 	for (int i = 1, j = 0; i + 1 < timing->valid_images; i++) {
-		if (verbose) siril_log_color_message(_("Frame #%i, Ampl= %0.2lf\n"), "red", orig_ind[i + 1], amplitude[i]);
+		if (verbose0) siril_log_color_message(_("Frame #%i, Ampl= %0.2lf\n"), "red", orig_ind[i + 1], amplitude[i]);
 		if (!start_pulse && (amplitude[i-1] < 0.5 * amplitude[i]) && (amplitude[i-1] < 0.5 * amplitude[i + 1]) && (amplitude[i + 1] > 0.55 * timing->hi_val)) {		// Identify raising edges
 			start_pulse = TRUE;
 			stop_pulse = FALSE;
 			pulse[k].start_ind_inseq = orig_ind[i + 1];
 			pulse[k].start_ind = i;
-			if (verbose) siril_log_color_message(_("Raising Edge of pulse#%i\n"), "salmon", k);
+			if (verbose0) siril_log_color_message(_("Raising Edge of pulse#%i\n"), "salmon", k);
 		}
 
 		if (start_pulse && (amplitude[i-1] > 1.06 * amplitude[i]) && (amplitude[i-1] > 20.0 * amplitude[i + 1]) && (amplitude[i + 1] < 0.05 * timing->hi_val)) {		// Identify falling edges
 			stop_pulse = TRUE;
-			if (verbose) siril_log_color_message(_("Falling Edge of pulse#%i\n"), "salmon", k);
+			if (verbose0) siril_log_color_message(_("Falling Edge of pulse#%i\n"), "salmon", k);
 		}
 
 		if (start_pulse) {
@@ -75,7 +75,7 @@ static int pulse_detection (struct occultation_args *pulse, double *amplitude, i
 				pulse[k].pls_nbr = j;
 				pulse[k].sum_flux = sum;
 				if (sum == 0.0) return 0;
-				if (verbose) siril_log_color_message(_("Start #%i @ %0.2lfADU, Stop #%i, Nbr frames= %i, Sum/pulse(ADU)= %0.2lf\n"), "salmon", orig_ind[i + 1] - pulse[k].pls_nbr + 1, amplitude[pulse[k].start_ind], orig_ind[i + 1], pulse[k].pls_nbr, pulse[k].sum_flux);
+				if (verbose0) siril_log_color_message(_("Start #%i @ %0.2lfADU, Stop #%i, Nbr frames= %i, Sum/pulse(ADU)= %0.2lf\n"), "salmon", orig_ind[i + 1] - pulse[k].pls_nbr + 1, amplitude[pulse[k].start_ind], orig_ind[i + 1], pulse[k].pls_nbr, pulse[k].sum_flux);
 				k++;	// Index of the pulse
 				j = 0;
 				sum = 0.0;
@@ -106,7 +106,8 @@ static GDateTime *round_date (GDateTime *date){
 
 //	Computes the different times for each pulse
 static int time_offset_calc (struct occultation_args *pulse, double *amplitude, sequence *seq, struct occ_res *timing) {
-	int verbose = com.pref.phot_set.time_disp_mask & ( 1 << 1 );
+	int verbose1 = com.pref.phot_set.time_disp_mask & ( 1 << 1 );	// the "time_disp_mask" integer variable definied in the prefs allows different levels of "verbosity" in the console
+	int verbose2 = com.pref.phot_set.time_disp_mask & ( 1 << 2 );	// the "time_disp_mask" integer variable definied in the prefs allows different levels of "verbosity" in the console
 	double *unity_flux = malloc(timing->th_pls_nbr * sizeof(double));
 	double *first_p = malloc(timing->th_pls_nbr * sizeof(double));
 	double exposure = timing->exposure;
@@ -114,8 +115,8 @@ static int time_offset_calc (struct occultation_args *pulse, double *amplitude, 
 	siril_log_color_message(_("Pulses analysis routine...\n"), "green");
 
 	for (int i = 0; i < timing->th_pls_nbr + 1; i++) {
-		if (i >= timing->det_pulses) continue;	// Avoid an overflow, even if it should not occur here...
-		unity_flux[i] = pulse[i].sum_flux / PULSE_WIDTH;	// in ADU/ms, assuming the pulse duration = 100ms
+		if (i >= timing->det_pulses) continue;	// Avoids an overflow, even if it should not occur here...
+		unity_flux[i] = pulse[i].sum_flux / PULSE_WIDTH;	// in ADU/ms
 		first_p[i] = amplitude[pulse[i].start_ind] / unity_flux[i];	// Lenght of the first pulse (ms)
 
 		GDateTime *begin_frame = g_date_time_ref(seq->imgparam[pulse[i].start_ind_inseq - 1].date_obs);	// Timestamp at the beginning of the frame
@@ -124,8 +125,8 @@ static int time_offset_calc (struct occultation_args *pulse, double *amplitude, 
 		GDateTime *end_frame2 = g_date_time_add_seconds (end_frame, -1.0 * first_p[i] / 1000.0);	// (Computed) Timestamp of the PPS
 		GDateTime *pps_time = round_date (end_frame2);	// (Observed) Timestamp of the precise PPS time the pulse refers to
 
-		if (com.pref.phot_set.time_disp_mask & ( 1 << 1 ) || com.pref.phot_set.time_disp_mask & ( 1 << 2 )) siril_log_color_message(_("Pulse # %i\n"), "plum", i);
-		if (verbose) {
+		if (verbose1 || verbose2) siril_log_color_message(_("Pulse # %i\n"), "plum", i);
+		if (verbose1) {
 			siril_log_color_message(_("Unity_flux[ADU/ms]= %0.2lf, Sum over the pulse(ADU) = %0.2lf\n"), "salmon", unity_flux[i], pulse[i].sum_flux);
 			siril_log_color_message(_("First Frame ADU(#%i)= %0.2lf, Time-to-End-Frame(ms)= %0.2lf\n"), "salmon", pulse[i].start_ind_inseq, amplitude[pulse[i].start_ind], first_p[i]);
 
@@ -142,7 +143,7 @@ static int time_offset_calc (struct occultation_args *pulse, double *amplitude, 
 
 		pulse[i].delay_comp = 1000.0 * timediff_in_s(pps_time, end_frame2);	// delay after the real PPS timestamp
 
-		if (com.pref.phot_set.time_disp_mask & ( 1 << 2 )) {
+		if (verbose2) {
 			if (pulse[i].delay_comp <= 0.0) siril_log_color_message(_("Warning: Huge PC clock offset\n"), "red");
 			siril_log_color_message(_("Delay time %0.2lf(ms)\n"), "blue", pulse[i].delay_comp);
 		}
@@ -176,7 +177,7 @@ static int time_offset_calc (struct occultation_args *pulse, double *amplitude, 
 
 int time_resync(struct light_curve_args *lcargs) {
 	int i, j;
-	int ret = 0;	// return value
+	int ret = 0;	// return value. 0 if all ok
 
 	sequence *seq = lcargs->seq;
 
@@ -237,7 +238,7 @@ int time_resync(struct light_curve_args *lcargs) {
 			date[j] = (double) i + 1; // should not happen.
 		}
 
-		// Y value: the the PSF amplitude
+		// Y value: the PSF amplitude
 		double target_amp = seq->photometry[0][i]->A;
 		double target_bck = seq->photometry[0][i]->B;
 		amplitude[j] = target_amp - target_bck;
@@ -258,7 +259,7 @@ int time_resync(struct light_curve_args *lcargs) {
 	} else {
 		if (!seq->imgparam[1].date_obs || !seq->imgparam[seq->number - 1].date_obs) {
 			siril_log_color_message(_("Something went wrong in the fits sequence. Should use the .ser file as a sequence.\n"), "red");
-			return 0;
+			return -1;
 		}
 		GTimeSpan timespan = g_date_time_difference(seq->imgparam[seq->number - 1].date_obs, seq->imgparam[1].date_obs);	// Given in µs. Note: smthg strange happens with [0]. [1] is a workaround.
 		expos = 1e-3 * timespan / (double)seq->number;	// Expressed in ms
@@ -282,7 +283,7 @@ int time_resync(struct light_curve_args *lcargs) {
 	// Is the blinking star saturated wrt the max ADU defined in the preferences?
 	if ((int)timing->hi_val > com.pref.phot_set.maxval) {
 		siril_log_color_message(_("The blinking star looks saturated.\n"), "red");
-		return 0;
+		return 1;
 	}
 
 	struct occultation_args *pulse = NULL;	// Structure embedding the results for each pulse
@@ -294,10 +295,10 @@ int time_resync(struct light_curve_args *lcargs) {
 	// A minimum of 2 pulses is required
 	if (timing->det_pulses < 3) {
 		siril_log_color_message(_("Not enought pulses detected. Enlarge the selection.\n"), "red");
-		return 0;
+		return 1;
 	}
 
-	// Computes offset
+	// Computes the time offset
 	ret = time_offset_calc(pulse, amplitude, seq, timing);
 	com.pref.phot_set.time_offset = timing->median_seq;
 

@@ -1711,14 +1711,13 @@ int seqpsf_image_hook(struct generic_seq_args *args, int out_index, int index, f
 	rectangle psfarea = { .x = 0, .y = 0, .w = fit->rx, .h = fit->ry };
 	psf_error error;
 	struct phot_config *ps = NULL;
-//	siril_log_color_message(_("for_occultation: %d, for_photometry: %d\n"),"salmon", spsfargs->for_occultation, spsfargs->for_photometry);
 	if (spsfargs->for_photometry)
 		ps = phot_set_adjusted_for_image(fit);
 	data->psf = psf_get_minimisation(fit, 0, &psfarea, spsfargs->for_photometry, ps, TRUE, com.pref.starfinder_conf.profile, &error);
 	free(ps);
 	if (data->psf) {
 		/* for photometry ? */
-		if (spsfargs->for_photometry && !com.pref.phot_set.t_delayed) {			// Not really nice, but need help here
+		if (spsfargs->for_photometry && !com.pref.phot_set.t_delayed) {	// the second condition refeers to the specific occultation use case where we do not want all warnings messages
 			if (data->psf->s_mag > 9.0 || !data->psf->phot_is_valid) {
 				siril_log_color_message(_("Photometry analysis failed for image %d (%s)\n"),
 						"salmon", index, psf_error_to_string(error));
@@ -1744,7 +1743,7 @@ int seqpsf_image_hook(struct generic_seq_args *args, int out_index, int index, f
 		args->seq->imgparam[index].airmass = fit->keywords.airmass;
 	}
 	else {
-		if (spsfargs->framing == FOLLOW_STAR_FRAME && !com.pref.phot_set.t_delayed) {
+		if (spsfargs->framing == FOLLOW_STAR_FRAME && !com.pref.phot_set.t_delayed) {	// the second condition refeers to the specific occultation use case where we do not want all warnings messages
 			siril_log_color_message(_("No star found in the area image %d around %d,%d:"
 						" error %s (use a larger area?)\n"),
 					"red", index, area->x, area->y, psf_error_to_string(error));
