@@ -35,7 +35,6 @@
 
 static GtkWidget *dialog = NULL;	// the window, a GtkDialog
 static GtkWidget *delay_cam = NULL;
-//static GtkWidget *std_delay = NULL;
 static GtkWidget *sep = NULL;
 static GtkWidget *apply_offset = NULL;
 static GtkWidget *data_grp, *res_data_grp, *label_data_grp;
@@ -102,7 +101,6 @@ static void build_the_dialog() {
 	gtk_container_add(GTK_CONTAINER(data_grp), delay_cam);
 	//// Item#2: the unit button, ms or min
 	GtkWidget *unit_box;
-//	GtkWidget *ms_unit, *min_unit;
 	unit_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
 	gtk_box_set_homogeneous(GTK_BOX(unit_box), TRUE);
 	gtk_widget_set_tooltip_text(unit_box, _("(ms) is usefull for occultation resync whereas (min) is usefull for transit resync"));
@@ -207,7 +205,6 @@ gboolean end_occultation_worker(gpointer p) {
 		args->seq = &com.seq;
 		delay = com.pref.phot_set.time_offset;
 		gtk_entry_set_text(GTK_ENTRY(delay_cam), g_strdup_printf("%0.3lf", delay));
-//		gtk_entry_set_text(GTK_ENTRY(std_delay), g_strdup_printf("%0.3lf", 2.654));		// Comment recuperer la std???
 		control_window_switch_to_tab(OUTPUT_LOGS);
 		free_light_curve_args(args);
 	}

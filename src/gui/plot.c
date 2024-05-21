@@ -601,25 +601,20 @@ static void build_photometry_dataset(sequence *seq, int dataset, int ref_image, 
 			if (seq->imgparam[i].date_obs) {
 				GDateTime *ts0 = g_date_time_ref(seq->imgparam[i].date_obs);
 				if (seq->exposure > 0.0) {
-//					GDateTime *new_dt = g_date_time_add_seconds(ts0, seq->exposure * 0.5);
 					GDateTime *new_dt = g_date_time_add_seconds(ts0, com.pref.phot_set.t_delayed ? seq->exposure * 0.5 + com.pref.phot_set.time_offset / 1000.0 : seq->exposure * 0.5);
 					julian0 = (int) date_time_to_Julian(new_dt);
 					g_date_time_unref(new_dt);
 				} else {
 					GDateTime *new_dt = g_date_time_add_seconds(ts0, com.pref.phot_set.t_delayed ? com.pref.phot_set.time_offset / 1000.0 : 0.0);
-//					julian0 = (int) date_time_to_Julian(ts0);
 					julian0 = date_time_to_Julian(new_dt);
 					g_date_time_unref(new_dt);
 				}
 				g_date_time_unref(ts0);
-				//siril_debug_print("julian0 set to %d\n", julian0);
 			}
 			if (julian0 && force_Julian) {
 				xlabel = malloc(XLABELSIZE * sizeof(char));
-//				g_snprintf(xlabel, XLABELSIZE, "(JD) %d +", julian0);
 				g_snprintf(xlabel, XLABELSIZE, "%s %d +", com.pref.phot_set.t_delayed ? "(JD shifted)" : "(JD)", julian0);
 			} else {
-//				xlabel = _("Frames");
 				xlabel = com.pref.phot_set.t_delayed ? _("Frames shifted") : _("Frames");
 			}
 		}
