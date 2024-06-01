@@ -165,7 +165,7 @@ static int time_offset_calc (struct occultation_args *pulse, double *amplitude, 
 	gsl_stats_minmax (&lo_val, &hi_val, tmp_dbl, 1, timing->det_pulses);
 	free(tmp_dbl);
 
-	siril_log_color_message(_("Detected pulses= %i vs expected Pulse Count= %i\n"), "salmon", timing->det_pulses, timing->th_pls_nbr);
+	siril_log_color_message(_("Detected pulses(%0.1lf ms)= %i vs expected Pulse Count= %i\n"), "salmon", com.pref.phot_set.pulse_width, timing->det_pulses, timing->th_pls_nbr);
 	siril_log_color_message(_("Median Time Offset: %0.3lf(ms), Std= %0.3lf(ms)\n"), "blue", timing->median_seq, timing->std_seq);
 	siril_log_color_message(_("mini Time Offset %0.3lf(ms), maxi Time Offset %0.3lf(ms)\n"), "blue", lo_val, hi_val);
 

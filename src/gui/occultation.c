@@ -37,8 +37,9 @@ static GtkWidget *dialog = NULL;	// the window, a GtkDialog
 static GtkWidget *delay_cam = NULL;
 static GtkWidget *sep = NULL;
 static GtkWidget *apply_offset = NULL;
-static GtkWidget *data_grp, *res_data_grp, *label_data_grp;
+static GtkWidget *data_grp, *res_data_grp, *pulse_lenght_grp;
 static GtkWidget *ms_unit, *min_unit;
+static GtkWidget *pls_len;
 static double delay = 0.0;
 
 static void on_occult_response(GtkDialog* self, gint response_id, gpointer user_data);
@@ -72,34 +73,56 @@ static void build_the_dialog() {
 	// Defines the results box, 3 lines
 	res_data_grp = gtk_box_new(GTK_ORIENTATION_VERTICAL, 3);
 	gtk_box_set_homogeneous(GTK_BOX(res_data_grp), TRUE);
-	gtk_widget_set_tooltip_text(res_data_grp, _("Data to resync"));
+	gtk_widget_set_tooltip_text(res_data_grp, _("Input data for the time synchronization process: the Pulse Lenght"));
 
-// Line#1: The title line, with 2 items
-	label_data_grp = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 2);
-	gtk_box_set_homogeneous(GTK_BOX(label_data_grp), TRUE);
-	//// Item #1, left side
-	GtkWidget *label_delay_cam = gtk_label_new(_("Delay to handle"));
-	gtk_widget_set_halign(label_delay_cam, GTK_ALIGN_START);
-	g_object_set(G_OBJECT(label_delay_cam), "margin-left", 15, NULL);
-	//// Item #2, right side
-	gtk_container_add(GTK_CONTAINER(label_data_grp), label_delay_cam);
-	g_object_set(G_OBJECT(label_data_grp), "margin-left", 15, NULL);
-	g_object_set(G_OBJECT(label_data_grp), "margin-top", 0, NULL);
-	g_object_set(G_OBJECT(label_data_grp), "margin-bottom", 0, NULL);
-	gtk_container_add(GTK_CONTAINER(res_data_grp), label_data_grp);	// Final Add to the upper container
+// Line#1: Lenght of the optical pulse
+	// Definition of the 3 elements horizontal sub-box
+	pulse_lenght_grp = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 3);
+	gtk_box_set_homogeneous(GTK_BOX(pulse_lenght_grp), TRUE);
+	gtk_widget_set_tooltip_text(pulse_lenght_grp, _("Used pulse lenght of the PPS"));
+	// 1st element, a label
+	GtkWidget *label1_pls_len = gtk_label_new(_("Pulse lenght: "));
+	gtk_widget_set_halign(label1_pls_len, GTK_ALIGN_END);
+	gtk_container_add(GTK_CONTAINER(pulse_lenght_grp), label1_pls_len);
+
+	// 2nd element, the target user name
+	pls_len = gtk_entry_new();
+	gtk_entry_set_text(GTK_ENTRY(pls_len), g_strdup_printf("%1.2lf", com.pref.phot_set.pulse_width));
+	gtk_entry_set_alignment (GTK_ENTRY (pls_len), 0.5);
+	gtk_widget_set_tooltip_text(pls_len, _("Used pulse width. The value must match the one used during the acquisition."));
+	gtk_widget_set_halign(pls_len, GTK_ALIGN_CENTER);
+	gtk_container_add(GTK_CONTAINER(pulse_lenght_grp), pls_len);
+
+
+	gtk_entry_set_alignment(GTK_ENTRY (pls_len), 0.5);
+	g_object_set(G_OBJECT(pls_len), "margin-top", 0, NULL);
+	g_object_set(G_OBJECT(pls_len), "margin-bottom", 0, NULL);
+	gtk_container_add(GTK_CONTAINER(pulse_lenght_grp), pls_len);
+	// 3rd element, another label
+	GtkWidget *label2_user_name = gtk_label_new(_("(ms)"));
+	gtk_widget_set_halign(label2_user_name, GTK_ALIGN_START);
+	gtk_container_add(GTK_CONTAINER(pulse_lenght_grp), label2_user_name);
+	// and finally include that box to the upper level box
+	gtk_container_add(GTK_CONTAINER(res_data_grp), pulse_lenght_grp);
+
 // Line#2: The result fields
-	//// A line with 5 elements
-	data_grp = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+	//// A line with 3 elements
+	data_grp = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 3);
 	gtk_box_set_homogeneous(GTK_BOX(data_grp), TRUE);
-	gtk_widget_set_tooltip_text(data_grp, _("Data to resync"));
-	//// Item#1: the Delay field
+	gtk_widget_set_tooltip_text(data_grp, _("Output data of the time synchronization process: the Delay"));
+	//// Item #1, the label
+	GtkWidget *label_delay_cam = gtk_label_new(_("Computed Delay:"));
+	gtk_widget_set_halign(label_delay_cam, GTK_ALIGN_END);
+	g_object_set(G_OBJECT(label_delay_cam), "margin-left", 15, NULL);
+	gtk_container_add(GTK_CONTAINER(data_grp), label_delay_cam);
+	//// Item#2: the Delay field
 	delay_cam = gtk_entry_new();
 	gtk_entry_set_text(GTK_ENTRY(delay_cam), "0.0");
 	gtk_entry_set_alignment (GTK_ENTRY (delay_cam), 0.5);
 	gtk_widget_set_tooltip_text(delay_cam, _("Delay"));
 	gtk_widget_set_halign(delay_cam, GTK_ALIGN_CENTER);
 	gtk_container_add(GTK_CONTAINER(data_grp), delay_cam);
-	//// Item#2: the unit button, ms or min
+	//// Item#3: the unit button, ms or min
 	GtkWidget *unit_box;
 	unit_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
 	gtk_box_set_homogeneous(GTK_BOX(unit_box), TRUE);
@@ -109,11 +132,8 @@ static void build_the_dialog() {
 	gtk_container_add(GTK_CONTAINER(unit_box), ms_unit);
 	gtk_container_add(GTK_CONTAINER(unit_box), min_unit);
 	gtk_container_add(GTK_CONTAINER(data_grp), unit_box);
-	//// Item#3: the Standard Deviation field	(not used, because not returned)
-	g_object_set(G_OBJECT(data_grp), "margin-left", 15, NULL);
-	g_object_set(G_OBJECT(data_grp), "margin-top", 0, NULL);
-	g_object_set(G_OBJECT(data_grp), "margin-bottom", 10, NULL);
 	gtk_container_add(GTK_CONTAINER(res_data_grp), data_grp);	// Final Add to the upper container
+	
 // Line#3: The button
 	GtkWidget *find_delay = gtk_button_new_with_mnemonic (_("Find Delay"));
 	g_signal_connect (find_delay, "clicked", G_CALLBACK (on_find_clicked), NULL);
@@ -186,6 +206,8 @@ static void on_find_clicked(GtkDialog* self, gint response_id, gpointer user_dat
 		com.selection.w = (int)(1.1 * com.pref.phot_set.outer);
 		com.selection.h = (int)(1.1 * com.pref.phot_set.outer);
 	}
+
+	com.pref.phot_set.pulse_width = g_strtod(gtk_entry_get_text(GTK_ENTRY(pls_len)), NULL);	// Use the entered pulse width by the used if it's been modified
 
 	struct light_curve_args *args = calloc(1, sizeof(struct light_curve_args));
 	args->seq = &com.seq;
