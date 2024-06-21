@@ -67,8 +67,20 @@ siril 1.4.0 xx xx, xx
 * Extended `requires` command to take optional second expiry parameter. (!674)
 * Added a new keyword FILENAME to save the original filename after conversion. (!678)
 * Added UI for conesearch and show commands (!680)
+* Added atmosphere model for SPCC (accounts for Rayleigh scattering) (!684)
+* Fixed a crash in ROI selection (#1320)
+* Optimised GHT code (~2x speedup) and fixed associated bugs (#1194, #1314, #1319)
+* Fixed handling wide-char characters in filenames on Windows (with cfitsio >= 4.4) (#1324)
+* Fix bug in GHT when only 1 or 2 channels are selected (#1329)
 
-siril 1.2.2 xx xx, 2024
+siril 1.2.3 June 19, 2024
+
+* Fixed handling wide-char characters in filenames on Windows (cfitsio rollback) (#1324)
+* Fixed compression error (files were not compressed anymore) (#1328)
+* Fixed internet connection in macOS version (packaging issue)
+
+siril 1.2.2 June 14, 2024
+
 * Removed background extraction samples after using it in script (#1265)
 * Fixed catalog parser problem with negative declination (less than 1°) (#1270)
 * Fixed weighting by number of stars during stacking if number of stars is the same accross the sequence (#1273)
@@ -84,6 +96,8 @@ siril 1.2.2 xx xx, 2024
 * Fixed drag & drop in image display on macOS (#1310)
 * Fixed bug in rgradient (Larson Sekanina) filter (#1313)
 * Fixed bug in generalized hyperbolic stretches (#1314)
+* Fixed path parsing error with savetif (#1318)
+* Added handling of empty command pipe reads (closes #1277)
 
 siril 1.2.1 January 26, 2024
 

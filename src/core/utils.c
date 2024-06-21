@@ -121,9 +121,15 @@ BYTE roundf_to_BYTE(float f) {
  * @return a truncated and rounded WORD
  */
 WORD roundf_to_WORD(float f) {
-	if (f < 0.5f) return 0;
-	if (f >= USHRT_MAX - 0.5f) return USHRT_MAX;
-	return (WORD)(f + 0.5f);
+	WORD retval;
+	if (f < 0.5f) {
+		retval = 0;
+	} else if (f >= USHRT_MAX - 0.5f) {
+		retval = USHRT_MAX;
+	} else {
+		retval = (WORD)(f + 0.5f);
+	}
+	return retval;
 }
 
 /**
@@ -1072,24 +1078,6 @@ int siril_change_dir(const char *dir, gchar **err) {
 	return retval;
 }
 
-/**
- * If Windows OS, converts a filename from UTF-8 to the system codepage. Do nothing on other system
- * @param path to convert
- * @return converted filename
- */
-gchar *get_locale_filename(const gchar *path) {
-	gchar *str;
-#ifdef _WIN32
-	str = g_win32_locale_filename_from_utf8(path);
-	if (!str) {
-		siril_log_color_message(_("Conversion of the filename to system codepage failed. Please consider removing all wide chars.\n"), "red");
-		return g_strdup(path);
-	}
-#else // _WIN32
-	str = g_strdup(path);
-#endif // _WIN32
-	return str;
-}
 
 /**
  * Expands the ~ in filenames

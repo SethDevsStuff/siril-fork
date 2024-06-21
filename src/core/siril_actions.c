@@ -30,6 +30,8 @@
 #include "core/initfile.h"
 #include "compositing/align_rgb.h"
 #include "io/annotation_catalogues.h"
+#include "io/single_image.h"
+#include "io/sequence.h"
 #include "algos/astrometry_solver.h"
 #include "algos/noise.h"
 #include "algos/geometry.h"
@@ -655,10 +657,18 @@ void fft_activate(GSimpleAction *action, GVariant *parameter, gpointer user_data
 }
 
 void rgb_compositing_activate(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
+	if (single_image_is_loaded() && siril_confirm_dialog(_("Close current image?"), _("Opening the RGB Composition dialog will close the current image without saving. Are you sure?"), _("Yes"))) {
+		close_single_image();
+	}
+	close_sequence(FALSE);
 	open_compositing_window();
 }
 
 void star_remix_activate(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
+	if (single_image_is_loaded() && siril_confirm_dialog(_("Close current image?"), _("Opening the Star Recomposition dialog will close the current image without saving. Are you sure?"), _("Yes"))) {
+		close_single_image();
+	}
+	close_sequence(FALSE);
 	toggle_remixer_window_visibility(CALL_FROM_MENU, NULL, NULL);
 }
 
