@@ -310,11 +310,10 @@ if enable_openmp
   if platform_osx
     message('Set OpenMP flags for macOS')
     siril_link_arg += ['-lomp']
-    siril_cpp_flag += ['-Xpreprocessor', '-fopenmp']
-    siril_c_flag += ['-Xpreprocessor', '-fopenmp']
-  else
-  openmp_dep = dependency('openmp', required : true)
+    siril_cpp_flag += ['-Xclang', '-fopenmp', '-D_OPENMP']
+    siril_c_flag += ['-Xclang', '-fopenmp', '-D_OPENMP']
   endif
+  openmp_dep = dependency('openmp', required : true)
 else
   message('OpenMP disabled')
 endif
@@ -747,7 +746,7 @@ summary(
 
 summary(
   {
-    'openmp'    : get_option('openmp'),
+    'openmp'    : openmp_dep.found(),
   }, section: 'Optional features'
 )
 
