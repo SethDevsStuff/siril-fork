@@ -120,9 +120,11 @@ static int time_offset_calc (struct occultation_args *pulse, double *amplitude, 
 		first_p[i] = amplitude[pulse[i].start_ind] / unity_flux[i];	// Lenght of the first pulse (ms)
 
 		GDateTime *begin_frame = g_date_time_ref(seq->imgparam[pulse[i].start_ind_inseq - 1].date_obs);	// Timestamp at the beginning of the frame
-		if (!begin_frame) continue;	// Sometimes this pointer is void for an unexplained reason.
+		GDateTime *begin_nxt_frame = g_date_time_ref(seq->imgparam[pulse[i].start_ind_inseq].date_obs);	// Timestamp at the beginning of the next frame
+		if (!begin_frame || !begin_nxt_frame) continue;	// Sometimes this pointer is void for an unexplained reason.
 		GDateTime *end_frame = g_date_time_add_seconds (begin_frame, exposure / 1000.0);	// (computed) Timestamp at the end of the frame
-		GDateTime *end_frame2 = g_date_time_add_seconds (end_frame, -1.0 * first_p[i] / 1000.0);	// (Computed) Timestamp of the PPS
+//		GDateTime *end_frame2 = g_date_time_add_seconds (end_frame, -1.0 * first_p[i] / 1000.0);	// (Computed) Timestamp of the PPS
+		GDateTime *end_frame2 = g_date_time_add_seconds (begin_nxt_frame, -1.0 * first_p[i] / 1000.0);	// (Computed) Timestamp of the PPS
 		GDateTime *pps_time = round_date (end_frame2);	// (Observed) Timestamp of the precise PPS time the pulse refers to
 
 		if (verbose1 || verbose2) siril_log_color_message(_("Pulse # %i\n"), "plum", i);
@@ -130,12 +132,21 @@ static int time_offset_calc (struct occultation_args *pulse, double *amplitude, 
 			siril_log_color_message(_("Unity_flux[ADU/ms]= %0.2lf, Sum over the pulse(ADU) = %0.2lf\n"), "salmon", unity_flux[i], pulse[i].sum_flux);
 			siril_log_color_message(_("First Frame ADU(#%i)= %0.2lf, Time-to-End-Frame(ms)= %0.2lf\n"), "salmon", pulse[i].start_ind_inseq, amplitude[pulse[i].start_ind], first_p[i]);
 
+
 			gchar *str = date_time_to_FITS_date(begin_frame);
-			siril_log_color_message(_("Begin_frame: %s, exposure= %0.3lf(ms)\n"), "salmon", str, exposure);
+			siril_log_color_message(_("Begin_frame: %s, mean exposure= %0.3lf(ms)\n"), "salmon", str, exposure);
+			str = date_time_to_FITS_date(begin_nxt_frame);
+			siril_log_color_message(_("Begin_next_frame: %s\n"), "salmon", str);
+
+			GTimeSpan duration = g_date_time_difference (seq->imgparam[pulse[i].start_ind_inseq].date_obs, seq->imgparam[pulse[i].start_ind_inseq - 1].date_obs);
+			siril_log_color_message(_("Frame duration: %0.3lf (ms)\n"), "salmon", 1e-3 * duration);
+
 			str = date_time_to_FITS_date(end_frame);
-			siril_log_color_message(_("End_frame: %s\n"), "salmon", str);
+			siril_log_color_message(_("End_frame (supposed, start+exp): %s\n"), "salmon", str);
+
 			str = date_time_to_FITS_date(end_frame2);
 			siril_log_color_message(_("Supposed PPS: %s\n"), "salmon", str);
+
 			str = date_time_to_FITS_date(pps_time);
 			siril_log_color_message(_("Real PPS_time: %s\n"), "salmon", str);
 			free(str);
