@@ -65,6 +65,7 @@ static const SirilDialogEntry entries[] =
 	{"extract_channel_dialog", NULL, OTHER_DIALOG, FALSE, NULL},
 	{"extract_wavelets_layers_dialog", NULL, OTHER_DIALOG, FALSE, NULL},
 	{"file_information", NULL, INFORMATION_DIALOG, FALSE, NULL},
+	{"graxpert_dialog", NULL, IMAGE_PROCESSING_DIALOG, FALSE, NULL },
 	{"histogram_dialog", NULL, IMAGE_PROCESSING_DIALOG, TRUE, apply_histo_cancel},
 	{"keywords_dialog", NULL, INFORMATION_DIALOG, FALSE, NULL},
 	{"icc_dialog", NULL, IMAGE_PROCESSING_DIALOG, FALSE, NULL},
@@ -162,6 +163,7 @@ void siril_open_dialog(gchar *id) {
 
 void siril_close_dialog(gchar *id) {
 	gtk_widget_hide(get_widget_by_id(id));
+	gtk_widget_hide_on_delete(get_widget_by_id(id));
 }
 
 void siril_close_preview_dialogs() {
