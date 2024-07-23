@@ -273,6 +273,9 @@ int time_resync(struct light_curve_args *lcargs) {
 			return -1;
 		}
 		GTimeSpan timespan = g_date_time_difference(seq->imgparam[seq->number - 1].date_obs, seq->imgparam[1].date_obs);	// Given in µs. Note: smthg strange happens with [0]. [1] is a workaround.
+		// We assume the frame duration (expos) is constant over the sequence.
+		// It's not really true.
+		// TODO: use the real time of exposure for each frama to refine the final calculation and lower the sigma. 
 		expos = 1e-3 * timespan / (double)seq->number;	// Expressed in ms
 		expos = expos * (1.0 + 2.0 / (double)seq->number);	// Correction because of the [0] issue. Still in ms
 		exp_pls_nbr = (int)(expos * 1e-3 * (double)seq->number);	// Floors it to get the total expected number of pulses

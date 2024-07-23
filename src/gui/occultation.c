@@ -73,13 +73,13 @@ static void build_the_dialog() {
 	// Defines the results box, 3 lines
 	res_data_grp = gtk_box_new(GTK_ORIENTATION_VERTICAL, 3);
 	gtk_box_set_homogeneous(GTK_BOX(res_data_grp), TRUE);
-	gtk_widget_set_tooltip_text(res_data_grp, _("Input data for the time synchronization process: the Pulse Lenght"));
+	gtk_widget_set_tooltip_text(res_data_grp, _("Find the offset delay in the loaded sequence if it embedds a 1-PPS blinking star"));
 
 // Line#1: Lenght of the optical pulse
 	// Definition of the 3 elements horizontal sub-box
 	pulse_lenght_grp = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 3);
 	gtk_box_set_homogeneous(GTK_BOX(pulse_lenght_grp), TRUE);
-	gtk_widget_set_tooltip_text(pulse_lenght_grp, _("Used pulse lenght of the PPS"));
+	gtk_widget_set_tooltip_text(pulse_lenght_grp, _("Used pulse width of the PPS"));
 	// 1st element, a label
 	GtkWidget *label1_pls_len = gtk_label_new(_("Pulse lenght: "));
 	gtk_widget_set_halign(label1_pls_len, GTK_ALIGN_END);
@@ -89,7 +89,7 @@ static void build_the_dialog() {
 	pls_len = gtk_entry_new();
 	gtk_entry_set_text(GTK_ENTRY(pls_len), g_strdup_printf("%1.2lf", com.pref.phot_set.pulse_width));
 	gtk_entry_set_alignment (GTK_ENTRY (pls_len), 0.5);
-	gtk_widget_set_tooltip_text(pls_len, _("Used pulse width. The value must match the one used during the acquisition."));
+	gtk_widget_set_tooltip_text(pls_len, _("Used optical pulse width. The value must match the one used during the acquisition."));
 	gtk_widget_set_halign(pls_len, GTK_ALIGN_CENTER);
 	gtk_container_add(GTK_CONTAINER(pulse_lenght_grp), pls_len);
 
@@ -109,7 +109,7 @@ static void build_the_dialog() {
 	//// A line with 3 elements
 	data_grp = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 3);
 	gtk_box_set_homogeneous(GTK_BOX(data_grp), TRUE);
-	gtk_widget_set_tooltip_text(data_grp, _("Output data of the time synchronization process: the Delay"));
+	gtk_widget_set_tooltip_text(data_grp, _("Output data of the time synchronization process or user setting for the next step"));
 	//// Item #1, the label
 	GtkWidget *label_delay_cam = gtk_label_new(_("Computed Delay:"));
 	gtk_widget_set_halign(label_delay_cam, GTK_ALIGN_END);
@@ -153,6 +153,7 @@ static void build_the_dialog() {
 	gtk_widget_set_halign(apply_offset, GTK_ALIGN_CENTER);
 	g_object_set(G_OBJECT(apply_offset), "margin-bottom", 35, NULL);
 	g_object_set(G_OBJECT(apply_offset), "margin-top", 5, NULL);
+	gtk_widget_set_tooltip_text(apply_offset, _("The previously processed or set value can be applied the the loaded sequence.\nHence, the new timestamps shall be in the form:\n	new_timestamp = old_timestamp + offset delay"));
 
 // Gather the graphic items
 	GtkWidget *content_area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
