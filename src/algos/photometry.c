@@ -312,6 +312,9 @@ static gboolean siril_plot_save_ETD_light_curve(siril_plot_data *spl_data, const
 		// spl_data->title is assumed to have the # signs at each line start as necessary
 		// and to finish by a \n character
 		header = g_string_new(spl_data->title);
+		if (com.pref.phot_set.t_delayed) g_string_append_printf(header, "#Applied offset of %0.3lf (%s)\n", 
+			fabs(com.pref.phot_set.time_offset) > 60000 ? com.pref.phot_set.time_offset / 60000.0 : com.pref.phot_set.time_offset,
+			fabs(com.pref.phot_set.time_offset) > 60000 ? "min" : "ms");	// Arbitrary limit of 60000ms=1min to switch from ms <-> s
 		g_string_append_printf(header, "# JD_UT V-C err");
 	} else
 		header = g_string_new("# JD_UT V-C err");
@@ -352,7 +355,7 @@ static gboolean siril_plot_save_ETD_light_curve(siril_plot_data *spl_data, const
 	fprintf(fileout, "%s", header->str);
 	index = 0;
 	for (int r = 0 ; r < nbpoints ; r++) {
-		fprintf(fileout, "\n%f", data[index++]); // print newline and x
+		fprintf(fileout, "\n%0.8f", data[index++]); // print newline and x. 8 digits to account with the ms precision
 		for (int c = 1 ; c < nbcols ; c++)
 			fprintf(fileout, " %g", data[index++]);
 	}
