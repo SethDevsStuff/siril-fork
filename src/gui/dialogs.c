@@ -39,6 +39,8 @@
 #include "compstars.h"
 #include "occultation.h"
 
+static gboolean dialog_is_opened = FALSE;
+
 static const SirilDialogEntry entries[] =
 {
 	{"aavso_dialog", NULL, INFORMATION_DIALOG, FALSE, NULL},
@@ -162,11 +164,12 @@ void siril_open_dialog(gchar *id) {
 	gtk_window_set_type_hint(win, GDK_WINDOW_TYPE_HINT_DIALOG);
 	gtk_window_set_transient_for(win, GTK_WINDOW(lookup_widget("control_window")));
 	gtk_window_present_with_time(win, GDK_CURRENT_TIME);
+	dialog_is_opened = TRUE;
 }
 
 void siril_close_dialog(gchar *id) {
 	gtk_widget_hide(get_widget_by_id(id));
-	gtk_widget_hide_on_delete(get_widget_by_id(id));
+	dialog_is_opened = FALSE;
 }
 
 void siril_close_preview_dialogs() {
@@ -177,6 +180,16 @@ void siril_close_preview_dialogs() {
 			gtk_widget_hide(w);
 		}
 	}
+}
+
+gboolean siril_widget_hide_on_delete(GtkWidget *widget) {
+    dialog_is_opened = FALSE;
+    gtk_widget_hide(widget);
+    return TRUE;
+}
+
+gboolean is_a_dialog_opened() {
+	return dialog_is_opened;
 }
 
 /************ file chooser ************/

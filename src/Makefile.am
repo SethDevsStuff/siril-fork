@@ -186,6 +186,8 @@ siril_common_SOURCES = \
 	filters/clahe.h \
 	filters/cosmetic_correction.c \
 	filters/cosmetic_correction.h \
+	filters/curve_transform.c \
+	filters/curve_transform.h \
 	filters/deconvolution.c \
 	filters/epf.c \
 	filters/epf.h \
@@ -265,6 +267,8 @@ siril_common_SOURCES = \
 	gui/conversion.h \
 	gui/colors.c \
 	gui/colors.h \
+	gui/curves.c \
+	gui/curves.h \
 	gui/cut.c \
 	gui/dialog_preview.c \
 	gui/dialog_preview.h \

@@ -68,6 +68,14 @@
 
 #include "siril_actions.h"
 
+#define CHECK_FOR_OPENED_DIALOG \
+    do { \
+        if (is_a_dialog_opened()) { \
+            siril_message_dialog(GTK_MESSAGE_INFO, _("Cannot process image"), _("The image can't be processed while another processing dialog is opened.")); \
+            return; \
+        } \
+    } while (0)
+
 void open_action_activate(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
 	header_open_button_clicked();
 	launch_clipboard_survey();
@@ -526,7 +534,8 @@ void remove_green_activate(GSimpleAction *action, GVariant *parameter, gpointer 
 }
 
 void saturation_activate(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
-	siril_open_dialog("satu_dialog");
+	if (value_check( &gfit))
+		siril_open_dialog("satu_dialog");
 }
 
 void color_calib_activate(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
@@ -545,20 +554,25 @@ void spcc_activate(GSimpleAction *action, GVariant *parameter,gpointer user_data
 }
 
 void split_channel_activate(GSimpleAction *action, GVariant *parameter,gpointer user_data) {
-	siril_open_dialog("extract_channel_dialog");
+	if (value_check(&gfit))
+		siril_open_dialog("extract_channel_dialog");
 }
 
 void negative_activate(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
-	siril_close_preview_dialogs();
-	negative_processing();
+	if (value_check(&gfit)) {
+		CHECK_FOR_OPENED_DIALOG;
+		negative_processing();
+	}
 }
 
 void histo_activate(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
-	toggle_histogram_window_visibility(1);
+	if (value_check(&gfit))
+		toggle_histogram_window_visibility(1);
 }
 
 void curves_activate(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
-    toggle_curves_window_visibility();
+	if (value_check(&gfit))
+		toggle_curves_window_visibility();
 }
 
 void fix_banding_activate(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
@@ -574,7 +588,8 @@ void background_extr_activate(GSimpleAction *action, GVariant *parameter, gpoint
 }
 
 void asinh_activate(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
-	siril_open_dialog("asinh_dialog");
+	if (value_check(&gfit))
+		siril_open_dialog("asinh_dialog");
 }
 
 void epf_activate(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
@@ -588,7 +603,8 @@ void deconvolution_activate(GSimpleAction *action, GVariant *parameter, gpointer
 }
 
 void payne_activate(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
-	toggle_histogram_window_visibility(2);
+	if (value_check(&gfit))
+		toggle_histogram_window_visibility(2);
 }
 
 void binning_activate(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
@@ -608,18 +624,22 @@ void rotation_activate(GSimpleAction *action, GVariant *parameter, gpointer user
 }
 
 void rotation90_activate(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
+	CHECK_FOR_OPENED_DIALOG;
 	siril_rotate90();
 }
 
 void rotation270_activate(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
+	CHECK_FOR_OPENED_DIALOG;
 	siril_rotate270();
 }
 
 void mirrorx_activate(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
+	CHECK_FOR_OPENED_DIALOG;
 	mirrorx_gui(&gfit);
 }
 
 void mirrory_activate(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
+	CHECK_FOR_OPENED_DIALOG;
 	mirrory_gui(&gfit);
 }
 
@@ -707,15 +727,15 @@ void merge_cfa_activate(GSimpleAction *action, GVariant *parameter, gpointer use
 }
 
 void star_desaturate_activate(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
-	if (!check_ok_if_cfa())
-		return;
-	siril_close_preview_dialogs();
+	CHECK_FOR_OPENED_DIALOG;
+	if (!check_ok_if_cfa()) return;
 	undo_save_state(&gfit, "Synthetic stars: desaturate clipped stars");
 	control_window_switch_to_tab(OUTPUT_LOGS);
 	start_in_new_thread(fix_saturated_stars, NULL);
 }
 
 void star_synthetic_activate(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
+	CHECK_FOR_OPENED_DIALOG;
 	if (!check_ok_if_cfa())
 		return;
 	undo_save_state(&gfit, "Synthetic stars: full replacement");
