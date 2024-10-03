@@ -143,6 +143,7 @@ int	process_platesolve(int nb);
 int	process_pm(int nb);
 int	process_profile(int nb);
 int	process_psf(int nb);
+int	process_pwd(int nb);
 
 int	process_rebayer(int nb);
 int	process_register(int nb);
@@ -244,6 +245,7 @@ int	process_tilt(int nb);
 int	process_trixel(int nb);
 
 int	process_unclip(int nb);
+int	process_unpurple(int nb);
 int	process_unset_mag(int nb);
 int	process_unset_mag_seq(int nb);
 int	process_unselect(int nb);

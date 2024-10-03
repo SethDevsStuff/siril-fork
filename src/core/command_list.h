@@ -136,6 +136,7 @@ static command commands[] = {
 	{"pm", 1, "pm \"expression\" [-rescale [low] [high]] [-nosum]", process_pm, STR_PM, TRUE, REQ_CMD_NONE},
 	{"profile", 2, "profile -from=x,y -to=x,y [-tri] [-cfa] [-arcsec] { [-savedat] | [-filename=] } [-layer=] [-width=] [-spacing=] [ {-xaxis=wavelength | -xaxis=wavenumber } ] [ {-wavenumber1= | -wavelength1=} -wn1at=x,y {-wavenumber2= | -wavelength2=} -wn2at=x,y [-bgremove [-bgpoly=] ] ] [\"-title=My Plot\"]", process_profile, STR_PROFILE, TRUE, REQ_CMD_SINGLE_IMAGE},
 	{"psf", 0, "psf [channel]", process_psf, STR_PSF, TRUE, REQ_CMD_SINGLE_IMAGE},
+	{"pwd", 0, "pwd", process_pwd, STR_PWD, TRUE, REQ_CMD_NONE},
 
 	{"register", 1, "register sequencename [-2pass] [-noout] [-upscale] [-prefix=] [-minpairs=] [-transf=] [-layer=] [-maxstars=] [-nostarlist] [-interp=] [-noclamp] [-selected]", process_register, STR_REGISTER, TRUE, REQ_CMD_NO_THREAD},
 	{"reloadscripts", 0, "reloadscripts", process_reloadscripts, STR_RELOADSCRIPTS, FALSE, REQ_CMD_NONE},
@@ -255,6 +256,7 @@ static command commands[] = {
 	{"trixel", 0, "trixel [-p]", process_trixel, STR_TRIXEL, TRUE, REQ_CMD_NONE | REQ_CMD_NO_THREAD},
 
 	{"unclipstars", 0, "unclipstars", process_unclip, STR_SYNTHSTARUNCLIP, TRUE, REQ_CMD_SINGLE_IMAGE},
+	{"unpurple", 0, "unpurple [-starmask] [-blue=value] [-thresh=value]", process_unpurple, STR_UNPURPLE, TRUE, REQ_CMD_SINGLE_IMAGE|REQ_CMD_FOR_RGB},
 	{"unselect", 3, "unselect sequencename from to", process_unselect, STR_UNSELECT, TRUE, REQ_CMD_NONE},
 	{"unsetmag", 0, "unsetmag", process_unset_mag, STR_UNSETMAG, FALSE, REQ_CMD_NONE},
 	{"unsharp", 2, "unsharp sigma multi", process_unsharp, STR_UNSHARP, TRUE, REQ_CMD_SINGLE_IMAGE},

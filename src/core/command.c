@@ -83,6 +83,7 @@
 #include "gui/registration_preview.h"
 #include "gui/script_menu.h"
 #include "gui/preferences.h"
+#include "gui/unpurple.h"
 #include "filters/asinh.h"
 #include "filters/banding.h"
 #include "filters/epf.h"
@@ -100,6 +101,7 @@
 #include "filters/scnr.h"
 #include "filters/starnet.h"
 #include "filters/synthstar.h"
+#include "filters/unpurple.h"
 #include "filters/wavelets.h"
 #include "algos/PSF.h"
 #include "algos/astrometry_solver.h"
@@ -591,7 +593,6 @@ int process_starnet(int nb){
 	}
 	starnet_data *starnet_args = calloc(1, sizeof(starnet_data));
 	starnet_args->linear = FALSE;
-	starnet_args->seq = NULL;
 	starnet_args->customstride = FALSE;
 	starnet_args->upscale = FALSE;
 	starnet_args->starmask = TRUE;
@@ -664,6 +665,9 @@ int process_seq_starnet(int nb){
 		free_sequence(seq, TRUE);
 		seq = &com.seq;
 	}
+	struct multi_output_data *multi_args = calloc(1, sizeof(struct multi_output_data));
+	if (!multi_args)
+		return CMD_ALLOC_ERROR;
 	starnet_data *starnet_args = calloc(1, sizeof(starnet_data));
 	if (!starnet_args)
 		return CMD_ALLOC_ERROR;
@@ -673,10 +677,11 @@ int process_seq_starnet(int nb){
 	starnet_args->starmask = TRUE;
 	starnet_args->follow_on = FALSE;
 	gboolean error = FALSE;
-	starnet_args->seq = seq;
-	if (!starnet_args->seq) {
+	multi_args->seq = seq;
+	if (!multi_args->seq) {
 		siril_log_message(_("Error: cannot open sequence\n"));
 		free(starnet_args);
+		free(multi_args);
 		return CMD_SEQUENCE_NOT_FOUND;
 	}
 
@@ -699,8 +704,8 @@ int process_seq_starnet(int nb){
 			if (arg == end) error = TRUE;
 			else if ((stride < 2.0) || (stride > 512) || (stride % 2)) {
 				siril_log_message(_("Error in stride parameter: must be a positive even integer, max 512, aborting.\n"));
-				if (!check_seq_is_comseq(starnet_args->seq))
-					free_sequence(starnet_args->seq, TRUE);
+				if (!check_seq_is_comseq(multi_args->seq))
+					free_sequence(multi_args->seq, TRUE);
 				free(starnet_args);
 				return CMD_ARG_ERROR;
 			}
@@ -711,22 +716,29 @@ int process_seq_starnet(int nb){
 		}
 		else {
 			siril_log_message(_("Unknown parameter %s, aborting.\n"), arg);
-				if (!check_seq_is_comseq(starnet_args->seq))
-					free_sequence(starnet_args->seq, TRUE);
+				if (!check_seq_is_comseq(multi_args->seq))
+					free_sequence(multi_args->seq, TRUE);
 				free(starnet_args);
 			return CMD_ARG_ERROR;
 		}
 		if (error) {
 			siril_log_message(_("Error parsing arguments, aborting.\n"));
-			if (!check_seq_is_comseq(starnet_args->seq))
-				free_sequence(starnet_args->seq, TRUE);
+			if (!check_seq_is_comseq(multi_args->seq))
+				free_sequence(multi_args->seq, TRUE);
 			free(starnet_args);
 			return CMD_ARG_ERROR;
 		}
 	}
-	sequence_cfa_warning_check(starnet_args->seq);
+	multi_args->n = starnet_args->starmask ? 2 : 1;
+	multi_args->prefixes = calloc(multi_args->n, sizeof(char*));
+	multi_args->prefixes[0] = g_strdup("starless_");
+	if (starnet_args->starmask) {
+		multi_args->prefixes[1] = g_strdup("starmask_");
+	}
+
+	sequence_cfa_warning_check(multi_args->seq);
 	set_cursor_waiting(TRUE);
-	apply_starnet_to_sequence(starnet_args);
+	apply_starnet_to_sequence(multi_args);
 
 #else
 	siril_log_message(_("starnet command unavailable as Siril has not been compiled with libtiff.\n"));
@@ -956,6 +968,11 @@ int process_rebayer(int nb){
 	siril_log_message("Bayer pattern produced: 1 layer, %dx%d pixels\n", out->rx, out->ry);
 	close_single_image();
 	copyfits(out, &gfit, CP_ALLOC | CP_COPYA | CP_FORMAT, -1);
+	copy_fits_metadata(out, &gfit);
+	update_sampling_information(&gfit, 0.5f);
+	update_bayer_pattern_information(&gfit, pattern);
+	free_wcs(&gfit);
+	update_fits_header(&gfit);
 	clearfits(out);
 	free(out);
 
@@ -1083,6 +1100,53 @@ int process_gauss(int nb){
 
 	char log[90];
 	sprintf(log, "Gaussian filtering, sigma: %.2f", sigma);
+	gfit.history = g_slist_append(gfit.history, strdup(log));
+	return CMD_OK | CMD_NOTIFY_GFIT_MODIFIED;
+}
+
+int process_unpurple(int nb){
+	gchar *end;
+	double mod = 1.f, thresh = 0.f;
+	gboolean withstarmask = FALSE;
+	fits *fit = &gfit;
+	fits starmask = {0};
+
+	// Extract parameters
+	for (int i = 1 ; i < nb ; i++) {
+		gchar *arg = word[i];
+		if (!g_strcmp0(arg, "-starmask")) {
+			withstarmask = TRUE;
+		}
+		else if (g_str_has_prefix(arg, "-mod=")) {
+			gchar *val = arg + 5;
+			mod = g_ascii_strtod(val, &end);
+			if (end == val) {
+				siril_log_color_message(_("Invalid argument %s, aborting.\n"), "red", arg);
+				return CMD_ARG_ERROR;
+			}
+		}
+		else if (g_str_has_prefix(arg, "-thresh=")) {
+			gchar *val = arg + 8;
+			thresh = g_ascii_strtod(val, &end);
+			if (end == val) {
+				siril_log_color_message(_("Invalid argument %s, aborting.\n"), "red", arg);
+				return CMD_ARG_ERROR;
+			}
+		}
+	}
+
+	if (withstarmask) {
+		generate_binary_starmask(fit, &starmask, thresh);
+	}
+
+	struct unpurpleargs *args = calloc(1, sizeof(struct unpurpleargs));
+	*args = (struct unpurpleargs){.fit = fit, .starmask = &starmask, .withstarmask = withstarmask, .thresh = thresh, .mod_b = mod, .verbose = FALSE};
+
+	//start_in_new_thread(unpurplehandler, args);
+	unpurple_filter(args);
+
+	char log[90];
+	sprintf(log, "Unpurple mod: %.2f, threshold: %.2f, withstarmask: %d", mod, thresh, withstarmask);
 	gfit.history = g_slist_append(gfit.history, strdup(log));
 	return CMD_OK | CMD_NOTIFY_GFIT_MODIFIED;
 }
@@ -3058,8 +3122,7 @@ int process_mtf(int nb) {
 		apply_linked_pseudoinverse_mtf_to_fits(&gfit, &gfit, params, TRUE);
 	else {
 		apply_linked_mtf_to_fits(&gfit, &gfit, params, TRUE);
-		siril_log_message(_("Applying MTF with values %f, %f, %f\n"),
-			params.shadows, params.midtones, params.highlights);
+		siril_log_message(_("Applying MTF with values %f, %f, %f\n"), params.shadows, params.midtones, params.highlights);
 	}
 	char log[90];
 	sprintf(log, "%s transfer (%.3f, %.4f, %.3f)",
@@ -6224,11 +6287,12 @@ int process_seq_split_cfa(int nb) {
 		return CMD_FOR_CFA_IMAGE;
 	}
 
-	struct split_cfa_data *args = calloc(1, sizeof(struct split_cfa_data));
+	struct multi_output_data *args = calloc(1, sizeof(struct multi_output_data));
 
 	args->seq = seq;
-	args->fit = &gfit;
-	args->seqEntry = strdup("CFA_"); // propose to default to "CFA" for consistency of output names with single image split_cfa
+	args->seqEntry = strdup("CFA"); // propose to default to "CFA" for consistency of output names with single image split_cfa
+	args->n = 4;
+	args->prefixes = calloc(5, sizeof(const char*));
 
 	int startoptargs = 2;
 	if (nb > startoptargs) {
@@ -6242,9 +6306,11 @@ int process_seq_split_cfa(int nb) {
 						if (!check_seq_is_comseq(seq))
 							free_sequence(seq, TRUE);
 						free(args->seqEntry);
+						free(args->prefixes);
 						free(args);
 						return CMD_ARG_ERROR;
 					}
+					free(args->seqEntry);
 					args->seqEntry = strdup(value);
 				}
 			}
@@ -6253,10 +6319,16 @@ int process_seq_split_cfa(int nb) {
 				if (!check_seq_is_comseq(seq))
 					free_sequence(seq, TRUE);
 				free(args->seqEntry);
+				free(args->prefixes);
 				free(args);
 				return CMD_ARG_ERROR;
 			}
 		}
+	}
+	if (args->seqEntry && args->seqEntry[0] == '\0')
+		args->seqEntry = strdup("CFA");
+	for (int i = 0 ; i < 4 ; i++) {
+		args->prefixes[i] = g_strdup_printf("%s%d_", args->seqEntry, i);
 	}
 
 	apply_split_cfa_to_sequence(args);
@@ -6353,7 +6425,7 @@ int process_seq_extractHa(int nb) {
 		return CMD_FOR_CFA_IMAGE;
 	}
 
-	struct split_cfa_data *args = calloc(1, sizeof(struct split_cfa_data));
+	struct simple_extract_data *args = calloc(1, sizeof(struct simple_extract_data));
 
 	args->seq = seq;
 	args->seqEntry = strdup("Ha_");
@@ -6405,7 +6477,7 @@ int process_seq_extractGreen(int nb) {
 		return CMD_FOR_CFA_IMAGE;
 	}
 
-	struct split_cfa_data *args = calloc(1, sizeof(struct split_cfa_data));
+	struct simple_extract_data *args = calloc(1, sizeof(struct simple_extract_data));
 
 	args->seq = seq;
 	args->seqEntry = strdup("Green_");
@@ -6454,8 +6526,13 @@ int process_seq_extractHaOIII(int nb) {
 		return CMD_FOR_CFA_IMAGE;
 	}
 
-	struct split_cfa_data *args = calloc(1, sizeof(struct split_cfa_data));
-	args->scaling = SCALING_NONE;
+	struct multi_output_data *args = calloc(1, sizeof(struct multi_output_data));
+	args->user_data = malloc(sizeof(extraction_scaling));
+	*(extraction_scaling *) args->user_data = (extraction_scaling) SCALING_NONE;
+	args->seq = seq;
+	args->seqEntry = strdup("CFA"); // propose to default to "CFA" for consistency of output names with single image split_cfa
+	args->n = 2;
+	args->prefixes = calloc(3, sizeof(const char*));
 
 	if (word[2]) {
 		if (g_str_has_prefix(word[2], "-resample=")) {
@@ -6468,14 +6545,14 @@ int process_seq_extractHaOIII(int nb) {
 				free(args);
 				return CMD_ARG_ERROR;
 			} else if (!strcmp(value, "ha")) {
-				args->scaling = SCALING_HA_UP;
+				*(extraction_scaling*) args->user_data = SCALING_HA_UP;
 			} else if (!strcmp(value, "oiii")) {
-				args->scaling = SCALING_OIII_DOWN;
+				*(extraction_scaling*) args->user_data = SCALING_OIII_DOWN;
 			}
 		}
 	}
-
-	args->seq = seq;
+	args->prefixes[0] = g_strdup("Ha_");
+	args->prefixes[1] = g_strdup("Oiii_");
 
 	apply_extractHaOIII_to_sequence(args);
 
@@ -11088,5 +11165,10 @@ int process_online(int nb) {
 
 int process_offline(int nb) {
 	set_online_status(FALSE);
+	return CMD_OK;
+}
+
+int process_pwd(int nb) {
+	siril_log_message(_("Current working directory: '%s'\n"), com.wd);
 	return CMD_OK;
 }
