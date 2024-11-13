@@ -130,6 +130,8 @@ static int ser_read_timestamp(struct ser_struct *ser_file) {
 
 		/* Check order of Timestamps */
 		guint64 *ts_ptr = ser_file->ts;
+		guint64 ts_ptr_before = 0;
+//		guint64 *delta_ts_ptr = ser_file->delta_ts;
 		guint64 min_ts = *ts_ptr;
 		guint64 max_ts = *ts_ptr;
 
@@ -147,6 +149,14 @@ static int ser_read_timestamp(struct ser_struct *ser_file) {
 			if (*ts_ptr < min_ts) {
 				min_ts = *ts_ptr;
 			}
+			if (i != 0){
+//				ser_file->delta_ts = min_ts-max_ts;// - *ts_ptr--;
+//				guint64 delt_ts_ptr = *ts_ptr - *ts_ptr--;
+//				&(ser_file->delta_ts) = (delt_ts_ptr);
+				ser_file->delta_ts[i -1] = *ts_ptr - ts_ptr_before;//timediff_in_s(ser_timestamp_to_date_time(ts_ptr), ser_timestamp_to_date_time(ts_ptr--));
+//				ser_file->delta_ts++;
+			}
+			ts_ptr_before = *ts_ptr;
 			ts_ptr++;
 		}
 

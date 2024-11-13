@@ -263,9 +263,27 @@ int time_resync(struct light_curve_args *lcargs) {
 	double fps, expos;	// fps, exposition time
 	int exp_pls_nbr;	// expected pulses number
 
+
+	double expo_median, expo_std;
+	if (com.seq.ser_file != NULL) {
+			double *tmp_tss;
+			tmp_tss = malloc(com.seq.ser_file->frame_count * sizeof(double));
+			for (int i = 0; i < com.seq.ser_file->frame_count; i++) {
+				tmp_tss[i] = com.seq.ser_file->delta_ts[i];
+				siril_log_color_message(_("tmp_tss[%d] = %lf\n"), "salmon", i, tmp_tss[i]);
+			}
+			gsl_sort (tmp_tss, 1, com.seq.ser_file->frame_count);
+			expo_median = 0.0001 * gsl_stats_median_from_sorted_data (tmp_tss, 1, com.seq.ser_file->frame_count); // one incement of timestamp is 100 nano-second
+			expo_std = 0.0001 * gsl_stats_sd(tmp_tss, 1, com.seq.ser_file->frame_count);
+			siril_log_color_message(_("expo_median = %lf, expo_std = %lf\n"), "salmon", expo_median, expo_std);
+			free(tmp_tss);
+	}
+	
+
 	if (com.seq.ser_file != NULL) {
 		fps = com.seq.ser_file->fps;
 		expos = 1000.0 / fps;
+		expos = expo_median;
 		exp_pls_nbr = (int)(expos * 1e-3 * (double)seq->number);	// Floors it to get the total expected number of pulses
 	} else {
 		if (!seq->imgparam[1].date_obs || !seq->imgparam[seq->number - 1].date_obs) {
@@ -282,6 +300,7 @@ int time_resync(struct light_curve_args *lcargs) {
 		fps = 1000.0 / expos;
 	}
 
+	siril_log_color_message(_("Old fashion expo = %lf\n"), "salmon", 1000.0 / fps);
 	siril_log_color_message(_("Mean Exposure= %0.3lf(ms), fps= %0.3lf\n"), "salmon", expos, fps);
 	siril_log_color_message(_("Number of frames = %i, Number of valid images= %i\n"), "salmon", seq->number, j);
 	
