@@ -1142,12 +1142,8 @@ int process_unpurple(int nb){
 	struct unpurpleargs *args = calloc(1, sizeof(struct unpurpleargs));
 	*args = (struct unpurpleargs){.fit = fit, .starmask = &starmask, .withstarmask = withstarmask, .thresh = thresh, .mod_b = mod, .verbose = FALSE};
 
-	//start_in_new_thread(unpurplehandler, args);
-	unpurple_filter(args);
+	start_in_new_thread(unpurple_filter, args);
 
-	char log[90];
-	sprintf(log, "Unpurple mod: %.2f, threshold: %.2f, withstarmask: %d", mod, thresh, withstarmask);
-	gfit.history = g_slist_append(gfit.history, strdup(log));
 	return CMD_OK | CMD_NOTIFY_GFIT_MODIFIED;
 }
 
@@ -1863,7 +1859,7 @@ int process_update_key(int nb) {
 
 	/* manage options */
 	if (word[1][0] == '-') {
-		if (!g_strcmp0(word[1], "-remove") && word[2]) {
+		if (!g_strcmp0(word[1], "-delete") && word[2]) {
 			key = replace_wide_char(word[2]);
 			CHECK_KEY_LENGTH(key);
 			updateFITSKeyword(&gfit, key, NULL, NULL, NULL, TRUE, FALSE);
@@ -1881,13 +1877,18 @@ int process_update_key(int nb) {
 
 	/* without options */
 	} else {
+		char valstring[FLEN_VALUE];
+
 		key = replace_wide_char(word[1]);
 		CHECK_KEY_LENGTH(key);
 		value = replace_wide_char(word[2]);
+
+		process_keyword_string_value(value, valstring, string_has_space(value));
+
 		if (nb == 4)
 			comment = replace_wide_char(word[3]);
 
-		updateFITSKeyword(&gfit, key, NULL, value, comment, TRUE, FALSE);
+		updateFITSKeyword(&gfit, key, NULL, valstring, comment, TRUE, FALSE);
 	}
 	if (!com.script) refresh_keywords_dialog();
 
@@ -1946,9 +1947,17 @@ int process_seq_update_key(int nb) {
 		}
 	/* without options */
 	} else {
+		char valstring[FLEN_VALUE];
+
 		args->FITS_key = replace_wide_char(word[2]);
 		CHECK_KEY_LENGTH_SEQ(args->FITS_key, seq, args);
+
 		args->value = replace_wide_char(word[3]);
+		process_keyword_string_value(args->value, valstring, string_has_space(args->value));
+
+		g_free(args->value);
+		args->value = g_strdup(valstring);
+
 		if (nb == 5)
 			args->comment = replace_wide_char(word[4]);
 	}
@@ -4048,15 +4057,40 @@ int process_pm(int nb) {
 	float min = -1.f;
 	float max = -1.f;
 	gboolean do_sum = TRUE;
+	gboolean has_gfit = FALSE;
 
-	cur = expression;
+	// first replace $T with "gfit"
+	GRegex *regex = g_regex_new("\\$T(?![A-Za-z0-9_])", 0, 0, NULL);
+	gchar *cleaned_expression = g_regex_replace(regex, expression, -1, 0, "gfit", 0, NULL);
+	g_regex_unref(regex);
+
+	// Check if a replacement was made to set some flags and check if an image is really laoded
+	if (g_strcmp0(expression, cleaned_expression) != 0) {
+		if (!single_image_is_loaded()) {
+			g_free(cleaned_expression);
+			return CMD_ARG_ERROR;
+		}
+		has_gfit = TRUE;
+	}
+
+    g_free(expression);
+
+    /* cleaned_expression is the expression we need to keep to work on it
+     * Let's free it at the end
+     */
+    expression = g_strdup(cleaned_expression);
+
+    /* as $T has already be changed, the number of tokens '$' must be even
+     * Let's count them
+     */
+    cur = expression;
 	while ((next = strchr(cur, '$')) != NULL) {
 		cur = next + 1;
 		count++;
 	}
 
-	if (count == 0) {
-		siril_log_message(_("You need to add at least one image as variable. Use $ tokens to surround the file names .\n"));
+	if (count == 0 && !has_gfit) {
+		siril_log_message(_("You need to add at least a loaded image or one image as variable. Use $ tokens to surround the file names .\n"));
 		return CMD_ARG_ERROR;
 	} else if (count % 2 != 0) {
 		siril_log_message(_("There is an unmatched $. Please check the expression.\n"));
@@ -4072,11 +4106,15 @@ int process_pm(int nb) {
 					min = g_ascii_strtod(word[i + 1], &end);
 					if (end == word[i + 1] || min < 0 || min > 1) {
 						siril_log_message(_("Rescale can only be done in the [0, 1] range.\n"));
+						g_free(expression);
+						g_free(cleaned_expression);
 						return CMD_ARG_ERROR;
 					}
 					max = g_ascii_strtod(word[i + 2], &end);
 					if (end == word[i + 2] || max < 0 || max > 1) {
 						siril_log_message(_("Rescale can only be done in the [0, 1] range.\n"));
+						g_free(expression);
+						g_free(cleaned_expression);
 						return CMD_ARG_ERROR;
 					}
 				} else {
@@ -4137,6 +4175,8 @@ int process_pm(int nb) {
 		if (args->varname && load_pm_var(args->varname[j], j, &w, &h, &c)) {
 			if (j > 0)
 				free_pm_var(j - 1);
+			g_free(expression);
+			g_free(cleaned_expression);
 			free(args->varname);
 			free(args);
 			return CMD_INVALID_IMAGE;
@@ -4150,6 +4190,8 @@ int process_pm(int nb) {
 			if (w != width || height != h || channel != c) {
 				siril_log_message(_("Image must have same dimension\n"));
 				free_pm_var(args->nb_rows);
+				g_free(expression);
+				g_free(cleaned_expression);
 				free(args->varname);
 				free(args);
 				return CMD_INVALID_IMAGE;
@@ -4157,16 +4199,33 @@ int process_pm(int nb) {
 		}
 	}
 
-	/* remove tokens */
-	g_free(expression);
-	expression = g_shell_unquote(word[1], NULL);
+	/* gfit image MUST have same size of the others */
+	if (has_gfit && width != -1) {
+		if (gfit.rx != width || height != gfit.ry || channel != gfit.naxes[2]) {
+			siril_log_message(_("Image must have same dimension\n"));
+			free_pm_var(args->nb_rows);
+			g_free(expression);
+			g_free(cleaned_expression);
+			free(args->varname);
+			free(args);
+			return CMD_INVALID_IMAGE;
+		}
+	}
 
-	// Now need to replace the original variable names between the $ signs in expression with
-	// the new generic variable names.
-	// This ensures the variable names in the expression passed to pm match the variable names
-	// that are stored in args->varname
-	gchar** chunks = g_strsplit(expression, "$", count + 1);
-	for (int i = 0, j = 1; i < count / 2 ; i++) {
+	/* OK. Now all prerequisites are ok. Let's remove the tokens
+	 * cleaned_expression can be freed right after its last used
+	 */
+	g_free(expression);
+	expression = g_shell_unquote(cleaned_expression, NULL);
+	g_free(cleaned_expression);
+
+	/* We must now replace the original variable names between the $ signs in the expression with
+	 * the new generic variable names.
+	 * This ensures that the variable names in the expression passed to pm match the variable names
+	 * stored in args->varname
+	 */
+	gchar **chunks = g_strsplit(expression, "$", count + 1);
+	for (int i = 0, j = 1; i < count / 2; i++) {
 		int idx = 0;
 		int k;
 		for (k = 0; k < args->nb_rows; k++) {
@@ -4184,10 +4243,11 @@ int process_pm(int nb) {
 	expression = g_strjoinv(NULL, chunks);
 	g_strfreev(chunks);
 
-	// Rewrite the variable names to var_1, var_2 etc. now the files are loaded.
-	// This avoids conflicts where characters are permitted in filenames but cannot
-	// be used in pixelmath variable names.
-	// We will amend the expression to match below.
+	/* Rewrite the variable names to var_1, var_2 etc. now the files are loaded.
+	 * This avoids conflicts where characters are permitted in filenames but cannot
+	 * be used in pixelmath variable names.
+	 * We will amend the expression to match below.
+	 */
 	for (int j = 0; j < args->nb_rows; j++) {
 		g_free(args->varname[j]);
 		args->varname[j] = g_strdup_printf("var_%d", j + 1);
@@ -4211,6 +4271,7 @@ int process_pm(int nb) {
 	args->ret = 0;
 	args->from_ui = FALSE;
 	args->do_sum = do_sum;
+	args->has_gfit = has_gfit;
 	if (min >= 0.f) {
 		args->rescale = TRUE;
 		args->min = min;
@@ -6005,6 +6066,9 @@ int process_split(int nb){
 	}
 
 	copy_fits_metadata(&gfit, args->fit);
+
+	args->fit->keywords.bayer_pattern[0] = '\0'; // Mark this as no longer having a Bayer pattern
+
 	start_in_new_thread(extract_channels, args);
 	return CMD_OK;
 }
@@ -6337,62 +6401,120 @@ int process_seq_split_cfa(int nb) {
 }
 
 int process_seq_merge_cfa(int nb) {
-	sequence *seq = load_sequence(word[1], NULL);
-	if (!seq)
+	sequence *seq0 = load_sequence(word[1], NULL);
+	if (!seq0)
 		return CMD_SEQUENCE_NOT_FOUND;
-
-	if (seq->nb_layers > 1) {
-		if (!check_seq_is_comseq(seq))
-			free_sequence(seq, TRUE);
+	if (seq0->nb_layers > 1) {
+		if (!check_seq_is_comseq(seq0))
+			free_sequence(seq0, TRUE);
 		return CMD_FOR_CFA_IMAGE;
 	}
 
-	struct merge_cfa_data *args = calloc(1, sizeof(struct merge_cfa_data));
-	if(!args)
-		return CMD_ALLOC_ERROR;
+	sequence *seq1 = load_sequence(word[2], NULL);
+	if (!seq1)
+		return CMD_SEQUENCE_NOT_FOUND;
+	if (seq1->nb_layers > 1) {
+		if (!check_seq_is_comseq(seq0)) {
+			free_sequence(seq0, TRUE);
+		}
+		free_sequence(seq1, TRUE);
+		return CMD_FOR_CFA_IMAGE;
+	}
 
-	if (!strcmp(word[2], "RGGB")) {
+	sequence *seq2 = load_sequence(word[3], NULL);
+	if (!seq2)
+		return CMD_SEQUENCE_NOT_FOUND;
+	if (seq2->nb_layers > 1) {
+		if (!check_seq_is_comseq(seq0)) {
+			free_sequence(seq0, TRUE);
+		}
+		free_sequence(seq1, TRUE);
+		free_sequence(seq2, TRUE);
+		return CMD_FOR_CFA_IMAGE;
+	}
+
+	sequence *seq3 = load_sequence(word[4], NULL);
+	if (!seq3)
+		return CMD_SEQUENCE_NOT_FOUND;
+
+	if (seq3->nb_layers > 1) {
+		if (!check_seq_is_comseq(seq0)) {
+			free_sequence(seq0, TRUE);
+		}
+		free_sequence(seq1, TRUE);
+		free_sequence(seq2, TRUE);
+		free_sequence(seq3, TRUE);
+		return CMD_FOR_CFA_IMAGE;
+	}
+	if (seq3->nb_layers > 1) {
+		if (!check_seq_is_comseq(seq3))
+			free_sequence(seq3, TRUE);
+		return CMD_FOR_CFA_IMAGE;
+	}
+
+	if ((seq0->rx != seq1->rx || seq0->rx != seq2->rx || seq0->rx != seq3->rx) ||
+	(seq0->ry != seq1->ry || seq0->ry != seq2->ry || seq0->ry != seq3->ry) ||
+	(seq0->nb_layers != seq1->nb_layers || seq0->nb_layers != seq2->nb_layers || seq0->nb_layers != seq3->nb_layers) ||
+	(seq0->bitpix != seq1->bitpix || seq0->bitpix != seq2->bitpix || seq0->bitpix != seq3->bitpix) ||
+	(seq0->number != seq1->number || seq0->number != seq2->number || seq0->number != seq3->number)) {
+		siril_log_color_message(_("Error: sequences don't match (dimensions, bitdepth, number of images must all be the same)\n"), "red");
+		if (!check_seq_is_comseq(seq0))
+			free_sequence(seq0, TRUE);
+		free_sequence(seq0, TRUE);
+		free_sequence(seq1, TRUE);
+		free_sequence(seq2, TRUE);
+		return CMD_GENERIC_ERROR;
+	}
+
+	struct merge_cfa_data *args = calloc(1, sizeof(struct merge_cfa_data));
+	if(!args) {
+		if (!check_seq_is_comseq(seq0))
+			free_sequence(seq0, TRUE);
+		free_sequence(seq0, TRUE);
+		free_sequence(seq1, TRUE);
+		free_sequence(seq2, TRUE);
+		return CMD_ALLOC_ERROR;
+	}
+	args->seq0 = seq0;
+	args->seq1 = seq1;
+	args->seq2 = seq2;
+	args->seq3 = seq3;
+
+	if (!strcmp(word[5], "RGGB")) {
 		args->pattern = BAYER_FILTER_RGGB;
-	} else if (!strcmp(word[2], "BGGR")) {
+	} else if (!strcmp(word[5], "BGGR")) {
 		args->pattern = BAYER_FILTER_BGGR;
-	} else if (!strcmp(word[2], "GBRG")) {
+	} else if (!strcmp(word[5], "GBRG")) {
 		args->pattern = BAYER_FILTER_GBRG;
-	} else if (!strcmp(word[2], "GRBG")) {
+	} else if (!strcmp(word[5], "GRBG")) {
 		args->pattern = BAYER_FILTER_GRBG;
 	} else {
 		siril_log_color_message(_("Invalid Bayer matrix specified!\n"), "red");
-		if (!check_seq_is_comseq(seq))
-			free_sequence(seq, TRUE);
+		if (!check_seq_is_comseq(seq0))
+			free_sequence(seq0, TRUE);
+		free_sequence(seq1, TRUE);
+		free_sequence(seq2, TRUE);
+		free_sequence(seq3, TRUE);
 		free(args);
 		return CMD_ARG_ERROR;
 	}
 	siril_log_message(_("Reconstructing %s Bayer matrix.\n"), word[2]);
-	args->seq = seq;
-	args->seqEntryIn = strdup("CFA_"); // propose to default to "CFA" for consistency of output names with single image split_cfa
 	args->seqEntryOut = strdup("mCFA_");
 
-	int startoptargs = 3;
+	int startoptargs = 6;
 	if (nb > startoptargs) {
 		for (int i = startoptargs; i < nb; i++) {
 			if (word[i]) {
-				if (g_str_has_prefix(word[i], "-inprefix=")) {
+				if (g_str_has_prefix(word[i], "-outprefix=")) {
 					char *current = word[i], *value;
 					value = current + 8;
 					if (value[0] == '\0') {
 						siril_log_message(_("Missing argument to %s, aborting.\n"), word[i]);
-						free(args);
-						if (!check_seq_is_comseq(seq))
-							free_sequence(seq, TRUE);
-						return CMD_ARG_ERROR;
-					}
-					args->seqEntryIn = strdup(value);
-				} else if (g_str_has_prefix(word[i], "-outprefix=")) {
-					char *current = word[i], *value;
-					value = current + 8;
-					if (value[0] == '\0') {
-						siril_log_message(_("Missing argument to %s, aborting.\n"), word[i]);
-						if (!check_seq_is_comseq(seq))
-							free_sequence(seq, TRUE);
+						if (!check_seq_is_comseq(seq0))
+							free_sequence(seq0, TRUE);
+						free_sequence(seq1, TRUE);
+						free_sequence(seq2, TRUE);
+						free_sequence(seq3, TRUE);
 						free(args);
 						return CMD_ARG_ERROR;
 					}
@@ -6401,8 +6523,11 @@ int process_seq_merge_cfa(int nb) {
 			}
 			else {
 				siril_log_message(_("Unknown parameter %s, aborting.\n"), word[i]);
-				if (!check_seq_is_comseq(seq))
-					free_sequence(seq, TRUE);
+				if (!check_seq_is_comseq(seq0))
+					free_sequence(seq0, TRUE);
+				free_sequence(seq1, TRUE);
+				free_sequence(seq2, TRUE);
+				free_sequence(seq3, TRUE);
 				free(args);
 				return CMD_ARG_ERROR;
 			}
@@ -10755,7 +10880,8 @@ int process_seq_profile(int nb) {
 	return CMD_OK;
 }
 
-static graxpert_data *fill_graxpert_data_from_cmdline(int nb, sequence *seq, graxpert_operation operation) {
+static graxpert_data* fill_graxpert_data_from_cmdline(int nb, sequence *seq,
+		graxpert_operation operation) {
 	graxpert_data *data = new_graxpert_data();
 	int start = (seq == NULL) ? 1 : 2;
 	if (seq)
@@ -10766,29 +10892,27 @@ static graxpert_data *fill_graxpert_data_from_cmdline(int nb, sequence *seq, gra
 		data->operation = GRAXPERT_BG;
 	} else if (operation == GRAXPERT_DENOISE) {
 		data->operation = GRAXPERT_DENOISE;
+	} else if (operation == GRAXPERT_DECONV) {
+		data->operation = GRAXPERT_DECONV;
 	} else {
 		siril_log_color_message(_("Error: unknown GraXpert operation!\n"), "red");
 		free_graxpert_data(data);
 		return NULL;
 	}
-	for (int i = start ; i < nb ; i++) {
+	for (int i = start; i < nb; i++) {
 		char *arg = word[i], *end;
 		if (!word[i])
 			break;
 		else if (!g_ascii_strncasecmp(arg, "-gpu", 3)) {
 			data->use_gpu = TRUE;
-		}
-		else if (!g_ascii_strncasecmp(arg, "-cpu", 3)) {
+		} else if (!g_ascii_strncasecmp(arg, "-cpu", 3)) {
 			data->use_gpu = FALSE;
-		}
-		else if (!g_ascii_strncasecmp(arg, "-keep_bg", 8)) {
+		} else if (!g_ascii_strncasecmp(arg, "-keep_bg", 8)) {
 			data->keep_bg = TRUE;
-		}
-		else if (!g_ascii_strncasecmp(arg, "-ai_version=", 12)) {
+		} else if (!g_ascii_strncasecmp(arg, "-ai_version=", 12)) {
 			arg += 12;
 			data->ai_version = g_strdup(arg);
-		}
-		else {
+		} else {
 			if (operation == GRAXPERT_BG) {
 				if (g_str_has_prefix(arg, "-algo=")) {
 					arg += 6;
@@ -10804,19 +10928,18 @@ static graxpert_data *fill_graxpert_data_from_cmdline(int nb, sequence *seq, gra
 						siril_log_color_message(_("Error: unknown background extraction algorithm!\n"), "red");
 						goto GRAX_ARG_ERROR;
 					}
-				}
-				else if (g_str_has_prefix(arg, "-mode=")) {
+				} else if (g_str_has_prefix(arg, "-mode=")) {
 					arg += 6;
 					if (!g_ascii_strncasecmp(arg, "sub", 3)) {
 						data->bg_mode = GRAXPERT_SUBTRACTION;
 					} else if (!g_ascii_strncasecmp(arg, "div", 3)) {
 						data->bg_mode = GRAXPERT_DIVISION;
 					} else {
-						siril_log_color_message(_("Error: unknown correction mode!\n"), "red");
+						siril_log_color_message(
+								_("Error: unknown correction mode!\n"), "red");
 						goto GRAX_ARG_ERROR;
 					}
-				}
-				else if (g_str_has_prefix(arg, "-kernel=")) {
+				} else if (g_str_has_prefix(arg, "-kernel=")) {
 					arg += 8;
 					if (!g_ascii_strncasecmp(arg, "thinplate", 9)) {
 						data->kernel = GRAXPERT_THIN_PLATE;
@@ -10827,74 +10950,98 @@ static graxpert_data *fill_graxpert_data_from_cmdline(int nb, sequence *seq, gra
 					} else if (!g_ascii_strncasecmp(arg, "linear", 6)) {
 						data->kernel = GRAXPERT_LINEAR;
 					} else {
-						siril_log_color_message(_("Error: unknown RBF kernel!\n"), "red");
+						siril_log_color_message(
+								_("Error: unknown RBF kernel!\n"), "red");
 						goto GRAX_ARG_ERROR;
 					}
-				}
-				else if (g_str_has_prefix(arg, "-ai_batch_size=")) {
+				} else if (g_str_has_prefix(arg, "-ai_batch_size=")) {
 					arg += 15;
 					data->ai_batch_size = (int) g_ascii_strtod(arg, &end);
 					if (arg == end) {
-						siril_log_message(_("Error: no AI batch size specified\n"));
+						siril_log_message(
+								_("Error: no AI batch size specified\n"));
 						goto GRAX_ARG_ERROR;
 					}
-				}
-				else if (g_str_has_prefix(arg, "-pts_per_row=")) {
+				} else if (g_str_has_prefix(arg, "-pts_per_row=")) {
 					arg += 13;
 					data->bg_pts_option = (int) g_ascii_strtod(arg, &end);
 					if (arg == end) {
-						siril_log_message(_("Error: no pts_per_row specified\n"));
+						siril_log_message(
+								_("Error: no pts_per_row specified\n"));
 						goto GRAX_ARG_ERROR;
 					}
-				}
-				else if (g_str_has_prefix(arg, "-splineorder=")) {
+				} else if (g_str_has_prefix(arg, "-splineorder=")) {
 					arg += 13;
 					data->spline_order = (int) g_ascii_strtod(arg, &end);
 					if (arg == end) {
-						siril_log_message(_("Error: no spline order specified\n"));
+						siril_log_message(
+								_("Error: no spline order specified\n"));
 						goto GRAX_ARG_ERROR;
 					}
-				}
-				else if (g_str_has_prefix(arg, "-samplesize=")) {
+				} else if (g_str_has_prefix(arg, "-samplesize=")) {
 					arg += 12;
 					data->sample_size = (int) g_ascii_strtod(arg, &end);
 					if (arg == end) {
-						siril_log_message(_("Error: no sample size specified\n"));
+						siril_log_message(
+								_("Error: no sample size specified\n"));
 						goto GRAX_ARG_ERROR;
 					}
-				}
-				else if (g_str_has_prefix(arg, "-smoothing=")) {
+				} else if (g_str_has_prefix(arg, "-smoothing=")) {
 					arg += 11;
 					data->bg_smoothing = g_ascii_strtod(arg, &end);
 					if (arg == end) {
-						siril_log_message(_("Error: no smoothing value specified\n"));
+						siril_log_message(
+								_("Error: no smoothing value specified\n"));
 						goto GRAX_ARG_ERROR;
 					}
-				}
-				else if (g_str_has_prefix(arg, "-bgtol=")) {
+				} else if (g_str_has_prefix(arg, "-bgtol=")) {
 					arg += 7;
 					data->bg_tol_option = g_ascii_strtod(arg, &end);
 					if (arg == end) {
-						siril_log_message(_("Error: no background tolerance value specified\n"));
+						siril_log_message(
+								_(
+										"Error: no background tolerance value specified\n"));
 						goto GRAX_ARG_ERROR;
 					}
-				}
-				else {
-					siril_log_color_message(_("Error: unknown argument!\n"), "red");
+				} else {
+					siril_log_color_message(_("Error: unknown argument!\n"),
+							"red");
 					goto GRAX_ARG_ERROR;
 				}
-			}
-			else { // operation must be GRAXPERT_DENOISE because of the earlier check
+			} else if (operation == GRAXPERT_DENOISE) {
 				if (g_str_has_prefix(arg, "-strength=")) {
 					arg += 10;
 					data->denoise_strength = g_ascii_strtod(arg, &end);
 					if (arg == end) {
-						siril_log_message(_("Error: no strength value specified\n"));
+						siril_log_message(
+								_("Error: no strength value specified\n"));
 						goto GRAX_ARG_ERROR;
 					}
+				} else {
+					siril_log_color_message(_("Error: unknown argument!\n"),
+							"red");
+					goto GRAX_ARG_ERROR;
 				}
-				else {
-					siril_log_color_message(_("Error: unknown argument!\n"), "red");
+			} else { // operation must be GRAXPERT_DECONV because of the earlier check
+				if (g_str_has_prefix(arg, "-strength=")) {
+					arg += 10;
+					data->deconv_strength = g_ascii_strtod(arg, &end);
+					if (arg == end) {
+						siril_log_message(
+								_("Error: no strength value specified\n"));
+						goto GRAX_ARG_ERROR;
+					}
+				} else if (g_str_has_prefix(arg, "-psfsize=")) {
+					arg += 9;
+					data->deconv_blur_psf_size = g_ascii_strtod(arg, &end);
+					if (arg == end) {
+						siril_log_message(
+								_("Error: no psf size value specified\n"));
+						goto GRAX_ARG_ERROR;
+					}
+				} else {
+					siril_log_color_message(_("Error: unknown argument!\n"),
+							"red");
 					goto GRAX_ARG_ERROR;
 				}
 			}
@@ -10910,13 +11057,18 @@ static graxpert_data *fill_graxpert_data_from_cmdline(int nb, sequence *seq, gra
 		data->denoise_strength = 0.0;
 	else if (data->denoise_strength > 1.0)
 		data->denoise_strength = 1.0;
+	else if (data->deconv_strength > 1.0)
+		data->deconv_strength = 1.0;
+	else if (data->deconv_blur_psf_size > 14.0)
+		data->deconv_blur_psf_size = 14.0;
 	if (data->bg_tol_option < -2.0)
 		data->bg_tol_option = -2.0;
 	else if (data->bg_tol_option > 6.0)
 		data->bg_tol_option = 6.0;
-	if (data->operation == GRAXPERT_DENOISE || data->bg_algo == GRAXPERT_BG_AI) {
+	if (data->operation == GRAXPERT_DENOISE || data->operation == GRAXPERT_DECONV
+			|| data->bg_algo == GRAXPERT_BG_AI) {
 		if (!check_graxpert_version(data->ai_version, data->operation)) {
-			siril_log_color_message(_("Error: the requested AI model version is unavailable. Available versions are:\n"), "red");
+			siril_log_color_message(_("Error: the requested AI model version is unavailable. Available versions are:\n"),"red");
 			ai_versions_to_log(operation);
 			goto GRAX_ARG_ERROR;
 		}
@@ -10924,22 +11076,26 @@ static graxpert_data *fill_graxpert_data_from_cmdline(int nb, sequence *seq, gra
 
 	return data;
 
-GRAX_ARG_ERROR:
+	GRAX_ARG_ERROR:
 
 	free_graxpert_data(data);
 	return NULL;
 }
 
 int process_graxpert_bg(int nb) {
-	graxpert_data *data = fill_graxpert_data_from_cmdline(nb, NULL, GRAXPERT_BG);
+	graxpert_data *data = fill_graxpert_data_from_cmdline(nb, NULL,
+			GRAXPERT_BG);
 	if (!data)
 		return CMD_ARG_ERROR;
 
 	if (data->bg_algo != GRAXPERT_BG_AI) {
 		const char *err;
-		data->bg_samples = generate_samples(&gfit, data->bg_pts_option, data->bg_tol_option, data->sample_size, &err, MULTI_THREADED);
+		data->bg_samples = generate_samples(&gfit, data->bg_pts_option,
+				data->bg_tol_option, data->sample_size, &err, MULTI_THREADED);
 		if (!data->bg_samples) {
-			siril_log_color_message(_("Failed to generate background samples for image: %s\n"), "red", _(err));
+			siril_log_color_message(
+					_("Failed to generate background samples for image: %s\n"),
+					"red", _(err));
 			free_graxpert_data(data);
 			return CMD_GENERIC_ERROR;
 		}
@@ -10950,6 +11106,15 @@ int process_graxpert_bg(int nb) {
 
 int process_graxpert_denoise(int nb) {
 	graxpert_data *data = fill_graxpert_data_from_cmdline(nb, NULL, GRAXPERT_DENOISE);
+	if (!data)
+		return CMD_ARG_ERROR;
+
+	start_in_new_thread(do_graxpert, data);
+	return CMD_OK;
+}
+
+int process_graxpert_deconv(int nb) {
+	graxpert_data *data = fill_graxpert_data_from_cmdline(nb, NULL, GRAXPERT_DECONV);
 	if (!data)
 		return CMD_ARG_ERROR;
 
@@ -10979,6 +11144,21 @@ int process_seq_graxpert_denoise(int nb) {
 		return CMD_SEQUENCE_NOT_FOUND;
 	}
 	graxpert_data *data = fill_graxpert_data_from_cmdline(nb, seq, GRAXPERT_DENOISE);
+	if (!data) {
+		free_sequence(seq, TRUE);
+		return CMD_ARG_ERROR;
+	}
+	apply_graxpert_to_sequence(data);
+	return CMD_OK;
+}
+
+int process_seq_graxpert_deconv(int nb) {
+	sequence *seq = load_sequence(word[1], NULL);
+	if (!seq) {
+		siril_log_color_message(_("Error: unable to load sequence\n"), "red");
+		return CMD_SEQUENCE_NOT_FOUND;
+	}
+	graxpert_data *data = fill_graxpert_data_from_cmdline(nb, seq, GRAXPERT_DECONV);
 	if (!data) {
 		free_sequence(seq, TRUE);
 		return CMD_ARG_ERROR;
