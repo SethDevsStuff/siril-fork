@@ -586,6 +586,48 @@ class ImgData:
     rx: int = 0                 #: width
     ry: int = 0                 #: height
 
+class DistoType(IntEnum):
+    """Python equivalent of the Siril disto_source enum"""
+    DISTO_UNDEF = 0      #: No distortion
+    DISTO_IMAGE = 1      #: Distortion from current image
+    DISTO_FILE = 2       #: Distortion from given file
+    DISTO_MASTER = 3     #: Distortion from master files
+    DISTO_FILES = 4      #: Distortion stored in each file (true only from seq platesolve, even with no distortion, it will be checked upon reloading)
+    DISTO_FILE_COMET = 5 #: special for cometary alignement, to be detected by apply reg
+
+    def __str__(self):
+        if self == DistoType.DISTO_UNDEF:
+            return "No distortion"
+        elif self == DistoType.DISTO_IMAGE:
+            return "Distortion from current image"
+        elif self == DistoType.DISTO_FILE: 
+            return "Distortion from given file"
+        elif self == DistoType.DISTO_MASTER:
+            return "Distortion from master files"
+        elif self == DistoType.DISTO_FILES:
+            return "Distortion stored in each file"
+        elif self == DistoType.DISTO_FILE_COMET:
+            return "Cometary alignement"
+        else:
+            return "Unknown distortion type"
+
+
+@dataclass
+class DistoData:
+    """Python equivalent of Siril disto_params structure"""
+    index: DistoType = DistoType.DISTO_UNDEF #: Specifies the distrosion type
+    filename: str = ""                     #: filename if DISTO_FILE or DISTO_MASTER (and optional for DISTO_FILE_COMET)
+    velocity: Tuple[float, float] = (0, 0) #: shift velocity if DISTO_FILE_COMET
+
+    def __str__(self):
+        """For pretty-printing distorsion information"""
+        pretty = f'{DistoType(self.index)}'
+        if len(self.filename) > 0:
+            pretty += f'\nDistorsion file: {self.filename}'
+        if self.index == DistoType.DISTO_FILE_COMET:
+            pretty += f'\nVelocity X/Y: {self.velocity[0]:.2f} {self.velocity[1]:.2f}'
+        return pretty
+
 @dataclass
 class Sequence:
     """Python equivalent of Siril sequ structure"""
@@ -600,8 +642,9 @@ class Sequence:
     bitpix: int = 0                      #: image pixel format, from fits
     reference_image: int = 0             #: reference image for registration
     imgparam: List[ImgData] = None       #: a structure for each image of the sequence
-    regparam: List[List[RegData]] = None #: registration parameters for each layer
+    regparam: List[RegData] = None       #: registration parameters for each image of the sequence
     stats: List[List[ImageStats]] = None #: statistics of the images for each layer
+    distoparam: DistoData = field(default_factory=DistoData) #: distortion parameters
     beg: int = 0                         #: imgparam[0]->filenum
     end: int = 0                         #: imgparam[number-1]->filenum
     exposure: float = 0.0                #: exposure of frames
@@ -609,6 +652,7 @@ class Sequence:
     type: SequenceType = None            #: the type of sequence
     cfa_opened_monochrome: bool = False  #: CFA SER opened in monochrome mode
     current: int = 0                     #: file number currently loaded
+    reglayer: int = -1                   #: layer used for registration
     # The following fields are not currently implemented:
     # photometry: List[List[PSFStar]] = None  # psf for multiple stars
     # reference_star: int = 0              # reference star for apparent magnitude
@@ -623,3 +667,21 @@ class Sequence:
             self.regparam = []
         if self.stats is None:
             self.stats = []
+    
+    def __str__(self):
+        """For pretty-printing sequence information"""
+        pretty = f'Sequence: {self.seqname}'
+        pretty += f'\nImages [selected/total]: {self.selnum} / {self.number}'
+        pretty += f'\nNumber of layers: {self.nb_layers}'
+        pretty += f'\nBitdepth: {self.bitpix}'
+        pretty += f'\nReference image: {self.reference_image + 1}'
+        if not self.is_variable:
+            pretty += f'\nImage size: {self.rx}x{self.ry}'
+        else:
+            pretty += f'\nImages have variable sizes'   
+        if self.regparam is not None:
+            pretty += f'\nSequence has registration data'
+            pretty += f' from layer {self.reglayer}' if self.nb_layers > 1 else ''
+            if self.regparam is not None and self.distoparam.index != DistoType.DISTO_UNDEF:
+                pretty += f'\nDistortion found in the sequence:\n{self.distoparam}'
+        return pretty

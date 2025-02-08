@@ -2024,20 +2024,21 @@ static int astrometry_prepare_hook(struct generic_seq_args *arg) {
 	clearfits(&fit);
 	// prepare for astrometric registration
 	if (args->update_reg) {
-		if (!arg->seq->regparam[args->layer]) {
+		if (!arg->seq->regparam) {
 			regdata *current_regdata = calloc(arg->seq->number, sizeof(regdata));
 			if (current_regdata == NULL) {
 				PRINT_ALLOC_ERR;
 				return 1;
 			}
-			arg->seq->regparam[args->layer] = current_regdata;
+			arg->seq->regparam = current_regdata;
 		} else {
-			siril_log_message(_("Recomputing already existing registration for this layer\n"));
+			siril_log_message(_("Recomputing already existing registration\n"));
 			/* we reset all values as we may register different images */
-			memset(arg->seq->regparam[args->layer], 0, arg->seq->number * sizeof(regdata));
+			memset(arg->seq->regparam, 0, arg->seq->number * sizeof(regdata));
 		}
+		arg->seq->reglayer = args->layer;
 		args->WCSDATA = calloc(arg->seq->number, sizeof(struct wcsprm));
-		arg->seq->distoparam[args->layer].index = DISTO_FILES;
+		arg->seq->distoparam.index = DISTO_FILES;
 	}
 	if (arg->has_output)
 		seq_prepare_hook(arg);
@@ -2075,7 +2076,7 @@ static int astrometry_image_hook(struct generic_seq_args *arg, int o, int i, fit
 		float FWHMx, FWHMy, B;
 		char *units;
 		FWHM_stats(stars, nb_stars, arg->seq->bitpix, &FWHMx, &FWHMy, &units, &B, NULL, 0.);
-		regdata *current_regdata = arg->seq->regparam[aargs_master->layer];
+		regdata *current_regdata = arg->seq->regparam;
 		current_regdata[i].roundness = FWHMy/FWHMx;
 		current_regdata[i].fwhm = FWHMx;
 		current_regdata[i].weighted_fwhm = FWHMx;
@@ -2221,10 +2222,10 @@ static int astrometry_finalize_hook(struct generic_seq_args *arg) {
 		seq_finalize_hook(arg);
 	if (aargs->update_reg && !arg->retval) {
 		siril_log_color_message(_("Computing astrometric registration...\n"), "green");
-		arg->retval = compute_Hs_from_astrometry(arg->seq, aargs->WCSDATA, FRAMING_CURRENT, aargs->layer, NULL, NULL);
-	}
-	if (!arg->retval)
+		arg->retval = compute_Hs_from_astrometry(arg->seq, aargs->WCSDATA, FRAMING_CURRENT, NULL, NULL);
+		arg->seq->reglayer = aargs->layer;
 		writeseqfile(arg->seq);
+	}
 	if (aargs->cat_center)
 		siril_world_cs_unref(aargs->cat_center);
 	if (aargs->ref_stars)

@@ -190,6 +190,7 @@ void initialize_ips_dialog() {
 	on_comboastro_order_changed(NULL, NULL);
 	// solver-related controls
 	on_comboastro_catalog_changed(NULL, NULL);
+	on_comboastro_solver_changed(NULL, NULL);
 }
 
 static void add_style_class(GtkWidget *widget, const char *class) {
@@ -988,6 +989,9 @@ gboolean end_platesolve_sequence(gpointer p) {
 	}
 	if (!check_seq_is_comseq(args->seq))
 		free_sequence(args->seq, TRUE);
+	else if (!args->retval) { // reloads the current filename in case the symlink was destroyed 
+		display_filename();
+	}
 	update_reg_interface(FALSE);
 	free(p);
 	return end_generic(NULL);

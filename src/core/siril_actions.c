@@ -468,8 +468,8 @@ void seq_list_activate(GSimpleAction *action, GVariant *parameter, gpointer user
 					_("Load another image"));
 		}
 		if (confirm) {
-			int layer = get_registration_layer(&com.seq);
-			update_seqlist(layer);
+			update_seqlist();
+			fill_sequence_list(&com.seq, FALSE);
 			siril_open_dialog("seqlist_dialog");
 		}
 	}

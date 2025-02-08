@@ -29,6 +29,7 @@
 #include "gui/message_dialog.h"
 #include "gui/dialogs.h"
 #include "gui/plot.h"
+#include "registration/registration.h"
 
 static GtkWidget *dialog = NULL;	// the window, a GtkDialog
 static GtkWidget *file_chooser = NULL;
@@ -242,15 +243,7 @@ static void on_nina_lc_response(GtkDialog* self, gint response_id, gpointer user
 		return;
 	}
 	purge_user_catalogue(CAT_AN_USER_TEMP);
-	int layer = -1;
-	if (com.seq.regparam) {
-		for (int i = 0; i < com.seq.nb_layers; i++) {
-			if (com.seq.regparam[i]) {
-				layer = i;
-				break;
-			}
-		}
-	}
+	int layer = get_registration_layer(&com.seq);
 	if (layer == -1) {
 		siril_debug_print("unregistered sequence\n");
 		//siril_message_dialog(GTK_MESSAGE_ERROR, _("Error"), _("The sequence must be registered"));
@@ -259,7 +252,7 @@ static void on_nina_lc_response(GtkDialog* self, gint response_id, gpointer user
 		else layer = 0;
 	}
 
-	if (sequence_drifts(&com.seq, layer, com.seq.rx / 4)) {
+	if (sequence_drifts(&com.seq, com.seq.rx / 4)) {
 		siril_message_dialog(GTK_MESSAGE_WARNING, _("Warning"), _("The sequence seems to have a heavy drift, the computation of a light curve may not be accurate or possible"));
 		// TODO: if clicked on close, do not continue
 	}
