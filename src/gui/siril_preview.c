@@ -1,7 +1,7 @@
 /*
  * This file is part of Siril, an astronomy image processor.
  * Copyright (C) 2005-2011 Francois Meyer (dulle at free.fr)
- * Copyright (C) 2012-2024 team free-astro (see more in AUTHORS file)
+ * Copyright (C) 2012-2025 team free-astro (see more in AUTHORS file)
  * Reference site is https://siril.org
  *
  * Siril is free software: you can redistribute it and/or modify
@@ -26,11 +26,8 @@
 #include "core/OS_utils.h"
 #include "core/processing.h"
 #include "core/siril_log.h"
-#include "core/undo.h"
 #include "gui/progress_and_log.h"
-#include "gui/image_display.h"
 #include "gui/callbacks.h"
-#include "gui/registration_preview.h"
 #include "io/single_image.h"
 #include "io/image_format_fits.h"
 
@@ -85,6 +82,13 @@ static void copy_backup_icc_to_gfit() {
 	gfit.icc_profile = copyICCProfile(preview_icc_backup);
 }
 
+static void clear_backup_icc() {
+	if (preview_icc_backup) {
+		cmsCloseProfile(preview_icc_backup);
+		preview_icc_backup = NULL;
+	}
+}
+
 int backup_roi() {
 	int retval;
 	if ((retval = copyfits(&gui.roi.fit, &preview_roi_backup, CP_ALLOC | CP_COPYA | CP_FORMAT, -1)))
@@ -111,6 +115,7 @@ void copy_gfit_to_backup() {
 		siril_debug_print("Image copy error in previews\n");
 		return;
 	}
+	copy_fits_metadata(&gfit, &preview_gfit_backup);
 	if (!com.script)
 		copy_gfit_icc_to_backup();
 	if (gui.roi.active && backup_roi()) {
@@ -131,6 +136,7 @@ int copy_backup_to_gfit() {
 		} else if (!com.script) {
 			copy_backup_icc_to_gfit();
 		}
+		if (retval == 0) copy_fits_metadata(&preview_gfit_backup, &gfit);
 		if (gui.roi.active && restore_roi()) {
 			siril_debug_print("Image copy error in ROI\n");
 			retval = 1;
@@ -153,6 +159,7 @@ gboolean is_preview_active() {
 
 void clear_backup() {
 	clearfits(&preview_gfit_backup);
+	clear_backup_icc();
 	preview_is_active = FALSE;
 }
 

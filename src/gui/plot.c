@@ -1,7 +1,7 @@
 /*
  * This file is part of Siril, an astronomy image processor.
  * Copyright (C) 2005-2011 Francois Meyer (dulle at free.fr)
- * Copyright (C) 2012-2024 team free-astro (see more in AUTHORS file)
+ * Copyright (C) 2012-2025 team free-astro (see more in AUTHORS file)
  * Reference site is https://siril.org
  *
  * Siril is free software: you can redistribute it and/or modify
@@ -33,10 +33,8 @@
 #include "core/proto.h"
 #include "core/siril_date.h"
 #include "core/processing.h"
-#include "core/siril_world_cs.h"
 #include "core/siril_log.h"
 #include "gui/utils.h"
-#include "gui/image_display.h"
 #include "gui/dialogs.h"
 #include "gui/message_dialog.h"
 #include "gui/progress_and_log.h"
@@ -44,14 +42,11 @@
 #include "gui/siril_plot.h"
 #include "registration/registration.h"
 #include "algos/PSF.h"
-#include "algos/siril_wcs.h"
 #include "io/aavso_extended.h"
-#include "io/ser.h"
 #include "io/sequence.h"
 #include "io/siril_plot.h"
 #include "gui/PSF_list.h"
 #include "opencv/opencv.h"
-#include "algos/astrometry_solver.h"
 #include "algos/comparison_stars.h"
 
 // TODO: Would probably be more efficient to cache plot surface and add selection as an overlay
@@ -849,8 +844,10 @@ void on_ButtonSwitch_Siril_plot_clicked(GtkButton *button, gpointer user_data) {
 		return;
 	}
 
-	siril_plot_data *spl_data = malloc(sizeof(siril_plot_data));
-	init_siril_plot_data(spl_data);
+	siril_plot_data *spl_data = init_siril_plot_data();
+	if (!spl_data)
+		return;
+
 	siril_plot_set_xlabel(spl_data, xlabel);
 	siril_plot_set_ylabel(spl_data, ylabel);
 
@@ -1312,7 +1309,7 @@ void on_button_aavso_apply_clicked(GtkButton *button, gpointer user_data) {
 	/* temporary code */
 	aavso_dlg *aavso_ptr = calloc(1, sizeof(aavso_dlg));
 
-	aavso_ptr->obscode = gtk_entry_get_text(GTK_ENTRY(lookup_widget("obscode_entry")));
+	aavso_ptr->obscode = gtk_entry_get_text(GTK_ENTRY(lookup_widget("observationcode_entry")));
 	aavso_ptr->obstype = gtk_combo_box_text_get_active_text(GTK_COMBO_BOX_TEXT(lookup_widget("obstype_combo")));
 	aavso_ptr->starid = gtk_entry_get_text(GTK_ENTRY(lookup_widget("starid_entry")));
 	aavso_ptr->cname = gtk_entry_get_text(GTK_ENTRY(lookup_widget("cname_entry")));

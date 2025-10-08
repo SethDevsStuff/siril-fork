@@ -1,7 +1,7 @@
 /*
  * This file is part of Siril, an astronomy image processor.
  * Copyright (C) 2005-2011 Francois Meyer (dulle at free.fr)
- * Copyright (C) 2012-2024 team free-astro (see more in AUTHORS file)
+ * Copyright (C) 2012-2025 team free-astro (see more in AUTHORS file)
  * Reference site is https://siril.org
  *
  * Siril is free software: you can redistribute it and/or modify
@@ -23,29 +23,20 @@
 #include "core/siril.h"
 #include "core/proto.h"
 #include "core/icc_profile.h"
-#include "core/command.h"
-#include "gui/cut.h"
-#include "gui/icc_profile.h"
 #include "core/processing.h"
-#include "core/undo.h"
 #include "core/siril_world_cs.h"
-#include "algos/background_extraction.h"
+#include "algos/demosaicing.h"
 #include "algos/siril_wcs.h"
 #include "algos/photometry.h"
 #include "io/single_image.h"
 #include "io/sequence.h"
 #include "io/image_format_fits.h"
-#include "gui/open_dialog.h"
-#include "gui/dialogs.h"
-#include "gui/PSF_list.h"
 #include "image_interactions.h"
 #include "gui/mouse_action_functions.h"
 #include "image_display.h"
 #include "gui/callbacks.h"
 #include "gui/utils.h"
 #include "progress_and_log.h"
-#include "message_dialog.h"
-#include "registration_preview.h"
 
 //#define DEBUG_SCROLL
 
@@ -64,6 +55,10 @@ mouse_status_enum mouse_status;
 cut_method cutting;
 static double margin_size = 10;
 static release_action button_release = { 0, mouse_nullfunction };
+
+mouse_status_enum get_mouse_status() {
+	return mouse_status;
+}
 
 #define MAX_CALLBACKS_PER_EVENT 10
 /* selection zone event management */
@@ -184,7 +179,7 @@ void unregister_selection_update_callback(const selection_update_callback f) {
 }
 
 // send the events
-void new_selection_zone() {
+gboolean new_selection_zone(gpointer user_data) {
 	int i;
 	siril_debug_print("selection: %d,%d,\t%dx%d\n", com.selection.x,
 			com.selection.y, com.selection.w, com.selection.h);
@@ -193,12 +188,13 @@ void new_selection_zone() {
 			_registered_selection_callbacks[i]();
 	}
 	redraw(REDRAW_OVERLAY);
+	return FALSE;
 }
 
 void delete_selected_area() {
 	memset(&com.selection, 0, sizeof(rectangle));
 	if (!com.script)
-		new_selection_zone();
+		gui_function(new_selection_zone, NULL);
 	if (gui.roi.active && com.pref.gui.roi_mode == ROI_AUTO)
 		on_clear_roi();
 }
@@ -328,6 +324,10 @@ void init_mouse() {
 	mouse_status = MOUSE_ACTION_SELECT_REG_AREA;
 }
 
+void init_draw_poly() {
+	mouse_status = MOUSE_ACTION_DRAW_POLY;
+}
+
 GdkModifierType get_primary() {
 	return gdk_keymap_get_modifier_mask(
 			gdk_keymap_get_for_display(gdk_display_get_default()),
@@ -365,6 +365,39 @@ void enforce_ratio_and_clamp() {
 	// clamp the selection inside the image (needed when enforcing a ratio or moving)
 	com.selection.x = set_int_in_interval(com.selection.x, 0, gfit.rx - com.selection.w);
 	com.selection.y = set_int_in_interval(com.selection.y, 0, gfit.ry - com.selection.h);
+
+	// If the image is CFA ensure the selection is aligned to a Bayer repeat
+	// This ensures CFA statistics (for Bayer patterns) will be valid
+	int cfa = get_cfa_pattern_index_from_string(gfit.keywords.bayer_pattern);
+	switch (cfa) {
+		case BAYER_FILTER_NONE:
+			break;
+		case BAYER_FILTER_RGGB: // Fallthrough intentional
+		case BAYER_FILTER_BGGR:
+		case BAYER_FILTER_GBRG:
+		case BAYER_FILTER_GRBG:
+			// Bayer (2x2 guarantees at least 1 pixel per subchannel for statistics)
+			if(com.selection.w < 2)
+				com.selection.w = 2;
+			if (com.selection.h < 2)
+				com.selection.h = 2;
+			break;
+		default: // X-trans (3x3 guarantees at least 1 pixel per subchannel for statistics)
+			if(com.selection.w < 3)
+				com.selection.w = 3;
+			if (com.selection.h < 3)
+				com.selection.h = 3;
+	}
+	if (cfa != BAYER_FILTER_NONE) {
+		com.selection.x &= ~1;
+		com.selection.y &= ~1;
+		com.selection.w &= ~1;
+		com.selection.h &= ~1;
+		if(com.selection.w < 2)
+			com.selection.w = 2;
+		if (com.selection.h < 2)
+			com.selection.h = 2;
+	}
 }
 
 gboolean on_drawingarea_button_press_event(GtkWidget *widget,
@@ -411,7 +444,7 @@ gboolean on_drawingarea_button_release_event(GtkWidget *widget,
 
 		button_release.function(&data);
 		clear_release_callback();
-		update_MenuItem();
+		gui_function(update_MenuItem, NULL);
 	}
 	return FALSE;
 }
@@ -552,7 +585,13 @@ gboolean on_drawingarea_motion_notify_event(GtkWidget *widget,
 	if (blank_density_cvport && gtk_label_get_text(labels_density[gui.cvport])[0] != '\0')
 		gtk_label_set_text(labels_density[gui.cvport], " ");
 
-	if (gui.translating) {
+	if (gui.drawing_polygon) {
+		point *ev = malloc(sizeof(point));
+		ev->x = zoomed.x;
+		ev->y = zoomed.y;
+		gui.drawing_polypoints = g_slist_prepend(gui.drawing_polypoints, ev);
+		redraw(REDRAW_OVERLAY);
+	} else if (gui.translating) {
 		update_zoom_fit_button();
 
 		pointi ev = { (int)(event->x), (int)(event->y) };
@@ -613,8 +652,9 @@ gboolean on_drawingarea_motion_notify_event(GtkWidget *widget,
 		redraw(REDRAW_OVERLAY);
 	}
 
-	/* don't change cursor if thread is running */
-	if (get_thread_run()) return FALSE;
+	/* don't change cursor if thread is running or if Python
+	 claims the thread */
+	if (get_thread_run() || com.python_claims_thread) return FALSE;
 
 	if (inside) {
 		if (mouse_status == MOUSE_ACTION_DRAW_SAMPLES) {
@@ -664,10 +704,22 @@ gboolean on_drawingarea_motion_notify_event(GtkWidget *widget,
 	return FALSE;
 }
 
+void on_drawingarea_enter_notify_event(GtkWidget *widget, GdkEvent *event,
+		gpointer user_data) {
+	if (single_image_is_loaded() || sequence_is_loaded()) {
+		if (get_thread_run() || com.python_claims_thread) {
+			set_cursor_waiting(TRUE);
+		} else {
+			/* trick to get default cursor */
+			set_cursor_waiting(FALSE);
+		}
+	}
+}
+
 void on_drawingarea_leave_notify_event(GtkWidget *widget, GdkEvent *event,
 		gpointer user_data) {
 	if (single_image_is_loaded() || sequence_is_loaded()) {
-		if (get_thread_run()) {
+		if (get_thread_run() || com.python_claims_thread) {
 			set_cursor_waiting(TRUE);
 		} else {
 			/* trick to get default cursor */
@@ -703,6 +755,11 @@ void update_zoom_label() {
 		g_sprintf(zoom_buffer, " ");
 	}
 	gdk_threads_add_idle(set_label_zoom_text_idle, zoom_buffer);
+}
+
+gboolean update_zoom_label_idle(gpointer user_data) {
+	update_zoom_label();
+	return FALSE;
 }
 
 gboolean update_zoom(gdouble x, gdouble y, double scale) {

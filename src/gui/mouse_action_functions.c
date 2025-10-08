@@ -1,7 +1,7 @@
 /*
  * This file is part of Siril, an astronomy image processor.
  * Copyright (C) 2005-2011 Francois Meyer (dulle at free.fr)
- * Copyright (C) 2012-2024 team free-astro (see more in AUTHORS file)
+ * Copyright (C) 2012-2025 team free-astro (see more in AUTHORS file)
  * Reference site is https://siril.org
  *
  * Siril is free software: you can redistribute it and/or modify
@@ -22,17 +22,13 @@
 
 #include "core/siril.h"
 #include "core/proto.h"
-#include "core/icc_profile.h"
-#include "core/command.h"
 #include "core/command_line_processor.h"
 #include "core/siril_log.h"
 #include "gui/cut.h"
 #include "gui/icc_profile.h"
 #include "core/processing.h"
 #include "core/undo.h"
-#include "core/siril_world_cs.h"
 #include "algos/background_extraction.h"
-#include "algos/siril_wcs.h"
 #include "algos/photometry.h"
 #include "io/single_image.h"
 #include "io/sequence.h"
@@ -47,8 +43,8 @@
 #include "gui/save_dialog.h"
 #include "gui/utils.h"
 #include "progress_and_log.h"
-#include "message_dialog.h"
 #include "registration_preview.h"
+#include "gui/user_polygons.h"
 
 // Tracks whether double middle click will zoom to fit or zoom to 1:1, for the
 // toggle
@@ -189,7 +185,7 @@ static gboolean select_reg_area_release(mouse_data *data) {
 
 		/* we have a new rectangular selection zone,
 			* or an unselection (empty zone) */
-		new_selection_zone();
+		gui_function(new_selection_zone, NULL);
 
 		// Terminate any specific selection modification mode
 		gui.freezeX = gui.freezeY = FALSE;
@@ -296,6 +292,19 @@ static gboolean measure_release (mouse_data *data) {
 	return TRUE;
 }
 
+static gboolean draw_poly_release(mouse_data *data) {
+	// Parse gui.drawing_polypoints into a Polygon and add it using add_user_polygon
+	gui.drawing_polygon = FALSE;
+	*data->mouse_status = MOUSE_ACTION_SELECT_REG_AREA;
+	UserPolygon *poly = create_user_polygon_from_points(gui.drawing_polypoints);
+	add_existing_polygon(poly, &gui.poly_ink, gui.poly_fill);
+	queue_redraw(REDRAW_OVERLAY);
+	// Free and NULL gui.drawing_polypoints
+	g_slist_free_full(gui.drawing_polypoints, free);
+	gui.drawing_polypoints = NULL;
+	return TRUE;
+}
+
 static gboolean show_popup_menu(mouse_data *data) {
 	if (*data->mouse_status != MOUSE_ACTION_DRAW_SAMPLES && *data->mouse_status != MOUSE_ACTION_PHOTOMETRY) {
 			do_popup_graymenu(data->widget, NULL);
@@ -315,7 +324,7 @@ gboolean open_if_nothing_loaded(mouse_data *data) {
 	 */
 	if (!single_image_is_loaded() && !sequence_is_loaded()) {
 		header_open_button_clicked();
-		launch_clipboard_survey();
+		gui_function(launch_clipboard_survey, NULL);
 	}
 	return TRUE;
 }
@@ -459,10 +468,12 @@ gboolean main_action_click(mouse_data *data) {
 
 				if (pt.x + radius < gfit.rx && pt.y + radius < gfit.ry
 						&& pt.x - radius > 0 && pt.y - radius > 0) {
+					sample_mutex_lock();
 					com.grad_samples = add_background_sample(com.grad_samples, &gfit, pt);
+					sample_mutex_unlock();
 
 					redraw(REDRAW_OVERLAY);
-					redraw_previews();
+					gui_function(redraw_previews, NULL);
 				}
 				break;
 			case MOUSE_ACTION_SELECT_PREVIEW1:
@@ -483,9 +494,15 @@ gboolean main_action_click(mouse_data *data) {
 				if (data->zoomed.x - area.w > 0 && data->zoomed.x + area.w < gfit.rx
 						&& data->zoomed.y - area.h > 0 && data->zoomed.y + area.h < gfit.ry) {
 					ps = phot_set_adjusted_for_image(&gfit);
-					gui.qphot = psf_get_minimisation(&gfit, select_vport(gui.cvport), &area, TRUE, ps, TRUE, com.pref.starfinder_conf.profile, NULL);
+					psf_error error = PSF_NO_ERR;
+					gui.qphot = psf_get_minimisation(&gfit, select_vport(gui.cvport), &area, TRUE, TRUE, ps, TRUE, com.pref.starfinder_conf.profile, &error);
 					free(ps);
 					if (gui.qphot) {
+						if (!gui.qphot->phot_is_valid || error != PSF_NO_ERR) {
+							free_psf(gui.qphot);
+							gui.qphot = NULL;
+							break;
+						}
 						gui.qphot->xpos = gui.qphot->x0 + area.x;
 						if (gfit.top_down)
 							gui.qphot->ypos = gui.qphot->y0 + area.y;
@@ -528,6 +545,15 @@ gboolean main_action_click(mouse_data *data) {
 			case MOUSE_ACTION_CUT_WN2:
 				register_release_callback(cut_wn2_release, data->event->button);
 				break;
+			case MOUSE_ACTION_DRAW_POLY:
+				g_assert(gui.drawing_polypoints == NULL);
+				point *ev = malloc(sizeof(point));
+				ev->x = data->zoomed.x;
+				ev->y = data->zoomed.y;
+				gui.drawing_polypoints = g_slist_prepend(gui.drawing_polypoints, ev);
+				register_release_callback(draw_poly_release, data->event->button);
+				gui.drawing_polygon = TRUE;
+				break;
 			default:
 				break;
 		}
@@ -554,10 +580,12 @@ gboolean second_action_click(mouse_data *data) {
 
 			if (pt.x + radius <= gfit.rx && pt.y + radius <= gfit.ry
 					&& pt.x - radius >= 0 && pt.y - radius >= 0) {
+				sample_mutex_lock();
 				com.grad_samples = remove_background_sample(com.grad_samples, &gfit, pt);
+				sample_mutex_unlock();
 
 				redraw(REDRAW_OVERLAY);
-				redraw_previews();
+				gui_function(redraw_previews, NULL);
 			}
 		} else if (*data->mouse_status == MOUSE_ACTION_PHOTOMETRY) {
 			if (sequence_is_loaded()) {
@@ -566,7 +594,7 @@ gboolean second_action_click(mouse_data *data) {
 				if (data->zoomed.x - area.w > 0 && data->zoomed.x + area.w < gfit.rx
 						&& data->zoomed.y - area.h > 0 && data->zoomed.y + area.h < gfit.ry) {
 					memcpy(&com.selection, &area, sizeof(rectangle));
-					process_seq_psf(0);
+					seq_qphot(&com.seq, select_vport(gui.cvport));
 					delete_selected_area();
 				}
 			}
@@ -598,7 +626,7 @@ gboolean photometry_box_set(mouse_data *data) {
 			com.selection.w = w;
 			com.selection.h = h;
 
-			new_selection_zone();
+			gui_function(new_selection_zone, NULL);
 		}
 	}
 	return TRUE;
@@ -714,9 +742,20 @@ gboolean scroll_zooms(scroll_data *data) {
 	// The handler is written to act on either horizontal or vertical scroll events
 	// However the handler will only ever be called for one or the other depending
 	// on the configuration.
+	double speed_limit = com.pref.gui.mouse_speed_limit;
 	switch (event->direction) {
 		case GDK_SCROLL_SMOOTH:
 			gdk_event_get_scroll_deltas((GdkEvent*) event, &delta.x, &delta.y);
+			if (speed_limit) {
+				if (delta.x > speed_limit)
+					delta.x = speed_limit;
+				else if (delta.x < -speed_limit)
+					delta.x = -speed_limit;
+				if (delta.y > speed_limit)
+					delta.y = speed_limit;
+				else if (delta.y < -speed_limit)
+					delta.y = -speed_limit;
+			}
 			if (data->direction == MOUSE_VERTICAL_SCROLL) {
 				if (delta.y < 0) {
 					return update_zoom(event->x, event->y, ((ZOOM_IN - 1.0) * fabs(delta.y)) + 1.0);

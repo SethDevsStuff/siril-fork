@@ -1,7 +1,7 @@
 /*
  * This file is part of Siril, an astronomy image processor.
  * Copyright (C) 2005-2011 Francois Meyer (dulle at free.fr)
- * Copyright (C) 2012-2024 team free-astro (see more in AUTHORS file)
+ * Copyright (C) 2012-2025 team free-astro (see more in AUTHORS file)
  * Reference site is https://siril.org
  *
  * Siril is free software: you can redistribute it and/or modify
@@ -23,7 +23,6 @@
 
 #include "core/siril.h"
 #include "core/proto.h"
-#include "core/siril_app_dirs.h"
 #include "core/siril_log.h"
 #include "core/processing.h"
 #include "core/icc_profile.h"
@@ -44,12 +43,12 @@
 #include "gui/callbacks.h"
 #include "gui/utils.h"
 #include "gui/siril_preview.h"
+#include "gui/user_polygons.h"
 #include "livestacking/livestacking.h"
 #include "histogram.h"
 #include "registration/matching/degtorad.h"
 #include "registration/registration.h"
 #include "opencv/opencv.h"
-#include "git-version.h"
 
 #include <wcslib.h>
 #include <wcsfix.h>
@@ -1011,6 +1010,101 @@ static void draw_measurement_line(const draw_data_t* dd) {
 	cairo_restore(cr);
 }
 
+static void draw_user_polygons(const draw_data_t *dd) {
+	if (gui.user_polygons == NULL)
+		return;
+	cairo_t *cr = dd->cr;
+	static double dash_format[] = { 4.0, 2.0 };
+	cairo_set_line_width(cr, 1.5 / dd->zoom);
+	cairo_set_dash(cr, dash_format, 2, 0);
+	GSList *l;
+	for (l = gui.user_polygons; l != NULL; l = l->next) {
+		UserPolygon *polygon = (UserPolygon *)l->data;
+		if (polygon->n_points < 2)
+			continue;
+
+		// Calculate center of polygon for legend placement
+		double center_x = 0, center_y = 0;
+		for (int i = 0; i < polygon->n_points; i++) {
+			center_x += polygon->points[i].x;
+			center_y += polygon->points[i].y;
+		}
+		center_x /= polygon->n_points;
+		center_y /= polygon->n_points;
+
+		if (polygon->fill) {
+			cairo_save(cr);
+			// Set color for filling
+			cairo_set_source_rgba(cr,
+								  polygon->color.red,
+						 polygon->color.green,
+						 polygon->color.blue,
+						 polygon->color.alpha);
+			cairo_move_to(cr, polygon->points[0].x + 0.5, polygon->points[0].y + 0.5);
+			for (int i = 1; i < polygon->n_points; i++) {
+				cairo_line_to(cr, polygon->points[i].x + 0.5, polygon->points[i].y + 0.5);
+			}
+			cairo_close_path(cr);
+			// Fill the polygon
+			cairo_fill_preserve(cr);
+			// Draw the outline
+			cairo_set_source_rgba(cr,
+								  polygon->color.red * 0.8, // Slightly darker outline if filled
+						 polygon->color.green * 0.8,
+						 polygon->color.blue * 0.8,
+						 polygon->color.alpha);
+			cairo_stroke(cr);
+			cairo_restore(cr);
+		} else {
+			cairo_save(cr);
+			// Set color for filling
+			cairo_set_source_rgba(cr,
+								  polygon->color.red,
+						 polygon->color.green,
+						 polygon->color.blue,
+						 polygon->color.alpha);
+			cairo_move_to(cr, polygon->points[0].x + 0.5, polygon->points[0].y + 0.5);
+			for (int i = 1; i < polygon->n_points; i++) {
+				cairo_line_to(cr, polygon->points[i].x + 0.5, polygon->points[i].y + 0.5);
+			}
+			cairo_close_path(cr);
+			cairo_stroke(cr);
+			cairo_restore(cr);
+		}
+
+		// Draw legend text if it exists
+		if (polygon->legend != NULL && polygon->legend[0] != '\0') {
+			cairo_save(cr);
+
+			// Set up text properties
+			cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+			cairo_set_font_size(cr, 12.0 / dd->zoom);
+
+			// Get text dimensions to center properly
+			cairo_text_extents_t text_extents;
+			cairo_text_extents(cr, polygon->legend, &text_extents);
+
+			// Create a background for the text for better visibility
+			double padding = 4.0 / dd->zoom;
+			cairo_set_source_rgba(cr, 0, 0, 0, 0.5);  // Darken the background
+			cairo_rectangle(cr,
+							center_x - text_extents.width/2 - padding,
+				   center_y - text_extents.height/2 - padding,
+				   text_extents.width + 2*padding,
+				   text_extents.height + 2*padding);
+			cairo_fill(cr);
+
+			// Draw the text
+			cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 1.0);  // White text
+			cairo_move_to(cr,
+						  center_x - text_extents.width/2,
+				 center_y + text_extents.height/2);
+			cairo_show_text(cr, polygon->legend);
+			cairo_restore(cr);
+		}
+	}
+}
+
 static void draw_stars(const draw_data_t* dd) {
 	cairo_t *cr = dd->cr;
 	int i = 0;
@@ -1197,6 +1291,26 @@ static void draw_brg_boxes(const draw_data_t* dd) {
 	}
 }
 
+static void draw_in_progress_poly(const draw_data_t* dd) {
+	if (!gui.drawing_polypoints) return;
+
+	cairo_t *cr = dd->cr;
+	cairo_set_line_width(cr, 1.5 / dd->zoom);
+	gdk_cairo_set_source_rgba(cr, &gui.poly_ink);
+
+	GSList *list = gui.drawing_polypoints;
+	const point* start = (point*) list->data;
+	cairo_move_to(cr, start->x + 0.5, start->y + 0.5);
+
+	// Build the complete path first
+	for (list = list->next; list; list = list->next) {
+		const point* position = (point*) list->data;
+		cairo_line_to(cr, position->x + 0.5, position->y + 0.5);
+	}
+
+	// Now stroke the entire path at once
+	cairo_stroke(cr);
+}
 
 static void draw_compass(const draw_data_t* dd) {
 	int pos = com.pref.gui.position_compass;
@@ -1603,6 +1717,8 @@ static void draw_annotates(const draw_data_t* dd) {
 		gdouble radius = get_catalogue_object_radius(object);
 		gdouble x = get_catalogue_object_x(object);
 		gdouble y = get_catalogue_object_y(object);
+		gdouble x1 = get_catalogue_object_x1(object);
+		gdouble y1 = get_catalogue_object_y1(object);
 		gchar *code = get_catalogue_object_code_pretty(object);
 		guint catalog = get_catalogue_object_cat(object);
 		gboolean revert = FALSE;
@@ -1640,7 +1756,11 @@ static void draw_annotates(const draw_data_t* dd) {
 		// radius now in pixels
 
 		point offset = {5., revert ? 5. : -5.};
-		if (radius < 0) {
+		if (catalog == CAT_AN_CONST) { // constellation line
+			cairo_move_to(cr, x, y);
+			cairo_line_to(cr, x1, y1);
+			cairo_stroke(cr);
+		} else if (radius < 0 || catalog == CAT_AN_CONST_NAME) {
 			// objects we don't have an accurate location (LdN, Sh2)
 		} else if (radius > 5) {
 			cairo_arc(cr, x, y, radius, 0., 2. * M_PI);
@@ -1905,7 +2025,7 @@ void adjust_vport_size_to_image() {
 
 void copy_roi_into_gfit() {
 	size_t npixels_roi = gui.roi.selection.w * gui.roi.selection.h;
-	if (npixels_roi == 0 || com.script)
+	if (npixels_roi == 0 || com.script || com.python_command)
 		return;
 	size_t npixels_gfit = gfit.rx * gfit.ry;
 	if (gui.roi.fit.type != gfit.type) {
@@ -1963,8 +2083,7 @@ void copy_roi_into_gfit() {
 }
 
 void redraw(remap_type doremap) {
-	if (com.script) return;
-//	siril_debug_print("redraw %d\n", doremap);
+	if (com.script && !com.python_script) return;
 	if (gui.roi.active && gui.roi.operation_supports_roi &&((gfit.type == DATA_FLOAT && gui.roi.fit.fdata) || (gfit.type == DATA_USHORT && gui.roi.fit.data)))
 		copy_roi_into_gfit();
 	switch (doremap) {
@@ -1996,6 +2115,20 @@ void redraw(remap_type doremap) {
 static gboolean redraw_idle(gpointer p) {
 	redraw((remap_type)GPOINTER_TO_INT(p)); // draw stars
 	return FALSE;
+}
+
+static gpointer redraw_idle_thread_func(gpointer data) {
+	sample_mutex_lock();
+	execute_idle_and_wait_for_it(redraw_idle, data);
+	sample_mutex_unlock();
+	return FALSE;
+}
+
+void queue_redraw_and_wait_for_it(remap_type doremap) {
+	if (!com.script && !com.python_command && !com.headless) {
+		GThread *thread = g_thread_new("redraw", redraw_idle_thread_func, GINT_TO_POINTER((int)doremap));
+		g_thread_join(thread);
+	}
 }
 
 void queue_redraw(remap_type doremap) {
@@ -2075,6 +2208,10 @@ gboolean redraw_drawingarea(GtkWidget *widget, cairo_t *cr, gpointer data) {
 
 	/* draw measurement line */
 	draw_measurement_line(&dd);
+
+	/* draw user polygons */
+	draw_in_progress_poly(&dd);
+	draw_user_polygons(&dd);
 
 	/* detected stars and highlight the selected star */
 	g_mutex_lock(&com.mutex);

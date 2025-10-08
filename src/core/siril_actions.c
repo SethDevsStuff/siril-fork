@@ -1,7 +1,7 @@
 /*
  * This file is part of Siril, an astronomy image processor.
  * Copyright (C) 2005-2011 Francois Meyer (dulle at free.fr)
- * Copyright (C) 2012-2024 team free-astro (see more in AUTHORS file)
+ * Copyright (C) 2012-2025 team free-astro (see more in AUTHORS file)
  * Reference site is https://siril.org
  *
  * Siril is free software: you can redistribute it and/or modify
@@ -22,8 +22,6 @@
 #include "core/proto.h"
 #include "core/command.h"
 #include "core/undo.h"
-#include "core/icc_profile.h"
-#include "core/command.h"
 #include "core/siril_update.h"
 #include "core/siril_cmd_help.h"
 #include "core/siril_log.h"
@@ -34,7 +32,6 @@
 #include "io/sequence.h"
 #include "algos/astrometry_solver.h"
 #include "algos/noise.h"
-#include "algos/geometry.h"
 #include "algos/photometry.h"
 #include "algos/siril_wcs.h"
 #include "algos/ccd-inspector.h"
@@ -55,14 +52,13 @@
 #include "gui/sequence_list.h"
 #include "gui/progress_and_log.h"
 #include "gui/dialogs.h"
-#include "gui/script_menu.h"
 #include "gui/image_interactions.h"
 #include "gui/image_display.h"
 #include "gui/photometric_cc.h"
 #include "gui/menu_gray_geometry.h"
 #include "gui/registration_preview.h"
 #include "gui/remixer.h"
-#include "livestacking/livestacking.h"
+#include "gui/user_polygons.h"
 #include "registration/registration.h"
 #include "io/siril_catalogues.h"
 
@@ -78,12 +74,12 @@
 
 void open_action_activate(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
 	header_open_button_clicked();
-	launch_clipboard_survey();
+	gui_function(launch_clipboard_survey, NULL);
 }
 
 void cwd_action_activate(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
 	cwd_btton_clicked();
-	update_MenuItem();
+	gui_function(update_MenuItem, NULL);
 }
 
 void livestacking_action_activate(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
@@ -137,12 +133,6 @@ void close_action_activate(GSimpleAction *action, GVariant *parameter, gpointer 
 	process_close(0);
 }
 
-void scripts_action_activate(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
-	siril_open_dialog("settings_window");
-	gtk_stack_set_visible_child((GtkStack*) lookup_widget("stack_pref"), lookup_widget("scripts_page"));
-//	siril_get_on_script_pages();
-}
-
 void updates_action_activate(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
 #if defined(HAVE_LIBCURL)
 	siril_check_updates(TRUE);
@@ -152,7 +142,7 @@ void updates_action_activate(GSimpleAction *action, GVariant *parameter, gpointe
 }
 
 void doc_action_activate(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
-	siril_get_documentation();
+	siril_get_documentation(NULL);
 }
 
 static gboolean is_extended = FALSE;
@@ -296,7 +286,7 @@ void negative_view_state(GSimpleAction *action, GVariant *state, gpointer user_d
 	g_simple_action_set_state(action, state);
 	set_cursor_waiting(TRUE);
 	redraw(REMAP_ALL);
-	redraw_previews();
+	gui_function(redraw_previews, NULL);
 	set_cursor_waiting(FALSE);
 }
 
@@ -328,7 +318,7 @@ void color_map_state(GSimpleAction *action, GVariant *state, gpointer user_data)
 	g_simple_action_set_state(action, state);
 	set_cursor_waiting(TRUE);
 	redraw(REMAP_ALL);
-	redraw_previews();
+	gui_function(redraw_previews, NULL);
 	set_cursor_waiting(FALSE);
 }
 
@@ -338,9 +328,33 @@ void color_map_activate(GSimpleAction *action, GVariant *parameter, gpointer use
 	g_variant_unref(state);
 }
 
+static void update_chain_channels_ui(gboolean linked) {
+	set_unlink_channels(!linked);
+
+	gchar *name = g_build_filename("/org/siril/ui/", "pixmaps",
+									linked ? "chain-linked.svg" : "chain.svg", NULL);
+	GtkWidget *image = lookup_widget("autostretch_linked_icon");
+	gtk_image_set_from_resource((GtkImage*) image, name);
+
+	GtkWidget *button = lookup_widget("linked_autostretch_button");
+	gchar *tooltip_text = g_strdup_printf(_("Link/unlink channels in autostretch viewer mode.\nCurrent state: %s."),
+										linked ? _("linked") : _("unlinked"));
+	gtk_widget_set_tooltip_text(button, tooltip_text);
+
+	g_free(name);
+	g_free(tooltip_text);
+}
+
 void chain_channels_state_change(GSimpleAction *action, GVariant *state, gpointer user_data) {
+	gboolean linked = g_variant_get_boolean(state);
 	g_simple_action_set_state(action, state);
-	set_unlink_channels(!g_variant_get_boolean(state));
+	update_chain_channels_ui(linked);
+}
+
+gboolean chain_channels_idle_callback(gpointer user_data) {
+	gboolean linked = GPOINTER_TO_INT(user_data);
+	update_chain_channels_ui(linked);
+	return G_SOURCE_REMOVE;
 }
 
 void chain_channels_activate(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
@@ -377,19 +391,53 @@ void psf_activate(GSimpleAction *action, GVariant *parameter, gpointer user_data
 		return;
 	}
 	struct phot_config *ps = phot_set_adjusted_for_image(&gfit);
-	result = psf_get_minimisation(&gfit, layer, &com.selection, TRUE, ps, TRUE, com.pref.starfinder_conf.profile, NULL);
+	psf_error error = PSF_NO_ERR;
+	result = psf_get_minimisation(&gfit, layer, &com.selection, TRUE, FALSE, ps, TRUE, com.pref.starfinder_conf.profile, &error);
 	free(ps);
-	if (!result)
-		return;
-
-	popup_psf_result(result, &com.selection, &gfit);
+	if (result)
+		popup_psf_result(result, &com.selection, &gfit);
 	free_psf(result);
 }
 
 void seq_psf_activate(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
 	if (!check_ok_if_cfa())
 		return;
-	process_seq_psf(0);
+
+	if (!sequence_is_loaded()) {
+		siril_log_color_message(_("Error: no sequence loaded.\n"), "red");
+		return;
+	}
+
+	// If we reach here, sequence is loaded
+	sequence *seq = &com.seq;
+	int layer = select_vport(gui.cvport);
+
+	// Validate selection size
+	if (com.selection.w > 300 || com.selection.h > 300) {
+		siril_log_color_message(_("Current selection is too large. To determine the PSF, please make a selection around a single star.\n"), "red");
+		return;
+	}
+	if (com.selection.w <= 0 || com.selection.h <= 0) {
+		siril_log_color_message(_("Select an area first\n"), "red");
+		return;
+	}
+
+	// Determine framing mode
+	framing_mode framing = REGISTERED_FRAME;
+	if (!seq->regparam[layer])
+		framing = ORIGINAL_FRAME;
+	if (framing == ORIGINAL_FRAME) {
+		// com.headless is FALSE, so we execute the GUI path
+		execute_idle_and_wait_for_it(get_followstar_idle, &framing);
+	}
+
+	// Run PSF
+	siril_log_message(_("Running the PSF on the sequence, layer %d\n"), layer);
+	int retval = seqpsf(seq, layer, FALSE, FALSE, FALSE, framing, TRUE, FALSE) ? 1 : 0;
+
+	if (retval != 0) {
+		siril_log_color_message(_("Error running the PSF on the sequence\n"), "red");
+	}
 }
 
 void crop_activate(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
@@ -397,7 +445,11 @@ void crop_activate(GSimpleAction *action, GVariant *parameter, gpointer user_dat
 }
 
 void seq_crop_activate(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
-	siril_open_dialog("crop_dialog");
+	if (valid_rgbcomp_seq()) {
+		crop_rgbcomp_seq();
+	} else {
+		siril_open_dialog("crop_dialog");
+	}
 }
 
 void annotate_dialog_activate(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
@@ -410,6 +462,7 @@ void annotate_object_state(GSimpleAction *action, GVariant *state, gpointer user
 			com.found_object = find_objects_in_field(&gfit);
 		}
 	} else {
+		clear_user_polygons();
 		g_slist_free(com.found_object);
 		com.found_object = NULL;
 		purge_user_catalogue(CAT_AN_USER_TEMP);
@@ -571,8 +624,7 @@ void spcc_activate(GSimpleAction *action, GVariant *parameter,gpointer user_data
 }
 
 void split_channel_activate(GSimpleAction *action, GVariant *parameter,gpointer user_data) {
-	if (value_check(&gfit))
-		siril_open_dialog("extract_channel_dialog");
+	siril_open_dialog("extract_channel_dialog");
 }
 
 void negative_activate(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
@@ -817,8 +869,4 @@ void set_roi(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
 
 void ccm_activate(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
 	siril_open_dialog("ccm_dialog");
-}
-
-void graxpert_activate(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
-	siril_open_dialog("graxpert_dialog");
 }

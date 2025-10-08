@@ -1,7 +1,7 @@
 /*
  * This file is part of Siril, an astronomy image processor.
  * Copyright (C) 2005-2011 Francois Meyer (dulle at free.fr)
- * Copyright (C) 2012-2024 team free-astro (see more in AUTHORS file)
+ * Copyright (C) 2012-2025 team free-astro (see more in AUTHORS file)
  * Reference site is https://siril.org
  *
  * Siril is free software: you can redistribute it and/or modify
@@ -144,7 +144,7 @@ static int listFITSKeywords(fits *fit, gboolean editable) {
 		fits_parse_value(card, value, comment, &status);
 		fits_get_keytype(value, &dtype, &status);
 		status = 0;
-		add_key_to_tree(keyname, value, comment, dtype, keyword_is_protected(card), editable);
+		add_key_to_tree(keyname, value, comment, dtype, keyword_is_protected(card, fit), editable);
 	}
 
 
@@ -166,7 +166,7 @@ static int listFITSKeywords(fits *fit, gboolean editable) {
 }
 
 void on_keywords_dialog_show(GtkWidget *dialog, gpointer user_data) {
-	refresh_keywords_dialog();
+	gui_function(refresh_keywords_dialog, NULL);
 }
 
 static void remove_selected_keys () {
@@ -193,7 +193,7 @@ static void remove_selected_keys () {
 
 				if (siril_confirm_dialog(_("Operation on the sequence"),
 						_("These keywords will be deleted from each image of "
-						"the entire sequence. Are you sure?”"), _("Proceed"))) {
+						"the entire sequence. Are you sure?"), _("Proceed"))) {
 					gtk_list_store_remove(GTK_LIST_STORE(treeModel), &iter);
 
 					start_sequence_keywords(&com.seq, kargs);
@@ -573,41 +573,50 @@ void on_add_keyword_button_clicked(GtkButton *button, gpointer user_data) {
 
 	gtk_widget_show_all(dialog);
 
-	gint result = gtk_dialog_run(GTK_DIALOG(dialog));
-	if (result == GTK_RESPONSE_OK) {
-		const gchar *key = gtk_entry_get_text(GTK_ENTRY(entry_name));
-		const gchar *value = gtk_entry_get_text(GTK_ENTRY(entry_value));
-		const gchar *comment = gtk_entry_get_text(GTK_ENTRY(entry_comment));
+	gint result;
+	do {
+		result = gtk_dialog_run(GTK_DIALOG(dialog));
+		if (result == GTK_RESPONSE_OK) {
+			const gchar *key = gtk_entry_get_text(GTK_ENTRY(entry_name));
+			const gchar *value = gtk_entry_get_text(GTK_ENTRY(entry_value));
+			const gchar *comment = gtk_entry_get_text(GTK_ENTRY(entry_comment));
 
-		if (g_strcmp0(key, "") == 0) key = NULL;
-		if (g_strcmp0(value, "") == 0) value = NULL;
-		if (g_strcmp0(comment, "") == 0) comment = NULL;
+			if (g_strcmp0(key, "") == 0) key = NULL;
+			if (g_strcmp0(value, "") == 0) value = NULL;
+			if (g_strcmp0(comment, "") == 0) comment = NULL;
 
-		if (comment || value || key) {
-			char valstring[FLEN_VALUE];
-			process_keyword_string_value(value, valstring, string_has_space(value));
+			if (comment || (value && key)) {
+				char valstring[FLEN_VALUE] = { 0 };
+				process_keyword_string_value(value, valstring, string_has_space(value));
 
-			if (sequence_is_loaded()) {
-				struct keywords_data *kargs = calloc(1, sizeof(struct keywords_data));
+				if (sequence_is_loaded()) {
+					struct keywords_data *kargs = calloc(1, sizeof(struct keywords_data));
 
-				kargs->FITS_key = g_strdup(key);
-				kargs->value = g_strdup(valstring);
-				kargs->comment = g_strdup(comment);
+					kargs->FITS_key = g_strdup(key);
+					kargs->value = valstring[0] == '\0' ? NULL : g_strdup(valstring);
+					kargs->comment = g_strdup(comment);
 
-				if (siril_confirm_dialog(_("Operation on the sequence"),
-						_("These keywords will be added / modified in each image of "
-								"the entire sequence. Are you sure?”"), _("Proceed"))) {
-					start_sequence_keywords(&com.seq, kargs);
+					if (siril_confirm_dialog(_("Operation on the sequence"),
+							_("These keywords will be added / modified in each image of "
+							  "the entire sequence. Are you sure?"), _("Proceed"))) {
+						start_sequence_keywords(&com.seq, kargs);
+						break;
+					} else {
+						free(kargs);
+						continue;
+					}
 				} else {
-					free(kargs);
+					updateFITSKeyword(&gfit, key, NULL, valstring[0] == '\0' ? NULL : valstring, comment, TRUE, FALSE);
+					gui_function(refresh_keywords_dialog, NULL);
+					scroll_to_end();
+					break;
 				}
-			} else {
-				updateFITSKeyword(&gfit, key, NULL, valstring, comment, TRUE, FALSE);
-				refresh_keywords_dialog();
-				scroll_to_end();
 			}
+		} else {
+			break;
 		}
-	}
+	} while (TRUE);
+
 	gtk_widget_destroy(dialog);
 }
 
@@ -653,7 +662,7 @@ void on_export_keywords_button_clicked(GtkButton *button, gpointer user_data) {
 	save_key_to_clipboard();
 }
 
-void refresh_keywords_dialog() {
+gboolean refresh_keywords_dialog(gpointer user_data) {
 	init_dialog();
 	gboolean is_a_single_image_loaded = single_image_is_loaded() &&
 			(!sequence_is_loaded() || (sequence_is_loaded() &&
@@ -661,6 +670,7 @@ void refresh_keywords_dialog() {
 	listFITSKeywords(&gfit, is_a_single_image_loaded);
 	if (gfit.header)
 		show_header_text(gfit.header);
+	return FALSE;
 }
 
 void on_notebook_keywords_switch_page (GtkNotebook* self, GtkWidget* page, guint page_num, gpointer user_data) {

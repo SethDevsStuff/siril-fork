@@ -1,7 +1,7 @@
 /*
  * This file is part of Siril, an astronomy image processor.
  * Copyright (C) 2005-2011 Francois Meyer (dulle at free.fr)
- * Copyright (C) 2012-2024 team free-astro (see more in AUTHORS file)
+ * Copyright (C) 2012-2025 team free-astro (see more in AUTHORS file)
  * Reference site is https://siril.org
  *
  * Siril is free software: you can redistribute it and/or modify
@@ -26,7 +26,6 @@
 #include <string.h>
 
 #include "core/siril.h"
-#include "gui/utils.h"
 #include "gui/image_display.h"
 #include "gui/progress_and_log.h"
 #include "gui/PSF_list.h"
@@ -201,7 +200,7 @@ int rgb_align(int m) {
 		set_progress_bar_data(_("Error in layers alignment."), PROGRESS_DONE);
 	} else {
 		set_progress_bar_data(_("Registration complete."), PROGRESS_DONE);
-		adjust_cutoff_from_updated_gfit();
+		notify_gfit_modified();
 		redraw(REMAP_ALL);
 	}
 	set_cursor_waiting(FALSE);

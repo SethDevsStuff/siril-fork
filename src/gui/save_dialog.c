@@ -1,7 +1,7 @@
 /*
  * This file is part of Siril, an astronomy image processor.
  * Copyright (C) 2005-2011 Francois Meyer (dulle at free.fr)
- * Copyright (C) 2012-2024 team free-astro (see more in AUTHORS file)
+ * Copyright (C) 2012-2025 team free-astro (see more in AUTHORS file)
  * Reference site is https://siril.org
  *
  * Siril is free software: you can redistribute it and/or modify
@@ -34,10 +34,8 @@
 #include "gui/dialog_preview.h"
 #include "gui/dialogs.h"
 #include "gui/icc_profile.h"
-#include "gui/utils.h"
 #include "gui/image_display.h"
 #include "gui/callbacks.h"
-#include "gui/dialogs.h"
 #include "io/Astro-TIFF.h"
 #include "io/conversion.h"
 #include "io/sequence.h"
@@ -367,6 +365,35 @@ static void filter_changed(gpointer user_data) {
 	g_free(filename);
 }
 
+gchar* extract_extension_from_filter(const gchar *filter_name) {
+	// Regex pattern to match first extension inside parentheses
+	GRegex *regex;
+	GError *error = NULL;
+	gchar *extension = NULL;
+
+	// Compile regex to match first extension after *. inside parentheses
+	regex = g_regex_new("\\*\\.([a-zA-Z0-9]+)", G_REGEX_MULTILINE, 0, &error);
+
+	if (error != NULL) {
+		g_warning("Regex compilation error: %s", error->message);
+		g_error_free(error);
+		return NULL;
+	}
+
+	// Try to match the regex
+	GMatchInfo *match_info;
+	if (g_regex_match(regex, filter_name, 0, &match_info)) {
+		// Get the first captured group (extension)
+		extension = g_match_info_fetch(match_info, 1);
+	}
+
+	// Free resources
+	g_match_info_free(match_info);
+	g_regex_unref(regex);
+
+	return extension;
+}
+
 static int save_dialog() {
 	init_dialog();
 
@@ -383,23 +410,51 @@ static int save_dialog() {
 	g_signal_connect(chooser, "notify::filter", G_CALLBACK(filter_changed), (gpointer) chooser);
 	g_free(fname);
 
-	gint res = siril_dialog_run(saveDialog);
-	if (res == GTK_RESPONSE_ACCEPT) {
+	while (TRUE) {
+		gint res = siril_dialog_run(saveDialog);
+
+		if (res != GTK_RESPONSE_ACCEPT) {
+			close_dialog();
+			siril_preview_free(preview);
+			return res;
+		}
+
 		gchar *filename = siril_file_chooser_get_filename(chooser);
-		type_of_image = get_type_from_filename(filename);
+		image_type file_type = get_type_from_filename(filename);
+
+		GtkFileFilter *current_filter = gtk_file_chooser_get_filter(chooser);
+		const gchar *filter_name = gtk_file_filter_get_name(current_filter);
+		gchar *filter_extension = extract_extension_from_filter(filter_name);
+
+		image_type filter_format = get_type_for_extension(filter_extension);
+
+		image_type selected_type = (filter_format != TYPEUNDEF) ? filter_format : file_type;
+
+		if (file_type != TYPEUNDEF && filter_format != TYPEUNDEF && file_type != filter_format) {
+			gboolean confirm = siril_confirm_dialog(_("Extension Mismatch"),
+							_("The given file extension does not match the chosen file type. Do you want to save the image using this name anyway?"),
+							_("Save Anyway"));
+
+			if (!confirm) {
+				g_free(filename);
+				g_free(filter_extension);
+				continue;
+			}
+
+			selected_type = file_type;
+		}
+
+		type_of_image = selected_type;
 
 		GtkEntry *savetext = GTK_ENTRY(lookup_widget("savetxt"));
 		gtk_entry_set_text(savetext, filename);
 
 		prepare_savepopup();
-
 		g_free(filename);
+		g_free(filter_extension);
+
 		return res;
 	}
-	close_dialog();
-	siril_preview_free(preview);
-
-	return res;
 }
 
 // idle function executed at the end of the Save Data processing
@@ -413,10 +468,10 @@ static gboolean end_save(gpointer p) {
 	gtk_entry_set_text(args->entry, "");
 	gtk_widget_hide(lookup_widget("savepopup"));
 	display_filename(); // update filename display
-	set_precision_switch();
+	gui_function(set_precision_switch, NULL);
 	set_cursor_waiting(FALSE);
 	close_dialog();
-	update_MenuItem();
+	gui_function(update_MenuItem, NULL);
 
 	g_free(args->copyright);
 	g_free(args->description);
@@ -515,8 +570,10 @@ static long calculate_jpeg_size(struct savedial_data *args) {
 	} else {
 		g_warning("Unable to get file size for '%s': %s", tmp_filename, g_strerror(errno));
 	}
-	g_free(tmp_filename);
-	g_unlink(tmp_filename);
+	if (g_unlink(tmp_filename)) {
+		siril_debug_print("g_unlink() failed\n");
+		g_free(tmp_filename);
+	}
 	return (long) file_size;
 }
 
@@ -603,6 +660,13 @@ static gpointer mini_save_dialog(gpointer p) {
 			args->retval = savefits(args->filename, &gfit);
 			if (!args->retval && single_image_is_loaded()) {
 				com.uniq->filename = strdup(args->filename);
+				// com.uniq->filename is handled by libc functions so we can't use g_strdup_printf directly
+				if (!g_str_has_suffix(args->filename, com.pref.ext)) {
+					gchar* tempfilename = g_strdup_printf("%s%s", args->filename, com.pref.ext);
+					free(com.uniq->filename);  // Free the previously allocated memory
+					com.uniq->filename = strdup(tempfilename);
+					g_free(tempfilename);  // Use g_free for GLib allocated memory
+				}
 				com.uniq->fileexist = TRUE;
 			}
 			break;
@@ -645,7 +709,11 @@ void on_size_estimate_toggle_toggled(GtkToggleButton *button, gpointer user_data
 
 	if (!get_thread_run() && gtk_toggle_button_get_active(button)) {
 		if (!get_thread_run()) {
-			start_in_new_thread(calculate_jpeg_size_thread, args);
+			if (!start_in_new_thread(calculate_jpeg_size_thread, args)) {
+				g_free(args->copyright);
+				g_free(args->description);
+				free(args);
+			}
 			return;
 		}
 	}
@@ -666,7 +734,11 @@ void on_quality_spinbutton_value_changed(GtkSpinButton *button, gpointer user_da
 		}
 		initialize_data(args);
 		if (!get_thread_run()) {
-			start_in_new_thread(calculate_jpeg_size_thread, args);
+			if (!start_in_new_thread(calculate_jpeg_size_thread, args)) {
+				g_free(args->copyright);
+				g_free(args->description);
+				free(args);
+			}
 		} else {
 			g_free(args->description);
 			g_free(args->copyright);
@@ -681,8 +753,12 @@ void on_button_savepopup_clicked(GtkButton *button, gpointer user_data) {
 
 	set_cursor_waiting(TRUE);
 	initialize_data(args);
-	if (test_for_viewer_mode(args)) {
-		start_in_new_thread(mini_save_dialog, args);
+	if (test_for_viewer_mode()) {
+		if (!start_in_new_thread(mini_save_dialog, args)) {
+			g_free(args->copyright);
+			g_free(args->description);
+			free(args);
+		}
 	} else {
 		g_free(args->copyright);
 		g_free(args->description);
@@ -696,8 +772,12 @@ void on_savetxt_activate(GtkEntry *entry, gpointer user_data) {
 
 	set_cursor_waiting(TRUE);
 	initialize_data(args);
-	if (test_for_viewer_mode(args)) {
-		start_in_new_thread(mini_save_dialog, args);
+	if (test_for_viewer_mode()) {
+		if (!start_in_new_thread(mini_save_dialog, args)) {
+			g_free(args->copyright);
+			g_free(args->description);
+			free(args);
+		}
 	} else {
 		g_free(args->copyright);
 		g_free(args->description);
@@ -721,8 +801,12 @@ void on_header_save_as_button_clicked() {
 
 				set_cursor_waiting(TRUE);
 				initialize_data(args);
-				if (test_for_viewer_mode(args)) {
-					start_in_new_thread(mini_save_dialog, args);
+				if (test_for_viewer_mode()) {
+					if (!start_in_new_thread(mini_save_dialog, args)) {
+						g_free(args->description);
+						g_free(args->copyright);
+						free(args);
+					}
 				} else {
 					g_free(args->copyright);
 					g_free(args->description);
@@ -816,8 +900,9 @@ void on_header_snapshot_button_clicked(gboolean clipboard) {
 		if (clipboard) {
 			GtkClipboard *cb = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
 			gtk_clipboard_set_image(cb, pixbuf);
+#if !defined _WIN32
 			gtk_clipboard_store(cb);
-
+#endif
 			GtkWidget *w = lookup_widget("header_snapshot_button");
 			GtkWidget *popover = snapshot_notification(w, NULL, pixbuf);
 			g_timeout_add(5000, (GSourceFunc) snapshot_notification_close, (gpointer) popover);

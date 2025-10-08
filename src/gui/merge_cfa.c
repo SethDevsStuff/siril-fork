@@ -1,7 +1,7 @@
 /*
 * This file is part of Siril, an astronomy image processor.
 * Copyright (C) 2005-2011 Francois Meyer (dulle at free.fr)
-* Copyright (C) 2012-2024 team free-astro (see more in AUTHORS file)
+* Copyright (C) 2012-2025 team free-astro (see more in AUTHORS file)
 * Reference site is https://siril.org
 *
 * Siril is free software: you can redistribute it and/or modify
@@ -19,7 +19,6 @@
 */
 
 #include "core/siril.h"
-#include "core/command.h"
 #include "core/command_line_processor.h" // for load_sequence - TODO: move this to sequence.c
 #include "algos/demosaicing.h"
 #include "algos/extraction.h"
@@ -58,13 +57,21 @@ void reset_controls() {
 	gtk_entry_set_text(GTK_ENTRY(lookup_widget("entryMergeCFAout")), "mCFA_");
 }
 
-void on_merge_cfa_close_clicked(GtkButton *button, gpointer user_data) {
+static void close_everything() {
 	reset_controls();
 	clearfits(&cfa0);
 	clearfits(&cfa1);
 	clearfits(&cfa2);
 	clearfits(&cfa3);
 	siril_close_dialog("merge_cfa_dialog");
+}
+void on_merge_cfa_close_clicked(GtkButton *button, gpointer user_data) {
+	close_everything();
+}
+
+gboolean merge_cfa_hide_on_delete(GtkWidget *widget) {
+	close_everything();
+	return TRUE;
 }
 
 void on_merge_cfa_reset_clicked(GtkButton *button, gpointer user_data) {
@@ -195,126 +202,142 @@ gint find_substring_number(const gchar* input, const gchar* substring) {
 }
 
 void apply_to_seq() {
-	// This should work with SER now as it uses generic sequence functions
-	// to get the FITS. TODO: remove this commented code if nobody complains before 1.4.0-beta
-/*	if (com.seq.type == SEQ_SER) {
-		siril_message_dialog( GTK_MESSAGE_ERROR, _("Error: sequence is SER"),
-				_("Only FITS format is supported for CFA merging"));
-		return;
-	}*/
+	sequence *seq0 = NULL, *seq1 = NULL, *seq2 = NULL, *seq3 = NULL;
+	struct merge_cfa_data *args = NULL;
+	gchar *seqname0 = NULL, *seqname1 = NULL, *seqname2 = NULL, *seqname3 = NULL;
+
+	// Get input sequence marker
 	GtkEntry *entryMergeCFAin = GTK_ENTRY(lookup_widget("entryMergeCFAin"));
 	GtkEntry *entryMergeCFAout = GTK_ENTRY(lookup_widget("entryMergeCFAout"));
 	const gchar *seqmarker = gtk_entry_get_text(entryMergeCFAin);
+
 	int comseqnumber = find_substring_number(com.seq.seqname, seqmarker);
 	if (comseqnumber == -1) {
-		siril_message_dialog( GTK_MESSAGE_ERROR, _("Error"), _("Error: input sequence CFA marker not found"));
+		siril_message_dialog(GTK_MESSAGE_ERROR, _("Error"),
+							 _("Error: input sequence CFA marker not found"));
 		return;
-	} else {
-		siril_log_message(_("Identified the loaded sequence as CFA%d\n"), comseqnumber);
 	}
-	gchar *seqname0 = replace_string_number(com.seq.seqname, seqmarker, 0);
-	gchar *seqname1 = replace_string_number(com.seq.seqname, seqmarker, 1);
-	gchar *seqname2 = replace_string_number(com.seq.seqname, seqmarker, 2);
-	gchar *seqname3 = replace_string_number(com.seq.seqname, seqmarker, 3);
 
-	struct merge_cfa_data *args = calloc(1, sizeof(struct merge_cfa_data));
-	args->seqEntryOut = strdup(gtk_entry_get_text(entryMergeCFAout));
-	if (args->seqEntryOut && args->seqEntryOut[0] == '\0')
-		args->seqEntryOut = "mCFA_";
+	siril_log_message(_("Identified the loaded sequence as CFA%d\n"), comseqnumber);
+
+	// Allocate sequence names
+	seqname0 = replace_string_number(com.seq.seqname, seqmarker, 0);
+	seqname1 = replace_string_number(com.seq.seqname, seqmarker, 1);
+	seqname2 = replace_string_number(com.seq.seqname, seqmarker, 2);
+	seqname3 = replace_string_number(com.seq.seqname, seqmarker, 3);
+
+	// Allocate merge data structure
+	args = calloc(1, sizeof(struct merge_cfa_data));
+	if (!args) {
+		goto cleanup;
+	}
+
+	const gchar *outText = gtk_entry_get_text(entryMergeCFAout);
+	args->seqEntryOut = strdup(outText && outText[0] ? outText : "mCFA_");
+	if (!args->seqEntryOut) {
+		goto cleanup;
+	}
+
 	GtkComboBox *combo_pattern = GTK_COMBO_BOX(lookup_widget("merge_cfa_pattern"));
-	gint p = gtk_combo_box_get_active(combo_pattern);
-	args->pattern = (sensor_pattern) p;
-	sequence *seq0 = NULL, *seq1 = NULL, *seq2 = NULL, *seq3 = NULL;
+	args->pattern = (sensor_pattern)gtk_combo_box_get_active(combo_pattern);
+
+	// Load sequences
 	if (comseqnumber != 0) {
 		seq0 = load_sequence(seqname0, NULL);
-		if (!seq0)
-			return;
-		if (seq0->nb_layers > 1) {
-			free_sequence(seq0, TRUE);
-			seq0 = NULL;
-			siril_message_dialog( GTK_MESSAGE_ERROR, _("Error"), _("Error: sequence has more than one channel, this is for mono (CFA subchannel) sequences"));
-			return;
+		if (!seq0 || seq0->nb_layers > 1) {
+			siril_message_dialog(GTK_MESSAGE_ERROR, _("Error"),
+								 _("Error: sequence has more than one channel, this is for mono (CFA subchannel) sequences"));
+			goto cleanup;
 		}
 	} else {
 		seq0 = &com.seq;
 	}
+
 	if (comseqnumber != 1) {
 		seq1 = load_sequence(seqname1, NULL);
-		if (!seq1)
-			return;
-		if (seq1->nb_layers > 1) {
-			free_sequence(seq1, TRUE);
-			seq1 = NULL;
-			siril_message_dialog( GTK_MESSAGE_ERROR, _("Error"), _("Error: sequence has more than one channel, this is for mono (CFA subchannel) sequences"));
-			return;
+		if (!seq1 || seq1->nb_layers > 1) {
+			siril_message_dialog(GTK_MESSAGE_ERROR, _("Error"),
+								 _("Error: sequence has more than one channel, this is for mono (CFA subchannel) sequences"));
+			goto cleanup;
 		}
 	} else {
 		seq1 = &com.seq;
 	}
+
 	if (comseqnumber != 2) {
 		seq2 = load_sequence(seqname2, NULL);
-		if (!seq2)
-			return;
-		if (seq2->nb_layers > 1) {
-			free_sequence(seq2, TRUE);
-			seq2 = NULL;
-			siril_message_dialog( GTK_MESSAGE_ERROR, _("Error"), _("Error: sequence has more than one channel, this is for mono (CFA subchannel) sequences"));
-			return;
+		if (!seq2 || seq2->nb_layers > 1) {
+			siril_message_dialog(GTK_MESSAGE_ERROR, _("Error"),
+								 _("Error: sequence has more than one channel, this is for mono (CFA subchannel) sequences"));
+			goto cleanup;
 		}
 	} else {
 		seq2 = &com.seq;
 	}
+
 	if (comseqnumber != 3) {
 		seq3 = load_sequence(seqname3, NULL);
-		if (!seq3)
-			return;
-		if (seq3->nb_layers > 1) {
-			free_sequence(seq3, TRUE);
-			seq3 = NULL;
-			siril_message_dialog( GTK_MESSAGE_ERROR, _("Error"), _("Error: sequence has more than one channel, this is for mono (CFA subchannel) sequences"));
-		return;
-			return;
+		if (!seq3 || seq3->nb_layers > 1) {
+			siril_message_dialog(GTK_MESSAGE_ERROR, _("Error"),
+								 _("Error: sequence has more than one channel, this is for mono (CFA subchannel) sequences"));
+			goto cleanup;
 		}
 	} else {
 		seq3 = &com.seq;
 	}
-	if (seq0 == NULL || seq1 == NULL || seq2 == NULL || seq3 == NULL) {
-		if (!check_seq_is_comseq(seq0))
-			free_sequence(seq0, TRUE);
-		if (!check_seq_is_comseq(seq1))
-			free_sequence(seq1, TRUE);
-		if (!check_seq_is_comseq(seq3))
-			free_sequence(seq2, TRUE);
-		if (!check_seq_is_comseq(seq3))
-			free_sequence(seq3, TRUE);
-		siril_message_dialog( GTK_MESSAGE_ERROR, _("Error"), _("Error: not all sequences loaded correctly"));
-		return;
+
+	// Verify sequence compatibility
+	if ((seq0->rx != seq1->rx || seq0->rx != seq2->rx || seq0->rx != seq3->rx) ||
+				(seq0->ry != seq1->ry || seq0->ry != seq2->ry || seq0->ry != seq3->ry) ||
+				(seq0->nb_layers != seq1->nb_layers || seq0->nb_layers != seq2->nb_layers ||
+				seq0->nb_layers != seq3->nb_layers) ||
+				(seq0->bitpix != seq1->bitpix || seq0->bitpix != seq2->bitpix ||
+				seq0->bitpix != seq3->bitpix) ||
+				(seq0->number != seq1->number || seq0->number != seq2->number ||
+				seq0->number != seq3->number)) {
+		siril_log_color_message(_("Error: sequences don't match (dimensions, bitdepth, "
+		"number of images must all be the same)\n"), "red");
+	goto cleanup;
 	}
 
-	if ((seq0->rx != seq1->rx || seq0->rx != seq2->rx || seq0->rx != seq3->rx) ||
-	(seq0->ry != seq1->ry || seq0->ry != seq2->ry || seq0->ry != seq3->ry) ||
-	(seq0->nb_layers != seq1->nb_layers || seq0->nb_layers != seq2->nb_layers || seq0->nb_layers != seq3->nb_layers) ||
-	(seq0->bitpix != seq1->bitpix || seq0->bitpix != seq2->bitpix || seq0->bitpix != seq3->bitpix) ||
-	(seq0->number != seq1->number || seq0->number != seq2->number || seq0->number != seq3->number)) {
-		siril_log_color_message(_("Error: sequences don't match (dimensions, bitdepth, number of images must all be the same)\n"), "red");
-		if (!check_seq_is_comseq(seq0))
-			free_sequence(seq0, TRUE);
-		if (!check_seq_is_comseq(seq1))
-			free_sequence(seq1, TRUE);
-		if (!check_seq_is_comseq(seq3))
-			free_sequence(seq2, TRUE);
-		if (!check_seq_is_comseq(seq3))
-			free_sequence(seq3, TRUE);
-		return;
-	}
+	// Set sequences in args
 	args->seq0 = seq0;
 	args->seq1 = seq1;
 	args->seq2 = seq2;
 	args->seq3 = seq3;
 
+	// Apply merge and cleanup
 	apply_mergecfa_to_sequence(args);
 	control_window_switch_to_tab(OUTPUT_LOGS);
 	siril_close_dialog("merge_cfa_dialog");
+
+	// Normal exit - don't free the sequences as they're now owned by apply_mergecfa_to_sequence
+	g_free(seqname0);
+	g_free(seqname1);
+	g_free(seqname2);
+	g_free(seqname3);
+	return;
+
+	cleanup:
+	// Free all allocated resources
+	g_free(seqname0);
+	g_free(seqname1);
+	g_free(seqname2);
+	g_free(seqname3);
+
+	if (args) {
+		free(args->seqEntryOut);
+		free(args);
+	}
+
+	if (seq0 && !check_seq_is_comseq(seq0))
+		free_sequence(seq0, TRUE);
+	if (seq1 && !check_seq_is_comseq(seq1))
+		free_sequence(seq1, TRUE);
+	if (seq2 && !check_seq_is_comseq(seq2))
+		free_sequence(seq2, TRUE);
+	if (seq3 && !check_seq_is_comseq(seq3))
+		free_sequence(seq3, TRUE);
 }
 
 void apply_to_img() {
@@ -359,11 +382,11 @@ void apply_to_img() {
 			com.seq.current = UNRELATED_IMAGE;
 			if (!create_uniq_from_gfit(strdup(_("Unsaved Bayer pattern merge")), FALSE))
 				com.uniq->comment = strdup(_("Bayer pattern merge"));
-			open_single_image_from_gfit();
+			gui_function(open_single_image_from_gfit, NULL);
 			initialize_display_mode();
 			update_zoom_label();
 			display_filename();
-			set_precision_switch();
+			gui_function(set_precision_switch, NULL);
 			sliders_mode_set_state(gui.sliders);
 			init_layers_hi_and_lo_values(MIPSLOHI);
 			set_cutoff_sliders_max_values();

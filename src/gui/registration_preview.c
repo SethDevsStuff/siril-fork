@@ -1,7 +1,7 @@
 /*
  * This file is part of Siril, an astronomy image processor.
  * Copyright (C) 2005-2011 Francois Meyer (dulle at free.fr)
- * Copyright (C) 2012-2024 team free-astro (see more in AUTHORS file)
+ * Copyright (C) 2012-2025 team free-astro (see more in AUTHORS file)
  * Reference site is https://siril.org
  *
  * Siril is free software: you can redistribute it and/or modify
@@ -28,6 +28,7 @@
 #include "gui/registration_preview.h"
 #include "gui/sequence_list.h"
 #include "registration/registration.h"
+#include "opencv/opencv.h"
 
 gboolean redraw_preview(GtkWidget *widget, cairo_t *cr, gpointer data) {
 	int current_preview, shiftx = 0, shifty = 0;
@@ -108,6 +109,14 @@ gboolean redraw_preview(GtkWidget *widget, cairo_t *cr, gpointer data) {
 		translation_from_H(com.seq.regparam[cvport][com.seq.current].H, &dx, &dy);
 		shiftx = round_to_int(dx);
 		shifty = round_to_int(dy);
+		if (shiftx == INT_MIN) { // mainly to avoid static checker warning
+			siril_debug_print("Error: image #%d has a wrong shift x value\n", com.seq.current + 1);
+			shiftx += 1;
+		}
+		if (shifty == INT_MIN) { // mainly to avoid static checker warning
+			siril_debug_print("Error: image #%d has a wrong shift y value\n", com.seq.current + 1);
+			shifty += 1;
+		}
 	}
 	if (shiftx || shifty)
 		cairo_translate(cr, shiftx, -shifty);
@@ -177,12 +186,12 @@ void test_and_allocate_reference_image(int vport) {
 	}
 }
 
-
-void redraw_previews() {
+gboolean redraw_previews(gpointer user_data) {
 	int i;
-	if (com.script) return;
+	if (com.script) return FALSE;
 	for (i = 0; i < PREVIEW_NB; i++)
 		gtk_widget_queue_draw(gui.preview_area[i]);
+	return FALSE;
 }
 
 void clear_previews() {
@@ -270,7 +279,7 @@ void on_toggle_preview_toggled(GtkToggleButton *toggle, gpointer user_data) {
 }
 
 void on_checkbutton_displayref_toggled(GtkToggleButton *togglebutton, gpointer user_data) {
-	redraw_previews();
+	gui_function(redraw_previews, NULL);
 }
 
 /* display registration data (shift{x|y} for now) in the manual adjustments */
@@ -283,7 +292,7 @@ void adjust_reginfo() {
 	spin_shiftx = GTK_SPIN_BUTTON(lookup_widget("spinbut_shiftx"));
 	spin_shifty = GTK_SPIN_BUTTON(lookup_widget("spinbut_shifty"));
 	seqcombo = GTK_COMBO_BOX_TEXT(lookup_widget("seqlist_dialog_combo"));
-	
+
 	cvport = gtk_combo_box_get_active(GTK_COMBO_BOX(seqcombo));
 	if (cvport < 0) return;
 
@@ -330,6 +339,7 @@ void on_spinbut_shift_value_change(GtkSpinButton *spinbutton, gpointer user_data
 			PRINT_ALLOC_ERR;
 			return;
 		}
+		cvGetEye(&com.seq.regparam[current_layer][com.seq.reference_image].H);
 	}
 
 	new_value = gtk_spin_button_get_value_as_int(spinbutton);
@@ -342,7 +352,7 @@ void on_spinbut_shift_value_change(GtkSpinButton *spinbutton, gpointer user_data
 	writeseqfile(&com.seq);
 	update_seqlist(current_layer);
 	fill_sequence_list(&com.seq, current_layer, FALSE);	// update list with new regparam
-	redraw_previews();
+	gui_function(redraw_previews, NULL);
 }
 
 /* enables or disables the "display reference" checkbox in registration preview */

@@ -168,24 +168,27 @@ macos:
   rules:
     - if: $CI_PROJECT_NAMESPACE != "free-astro" && $CI_PROJECT_NAMESPACE != "dehesselle"
       when: never  # job requires custom runner, not suitable outside the project
-    - if: $ARCHITECTURE == "arm64"
-      variables:
-        SDKROOT: /opt/sdks/MacOSX11.3.sdk
     - if: $ARCHITECTURE == "x86_64"
       when: manual
       allow_failure: true
-      variables:
-        SDKROOT: /opt/sdks/MacOSX10.15.6.sdk
+    - when: on_success
   tags:
     - macos
     - ${ARCHITECTURE}
+  cache:
+    - key: ccache-$CI_JOB_NAME_SLUG
+      paths:
+        - ccache
   variables:
-    CCACHE_DIR: /Users/Shared/work/ccache
+    CCACHE_DIR: $CI_PROJECT_DIR/ccache
+    CCACHE_MAXSIZE: "500Mi"
+    ORKA_RUNNER: sonoma-2
+    PACKAGE_REGISTRY_URL: $CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic
     REP_DIR: $CI_PROJECT_DIR
+    SDKROOT: /opt/sdks/MacOSX11.3.sdk
     SIRIL_BUILD: $CI_PIPELINE_IID
-    SM_REPO_REF: 87be2d6e8dd536849f7da0fa47e79bb1e2effa7f
+    SM_REPO_REF: 62d80e546e5ddf4455a837c943b865b37edc82b7
     SM_REPO_URL: https://gitlab.com/free-astro/siril_macos.git
-    WRK_DIR: $CI_PROJECT_DIR
   script:
     # Clone the repo containing all the build scripts.
     - |
@@ -200,16 +203,15 @@ macos:
       echo $CI_PROJECT_DIR > sm/ci_project_dir.txt
       SM_SHA=$(LANG=C find -s sm -type f -not -wholename '*.git/*' -exec cat {} \+ | shasum | awk '{ print $1 }')
       VER_DIR=$(sm/jhb/usr/bin/config get VER_DIR)
-      PACKAGE_URL=${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/macos-deps/${SM_SHA}/$(basename $VER_DIR)_${ARCHITECTURE}.dmg
+      PACKAGE_URL=${PACKAGE_REGISTRY_URL}/macos-deps/${SM_SHA}/$(basename $VER_DIR)_${ARCHITECTURE}.dmg
       if ! curl -H "JOB-TOKEN: $CI_JOB_TOKEN" -fLO $PACKAGE_URL; then
-        export FORCE_BUILD_FROM_SOURCE=true
         sm/build_toolset.sh
+        rm $VER_DIR/var/cache/pkg/.skip
         sm/jhb/usr/bin/jhb run rustup self uninstall -y || true
         sm/jhb/usr/bin/archive remove_nonessentials
         sm/jhb/usr/bin/archive create_dmg
         curl --fail-with-body -H "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file $(basename $PACKAGE_URL) $PACKAGE_URL
         rm -rf ${VER_DIR:?}
-        unset FORCE_BUILD_FROM_SOURCE
       fi
     - sm/jhb/usr/bin/archive install_dmg
     - sm/build_siril.sh
@@ -227,21 +229,26 @@ macos:
 win64-native:
   stage: packaging
   cache:
-    key: "cache-windows"
+    key: "cache-windows-small1"
     paths:
       - ccache
-      - DLLcache
+      - DLLcache # cache for the DLL txt files recording all files to be copied to the package
     when: always
   variables:
     CCACHE_DIR: $CI_PROJECT_DIR/ccache
-    CCACHE_MAXSIZE: "1.0G"
+    CCACHE_MAXSIZE: "50M"
     CHERE_INVOKING: "yes"
     MSYSTEM: "MINGW64"
     # SDW = Siril Deps Windows, https://gitlab.com/free-astro/siril_windows
-    SDW_VERSION: 30
+    SDW_VERSION: 47
     SDW_NAME: siril$SDW_VERSION
     SDW_RELEASE_URL: $CI_API_V4_URL/projects/47854290/packages/generic/windows/r$SDW_VERSION/$SDW_NAME.7z
+    # SPW = Siril Python Windows, https://gitlab.com/free-astro/siril-windows-python
+    SPW_VERSION: 23
+    SPW_NAME: siril-python$SPW_VERSION
+    SPW_RELEASE_URL: $CI_API_V4_URL/projects/64372315/packages/generic/windows-python/r$SPW_VERSION/$SPW_NAME.7z
     W64_OUT: "/c/$SDW_NAME/mingw64" #used in siril-package.sh
+    PY_OUT: "/c/siril-python" #used in siril-package.sh
   tags:
     - saas-windows-medium-amd64
   needs: []
@@ -252,22 +259,25 @@ win64-native:
     paths:
     - ${INSTALL_DIR}
   before_script:
+    - wget.exe --quiet --no-check-certificate $SPW_RELEASE_URL
+    - 7z x -oC:/ "$Env:SPW_NAME.7z"
     - wget.exe --quiet --no-check-certificate $SDW_RELEASE_URL
     - 7z x -oC:/ "$Env:SDW_NAME.7z"
   script:
     - . "C:/$Env:SDW_NAME/msys2_shell.cmd" -defterm -no-start -c "bash -x ./build/windows/native-gitlab-ci/siril-build.sh"
     - . "C:/$Env:SDW_NAME/msys2_shell.cmd" -defterm -no-start -c "bash -x ./build/windows/native-gitlab-ci/siril-package.sh"
+    - . "C:/$Env:SDW_NAME/msys2_shell.cmd" -defterm -no-start -c "ccache -s"
 
 flatpak:
   rules:
     *run_ondemand_schedule_tag
-  image: 'quay.io/gnome_infrastructure/gnome-runtime-images:gnome-master'
+  image: 'quay.io/gnome_infrastructure/gnome-runtime-images:gnome-48'
   stage: packaging
   variables:
     MANIFEST_PATH: "build/flatpak/org.siril.Siril.json"
     FLATPAK_MODULE: "siril"
     APP_ID: "org.siril.Siril"
-    RUNTIME_REPO: "https://nightly.gnome.org/gnome-nightly.flatpakrepo"
+    RUNTIME_REPO: "https://flathub.org/repo/flathub.flatpakrepo"
     BUNDLE: "org.siril.Siril.flatpak"
     GIT_SUBMODULE_STRATEGY: recursive
   script:

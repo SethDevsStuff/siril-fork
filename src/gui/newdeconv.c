@@ -1,7 +1,7 @@
 /*
  * This file is part of Siril, an astronomy image processor.
  * Copyright (C) 2005-2011 Francois Meyer (dulle at free.fr)
- * Copyright (C) 2012-2024 team free-astro (see more in AUTHORS file)
+ * Copyright (C) 2012-2025 team free-astro (see more in AUTHORS file)
  * Reference site is https://siril.org
  *
  * Siril is free software: you can redistribute it and/or modify
@@ -23,34 +23,24 @@
 #include <locale.h>
 #include <gdk/gdk.h>
 #include "core/siril.h"
-#include "core/siril_app_dirs.h"
 #include "core/siril_date.h"
 #include "core/command.h"
-#include "algos/colors.h"
 #include "io/single_image.h"
 #include "io/image_format_fits.h"
 #include "gui/callbacks.h"
 #include "gui/dialogs.h"
-#include "gui/image_interactions.h"
-#include "gui/image_display.h"
-#include "gui/sequence_list.h"
 #include "gui/message_dialog.h"
-#include "gui/PSF_list.h"
 #include "gui/registration_preview.h"
 #include "core/processing.h"
 #include "core/siril_log.h"
-#include "core/undo.h"
 #include "core/OS_utils.h"
 #include "gui/utils.h"
 #include "gui/siril_preview.h"
 #include "gui/progress_and_log.h"
 #include "gui/newdeconv.h"
 #include "filters/deconvolution/deconvolution.h"
-#include "filters/synthstar.h"
-#include "algos/statistics.h"
 #include "algos/PSF.h"
 #include "io/sequence.h"
-#include "io/ser.h"
 
 extern gboolean aperture_warning_given;
 extern gboolean bad_load;
@@ -168,7 +158,7 @@ void bdeconv_dialog_init_statics() {
 //set below flag to zero to avoid kernel printout to stdout
 #define DEBUG_PSF 0
 
-void reset_conv_controls() {
+gboolean reset_conv_controls(gpointer user_data) {
 	gtk_combo_box_set_active(bdeconv_profile, args.profile);
 	gtk_combo_box_set_active(bdeconv_blindtype, args.blindtype);
 	gtk_combo_box_set_active(bdeconv_nonblindtype, args.nonblindtype);
@@ -202,6 +192,7 @@ void reset_conv_controls() {
 	gtk_spin_button_set_value(bdeconv_stopcriterion, args.stopcriterion);
 	gtk_spin_button_set_value(bdeconv_stepsize, args.stepsize);
 	gtk_spin_button_set_value(bdeconv_ncomp, args.compensationfactor);
+	return FALSE;
 }
 
 void on_bdeconv_psfblind_toggled(GtkToggleButton *button, gpointer user_data) {
@@ -226,7 +217,7 @@ void on_bdeconv_ks_value_changed(GtkSpinButton *button, gpointer user_data) {
 		gtk_spin_button_set_value(button, args.ks);
 	}
 	reset_conv_kernel();
-	DrawPSF();
+	DrawPSF(NULL);
 }
 
 void on_bdeconv_advice_button_clicked(GtkButton *button, gpointer user_data) {
@@ -638,12 +629,12 @@ void on_bdeconv_savekernel_clicked(GtkButton *button, gpointer user_data) {
 	g_free(temp5);
 	g_free(temp6);
 	g_free(filename);
-
 	return;
 }
 
-void set_kernel_size_in_gui() {
+gboolean set_kernel_size_in_gui(gpointer user_data) {
 	gtk_spin_button_set_value(bdeconv_ks, com.kernelsize);
+	return FALSE;
 }
 
 void on_bdeconv_filechooser_file_set(GtkFileChooser *filechooser, gpointer user_data) {
@@ -712,7 +703,7 @@ gboolean estimate_idle(gpointer arg) {
 	stop_processing_thread();
 	free(args.fdata);
 	args.fdata = NULL;
-	DrawPSF();
+	DrawPSF(NULL);
 	return FALSE;
 }
 
@@ -779,12 +770,14 @@ void on_bdeconv_apply_clicked(GtkButton *button, gpointer user_data) {
 		return;
 	set_cursor_waiting(TRUE);
 	if (gtk_toggle_button_get_active(bdeconv_seqapply) && sequence_is_loaded()) {
-		seqargs = malloc(sizeof(deconvolution_sequence_data));
+		seqargs = calloc(1, sizeof(deconvolution_sequence_data));
 		seqargs->seq = &com.seq;
 		seqargs->from_command = FALSE;
 		seqargs->seqEntry = strdup(gtk_entry_get_text(bdeconv_seq_prefix));
-		if (seqargs->seqEntry && seqargs->seqEntry[0] == '\0')
+		if (seqargs->seqEntry && seqargs->seqEntry[0] == '\0') {
+			free(seqargs->seqEntry);
 			seqargs->seqEntry = strdup("dec_");
+		}
 		apply_deconvolve_to_sequence(seqargs);
 	} else {
 		copy_backup_to_gfit();
@@ -875,6 +868,8 @@ gboolean on_PSFkernel_draw(GtkWidget *widget, cairo_t *cr, gpointer data) {
 }
 
 // caller
-void DrawPSF() {
-	gtk_widget_queue_draw(GTK_WIDGET(bdeconv_drawingarea));
+gboolean DrawPSF(gpointer user_data) {
+	if (GTK_IS_WIDGET(bdeconv_drawingarea))
+		gtk_widget_queue_draw(GTK_WIDGET(bdeconv_drawingarea));
+	return FALSE;
 }

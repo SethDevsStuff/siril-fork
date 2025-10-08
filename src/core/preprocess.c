@@ -1,7 +1,7 @@
 /*
  * This file is part of Siril, an astronomy image processor.
  * Copyright (C) 2005-2011 Francois Meyer (dulle at free.fr)
- * Copyright (C) 2012-2024 team free-astro (see more in AUTHORS file)
+ * Copyright (C) 2012-2025 team free-astro (see more in AUTHORS file)
  * Reference site is https://siril.org
  *
  * Siril is free software: you can redistribute it and/or modify
@@ -184,7 +184,7 @@ static int darkOptimization(fits *raw, struct preprocessing_data *args, int in_i
 			return 1;
 		}
 		if (raw->keywords.exposure <= 0.0) {
-			siril_log_color_message(_("The light frame (%d) contains no exposure data or incorrect exposure data.\n"), "red", in_index);
+			siril_log_color_message(_("The light frame (%d) contains no exposure data or incorrect exposure data.\n"), "red", in_index + 1);
 			clearfits(&dark_tmp);
 			return 1;
 		}
@@ -511,7 +511,10 @@ void start_sequence_preprocessing(struct preprocessing_data *prepro) {
 			(args->seq->type == SEQ_SER && !args->force_fitseq_output)) ?
 		DATA_USHORT : DATA_FLOAT;
 
-	start_in_new_thread(generic_sequence_worker, args);
+	if (!start_in_new_thread(generic_sequence_worker, args)) {
+		free(prepro->ppprefix);
+		free_generic_seq_args(args, TRUE);
+	}
 }
 
 /********** SINGLE IMAGE (from com.uniq) ************/
@@ -938,10 +941,7 @@ void on_prepro_button_clicked(GtkButton *button, gpointer user_data) {
 		free(args);
 		return;
 	}
-	if (!args->use_bias && !args->use_dark && !args->use_flat) {
-		free(args);
-		return;
-	}
+
 	siril_log_color_message(_("Preprocessing...\n"), "green");
 
 	// set output filename (preprocessed file name prefix)
@@ -982,7 +982,7 @@ void on_prepro_button_clicked(GtkButton *button, gpointer user_data) {
 		else {
 			set_progress_bar_data(PROGRESS_TEXT_RESET, PROGRESS_RESET);
 			invalidate_gfit_histogram();
-			open_single_image_from_gfit();
+			gui_function(open_single_image_from_gfit, NULL);
 		}
 		set_cursor_waiting(FALSE);
 	}
@@ -1014,8 +1014,8 @@ void on_GtkButtonEvaluateCC_clicked(GtkButton *button, gpointer user_data) {
 	}
 
 	set_cursor_waiting(TRUE);
-	sig[0] = gtk_spin_button_get_value(GTK_SPIN_BUTTON(lookup_widget("spinSigCosmeColdBox")));
-	sig[1] = gtk_spin_button_get_value(GTK_SPIN_BUTTON(lookup_widget("spinSigCosmeHotBox")));
+	sig[0] = gtk_spin_button_get_value(GTK_SPIN_BUTTON(lookup_widget("spinSigCosmeCold")));
+	sig[1] = gtk_spin_button_get_value(GTK_SPIN_BUTTON(lookup_widget("spinSigCosmeHot")));
 	widget[0] = lookup_widget("GtkLabelColdCC");
 	widget[1] = lookup_widget("GtkLabelHotCC");
 	label[0] = GTK_LABEL(lookup_widget("GtkLabelColdCC"));
@@ -1033,6 +1033,8 @@ void on_GtkButtonEvaluateCC_clicked(GtkButton *button, gpointer user_data) {
 		return;
 	}
 	find_deviant_pixels(&fit, sig, &icold, &ihot, TRUE);
+	printf("sig[0]=%lf\n", sig[0]);
+	printf("sig[1]=%lf\n", sig[1]);
 	total = fit.rx * fit.ry;
 	clearfits(&fit);
 	rate = (double)icold / total;

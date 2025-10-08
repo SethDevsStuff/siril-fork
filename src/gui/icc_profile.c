@@ -1,7 +1,7 @@
 /*
  * This file is part of Siril, an astronomy image processor.
  * Copyright (C) 2005-2011 Francois Meyer (dulle at free.fr)
- * Copyright (C) 2012-2024 team free-astro (see more in AUTHORS file)
+ * Copyright (C) 2012-2025 team free-astro (see more in AUTHORS file)
  * Reference site is https://siril.org
  *
  * Siril is free software: you can redistribute it and/or modify
@@ -23,7 +23,6 @@
 #include "algos/colors.h"
 #include "core/proto.h"
 #include "core/icc_profile.h"
-#include "core/OS_utils.h"
 #include "core/processing.h"
 #include "core/undo.h"
 #include "gui/image_display.h"
@@ -33,18 +32,11 @@
 #include "gui/message_dialog.h"
 #include "gui/progress_and_log.h"
 #include "gui/image_interactions.h"
-#include "gui/siril-window.h"
-#include "gui/registration_preview.h"
 #include "gui/utils.h"
-#include "gui/siril_plot.h"
-#include "gui/siril_preview.h"
 #include "io/single_image.h"
 #include "io/image_format_fits.h"
 #include "io/sequence.h"
-#include "io/siril_plot.h"
 #include "core/siril_log.h"
-#include "core/siril_app_dirs.h"
-#include "core/proto.h"
 
 static cmsHPROFILE target = NULL; // Target profile for the GUI tool
 
@@ -311,19 +303,24 @@ void on_icc_assign_clicked(GtkButton* button, gpointer* user_data) {
 	// We save the undo state as dealing with gfit
 	undo_save_state(&gfit, _("Color profile assignment"));
 
+	cmsUInt32Number target_colorspace = cmsGetColorSpace(target);
+	cmsUInt32Number target_colorspace_channels = cmsChannelsOf(target_colorspace);
+
 	// Handle initial assignment of an ICC profile
 	if (!gfit.color_managed || !gfit.icc_profile) {
 		if (gfit.icc_profile) {
 			cmsCloseProfile(gfit.icc_profile);
 			gfit.icc_profile = NULL;
 		}
+		if (target_colorspace_channels > gfit.naxes[2]) {
+			siril_message_dialog(GTK_MESSAGE_ERROR, _("Color space has incorrect channels"), _("Mismatch in number of channels between the current image and the ICC profile. You cannot assign a RGB ICC profile to a mono image."));
+			return;
+		}
 		goto FINISH;
 	}
 
 	cmsUInt32Number gfit_colorspace = cmsGetColorSpace(gfit.icc_profile);
 	cmsUInt32Number gfit_colorspace_channels = cmsChannelsOf(gfit_colorspace);
-	cmsUInt32Number target_colorspace = cmsGetColorSpace(target);
-	cmsUInt32Number target_colorspace_channels = cmsChannelsOf(target_colorspace);
 
 	if (target_colorspace != cmsSigGrayData && target_colorspace != cmsSigRgbData) {
 		siril_message_dialog(GTK_MESSAGE_ERROR, _("Color space not supported"), _("Siril only supports representing the image in Gray or RGB color spaces at present. You cannot assign or convert to non-RGB color profiles"));
@@ -400,8 +397,8 @@ void on_icc_convertto_clicked(GtkButton* button, gpointer* user_data) {
 	gtk_widget_set_sensitive(lookup_widget("icc_convertto"), gfit.color_managed);
 	set_source_information();
 	refresh_icc_transforms();
-	close_tab();
-	init_right_tab();
+	gui_function(close_tab, NULL);
+	gui_function(init_right_tab, NULL);
 	notify_gfit_modified();
 }
 
@@ -638,6 +635,7 @@ gboolean on_iso12646_panel_hide_completed(GtkWidget *widget, gpointer data) {
 	gui.display_offset.x = (window_width / 2 - (gfit.rx / 2) * z);
 	gui.display_offset.y = (window_height / 2) - (gfit.ry / 2 * z);
 	adjust_vport_size_to_image();
+	// TODO: convince myself this is safe if a thread is updating gfit...
 	queue_redraw(remap ? REMAP_ALL : REDRAW_IMAGE); // Has to do the remap in case the sliders have been changed
 	gtk_widget_queue_draw(lookup_widget("vbox_r"));
 	gtk_widget_queue_draw(lookup_widget("vbox_g"));

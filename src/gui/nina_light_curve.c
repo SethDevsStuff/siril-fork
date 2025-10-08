@@ -1,7 +1,7 @@
 /*
  * This file is part of Siril, an astronomy image processor.
  * Copyright (C) 2005-2011 Francois Meyer (dulle at free.fr)
- * Copyright (C) 2012-2024 team free-astro (see more in AUTHORS file)
+ * Copyright (C) 2012-2025 team free-astro (see more in AUTHORS file)
  * Reference site is https://siril.org
  *
  * Siril is free software: you can redistribute it and/or modify
@@ -287,8 +287,11 @@ static void on_nina_lc_response(GtkDialog* self, gint response_id, gpointer user
 	args->display_graph = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(display_curve));
 	siril_debug_print("starting PSF analysis of %d stars\n", args->nb);
 
-	start_in_new_thread(light_curve_worker, args);
-
+	if (!start_in_new_thread(light_curve_worker, args)) {
+		free(args);
+		g_free(nina_file);
+		return;
+	}
 	// Update of the UI
 	radius_label = !com.pref.phot_set.force_radius ? "Radius/half-FWHM ratio:" : "Aperture radius (px):";
 	gtk_label_set_text(GTK_LABEL(apert), radius_label);

@@ -1,7 +1,7 @@
 /*
  * This file is part of Siril, an astronomy image processor.
  * Copyright (C) 2005-2011 Francois Meyer (dulle at free.fr)
- * Copyright (C) 2012-2024 team free-astro (see more in AUTHORS file)
+ * Copyright (C) 2012-2025 team free-astro (see more in AUTHORS file)
  * Reference site is https://siril.org
  *
  * Siril is free software: you can redistribute it and/or modify
@@ -33,7 +33,6 @@
 #include "core/siril_log.h"
 #include "core/icc_profile.h"
 #include "core/processing.h"
-#include "gui/utils.h"
 #include "gui/progress_and_log.h"
 #include "io/image_format_fits.h"
 #include "io/fits_keywords.h"
@@ -213,7 +212,7 @@ int readbmp(const char *name, fits *fit) {
 	FILE *file;
 	long int count;
 	unsigned char *buf;
-	unsigned long data_offset = 0;
+	long data_offset = 0;
 	unsigned long width = 0, height = 0;
 	unsigned short nbplane = 0;
 

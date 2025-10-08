@@ -1,7 +1,7 @@
 /*
  * This file is part of Siril, an astronomy image processor.
  * Copyright (C) 2005-2011 Francois Meyer (dulle at free.fr)
- * Copyright (C) 2012-2024 team free-astro (see more in AUTHORS file)
+ * Copyright (C) 2012-2025 team free-astro (see more in AUTHORS file)
  * Reference site is https://siril.org
  *
  * Siril is free software: you can redistribute it and/or modify
@@ -22,7 +22,6 @@
 
 #include "core/siril.h"
 #include "core/proto.h"
-#include "core/command.h"
 #include "core/processing.h"
 #include "core/siril_log.h"
 #include "algos/PSF.h"
@@ -283,7 +282,10 @@ void apply_tilt_to_sequence(struct tilt_data *tilt_args) {
 
 	tilt_args->fit = NULL;	// not used here
 
-	start_in_new_thread(generic_sequence_worker, args);
+	if (!start_in_new_thread(generic_sequence_worker, args)) {
+		free(tilt_args);
+		free_generic_seq_args(args, TRUE);
+	}
 }
 
 
