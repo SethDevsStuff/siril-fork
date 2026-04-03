@@ -62,7 +62,7 @@ def check_mirrors(json_file):
                     else:
                         print(f"[FAILURE] {full_url}")
                         print(f"Expected 206, but received {response.status_code} for file {filename}")
-                        #sys.exit(1)
+                        sys.exit(1)
                         
                 except requests.exceptions.RequestException as e:
                     print(f"[CONNECTION FAILURE] {full_url}")
