@@ -1,68 +1,78 @@
 import json
 import requests
 import random
+import sys
 import os
 
 def check_mirrors(json_file):
-    # 1. Load the JSON data
     if not os.path.exists(json_file):
         print(f"Error: {json_file} not found.")
-        return
+        sys.exit(1)
 
-    with open(json_file, 'r') as f:
-        mirrors = json.load(f)
+    try:
+        with open(json_file, 'r') as f:
+            mirrors = json.load(f)
+    except json.JSONDecodeError as e:
+        print(f"Error parsing JSON: {e}")
+        sys.exit(1)
 
     # Configuration
     file_prefix = "siril_cat1_healpix8_xpsamp_"
     file_suffix = ".dat"
-    num_files = 48  # 0 through 47
+    num_files = 48
     checks_per_file = 1
-    chunk_size = 100 # bytes
+    chunk_size = 100 
+
+    # Using a Session object keeps the connection alive
+    session = requests.Session()
+    session.headers.update({'User-Agent': 'Siril/1.5-mirror-check'})
 
     for mirror in mirrors:
         base_url = mirror['url'].rstrip('/')
         description = mirror['description']
         
-        print(f"\n{'='*60}")
-        print(f"TESTING MIRROR: {description}")
-        print(f"BASE URL: {base_url}")
-        print(f"{'='*60}")
+        print(f"\n--- TESTING MIRROR: {description} ({base_url}) ---")
 
         for i in range(num_files):
             filename = f"{file_prefix}{i}{file_suffix}"
-            
-            # Note: Some mirrors like Zenodo might have different path structures
-            # but we follow your format: base_url + filename
             full_url = f"{base_url}/{filename}"
             
-            print(f"Checking {filename}...")
-            
             for _ in range(checks_per_file):
-                # Using a safe range (0-5000) for initial bytes
                 start_byte = random.randint(0, 5000)
                 end_byte = start_byte + chunk_size
                 
-                headers = {
-                        'Range': f'bytes={start_byte}-{end_byte}',
-                        'User-Agent': 'Siril/0.0-mirror-check'
-                        }
+                # Range header is specific to each request
+                headers = {'Range': f'bytes={start_byte}-{end_byte}'}
                 
                 try:
-                    # stream=True is more efficient for just checking the response code/headers
-                    response = requests.get(full_url, headers=headers, timeout=10, stream=True)
+                    # stream=False (default) + Session for connection reuse
+                    response = session.get(full_url, headers=headers, timeout=10)
+                    
+                    # Read the response body into memory
+                    data = response.content
                     
                     if response.status_code == 206:
-                        print(f"  [PASS] Range {start_byte}-{end_byte}: 206 Partial Content")
+                        # Verify we actually got the number of bytes we expected
+                        if len(data) == (chunk_size + 1):
+                            print(f"  [PASS] Range {start_byte}-{end_byte}: 206 Partial Content")
+                            continue # Pass
+                        else:
+                            print(f"[FAILURE] {filename}: Byte count mismatch. Got {len(data)} bytes.")
+                            sys.exit(1)
                     else:
-                        print(f"  [WARN] {filename}: Status {response.status_code}")
+                        print(f"[FAILURE] {full_url}")
+                        print(f"Expected 206, but received {response.status_code}")
                         sys.exit(1)
-                    
-                    # Close connection early since we only need the header/status
-                    response.close()
                         
                 except requests.exceptions.RequestException as e:
-                    print(f"  [ERR] Connection failed: {e}")
-                    break # Skip to next file if connection is dead
+                    print(f"[CONNECTION FAILURE] {full_url}")
+                    print(f"Error details: {e}")
+                    sys.exit(1)
+
+        print(f"Mirror '{description}' passed all checks.")
+
+    print("\nAll mirrors verified successfully.")
+    sys.exit(0)
 
 if __name__ == "__main__":
     check_mirrors('spcc_mirrors.json')
