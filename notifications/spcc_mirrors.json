@@ -8,8 +8,8 @@
     "description": "OVH Helsinki"
   },
   {
-    "url": "http://siril-spcc-public-az-london.s3-website.uk.io.cloud.ovh.net/",
-    "description": "OVH London"
+    "url": "http://siril-spcc-public-lz-man.s3-website.eu-west-lz-mnc-a.cloud.ovh.net/",
+    "description": "OVH Manchester"
   },
   {
     "url": "http://siril-spcc-public-az-sydney.s3-website.ap-southeast-syd.io.cloud.ovh.net/",
@@ -28,3 +28,4 @@
     "description": "Huggingface"
   }
 ]
+
