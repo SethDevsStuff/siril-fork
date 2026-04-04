@@ -12,11 +12,11 @@
     "description": "OVH Manchester"
   },
   {
-    "url": "http://siril-spcc-public-az-sydney.s3.ap-southeast-syd.io.cloud.ovh.net/",
+    "url": "http://siril-spcc-public-az-sydney.s3-website.ap-southeast-syd.io.cloud.ovh.net/",
     "description": "OVH Sydney"
   },
   {
-    "url": "http://siril-spcc-public-az-mumbai.s3.ap-south-mum.io.cloud.ovh.net/",
+    "url": "http://siril-spcc-public-az-mumbai.s3-website.ap-south-mum.io.cloud.ovh.net/",
     "description": "OVH Mumbai"
   },
   {
