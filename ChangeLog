@@ -20,7 +20,8 @@ siril-1.4.3
 * Fixed incorrect dimensions constraint in sirilpy when setting FFit.data
 * Fixed use-after-free error that caused a crash if the python module fails to install
 * Fixed Windows pipes naming (#1921)
-* Add SirilInterface.open_dialog()
+* Fixed crash with Hubble images (#1932)
+* Added SirilInterface.open_dialog()
 * Allow certain python scripts to be run automatically at startup (!1001)
 
 siril-1.4.2

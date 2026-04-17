@@ -58,34 +58,81 @@ void free_wcs(fits *fit) {
 }
 
 wcsprm_t *wcs_deepcopy(wcsprm_t *wcssrc, int *status) {
-	if (status)
-		*status = 1;
-	if (!wcssrc)
-		return NULL;
-	wcsprm_t *wcsdst = NULL;
-	int axes[2], nsub;
-	nsub = 2;
-	axes[0] = WCSSUB_LONGITUDE;
-	axes[1] = WCSSUB_LATITUDE;
-	wcsdst = calloc(1, sizeof(wcsprm_t));
+	if (status) *status = 1;
+	if (!wcssrc) return NULL;
+
+	wcsprm_t *wcsdst = calloc(1, sizeof(wcsprm_t));
 	if (!wcsdst) {
 		PRINT_ALLOC_ERR;
-		if (status)
-			*status = WCSERR_MEMORY;
+		if (status) *status = WCSERR_MEMORY;
 		return NULL;
 	}
 	wcsdst->flag = -1;
-	int statuscpy = wcssub(0, wcssrc, &nsub, axes, wcsdst);
+
+	// Workaround: wcssub() triggers disinit() which overflows its allocation
+	// due to an ABI mismatch in wcslib when SIP distortions are present.
+	// Pass a shallow copy of wcssrc with dispre/disseq nulled out to wcssub(),
+	// then copy distortions separately via discpy(). Thread-safe: wcssrc is
+	// never mutated.
+	wcsprm_t wcssrc_nodis = *wcssrc;
+	wcssrc_nodis.lin.dispre = NULL;
+	wcssrc_nodis.lin.disseq = NULL;
+
+	int nsub = 2;
+	int axes[2] = { WCSSUB_LONGITUDE, WCSSUB_LATITUDE };
+	int statuscpy = wcssub(0, &wcssrc_nodis, &nsub, axes, wcsdst);
 	if (statuscpy) {
-		if (status)
-			*status = statuscpy;
+		if (status) *status = statuscpy;
 		wcsfree(wcsdst);
+		free(wcsdst);
 		return NULL;
 	}
+
+	// Copy forward distortion (pixel->world, SIP A/B terms)
+	if (wcssrc->lin.dispre) {
+		wcsdst->lin.dispre = calloc(1, sizeof(struct disprm));
+		if (wcsdst->lin.dispre) {
+			wcsdst->lin.dispre->flag = -1;
+			if (discpy(1, wcssrc->lin.dispre, wcsdst->lin.dispre)) {
+				free(wcsdst->lin.dispre);
+				wcsdst->lin.dispre = NULL;
+			}
+		}
+	}
+	// Copy inverse distortion (world->pixel, SIP AP/BP terms)
+	if (wcssrc->lin.disseq) {
+		wcsdst->lin.disseq = calloc(1, sizeof(struct disprm));
+		if (wcsdst->lin.disseq) {
+			wcsdst->lin.disseq->flag = -1;
+			if (discpy(1, wcssrc->lin.disseq, wcsdst->lin.disseq)) {
+				free(wcsdst->lin.disseq);
+				wcsdst->lin.disseq = NULL;
+			}
+		}
+	}
+
+	// If no inverse SIP terms (AP/BP) are present in the forward distortion
+	// model, strip it from the inverse path to avoid world->pixel returning
+	// wrong results with zero coefficients. pixel->world remains unaffected.
+	if (wcsdst->lin.dispre) {
+		double AP[MAX_SIP_SIZE][MAX_SIP_SIZE] = {{ 0. }};
+		double BP[MAX_SIP_SIZE][MAX_SIP_SIZE] = {{ 0. }};
+		extract_SIP_order_and_matrices(wcsdst->lin.dispre, NULL, NULL, AP, BP);
+		gboolean has_inverse = FALSE;
+		for (int i = 0; i < MAX_SIP_SIZE && !has_inverse; i++)
+			for (int j = 0; j < MAX_SIP_SIZE && !has_inverse; j++)
+				if (AP[i][j] != 0. || BP[i][j] != 0.)
+					has_inverse = TRUE;
+		if (!has_inverse) {
+			disfree(wcsdst->lin.dispre);
+			free(wcsdst->lin.dispre);
+			wcsdst->lin.dispre = NULL;
+		}
+	}
+
 	wcsdst->flag = 0;
 	wcsset(wcsdst);
-	if (status)
-		*status = 0;
+	if (status) *status = 0;
 	return wcsdst;
 }
 
