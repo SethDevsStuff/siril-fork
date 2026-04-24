@@ -34,7 +34,9 @@
 #include "core/processing.h"
 #include "opencv/opencv.h"
 #include "io/sequence.h"
+#include "io/image_format_flis.h"
 #include "io/image_format_fits.h"
+#include "gui/flis_gui.h"
 #include "io/single_image.h"
 #include "gui/callbacks.h"
 #include "gui/PSF_list.h"
@@ -707,6 +709,20 @@ int fits_binning(fits *fit, int factor, gboolean mean) {
 		}
 	}
 
+	flis_layer_t *_lay_bin = flis_layer_get_by_fit(fit);
+	if (_lay_bin && _lay_bin->lmask && _lay_bin->lmask->data) {
+		mask_t _tmp = { .bitpix = _lay_bin->lmask->bitpix, .data = _lay_bin->lmask->data };
+		if (bin_mask(&_tmp, old_rx, old_ry, factor, mean)) {
+			siril_log_color_message(_("Error binning layer mask\n"), "red");
+			layermask_free(_lay_bin->lmask);
+			_lay_bin->lmask = NULL;
+		} else {
+			_lay_bin->lmask->data = _tmp.data;
+			_lay_bin->lmask->w = old_rx / factor;
+			_lay_bin->lmask->h = old_ry / factor;
+		}
+	}
+
 	free_wcs(fit);
 	reset_wcsdata(fit);
 	refresh_annotations(TRUE);
@@ -771,11 +787,31 @@ int verbose_resize_gaussian(fits *image, int toX, int toY, opencv_interpolation 
 		}
 	}
 
+	if (retvalue == 0) {
+		flis_layer_t *_lay_res = flis_layer_get_by_fit(image);
+		if (_lay_res && _lay_res->lmask && _lay_res->lmask->data) {
+			mask_t _tmp = { .bitpix = _lay_res->lmask->bitpix, .data = _lay_res->lmask->data };
+			if (resize_mask(&_tmp, old_rx, old_ry, toX, toY, interpolation)) {
+				siril_log_color_message(_("Error resizing layer mask\n"), "red");
+				layermask_free(_lay_res->lmask);
+				_lay_res->lmask = NULL;
+			} else {
+				_lay_res->lmask->data = _tmp.data;
+				_lay_res->lmask->w = toX;
+				_lay_res->lmask->h = toY;
+			}
+		}
+	}
+
 	if (image->keywords.pixel_size_x > 0) image->keywords.pixel_size_x *= factor_X;
 	if (image->keywords.pixel_size_y > 0) image->keywords.pixel_size_y *= factor_Y;
 	free_wcs(image);
 	reset_wcsdata(image);
 	refresh_annotations(TRUE);
+
+	// This does nothing for non-FLIS images
+	if (retvalue == 0)
+		flis_update_layer_offset_after_resize(old_rx, old_ry, toX, toY);
 
 	return retvalue;
 }
@@ -798,6 +834,10 @@ static void GetMatrixReframe(fits *image, rectangle area, double angle, int crop
 // wraps cvRotateImage to update WCS data as well
 int verbose_rotate_fast(fits *image, int angle) {
 	if (angle % 90 != 0) return 1; // only for multiples of 90 \deg
+	/* 0° (and any multiple of 360°) is a no-op.  cvRotateImage() does not
+	 * handle angle==0 correctly (falls into the 270° branch), so we must
+	 * bail out before calling it. */
+	if (angle % 360 == 0) return 0;
 	on_clear_roi(); // ROI is cleared on geometry-altering operations
 	gboolean tmp_mask_active = FALSE;
 	if (image->mask) {
@@ -827,6 +867,20 @@ int verbose_rotate_fast(fits *image, int angle) {
 		}
 	}
 
+	flis_layer_t *_lay_rf = flis_layer_get_by_fit(image);
+	if (_lay_rf && _lay_rf->lmask && _lay_rf->lmask->data) {
+		mask_t _tmp = { .bitpix = _lay_rf->lmask->bitpix, .data = _lay_rf->lmask->data };
+		if (transform_mask(&_tmp, orig_rx, orig_ry, target_rx, target_ry, H, OPENCV_NEAREST)) {
+			siril_log_color_message(_("Error rotating layer mask\n"), "red");
+			layermask_free(_lay_rf->lmask);
+			_lay_rf->lmask = NULL;
+		} else {
+			_lay_rf->lmask->data = _tmp.data;
+			_lay_rf->lmask->w = target_rx;
+			_lay_rf->lmask->h = target_ry;
+		}
+	}
+
 	if (has_wcs(image)) {
 		cvApplyFlips(&H, orig_ry, target_ry);
 		reframe_astrometry_data(image, &H);
@@ -834,6 +888,13 @@ int verbose_rotate_fast(fits *image, int angle) {
 		update_fits_header(image);
 		refresh_annotations(FALSE);
 	}
+	/* For a group operation the offset update is deferred to the group
+	 * processing path (processing.c) which calls it once, correctly, after
+	 * all members have been processed.  Calling it here per-member would
+	 * use flis_active_layer() == the group node (not the base layer) and
+	 * update positions multiple times with the wrong branch. */
+	if (!flis_get_selected_group())
+		flis_update_layer_offset_after_rotate(orig_rx, orig_ry, target_rx, target_ry, (double)angle);
 	return 0;
 }
 
@@ -868,6 +929,20 @@ int verbose_rotate_image(fits *image, rectangle area, double angle, int interpol
 		}
 	}
 
+	flis_layer_t *_lay_ri = flis_layer_get_by_fit(image);
+	if (_lay_ri && _lay_ri->lmask && _lay_ri->lmask->data) {
+		mask_t _tmp = { .bitpix = _lay_ri->lmask->bitpix, .data = _lay_ri->lmask->data };
+		if (transform_mask(&_tmp, orig_rx, orig_ry, target_rx, target_ry, H, OPENCV_CUBIC)) {
+			siril_log_color_message(_("Error rotating layer mask\n"), "red");
+			layermask_free(_lay_ri->lmask);
+			_lay_ri->lmask = NULL;
+		} else {
+			_lay_ri->lmask->data = _tmp.data;
+			_lay_ri->lmask->w = target_rx;
+			_lay_ri->lmask->h = target_ry;
+		}
+	}
+
 	if (has_wcs(image)) {
 		cvApplyFlips(&H, orig_ry, target_ry);
 		reframe_astrometry_data(image, &H);
@@ -875,6 +950,8 @@ int verbose_rotate_image(fits *image, rectangle area, double angle, int interpol
 		update_fits_header(image);
 		refresh_annotations(FALSE);
 	}
+	// This does nothing for non-FLIS images
+	flis_update_layer_offset_after_rotate(orig_rx, orig_ry, target_rx, target_ry, angle);
 	return 0;
 }
 
@@ -968,6 +1045,16 @@ void mirrorx(fits *fit, gboolean verbose) {
 		}
 	}
 
+	flis_layer_t *_lay_mx = flis_layer_get_by_fit(fit);
+	if (_lay_mx && _lay_mx->lmask && _lay_mx->lmask->data) {
+		mask_t _tmp = { .bitpix = _lay_mx->lmask->bitpix, .data = _lay_mx->lmask->data };
+		if (mirrorx_mask(&_tmp, fit->rx, fit->ry)) {
+			siril_log_color_message(_("Error mirroring layer mask\n"), "red");
+			layermask_free(_lay_mx->lmask);
+			_lay_mx->lmask = NULL;
+		}
+	}
+
 	if (!strcmp(fit->keywords.row_order, "BOTTOM-UP"))
 		sprintf(fit->keywords.row_order, "TOP-DOWN");
 	else {
@@ -1011,6 +1098,17 @@ void mirrory(fits *fit, gboolean verbose) {
 			show_or_hide_mask_tab();
 		} else {
 			set_mask_active(fit, tmp_mask_active);
+		}
+	}
+
+	flis_layer_t *_lay_my = flis_layer_get_by_fit(fit);
+	if (_lay_my && _lay_my->lmask && _lay_my->lmask->data) {
+		mask_t _tmp = { .bitpix = _lay_my->lmask->bitpix, .data = _lay_my->lmask->data };
+		if (mirrorx_mask(&_tmp, fit->rx, fit->ry) ||
+		    rotate_mask_pi(&_tmp, fit->rx, fit->ry)) {
+			siril_log_color_message(_("Error mirroring layer mask\n"), "red");
+			layermask_free(_lay_my->lmask);
+			_lay_my->lmask = NULL;
 		}
 	}
 
@@ -1230,6 +1328,20 @@ int crop(fits *fit, rectangle *bounds) {
 		}
 	}
 
+	flis_layer_t *_lay_cr = flis_layer_get_by_fit(fit);
+	if (_lay_cr && _lay_cr->lmask && _lay_cr->lmask->data) {
+		mask_t _tmp = { .bitpix = _lay_cr->lmask->bitpix, .data = _lay_cr->lmask->data };
+		if (crop_mask(&_tmp, bounds, orig_rx, orig_ry)) {
+			siril_log_color_message(_("Error cropping layer mask\n"), "red");
+			layermask_free(_lay_cr->lmask);
+			_lay_cr->lmask = NULL;
+		} else {
+			_lay_cr->lmask->data = _tmp.data;
+			_lay_cr->lmask->w = bounds->w;
+			_lay_cr->lmask->h = bounds->h;
+		}
+	}
+
 	invalidate_stats_from_fit(fit);
 	if (wcs) {
 		cvApplyFlips(&H, orig_ry, target_ry);
@@ -1237,6 +1349,26 @@ int crop(fits *fit, rectangle *bounds) {
 		update_wcsdata_from_wcs(fit);
 		update_fits_header(fit);
 		refresh_annotations(FALSE);
+	}
+	/* In group mode the position update is handled by the group loop in
+	 * processing.c.  For single-layer (non-group) mode call it now.
+	 *
+	 * For non-base FLIS layers, crop_image_hook_single converts params->area
+	 * from canvas to layer-local before calling crop(), so bounds->x/y are
+	 * layer-local here.  Reconstruct the canvas-coordinate origin by adding
+	 * back the layer's canvas offset so flis_update_layer_offset_after_crop
+	 * receives the canvas intersection top-left (ix1, iy1). */
+	if (!flis_get_selected_group()) {
+		flis_layer_t *_off_lay  = flis_layer_get_by_fit(fit);
+		flis_layer_t *_off_base = is_current_image_flis() && com.uniq && com.uniq->layers
+		    ? (flis_layer_t *)com.uniq->layers->data : NULL;
+		if (_off_lay && _off_base && _off_lay != _off_base) {
+			flis_update_layer_offset_after_crop(
+			    _off_lay->position_x + bounds->x,
+			    _off_lay->position_y + bounds->y);
+		} else {
+			flis_update_layer_offset_after_crop(bounds->x, bounds->y);
+		}
 	}
 	return 0;
 }
@@ -1629,7 +1761,41 @@ int crop_image_hook_single(struct generic_img_args *args, fits *fit, int nb_thre
 	struct crop_args *params = (struct crop_args *)args->user;
 	if (!params)
 		return 1;
-	int retval = crop(fit, &params->area);
+
+	rectangle local_area = params->area;  /* canvas coords; adjusted below for non-base FLIS */
+
+	/* params->area is always in canvas coordinates.  For any non-base FLIS
+	 * layer (group or single-layer mode), the layer may be smaller than or
+	 * offset from the canvas, so convert to layer-local before calling crop().
+	 * If the selection doesn't intersect the layer at all, skip it. */
+	flis_layer_t *_crop_lay  = flis_layer_get_by_fit(fit);
+	flis_layer_t *_crop_base = (is_current_image_flis() && com.uniq && com.uniq->layers)
+	    ? (flis_layer_t *)com.uniq->layers->data : NULL;
+	if (_crop_lay && _crop_base && _crop_lay != _crop_base) {
+		gint can_x1 = params->area.x;
+		gint can_y1 = params->area.y;
+		gint can_x2 = params->area.x + params->area.w;
+		gint can_y2 = params->area.y + params->area.h;
+		gint lay_x2 = _crop_lay->position_x + (gint)fit->rx;
+		gint lay_y2 = _crop_lay->position_y + (gint)fit->ry;
+
+		gint ix1 = MAX(can_x1, _crop_lay->position_x);
+		gint iy1 = MAX(can_y1, _crop_lay->position_y);
+		gint ix2 = MIN(can_x2, lay_x2);
+		gint iy2 = MIN(can_y2, lay_y2);
+
+		if (ix2 <= ix1 || iy2 <= iy1) {
+			/* No intersection: leave this layer untouched */
+			gui_function(crop_gui_updates, NULL);
+			return 0;
+		}
+		local_area.x = ix1 - _crop_lay->position_x;
+		local_area.y = iy1 - _crop_lay->position_y;
+		local_area.w = ix2 - ix1;
+		local_area.h = iy2 - iy1;
+	}
+
+	int retval = crop(fit, &local_area);
 	gui_function(crop_gui_updates, NULL);
 	return retval;
 }
@@ -1660,6 +1826,16 @@ int rotation_image_hook(struct generic_img_args *args, fits *fit, int nb_threads
 	if (!params)
 		return 1;
 
+	/* When processing a layer group, each member may have different
+	 * dimensions.  params->area was set from the first layer (gfit).
+	 * For fast rotations (interpolation == -1) the area must always
+	 * cover the full image, so update it to match the current fit. */
+	if (params->interpolation == -1 &&
+	    params->area.x == 0 && params->area.y == 0) {
+		params->area.w = fit->rx;
+		params->area.h = fit->ry;
+	}
+
 	// Check for fast rotation (90 degree increments)
 	int angle_int = (int)params->angle;
 	int retval;
@@ -1668,18 +1844,43 @@ int rotation_image_hook(struct generic_img_args *args, fits *fit, int nb_threads
 	    params->area.w == fit->rx && params->area.h == fit->ry) {
 		retval = verbose_rotate_fast(fit, angle_int);
 	} else {
-		retval = verbose_rotate_image(fit, params->area, params->angle,
+		/* For cropped rotations, params->area is in canvas coordinates.
+		 * verbose_rotate_image expects layer-local coordinates, so
+		 * subtract the layer's canvas offset for FLIS layers with offset.
+		 * For non-cropped rotations the rotation is always around the image
+		 * centre (area.x/y are overwritten in GetMatrixReframe), so no
+		 * conversion is needed in that case. */
+		rectangle _local_area = params->area;
+		if (params->cropped) {
+			flis_layer_t *_ri_lay = flis_layer_get_by_fit(fit);
+			if (_ri_lay) {
+				_local_area.x -= _ri_lay->position_x;
+				_local_area.y -= _ri_lay->position_y;
+			}
+		}
+		retval = verbose_rotate_image(fit, _local_area, params->angle,
 	                             params->interpolation, params->cropped,
 	                             params->clamp);
 	}
 
-	// If a selection is set, we set it to the entire image
+	// Reset selection to current active layer area (canvas coords)
 	if (com.selection.w > 0 && com.selection.h > 0) {
+		gint _sx = 0, _sy = 0;
+		flis_layer_t *_al = flis_active_layer();
+		if (_al) { _sx = _al->position_x; _sy = _al->position_y; }
 		g_mutex_lock(&com.mutex);
-		com.selection = (rectangle){ 0, 0, gfit->rx, gfit->ry };
+		com.selection = (rectangle){ _sx, _sy, gfit->rx, gfit->ry };
 		g_mutex_unlock(&com.mutex);
 		gui_function(new_selection_zone, NULL);
 	}
+	/* For group operations, notify_gfit_data_modified() is called by the
+	 * group path in processing.c AFTER canvas positions are updated.
+	 * Calling it here (before positions are updated) would build the
+	 * composite with stale positions and write wrong pixels to the Cairo
+	 * surfaces; the subsequent correct call would fix the composite but
+	 * redraw() does not re-remap Cairo surfaces unless they are stale. */
+	if (!flis_get_selected_group())
+		notify_gfit_data_modified();
 	update_zoom_label();
 	return retval;
 }

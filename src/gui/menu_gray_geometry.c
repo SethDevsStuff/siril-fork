@@ -28,6 +28,8 @@
 #include "gui/registration_preview.h"
 #include "gui/siril_preview.h"
 #include "gui/utils.h"
+#include "io/image_format_flis.h"
+#include "gui/flis_gui.h"
 #include "menu_gray_geometry.h"
 
 /**
@@ -41,8 +43,11 @@ static gboolean rotation_idle(gpointer p) {
 	stop_processing_thread();
 
 	if (args->retval == 0) {
-		// Reset selection to current image size and reset rotation
-		rectangle area = {0, 0, gfit->rx, gfit->ry};
+		// Reset selection to current image/layer area
+		gint _sx = 0, _sy = 0;
+		flis_layer_t *_al = flis_active_layer();
+		if (_al) { _sx = _al->position_x; _sy = _al->position_y; }
+		rectangle area = {_sx, _sy, gfit->rx, gfit->ry};
 		memcpy(&com.selection, &area, sizeof(rectangle));
 		gtk_spin_button_set_value(
 			GTK_SPIN_BUTTON(lookup_widget("spinbutton_rotation")), 0.);
@@ -81,6 +86,14 @@ static void rotate_gui(fits *fit) {
 		if (cropped)
 			gtk_toggle_button_set_active(crop_rotation, TRUE);
 	}
+	if (cropped && flis_get_selected_group()) {
+		siril_message_dialog(GTK_MESSAGE_ERROR,
+			_("Layer Group Selected"),
+			_("Rotate and crop cannot be applied to a layer group.\n"
+			  "Select an individual layer, or uncheck 'Crop to selection'."));
+		return;
+	}
+
 	gboolean clamp = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(lookup_widget("toggle_rot_clamp")));
 
 	set_cursor_waiting(TRUE);
@@ -115,6 +128,7 @@ static void rotate_gui(fits *fit) {
 	args->idle_function = rotation_idle;
 	args->description = _("Rotation");
 	args->verbose = TRUE;
+	args->geometry_changing = TRUE;
 	args->user = params;
 	args->max_threads = com.max_thread;
 
@@ -173,6 +187,7 @@ void siril_rotate90() {
 	args->idle_function = fast_rotation_idle;
 	args->description = _("Rotation 90°");
 	args->verbose = TRUE;
+	args->geometry_changing = TRUE;
 	args->user = params;
 	args->max_threads = 1;  // Fast rotation doesn't benefit from threading
 
@@ -215,6 +230,7 @@ void siril_rotate270() {
 	args->idle_function = fast_rotation_idle;
 	args->description = _("Rotation -90°");
 	args->verbose = TRUE;
+	args->geometry_changing = TRUE;
 	args->user = params;
 	args->max_threads = 1;
 
@@ -248,7 +264,10 @@ void on_spin_rotation_value_changed(GtkSpinButton *button, gpointer user_data) {
 
 void on_checkbutton_rotation_crop_toggled(GtkToggleButton *button, gpointer user_data) {
 	if (!gtk_toggle_button_get_active(button)) {
-		rectangle area = {0, 0, gfit->rx, gfit->ry};
+		gint _sx = 0, _sy = 0;
+		flis_layer_t *_al = flis_active_layer();
+		if (_al) { _sx = _al->position_x; _sy = _al->position_y; }
+		rectangle area = {_sx, _sy, gfit->rx, gfit->ry};
 		memcpy(&com.selection, &area, sizeof(rectangle));
 		gui_function(new_selection_zone, NULL);
 	}
@@ -324,6 +343,7 @@ void mirrorx_gui(fits *fit) {
 	args->idle_function = mirror_idle;
 	args->description = _("Mirror X");
 	args->verbose = TRUE;
+	args->geometry_changing = TRUE;
 	args->user = params;
 	args->max_threads = com.max_thread;
 
@@ -361,6 +381,7 @@ void mirrory_gui(fits *fit) {
 	args->idle_function = mirror_idle;
 	args->description = _("Mirror Y");
 	args->verbose = TRUE;
+	args->geometry_changing = TRUE;
 	args->user = params;
 	args->max_threads = com.max_thread;
 
@@ -430,6 +451,7 @@ void on_button_binning_ok_clicked(GtkButton *button, gpointer user_data) {
 	args->idle_function = binning_idle;
 	args->description = _("Binning");
 	args->verbose = TRUE;
+	args->geometry_changing = TRUE;
 	args->user = params;
 	args->max_threads = com.max_thread;
 
@@ -514,6 +536,7 @@ void on_button_resample_ok_clicked(GtkButton *button, gpointer user_data) {
 	args->idle_function = resample_idle;
 	args->description = _("Resample");
 	args->verbose = TRUE;
+	args->geometry_changing = TRUE;
 	args->user = params;
 	args->max_threads = com.max_thread;
 
@@ -711,6 +734,7 @@ void siril_crop() {
 	args->description = _("Crop");
 	args->log_hook = crop_log_hook;
 	args->verbose = TRUE;
+	args->geometry_changing = TRUE;
 	args->user = params;
 	args->max_threads = 1;  // Crop doesn't benefit from threading
 

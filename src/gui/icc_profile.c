@@ -24,6 +24,7 @@
 #include "core/proto.h"
 #include "core/icc_profile.h"
 #include "core/processing.h"
+#include "core/processing_thread.h"
 #include "core/undo.h"
 #include "gui/image_display.h"
 #include "gui/callbacks.h"
@@ -35,6 +36,7 @@
 #include "gui/utils.h"
 #include "io/single_image.h"
 #include "io/image_format_fits.h"
+#include "io/image_format_flis.h"
 #include "io/sequence.h"
 #include "core/siril_log.h"
 
@@ -110,14 +112,16 @@ void set_source_information() {
 	GtkLabel* label = (GtkLabel*) lookup_widget("icc_current_profile_label");
 	GtkLabel* mfr_label = (GtkLabel*) lookup_widget("icc_mfr_label");
 	GtkLabel* copyright_label = (GtkLabel*) lookup_widget("icc_copyright_label");
-	if (!gfit->color_managed) {
+	/* For FLIS, use the base (profiled) layer; for other images this is gfit. */
+	fits *profiled = flis_get_profiled_fit();
+	if (!profiled->color_managed) {
 		siril_debug_print("Target image is not color managed\n");
 		gtk_label_set_text(label, _("No ICC profile"));
 		gtk_label_set_text(mfr_label, "");
 		gtk_label_set_text(copyright_label, "");
 		return;
 	}
-	if (!gfit->icc_profile) {
+	if (!profiled->icc_profile) {
 		siril_debug_print("Target profile is NULL\n");
 		gtk_label_set_text(label, _("No ICC profile"));
 		gtk_label_set_text(mfr_label, "");
@@ -125,19 +129,19 @@ void set_source_information() {
 		return;
 	}
 	// Set description
-	gchar *buffer = siril_color_profile_get_description(gfit->icc_profile);
+	gchar *buffer = siril_color_profile_get_description(profiled->icc_profile);
 	if (buffer)
 		gtk_label_set_text(label, buffer);
 	free(buffer);
 
 	// Set manufacturer
-	buffer = siril_color_profile_get_manufacturer(gfit->icc_profile);
+	buffer = siril_color_profile_get_manufacturer(profiled->icc_profile);
 	if (buffer)
 		gtk_label_set_text(mfr_label, buffer);
 	free(buffer);
 
 	// Set copyright
-	buffer = siril_color_profile_get_copyright(gfit->icc_profile);
+	buffer = siril_color_profile_get_copyright(profiled->icc_profile);
 	if (buffer)
 		gtk_label_set_text(copyright_label, buffer);
 	free(buffer);
@@ -268,31 +272,6 @@ void on_pref_icc_assign_never_toggled(GtkToggleButton *button, gpointer user_dat
 		g_signal_handlers_unblock_by_func(composition, on_pref_icc_assign_toggled, NULL);
 	}
 }
-/* Idle function for generic_image_worker path of on_icc_assign_clicked
- * and on_icc_remove_clicked */
-static gboolean icc_assign_idle(gpointer p) {
-	stop_processing_thread();
-	gtk_widget_set_sensitive(lookup_widget("icc_convertto"), gfit->color_managed);
-	gtk_widget_set_sensitive(lookup_widget("icc_remove"), gfit->color_managed);
-	set_source_information();
-	gfit_modified_update_gui();
-	free_generic_img_args((struct generic_img_args *)p);
-	set_cursor_waiting(FALSE);
-	return FALSE;
-}
-
-/* Idle function for generic_image_worker path of on_icc_convertto_clicked */
-static gboolean icc_convert_to_idle(gpointer p) {
-	stop_processing_thread();
-	gtk_widget_set_sensitive(lookup_widget("icc_convertto"), gfit->color_managed);
-	set_source_information();
-	gui_function(close_tab, NULL);
-	gui_function(init_right_tab, NULL);
-	gfit_modified_update_gui();
-	free_generic_img_args((struct generic_img_args *)p);
-	set_cursor_waiting(FALSE);
-	return FALSE;
-}
 
 //////// GUI callbacks for the color management dialog
 
@@ -326,66 +305,49 @@ void on_icc_assign_clicked(GtkButton* button, gpointer* user_data) {
 		return;
 	}
 	on_clear_roi();
+	fits *profiled = flis_get_profiled_fit();
 
+	/* Validate channel counts before spawning the worker. */
 	cmsUInt32Number target_colorspace = cmsGetColorSpace(target);
-	cmsUInt32Number target_colorspace_channels = cmsChannelsOf(target_colorspace);
-
-	// Handle initial assignment of an ICC profile
-	if (!gfit->color_managed || !gfit->icc_profile) {
-		if (gfit->icc_profile) {
-			cmsCloseProfile(gfit->icc_profile);
-			gfit->icc_profile = NULL;
-		}
-		if (target_colorspace_channels > gfit->naxes[2]) {
+	cmsUInt32Number target_ch = cmsChannelsOf(target_colorspace);
+	if (!profiled->color_managed || !profiled->icc_profile) {
+		if (target_ch > flis_composite_naxes2()) {
 			siril_message_dialog(GTK_MESSAGE_ERROR, _("Color space has incorrect channels"), _("Mismatch in number of channels between the current image and the ICC profile. You cannot assign a RGB ICC profile to a mono image."));
 			return;
 		}
-		goto FINISH;
+	} else {
+		cmsUInt32Number cur_ch = cmsChannelsOf(cmsGetColorSpace(profiled->icc_profile));
+		if (target_colorspace != cmsSigGrayData && target_colorspace != cmsSigRgbData) {
+			siril_message_dialog(GTK_MESSAGE_ERROR, _("Color space not supported"), _("Siril only supports representing the image in Gray or RGB color spaces at present. You cannot assign or convert to non-RGB color profiles"));
+			return;
+		}
+		if (cur_ch != target_ch && !is_current_image_flis()) {
+			siril_message_dialog(GTK_MESSAGE_ERROR, _("Transform not supported"), _("Image cannot be assigned a color profile with a different number of channels to its current color profile"));
+			return;
+		}
 	}
 
-	cmsUInt32Number gfit_colorspace = cmsGetColorSpace(gfit->icc_profile);
-	cmsUInt32Number gfit_colorspace_channels = cmsChannelsOf(gfit_colorspace);
-
-	if (target_colorspace != cmsSigGrayData && target_colorspace != cmsSigRgbData) {
-		siril_message_dialog(GTK_MESSAGE_ERROR, _("Color space not supported"), _("Siril only supports representing the image in Gray or RGB color spaces at present. You cannot assign or convert to non-RGB color profiles"));
-		return;
+	struct icc_op_args *args = g_new0(struct icc_op_args, 1);
+	args->profiled   = profiled;
+	args->op         = ICC_OP_ASSIGN;
+	args->profile    = copyICCProfile(target);
+	args->undo_label = g_strdup(_("Color profile assignment"));
+	if (!start_in_new_thread(icc_operation_worker, args)) {
+		free_icc_op_args(args);
 	}
-	if (gfit_colorspace_channels != target_colorspace_channels) {
-		siril_message_dialog(GTK_MESSAGE_ERROR, _("Transform not supported"), _("Image cannot be assigned a color profile with a different number of channels to its current color profile"));
-		return;
-	}
-	if (gfit->icc_profile) {
-		cmsCloseProfile(gfit->icc_profile);
-		gfit->icc_profile = NULL;
-	}
-FINISH:;
-	struct icc_data *icc_args = calloc(1, sizeof(struct icc_data));
-	icc_args->destroy_fn = free_icc_data;
-	icc_args->profile = copyICCProfile(target);
-
-	struct generic_img_args *args = calloc(1, sizeof(struct generic_img_args));
-	args->fit = gfit;
-	args->image_hook = icc_assign_hook;
-	args->log_hook = icc_assign_log_hook;
-	args->idle_function = icc_assign_idle;
-	args->description = _("ICC profile assignment");
-	args->verbose = TRUE;
-	args->user = icc_args;
-	if (!start_in_new_thread(generic_image_worker, args))
-		free_generic_img_args(args);
 }
 
 void on_icc_remove_clicked(GtkButton* button, gpointer* user_data) {
 	on_clear_roi();
-	struct generic_img_args *args = calloc(1, sizeof(struct generic_img_args));
-	args->fit = gfit;
-	args->image_hook = icc_remove_hook;
-	args->log_hook = icc_remove_log_hook;
-	args->idle_function = icc_assign_idle;
-	args->description = _("ICC profile removal");
-	args->verbose = TRUE;
-	if (!start_in_new_thread(generic_image_worker, args))
-		free_generic_img_args(args);
+	fits *profiled = flis_get_profiled_fit();
+
+	struct icc_op_args *args = g_new0(struct icc_op_args, 1);
+	args->profiled   = profiled;
+	args->op         = ICC_OP_REMOVE;
+	args->undo_label = g_strdup(_("Color profile removal"));
+	if (!start_in_new_thread(icc_operation_worker, args)) {
+		free_icc_op_args(args);
+	}
 }
 
 void on_icc_convertto_clicked(GtkButton* button, gpointer* user_data) {
@@ -394,33 +356,28 @@ void on_icc_convertto_clicked(GtkButton* button, gpointer* user_data) {
 		return;
 	}
 	on_clear_roi();
-	if (!gfit->color_managed || !gfit->icc_profile) {
+	fits *profiled = flis_get_profiled_fit();
+	if (!profiled->color_managed || !profiled->icc_profile) {
 		siril_message_dialog(GTK_MESSAGE_ERROR, _("No color profile set"), _("The current image has no color profile. You need to assign one first."));
 		return;
 	}
-
 	cmsUInt32Number target_colorspace = cmsGetColorSpace(target);
-
 	if (target_colorspace != cmsSigGrayData && target_colorspace != cmsSigRgbData) {
 		siril_message_dialog(GTK_MESSAGE_ERROR, _("Color space not supported"), _("Siril only supports representing the image in Gray or RGB color spaces at present. You cannot assign or convert to non-RGB color profiles"));
 		return;
 	}
 
-	struct icc_data *icc_args = calloc(1, sizeof(struct icc_data));
-	icc_args->destroy_fn = free_icc_data;
-	icc_args->profile = copyICCProfile(target);
-	icc_args->intent = com.pref.icc.export_intent;
-
-	struct generic_img_args *args = calloc(1, sizeof(struct generic_img_args));
-	args->fit = gfit;
-	args->image_hook = icc_convert_to_hook;
-	args->log_hook = icc_convert_to_log_hook;
-	args->idle_function = icc_convert_to_idle;
-	args->description = _("ICC color space conversion");
-	args->verbose = TRUE;
-	args->user = icc_args;
-	if (!start_in_new_thread(generic_image_worker, args))
-		free_generic_img_args(args);
+	struct icc_op_args *args = g_new0(struct icc_op_args, 1);
+	args->profiled          = profiled;
+	args->op                = ICC_OP_CONVERT;
+	args->profile           = copyICCProfile(target);
+	args->intent            = com.pref.icc.export_intent;
+	args->flis_mode         = is_current_image_flis();
+	args->tab_update_needed = TRUE;
+	args->undo_label        = g_strdup(_("Color profile conversion"));
+	if (!start_in_new_thread(icc_operation_worker, args)) {
+		free_icc_op_args(args);
+	}
 }
 
 void on_icc_target_combo_changed(GtkComboBox* combo, gpointer* user_data) {

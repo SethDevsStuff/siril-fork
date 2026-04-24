@@ -57,6 +57,8 @@
 #include "gui/progress_and_log.h"
 #include "gui/dialogs.h"
 #include "gui/image_display.h"
+#include "gui/flis_gui.h"
+#include "io/image_format_flis.h"
 #include "gui/photometric_cc.h"
 #include "gui/menu_gray_geometry.h"
 #include "gui/registration_preview.h"
@@ -69,7 +71,7 @@
 
 #define CHECK_FOR_OPENED_DIALOG \
     do { \
-        if (is_a_dialog_opened()) { \
+        if (is_an_image_processing_dialog_opened()) { \
             siril_message_dialog(GTK_MESSAGE_INFO, _("Cannot process image"), _("The image can't be processed while another processing dialog is opened.")); \
             return; \
         } \
@@ -476,8 +478,9 @@ void annotate_dialog_activate(GSimpleAction *action, GVariant *parameter, gpoint
 
 void annotate_object_state(GSimpleAction *action, GVariant *state, gpointer user_data) {
 	if (g_variant_get_boolean(state)) {
-		if (has_wcs(gfit)) {
-			com.found_object = find_objects_in_field(gfit);
+		fits *base = flis_get_profiled_fit(); // returns the canvas layer for FLIS, or gfit for simple FITS files
+		if (has_wcs(base)) {
+			com.found_object = find_objects_in_field(base);
 		}
 	} else {
 		clear_user_polygons();
@@ -710,7 +713,10 @@ void resample_activate(GSimpleAction *action, GVariant *parameter, gpointer user
 
 void rotation_activate(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
 	if (com.selection.w == 0 || com.selection.h == 0) {
-		com.selection = (rectangle){ 0, 0, gfit->rx, gfit->ry };
+		gint _sx = 0, _sy = 0;
+		flis_layer_t *_al = flis_active_layer();
+		if (_al) { _sx = _al->position_x; _sy = _al->position_y; }
+		com.selection = (rectangle){ _sx, _sy, gfit->rx, gfit->ry };
 	}
 	siril_open_dialog("rotation_dialog");
 	redraw(REDRAW_OVERLAY);
@@ -920,6 +926,11 @@ void mask_from_file_activate(GSimpleAction *action, GVariant *parameter, gpointe
 }
 
 void clear_mask_activate(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
+	if (get_flis_show_layer_mask() && is_current_image_flis()) {
+		flis_remove_selected_lmask();
+		return;
+	}
+
 	if (!gfit || !gfit->mask) {
 		return;
 	}
@@ -935,7 +946,8 @@ void clear_mask_activate(GSimpleAction *action, GVariant *parameter, gpointer us
 }
 
 void autostretch_mask_activate(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
-	if (!gfit || !gfit->mask || !gfit->mask->data) {
+	gboolean lmask_mode = get_flis_show_layer_mask() && is_current_image_flis();
+	if (!lmask_mode && (!gfit || !gfit->mask || !gfit->mask->data)) {
 		siril_message_dialog(GTK_MESSAGE_ERROR, _("No mask present"),
 		                     _("There is no mask to autostretch."));
 		return;
@@ -948,6 +960,8 @@ void autostretch_mask_activate(GSimpleAction *action, GVariant *parameter, gpoin
 	args->description = _("Autostretch mask");
 	args->verbose = TRUE;
 	args->max_threads = com.max_thread;
+	if (lmask_mode)
+		args->target_layer_id = flis_get_selected_layer_id();
 
 	start_in_new_thread(generic_mask_worker, args);
 }
@@ -965,7 +979,8 @@ void mask_scale_activate(GSimpleAction *action, GVariant *parameter, gpointer us
 }
 
 void invert_mask_activate(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
-	if (!gfit || !gfit->mask || !gfit->mask->data) {
+	gboolean lmask_mode = get_flis_show_layer_mask() && is_current_image_flis();
+	if (!lmask_mode && (!gfit || !gfit->mask || !gfit->mask->data)) {
 		siril_message_dialog(GTK_MESSAGE_ERROR, _("No mask present"),
 		                     _("There is no mask to invert."));
 		return;
@@ -980,6 +995,8 @@ void invert_mask_activate(GSimpleAction *action, GVariant *parameter, gpointer u
 	args->verbose = TRUE;
 	args->user = NULL;
 	args->max_threads = com.max_thread;
+	if (lmask_mode)
+		args->target_layer_id = flis_get_selected_layer_id();
 
 	start_in_new_thread(generic_mask_worker, args);
 }
@@ -997,16 +1014,24 @@ void mask_from_gradient_activate(GSimpleAction *action, GVariant *parameter, gpo
 		return;
 	}
 
+	gboolean lmask_mode = get_flis_show_layer_mask() && is_current_image_flis();
+
 	struct generic_mask_args *args = calloc(1, sizeof(struct generic_mask_args));
 	args->fit = gfit;
 	args->mask_hook = mask_from_gradient_hook;
 	args->description = _("Gradient of mask");
 	args->verbose = TRUE;
 	args->max_threads = com.max_thread;
+	if (lmask_mode)
+		args->target_layer_id = flis_get_selected_layer_id();
 
 	start_in_new_thread(generic_mask_worker, args);
 }
 
 void threshold_mask_activate(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
 	siril_open_dialog("mask_thresholds_dialog");
+}
+
+void layers_tool_activate(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
+	siril_open_dialog("flis_layers_window");
 }

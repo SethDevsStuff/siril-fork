@@ -9,6 +9,25 @@ typedef enum {
 	REMAP_ALL       // the image data changed, remap and render all
 } remap_type;
 
+/* FLIS composite cache control — defined in image_display.c.
+ * flis_invalidate_composite() must be called whenever any layer property
+ * changes.  flis_composite_free() must be called when a FLIS file is
+ * closed (done automatically by free_image_data() in single_image.c). */
+void flis_invalidate_composite(void);
+void flis_composite_free(void);
+int  flis_composite_build(void);   /* rebuild if dirty; no-op if already current */
+void flis_init_display_levels(sliders_mode force_minmax); /* init hi/lo from composite for FLIS, gfit otherwise */
+
+/* flis_render_layers: composites a GSList of flis_layer_t* into a newly
+ * allocated float-RGB fits*.  The caller must clearfits()+free() the result.
+ * Used by the display pipeline, merge-down, flatten, and flat-FITS save. */
+fits *flis_render_layers(GSList *layers);
+
+/* Controls whether the mask viewport and tint show the active FLIS layer's
+ * layer mask (TRUE) or its processing mask (FALSE, default). */
+gboolean get_flis_show_layer_mask(void);
+void     set_flis_show_layer_mask(gboolean val);
+
 void check_gfit_profile_identical_to_monitor();
 
 void allocate_hd_remap_indices();

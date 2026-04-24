@@ -27,6 +27,7 @@
 
 #include <assert.h>
 #include <string.h>
+#include <math.h>
 #include <glib.h>
 
 #include "core/siril.h"
@@ -40,6 +41,8 @@
 #include "core/undo.h"
 #include "gui/callbacks.h"
 #include "gui/dialogs.h"
+#include "gui/message_dialog.h"
+#include "gui/flis_gui.h"
 #include "gui/image_display.h"
 #include "io/single_image.h"
 #include "gui/progress_and_log.h"
@@ -51,6 +54,8 @@
 #include "io/seqwriter.h"
 #include "io/fits_sequence.h"
 #include "io/image_format_fits.h"
+#include "io/image_format_flis.h"
+#include "algos/geometry.h"
 #include "algos/statistics.h"
 #include "registration/registration.h"
 
@@ -1374,8 +1379,19 @@ void free_generic_mask_args(struct generic_mask_args *args) {
 gboolean end_generic_mask(gpointer p) {
 	struct generic_mask_args *args = (struct generic_mask_args*) p;
 	stop_processing_thread();
-	show_or_hide_mask_tab();
-	queue_redraw_mask();
+	if (is_current_image_flis() && args->target_layer_id > 0) {
+		/* Layer mask operation: switch mask tab to show new layer mask,
+		 * refresh the layer list indicator, and trigger a full composite
+		 * redraw plus a mask viewport update. */
+		set_flis_show_layer_mask(TRUE);
+		show_or_hide_mask_tab();
+		queue_redraw_mask();
+		queue_redraw(REMAP_ALL);
+		flis_gui_update_from_idle();
+	} else {
+		show_or_hide_mask_tab();
+		queue_redraw_mask();
+	}
 	free_generic_mask_args(args);
 	return FALSE;
 }
@@ -1546,10 +1562,468 @@ gpointer generic_image_worker(gpointer p) {
 	gboolean arg_update_gfit = args->command_updates_gfit;
 	gboolean undo_state = FALSE;
 	gchar* desc = g_strdup(args->description);
+	/* Hoisted here so goto the_end (group path) does not jump over their
+	 * initialisers — leaving them as garbage and causing layermask_free()
+	 * to be called on a random stack value at clean-up time. */
+	flis_layer_t *_flis_lay_undo = NULL;
+	layermask_t  *_pre_lmask     = NULL;
 
 	set_progress_bar_data(NULL, PROGRESS_RESET);
 	gettimeofday(&t_start, NULL);
 	args->retval = 0;
+
+
+	// Set default max_threads if not specified
+	if (args->max_threads < 1)
+		args->max_threads = com.max_thread;
+
+	/* ------------------------------------------------------------------ *
+	 * GROUP PATH                                                           *
+	 * When a layer group is selected, apply the operation to every layer  *
+	 * in the group using the same image_hook and args->user, saving a     *
+	 * single atomic multi-layer undo state.                               *
+	 * ------------------------------------------------------------------ */
+	flis_group_t *_grp         = NULL;
+	GSList       *_grp_members = NULL;
+	if (!args->command && is_current_image_flis())
+		_grp = flis_get_selected_group();
+	if (_grp)
+		_grp_members = flis_group_get_layers(_grp);
+
+	if (_grp_members) {
+		int n_members = (int)g_slist_length(_grp_members);
+
+		if (args->description && verbose) {
+			gchar *_gdesc = g_strdup_printf(
+			    _("%s: processing group (%d layer%s)...\n"),
+			    args->description, n_members, n_members == 1 ? "" : "s");
+			siril_log_color_message(_gdesc, "green");
+			g_free(_gdesc);
+		}
+		set_progress_bar_data(_("Processing group..."), 0.1f);
+
+		/* Memory check: we process one layer at a time, so the peak
+		 * memory is that of a single member.  Use gfit (active layer)
+		 * as the representative fit. */
+		if (args->mem_ratio > 0.0f) {
+			args->fit = gfit;
+			if (default_img_mem_hook(args)) {
+				args->retval = 1;
+				g_slist_free(_grp_members);
+				goto the_end;
+			}
+		}
+
+		if (args->for_preview) {
+			/* First preview call: save pixel copies for non-active members.
+			 * The active layer (gfit) is already backed up by copy_gfit_to_backup().
+			 * On subsequent calls copy_backup_to_gfit() has already restored
+			 * every member (via restore_flis_group_members_from_backup), so
+			 * we just re-apply. */
+			if (!is_flis_group_backup_active()) {
+				fits **_nonactive = malloc(n_members * sizeof(fits *));
+				if (_nonactive) {
+					int _na = 0;
+					for (GSList *l = _grp_members; l; l = l->next) {
+						flis_layer_t *_lay = l->data;
+						if (_lay && _lay->fit && _lay->fit != gfit)
+							_nonactive[_na++] = _lay->fit;
+					}
+					if (_na > 0)
+						copy_flis_group_members_to_backup(_nonactive, _na);
+					free(_nonactive);
+				}
+			}
+
+			/* Apply hook to every member in-place. */
+			for (GSList *l = _grp_members; l && !args->retval; l = l->next) {
+				flis_layer_t *_lay = l->data;
+				if (!_lay || !_lay->fit) continue;
+				gboolean _ly_mask = args->mask_aware &&
+				                    _lay->fit->mask && _lay->fit->mask_active;
+				fits *_ly_orig = NULL;
+				if (_ly_mask) {
+					_ly_orig = calloc(1, sizeof(fits));
+					if (_ly_orig && copyfits(_lay->fit, _ly_orig,
+					        CP_ALLOC | CP_FORMAT | CP_COPYA | CP_COPYMASK, -1)) {
+						free(_ly_orig); _ly_orig = NULL;
+					}
+				}
+				args->fit = _lay->fit;
+				if (args->image_hook(args, _lay->fit, args->max_threads))
+					args->retval = 1;
+				if (_ly_mask && _ly_orig) {
+					blend_fits_with_mask(_lay->fit, _ly_orig);
+					clearfits(_ly_orig); free(_ly_orig);
+				}
+			}
+
+			/* For FLIS: pixel data of every group member was modified in-place.
+			 * Invalidate and rebuild the composite now so the display reflects
+			 * the preview result when the idle calls queue_redraw(). */
+			if (!args->retval && is_current_image_flis())
+				notify_gfit_data_modified();
+
+		} else {
+			/* Final apply: copy_backup_to_gfit() was called by the dialog
+			 * before starting this worker, which restores gfit AND all
+			 * non-active group members.  Discard the now-consumed backups
+			 * so clear_backup() does not attempt a redundant restore. */
+			if (is_flis_group_backup_active())
+				free_flis_group_backups();
+
+			/* Generate summary BEFORE hooks run (args->user is unchanged). */
+			summary = args->log_hook
+			        ? args->log_hook(args->user, SUMMARY)
+			        : g_strdup(args->description);
+
+			/* Single atomic undo covering every group member. */
+			if (!args->custom_undo)
+				undo_save_flis_multi_layer(_grp_members, "%s",
+				                           summary ? summary : args->description);
+
+			/* ---- Geometry correction setup --------------------------------
+			 * Must happen before the loop so we have the canvas dims and
+			 * rotation coefficients before any hooks change fit->rx/ry. */
+			gint _grp_canvas_rx_before = (gint)canvas_rx();
+			gint _grp_canvas_ry_before = (gint)canvas_ry();
+
+			gboolean _is_rotation = (args->image_hook == rotation_image_hook);
+			gboolean _is_mirrorx  = (args->image_hook == mirrorx_image_hook);
+			gboolean _is_mirrory  = (args->image_hook == mirrory_image_hook);
+			gboolean _is_crop     = (args->image_hook == crop_image_hook_single);
+			gboolean _is_binning  = (args->image_hook == binning_image_hook);
+			gboolean _is_resample = (args->image_hook == resample_image_hook);
+
+			struct rotation_args *_rp_geom = _is_rotation
+			    ? (struct rotation_args *)args->user : NULL;
+			struct crop_args *_cp_geom = _is_crop
+			    ? (struct crop_args *)args->user : NULL;
+			struct binning_args *_bn_geom = _is_binning
+			    ? (struct binning_args *)args->user : NULL;
+			struct resample_args *_rs_geom = _is_resample
+			    ? (struct resample_args *)args->user : NULL;
+			/* Saved original resample target dims (may be modified per-member) */
+			gint _rs_orig_toX = _rs_geom ? _rs_geom->toX : 0;
+			gint _rs_orig_toY = _rs_geom ? _rs_geom->toY : 0;
+			double _rot_cos_a = 1.0, _rot_sin_a = 0.0;
+			/* Predicted new canvas dims for 90°/270° rotations (dims swap). */
+			gint _new_canvas_rx = _grp_canvas_rx_before;
+			gint _new_canvas_ry = _grp_canvas_ry_before;
+
+			flis_layer_t *_grp_base = (is_current_image_flis() && com.uniq && com.uniq->layers)
+			    ? (flis_layer_t *)com.uniq->layers->data : NULL;
+			gboolean _base_in_grp = _grp_base &&
+			    g_slist_find(_grp_members, _grp_base) != NULL;
+
+			if (_rp_geom) {
+				double _rad = _rp_geom->angle * M_PI / 180.0;
+				_rot_cos_a = cos(_rad);
+				_rot_sin_a = sin(_rad);
+				/* For 90°/270° the canvas dims swap when base is in the group. */
+				int _ai = (int)_rp_geom->angle;
+				if (_base_in_grp && (double)_ai == _rp_geom->angle &&
+				    _ai % 90 == 0 && _ai % 180 != 0) {
+					_new_canvas_rx = _grp_canvas_ry_before;
+					_new_canvas_ry = _grp_canvas_rx_before;
+				}
+				/* For 180° the dims are unchanged; for general angles the
+				 * new canvas size is read from canvas_rx() after the
+				 * base layer's hook call below (updated inline). */
+			}
+			/* ---- End geometry setup --------------------------------------- */
+
+			/* Apply hook to every member. */
+			for (GSList *l = _grp_members; l && !args->retval; l = l->next) {
+				flis_layer_t *_lay = l->data;
+				if (!_lay || !_lay->fit) continue;
+
+				/* Save pre-hook geometry (dims and canvas position) so the
+				 * rotation correction can use old values after the hook has
+				 * changed fit->rx/ry for 90°/270° rotations. */
+				gint _pre_rx = _lay->fit->rx, _pre_ry = _lay->fit->ry;
+				gint _pre_px = _lay->position_x, _pre_py = _lay->position_y;
+
+				gboolean _ly_mask = args->mask_aware &&
+				                    _lay->fit->mask && _lay->fit->mask_active;
+				fits *_ly_orig = NULL;
+				if (_ly_mask) {
+					_ly_orig = calloc(1, sizeof(fits));
+					if (_ly_orig && copyfits(_lay->fit, _ly_orig,
+					        CP_ALLOC | CP_FORMAT | CP_COPYA | CP_COPYMASK, -1)) {
+						free(_ly_orig); _ly_orig = NULL;
+					}
+				}
+				/* Resample: non-base members resize proportionally, not to the
+				 * same absolute dimensions as the base target.  Temporarily
+				 * override params->toX/toY with the proportional target. */
+				if (_is_resample && _rs_geom && _lay != _grp_base
+				        && _grp_canvas_rx_before > 0 && _grp_canvas_ry_before > 0) {
+					_rs_geom->toX = MAX(1, (gint)round(
+					    (double)_pre_rx * _rs_orig_toX / _grp_canvas_rx_before));
+					_rs_geom->toY = MAX(1, (gint)round(
+					    (double)_pre_ry * _rs_orig_toY / _grp_canvas_ry_before));
+				}
+
+				args->fit = _lay->fit;
+				if (args->image_hook(args, _lay->fit, args->max_threads)) {
+					siril_log_color_message(
+					    _("%s: processing failed on layer '%s'.\n"), "red",
+					    args->description,
+					    _lay->layer_name ? _lay->layer_name : "?");
+					args->retval = 1;
+				}
+
+				/* Restore original resample dims for subsequent members. */
+				if (_is_resample && _rs_geom) {
+					_rs_geom->toX = _rs_orig_toX;
+					_rs_geom->toY = _rs_orig_toY;
+				}
+
+				if (_ly_mask && _ly_orig) {
+					blend_fits_with_mask(_lay->fit, _ly_orig);
+					clearfits(_ly_orig); free(_ly_orig);
+				}
+
+				if (args->retval) continue;
+
+				if (_is_crop && _cp_geom && _lay != _grp_base) {
+					/* Non-base crop member: update canvas position to the
+					 * intersection top-left, shifted by the crop origin when
+					 * the base is also in the group (canvas shrinks). */
+					gint sel_x = _cp_geom->area.x, sel_y = _cp_geom->area.y;
+					if (_base_in_grp) {
+						_lay->position_x = MAX(_pre_px, sel_x) - sel_x;
+						_lay->position_y = MAX(_pre_py, sel_y) - sel_y;
+					} else {
+						_lay->position_x = MAX(_pre_px, sel_x);
+						_lay->position_y = MAX(_pre_py, sel_y);
+					}
+				}
+
+				if (_is_rotation && _rp_geom && _lay != _grp_base) {
+					/* Non-base group member: update canvas position.
+					 *
+					 * Two cases:
+					 * A) Base is in the group (canvas rotated): rotate this
+					 *    layer's centre around the old canvas centre.
+					 * B) Base not in group (canvas unchanged): preserve this
+					 *    layer's centre at the same canvas position.
+					 *
+					 * Both cases use PRE-hook dims/pos so the centre is
+					 * computed from the old (pre-rotation) layer size. */
+					if (_base_in_grp &&
+					    (_new_canvas_rx != _grp_canvas_rx_before ||
+					     _new_canvas_ry != _grp_canvas_ry_before)) {
+						/* Case A: rotate centre around the rotation centre.
+						 * For non-cropped rotations this is the canvas centre.
+						 * For cropped rotations it is the selection midpoint. */
+						double _ocx = (_rp_geom->cropped)
+						    ? _rp_geom->area.x + _rp_geom->area.w * 0.5
+						    : _grp_canvas_rx_before / 2.0;
+						double _ocy = (_rp_geom->cropped)
+						    ? _rp_geom->area.y + _rp_geom->area.h * 0.5
+						    : _grp_canvas_ry_before / 2.0;
+						double _cx  = _pre_px + _pre_rx / 2.0;
+						double _cy  = _pre_py + _pre_ry / 2.0;
+						double _dx  = _cx - _ocx;
+						double _dy  = _cy - _ocy;
+						double _ncx = _new_canvas_rx / 2.0
+						            + _dx * _rot_cos_a - _dy * _rot_sin_a;
+						double _ncy = _new_canvas_ry / 2.0
+						            + _dx * _rot_sin_a + _dy * _rot_cos_a;
+						_lay->position_x = (gint)round(_ncx - _lay->fit->rx / 2.0);
+						_lay->position_y = (gint)round(_ncy - _lay->fit->ry / 2.0);
+					} else {
+						/* Case B: preserve canvas centre */
+						_lay->position_x = _pre_px + (_pre_rx - (gint)_lay->fit->rx) / 2;
+						_lay->position_y = _pre_py + (_pre_ry - (gint)_lay->fit->ry) / 2;
+					}
+				}
+
+				/* After any geometric hook on the base layer: sync the
+				 * independently-tracked canvas size.  Moving the base layer
+				 * (position_x/y) does not reach here, so this only fires for
+				 * operations that actually change the pixel dimensions. */
+				if (_lay == _grp_base && !args->retval && _lay->fit &&
+				    is_current_image_flis() && com.uniq) {
+					com.uniq->canvas_rx = _lay->fit->rx;
+					com.uniq->canvas_ry = _lay->fit->ry;
+				}
+
+				/* For general (non-90°-multiple) rotation: after the base
+				 * layer's hook, read the actual new canvas dims from the
+				 * updated base fit so subsequent layers use the right centre. */
+				if (_is_rotation && _lay == _grp_base) {
+					_new_canvas_rx = (gint)canvas_rx();
+					_new_canvas_ry = (gint)canvas_ry();
+				}
+
+				if (_is_resample && _rs_geom && _lay != _grp_base) {
+					/* Resample: update canvas position for non-base member.
+					 * A) Base in group (canvas resizes): scale centre by the
+					 *    same factor as the base layer.
+					 * B) Base not in group (canvas unchanged): preserve centre
+					 *    (shift by half the size change). */
+					if (_base_in_grp) {
+						double _sx = (double)_rs_orig_toX / _grp_canvas_rx_before;
+						double _sy = (double)_rs_orig_toY / _grp_canvas_ry_before;
+						_lay->position_x = (gint)round(
+						    (_pre_px + _pre_rx / 2.0) * _sx - _lay->fit->rx / 2.0);
+						_lay->position_y = (gint)round(
+						    (_pre_py + _pre_ry / 2.0) * _sy - _lay->fit->ry / 2.0);
+					} else {
+						_lay->position_x = _pre_px + (_pre_rx - (gint)_lay->fit->rx) / 2;
+						_lay->position_y = _pre_py + (_pre_ry - (gint)_lay->fit->ry) / 2;
+					}
+				}
+
+				if (_is_binning && _bn_geom && _lay != _grp_base) {
+					/* Binning: update canvas position for non-base member.
+					 * A) Base in group: scale centre by 1/factor.
+					 * B) Base not in group: preserve centre. */
+					if (_base_in_grp) {
+						double _bf = (double)_bn_geom->factor;
+						_lay->position_x = (gint)round(
+						    (_pre_px + _pre_rx / 2.0) / _bf - _lay->fit->rx / 2.0);
+						_lay->position_y = (gint)round(
+						    (_pre_py + _pre_ry / 2.0) / _bf - _lay->fit->ry / 2.0);
+					} else {
+						_lay->position_x = _pre_px + (_pre_rx - (gint)_lay->fit->rx) / 2;
+						_lay->position_y = _pre_py + (_pre_ry - (gint)_lay->fit->ry) / 2;
+					}
+				}
+			}
+
+			/* For rotation with canvas change: also update non-group non-base
+			 * layers.  Their pixel data was not rotated so their dims are
+			 * still the old values — use them directly as the old centre. */
+			if (!args->retval && _is_rotation && _base_in_grp && is_current_image_flis() &&
+			    com.uniq && com.uniq->layers &&
+			    (_new_canvas_rx != _grp_canvas_rx_before ||
+			     _new_canvas_ry != _grp_canvas_ry_before)) {
+				double _ocx = (_rp_geom && _rp_geom->cropped)
+				    ? _rp_geom->area.x + _rp_geom->area.w * 0.5
+				    : _grp_canvas_rx_before / 2.0;
+				double _ocy = (_rp_geom && _rp_geom->cropped)
+				    ? _rp_geom->area.y + _rp_geom->area.h * 0.5
+				    : _grp_canvas_ry_before / 2.0;
+				for (GSList *_al = com.uniq->layers->next; _al; _al = _al->next) {
+					flis_layer_t *_ng = (flis_layer_t *)_al->data;
+					if (!_ng || !_ng->fit) continue;
+					if (g_slist_find(_grp_members, _ng)) continue; /* already updated */
+					double _cx = _ng->position_x + _ng->fit->rx / 2.0;
+					double _cy = _ng->position_y + _ng->fit->ry / 2.0;
+					double _dx = _cx - _ocx;
+					double _dy = _cy - _ocy;
+					_ng->position_x = (gint)round(
+					    _new_canvas_rx / 2.0 + _dx * _rot_cos_a - _dy * _rot_sin_a
+					    - _ng->fit->rx / 2.0);
+					_ng->position_y = (gint)round(
+					    _new_canvas_ry / 2.0 + _dx * _rot_sin_a + _dy * _rot_cos_a
+					    - _ng->fit->ry / 2.0);
+				}
+				flis_invalidate_composite();
+			}
+
+			/* Crop: update non-group non-base layer offsets when the base is in
+			 * the group (canvas shrinks by the crop origin). */
+			if (!args->retval && _is_crop && _cp_geom && _base_in_grp &&
+			    is_current_image_flis() && com.uniq && com.uniq->layers) {
+				gint sel_x = _cp_geom->area.x, sel_y = _cp_geom->area.y;
+				for (GSList *_al = com.uniq->layers->next; _al; _al = _al->next) {
+					flis_layer_t *_ng = (flis_layer_t *)_al->data;
+					if (!_ng) continue;
+					if (g_slist_find(_grp_members, _ng)) continue; /* already updated */
+					_ng->position_x -= sel_x;
+					_ng->position_y -= sel_y;
+				}
+				flis_invalidate_composite();
+			}
+
+			/* Resample with canvas change: also scale non-group non-base layers. */
+			if (!args->retval && _is_resample && _base_in_grp && is_current_image_flis() &&
+			    com.uniq && com.uniq->layers) {
+				double _sx = (double)_rs_orig_toX / _grp_canvas_rx_before;
+				double _sy = (double)_rs_orig_toY / _grp_canvas_ry_before;
+				for (GSList *_al = com.uniq->layers->next; _al; _al = _al->next) {
+					flis_layer_t *_ng = (flis_layer_t *)_al->data;
+					if (!_ng || !_ng->fit) continue;
+					if (g_slist_find(_grp_members, _ng)) continue; /* already updated */
+					double _cx = _ng->position_x + _ng->fit->rx / 2.0;
+					double _cy = _ng->position_y + _ng->fit->ry / 2.0;
+					_ng->position_x = (gint)round(_cx * _sx - _ng->fit->rx / 2.0);
+					_ng->position_y = (gint)round(_cy * _sy - _ng->fit->ry / 2.0);
+				}
+				flis_invalidate_composite();
+			}
+
+			/* Binning with canvas change: also scale non-group non-base layers. */
+			if (!args->retval && _is_binning && _base_in_grp && _bn_geom &&
+			    is_current_image_flis() && com.uniq && com.uniq->layers) {
+				double _bf = (double)_bn_geom->factor;
+				for (GSList *_al = com.uniq->layers->next; _al; _al = _al->next) {
+					flis_layer_t *_ng = (flis_layer_t *)_al->data;
+					if (!_ng || !_ng->fit) continue;
+					if (g_slist_find(_grp_members, _ng)) continue; /* already updated */
+					double _cx = _ng->position_x + _ng->fit->rx / 2.0;
+					double _cy = _ng->position_y + _ng->fit->ry / 2.0;
+					_ng->position_x = (gint)round(_cx / _bf - _ng->fit->rx / 2.0);
+					_ng->position_y = (gint)round(_cy / _bf - _ng->fit->ry / 2.0);
+				}
+				flis_invalidate_composite();
+			}
+
+			/* Mirror operations: reflect group member positions. */
+			if (!args->retval && is_current_image_flis()) {
+				if (_is_mirrorx) {
+					/* mirrorx = vertical flip (swaps rows).
+					 * Reflect each member's canvas y-position. */
+					guint _ch = canvas_ry();
+					for (GSList *l = _grp_members; l; l = l->next) {
+						flis_layer_t *_lay = l->data;
+						if (_lay && _lay->fit)
+							_lay->position_y = (gint)_ch
+							                 - _lay->position_y
+							                 - (gint)_lay->fit->ry;
+					}
+				} else if (_is_mirrory) {
+					/* mirrory = horizontal flip (flip_top_to_bottom + rotate_pi).
+					 * Reflect each member's canvas x-position. */
+					guint _cw = canvas_rx();
+					for (GSList *l = _grp_members; l; l = l->next) {
+						flis_layer_t *_lay = l->data;
+						if (_lay && _lay->fit)
+							_lay->position_x = (gint)_cw
+							                 - _lay->position_x
+							                 - (gint)_lay->fit->rx;
+					}
+				}
+			}
+
+			/* For FLIS: rebuild the composite and remap Cairo surfaces now that
+			 * all hooks have run and all canvas positions are up to date.
+			 * This ensures the idle's queue_redraw() finds correctly-positioned
+			 * pixel data rather than a stale composite built before the
+			 * position corrections above. */
+			if (!args->retval && is_current_image_flis())
+				notify_gfit_data_modified();
+
+			if (!args->retval) {
+				history = args->log_hook
+				        ? args->log_hook(args->user, DETAILED)
+				        : g_strdup(args->description);
+			}
+		}
+
+		/* Restore args->fit to gfit for the end_generic_image idle path. */
+		args->fit = gfit;
+		g_slist_free(_grp_members);
+		goto the_end;
+	}
+	/* ------------------------------------------------------------------ *
+	 * END GROUP PATH — single-layer path continues below                  *
+	 * ------------------------------------------------------------------ */
 
 	g_rw_lock_reader_lock(&com.pref_rwlock);
 	g_rw_lock_writer_lock(&args->fit->rwlock);
@@ -1573,10 +2047,6 @@ gpointer generic_image_worker(gpointer p) {
 		}
 	}
 
-	// Set default max_threads if not specified
-	if (args->max_threads < 1)
-		args->max_threads = com.max_thread;
-
 	// Memory check
 	if (args->mem_ratio > 0.0f) {
 		if (default_img_mem_hook(args)) {
@@ -1593,6 +2063,87 @@ gpointer generic_image_worker(gpointer p) {
 	}
 
 	set_progress_bar_data(_("Processing image..."), 0.1f);
+
+	/* For geometry-changing operations on FLIS layers, snapshot the layer's
+	 * lmask and properties BEFORE the hook runs.  The hook transforms both
+	 * pixel data and lmask in-place; by the time we save the undo state the
+	 * lmask has already changed.  We also capture position here so we don't
+	 * need to patch it manually afterwards (geometry ops can update position
+	 * inside their hook, e.g. crop → flis_update_layer_offset_after_crop). */
+	_flis_lay_undo = NULL;
+	_pre_lmask     = NULL;
+	flis_layer_props_t  _pre_props;
+	memset(&_pre_props, 0, sizeof(_pre_props));
+	/* For non-geometry ops we still need the pre-op position for the patch. */
+	gint flis_pre_pos_x = 0, flis_pre_pos_y = 0;
+	/* Set TRUE when we have pre-saved a multi-layer undo for a base-layer
+	 * geometry op so that the single-layer undo_save_flis_layer_full path is
+	 * skipped (undo state is already in the ring buffer). */
+	gboolean _flis_base_multi_undo = FALSE;
+	if (is_current_image_flis()) {
+		flis_layer_t *_active = flis_active_layer();
+		if (_active) {
+			flis_pre_pos_x = _active->position_x;
+			flis_pre_pos_y = _active->position_y;
+			if (args->geometry_changing && !args->for_preview) {
+				_flis_lay_undo = _active;
+				_pre_props.blend_mode   = _active->blend_mode;
+				_pre_props.opacity      = _active->opacity;
+				_pre_props.visible      = _active->visible;
+				_pre_props.locked       = _active->locked;
+				_pre_props.has_tint     = _active->has_tint;
+				_pre_props.tint         = _active->layer_tint;
+				_pre_props.lmask_active = _active->lmask_active;
+				_pre_props.position_x   = _active->position_x;
+				_pre_props.position_y   = _active->position_y;
+				g_strlcpy(_pre_props.name,
+				          _active->layer_name ? _active->layer_name : "",
+				          sizeof(_pre_props.name));
+				if (_active->lmask && _active->lmask->data) {
+					size_t elem_size;
+					switch (_active->lmask->bitpix) {
+						case 8:  elem_size = sizeof(uint8_t);  break;
+						case 16: elem_size = sizeof(uint16_t); break;
+						default: elem_size = sizeof(float);    break;
+					}
+					size_t total = _active->lmask->w * _active->lmask->h * elem_size;
+					_pre_lmask = calloc(1, sizeof(layermask_t));
+					if (_pre_lmask) {
+						_pre_lmask->w      = _active->lmask->w;
+						_pre_lmask->h      = _active->lmask->h;
+						_pre_lmask->bitpix = _active->lmask->bitpix;
+						_pre_lmask->data   = malloc(total);
+						if (_pre_lmask->data) {
+							memcpy(_pre_lmask->data, _active->lmask->data, total);
+						} else {
+							free(_pre_lmask);
+							_pre_lmask = NULL;
+						}
+					}
+				}
+			}
+		}
+	}
+
+	/* For geometry-changing operations on the FLIS BASE layer (single-layer
+	 * path, no group selected), save ALL layers atomically before the hook
+	 * runs.  This captures the non-base layers' pre-op positions so that an
+	 * undo correctly restores offsets that flis_update_layer_offset_after_crop
+	 * (and similar functions) would otherwise change without being tracked.
+	 * The same "save before hook" pattern is used by the group path above. */
+	if (!_flis_base_multi_undo &&
+	    is_current_image_flis() && args->geometry_changing &&
+	    !args->for_preview && !args->command && !args->custom_undo &&
+	    args->fit == gfit && !flis_get_selected_group() &&
+	    com.uniq && com.uniq->layers && com.uniq->layers->next != NULL &&
+	    flis_active_layer() == (flis_layer_t *)com.uniq->layers->data) {
+		gchar *_msumm = args->log_hook
+		    ? args->log_hook(args->user, SUMMARY) : g_strdup(args->description);
+		if (!undo_save_flis_multi_layer(com.uniq->layers, "%s",
+		                                _msumm ? _msumm : args->description))
+			_flis_base_multi_undo = TRUE;
+		g_free(_msumm);
+	}
 
 	// Call the image processing hook - operates in-place on args->fit
 	if (args->image_hook(args, args->fit, args->max_threads)) {
@@ -1657,7 +2208,25 @@ the_end:;
 
 	if (!retval) {
 		if (undo_state && orig) {
-			undo_save_state(orig, summary); // We just use the short description for the undo state
+			if (_flis_base_multi_undo) {
+				/* Multi-layer undo was saved before the hook (captures base
+				 * pixels + all non-base positions atomically); nothing more
+				 * to do here.  _pre_lmask and _flis_lay_undo are still freed
+				 * below at the regular cleanup point. */
+			} else if (args->geometry_changing && _flis_lay_undo) {
+				/* Full geometry undo: pixels + pmask + lmask + props in one entry.
+				 * _pre_lmask holds the pre-op lmask snapshot; pass it to the undo
+				 * function BEFORE freeing it so the swap file can be written. */
+				undo_save_flis_layer_full(orig, _flis_lay_undo,
+				                         _pre_lmask, &_pre_props, summary);
+			} else {
+				undo_save_state(orig, summary);
+				/* Patch position for non-geometry FLIS ops. */
+				if (is_current_image_flis() && com.history && com.hist_current > 0) {
+					com.history[com.hist_current - 1].flis_position_x = flis_pre_pos_x;
+					com.history[com.hist_current - 1].flis_position_y = flis_pre_pos_y;
+				}
+			}
 		} else {
 			// Update the HISTORY card if it wasn't updated by undo_save_state'
 			if (!arg_custom_undo && arg_update_gfit) {
@@ -1678,6 +2247,7 @@ the_end:;
 	g_free(summary); // free the message
 	g_free(history);
 	g_free(desc);
+	if (_pre_lmask) layermask_free(_pre_lmask);
 	if (orig)
 		clearfits(orig);
 	free(orig);
@@ -1706,30 +2276,113 @@ gpointer generic_mask_worker(gpointer p) {
 	if (args->max_threads < 1)
 		args->max_threads = com.max_thread;
 
-	// Memory check
-	if (args->mem_ratio > 0.0f) {
-		if (default_mask_mem_hook(args)) {
+	/* Refuse to run a layer-mask operation when a group is selected.
+	 * Two cases must be caught:
+	 * (a) target_layer_id > 0: an explicit layer was chosen in a creation
+	 *     dialog (mask_from_stars / mask_from_image / mask_from_color) — the
+	 *     combo populates regardless of group selection.
+	 * (b) target_layer_id == 0 in lmask mode: flis_get_selected_layer_id()
+	 *     returned 0 for the group; without the guard this silently falls
+	 *     back to a processing-mask operation. */
+	if (!args->command && is_current_image_flis() && flis_get_selected_group() != NULL &&
+	    (args->target_layer_id > 0 || get_flis_show_layer_mask())) {
+		siril_log_color_message(_("%s: cannot apply layer mask operation to a "
+		    "layer group — select an individual layer.\n"), "red", args->description);
+		queue_error_message_dialog(_("Layer Group Selected"),
+		    _("This operation cannot be applied to a layer group.\n"
+		      "Please select an individual layer."));
+		args->retval = 1;
+		goto the_end;
+	}
+
+	/* Layer mask target detection.  Layer IDs start at 1; calloc default
+	 * of 0 means "no layer target" (normal processing mask). */
+	gboolean is_lmask_op = is_current_image_flis() && (args->target_layer_id > 0);
+	flis_layer_t *target_lay = is_lmask_op
+	                         ? flis_layer_get_by_id(args->target_layer_id) : NULL;
+	if (is_lmask_op && !target_lay) {
+		siril_log_color_message(_("Layer mask: target layer (id %d) not found.\n"),
+		                        "red", args->target_layer_id);
+		args->retval = 1;
+		goto the_end;
+	}
+	if (is_lmask_op && target_lay->fit &&
+	    ((guint)target_lay->fit->rx != (guint)args->fit->rx ||
+	     (guint)target_lay->fit->ry != (guint)args->fit->ry)) {
+		siril_log_color_message(
+		    _("Layer mask: target layer dimensions (%dx%d) do not match "
+		      "the canvas (%dx%d). Cannot create layer mask.\n"), "red",
+		    target_lay->fit->rx, target_lay->fit->ry,
+		    args->fit->rx, args->fit->ry);
+		args->retval = 1;
+		goto the_end;
+	}
+
+	/* For modification ops targeting a layer mask: temporarily install the
+	 * layer's lmask data as args->fit->mask so existing hooks work unchanged.
+	 * Ownership of the data is transferred to the temp wrapper; the original
+	 * lmask->data pointer is NULLed to prevent double-free if the hook
+	 * reallocates (e.g. mask_change_bitpix). */
+	mask_t *orig_fit_mask = NULL;
+	mask_t *temp_mask_wrap = NULL;
+	if (is_lmask_op && !args->mask_creation) {
+		orig_fit_mask = args->fit->mask;
+		if (target_lay->lmask && target_lay->lmask->data) {
+			/* Save undo state while lmask->data is still intact, before
+			 * ownership is transferred to the temp wrapper. */
+			if (args->fit == gfit && !args->command)
+				undo_save_flis_lmask(target_lay, args->description);
+
+			temp_mask_wrap = calloc(1, sizeof(mask_t));
+			if (!temp_mask_wrap) { PRINT_ALLOC_ERR; args->retval = 1; goto the_end; }
+			temp_mask_wrap->bitpix   = target_lay->lmask->bitpix;
+			temp_mask_wrap->data     = target_lay->lmask->data;
+			target_lay->lmask->data  = NULL; /* ownership transferred */
+			args->fit->mask = temp_mask_wrap;
+		} else {
+			/* No existing layer mask to operate on */
+			siril_log_color_message(
+			    _("Layer mask: no existing layer mask to modify on this layer.\n"), "red");
 			args->retval = 1;
 			goto the_end;
 		}
 	}
 
+	// Memory check
+	if (args->mem_ratio > 0.0f) {
+		if (default_mask_mem_hook(args)) {
+			args->retval = 1;
+			goto the_end_lmask_restore;
+		}
+	}
+
 	// Output print of operation description
 	if (args->description && verbose) {
-		gchar *desc = g_strdup_printf(_("%s: processing mask...\n"), args->description);
+		gchar *desc = g_strdup_printf(
+		    is_lmask_op ? _("%s: processing layer mask...\n")
+		               : _("%s: processing mask...\n"),
+		    args->description);
 		siril_log_color_message(desc, "green");
 		g_free(desc);
 	}
 
 	set_progress_bar_data(_("Processing mask..."), 0.1f);
 
+	/* Save undo state: creation ops (lmask_op or not) and non-lmask ops.
+	 * Modification lmask ops are handled above before temp_mask_wrap is set up. */
 	g_rw_lock_writer_lock(&args->fit->rwlock);
 	rwlocked = TRUE;
 	if (args->fit == gfit && !args->command) {
-		gchar *undo_msg = args->log_hook ? args->log_hook(args->user, SUMMARY) : g_strdup(args->description);
-		undo_save_state(gfit, undo_msg);
-		g_free(undo_msg);
+		if (is_lmask_op && args->mask_creation) {
+			undo_save_flis_lmask(target_lay, args->description);
+		} else if (!is_lmask_op) {
+			gchar *undo_msg = args->log_hook
+			    ? args->log_hook(args->user, SUMMARY) : g_strdup(args->description);
+			undo_save_state(gfit, undo_msg);
+			g_free(undo_msg);
+		}
 	}
+
 	// Call the mask processing hook
 	if (args->mask_hook(args)) {
 		siril_log_color_message(_("%s mask processing failed.\n"), "red", args->description);
@@ -1747,6 +2400,49 @@ gpointer generic_mask_worker(gpointer p) {
 		}
 	}
 
+	/* Post-hook: transfer result to target layer's lmask */
+	if (is_lmask_op && !args->retval && args->fit->mask && args->fit->mask->data) {
+		/* Layer masks are always 8-bit uint8; convert if the hook produced
+		 * a different bit depth (e.g. a 32-bit creation hook). */
+		if (args->fit->mask->bitpix != 8)
+			mask_change_bitpix(args->fit, 8);
+
+		layermask_t *lm = calloc(1, sizeof(layermask_t));
+		if (lm) {
+			lm->w      = (size_t)target_lay->fit->rx;
+			lm->h      = (size_t)target_lay->fit->ry;
+			lm->bitpix = 8;
+			lm->data   = args->fit->mask->data;
+			args->fit->mask->data = NULL; /* ownership transferred to lm */
+
+			/* For creation ops there is no restore block, so free the
+			 * mask_t shell here.  For modification ops, temp_mask_wrap
+			 * IS args->fit->mask and the restore block frees it. */
+			if (args->mask_creation) {
+				free(args->fit->mask);
+				args->fit->mask = NULL;
+			}
+
+			layermask_free(target_lay->lmask);
+			target_lay->lmask        = lm;
+			target_lay->lmask_active = TRUE;
+			flis_layer_touch_modified(target_lay);
+		} else {
+			PRINT_ALLOC_ERR;
+			args->retval = 1;
+		}
+	}
+
+the_end_lmask_restore:
+	/* Restore the processing mask for modification ops (creation ops leave
+	 * args->fit->mask NULL which is correct — no processing mask was changed). */
+	if (temp_mask_wrap) {
+		/* data was moved into new layermask_t (or freed on failure); just
+		 * free the wrapper shell and restore the original mask pointer. */
+		free(temp_mask_wrap);
+		args->fit->mask = orig_fit_mask;
+	}
+
 the_end:
 	if (args->retval) {
 		set_progress_bar_data(_("Mask processing failed. Check the log."), PROGRESS_RESET);
@@ -1756,7 +2452,8 @@ the_end:
 
 	int retval = args->retval;
 
-	if (args->mask_creation) {
+	if (args->mask_creation && !is_lmask_op) {
+		/* Only activate the processing mask for non-layer-mask creation ops */
 		set_mask_active(args->fit, TRUE);
 	}
 	if (rwlocked)
@@ -1777,5 +2474,137 @@ the_end:
 		siril_add_idle(end_generic_mask, args);
 	}
 
+	return GINT_TO_POINTER(retval);
+}
+
+/* =========================================================================
+ * generic_layer_worker
+ *
+ * A processing-thread worker for FLIS layer operations: property changes
+ * (blend mode, opacity, visibility, name, tint), layer mask (lmask) add /
+ * remove / move, and layer reorder.  Follows the same pattern as
+ * generic_image_worker and generic_mask_worker.
+ *
+ * Responsibilities:
+ *   - Run layer_hook(args) on the processing thread (fast; no heavy I/O)
+ *   - On success: invalidate the FLIS composite, update the layers panel,
+ *     refresh the mask tab, and request a redraw — all via GTK-safe idles
+ *   - Honour the command / idle_function override paths for script use
+ *
+ * Undo handling:
+ *   Undo state is saved by the caller (flis_gui.c) BEFORE calling
+ *   start_in_new_thread(generic_layer_worker, args), exactly as the GUI
+ *   callbacks currently call undo_save_flis_layer_props() etc. before
+ *   performing the operation.  The worker itself does NOT save undo state.
+ *
+ * Lock / unlock layer:
+ *   These do not trigger a composite rebuild or redraw, so they do not
+ *   need to go through this worker.  The flis_gui.c callbacks may call
+ *   flis_layer_set_locked() directly on the GTK main thread.
+ * ========================================================================= */
+
+/** Free generic_layer_args structure */
+void free_generic_layer_args(struct generic_layer_args *args) {
+	if (!args)
+		return;
+	if (args->user)
+		destroy_any_args(args->user);
+	free(args);
+}
+
+/* Default end-idle for layer operations: invalidates the composite,
+ * updates the layers panel, refreshes the mask tab if the lmask changed,
+ * and requests a full redraw. */
+static gboolean end_generic_layer(gpointer p) {
+	struct generic_layer_args *args = (struct generic_layer_args *)p;
+	stop_processing_thread();
+
+	if (!args->retval && is_current_image_flis()) {
+		flis_invalidate_composite();
+
+		/* Refresh mask tab visibility: show_or_hide_mask_tab() checks
+		 * gfit->mask which reflects the active layer after uniq_set_active_layer.
+		 * Call it whenever an lmask may have changed. */
+		if (args->updates_lmask)
+			show_or_hide_mask_tab();
+
+		flis_gui_update();
+
+		/* Rebuild the composite and remap the Cairo buffers so that the
+		 * subsequent queue_redraw() paints from up-to-date data.
+		 * notify_gfit_data_modified() is called here on the GTK main
+		 * thread (idle callback), so cairo_surface_destroy() inside
+		 * invalidate_image_render_cache() runs safely on the main thread. */
+		notify_gfit_data_modified();
+
+		if (args->updates_lmask) {
+			/* Always redraw the mask viewport when the layer mask changes.
+			 * queue_redraw_mask() also triggers REMAP_ALL internally when
+			 * mask tints are enabled; call it unconditionally here and add
+			 * a separate REMAP_ALL only when tinting is off (composite may
+			 * be affected by the lmask change). */
+			queue_redraw_mask();
+			if (!com.pref.gui.mask_tints_vports)
+				queue_redraw(REMAP_ALL);
+		} else {
+			queue_redraw(REMAP_ALL);
+		}
+	}
+
+	free_generic_layer_args(args);
+	return FALSE;
+}
+
+gpointer generic_layer_worker(gpointer p) {
+	struct generic_layer_args *args = (struct generic_layer_args *)p;
+	struct timeval t_start, t_end;
+
+	assert(args);
+	assert(args->layer_hook);
+
+	gboolean verbose = args->verbose;
+	gchar *desc = g_strdup(args->description);
+
+	set_progress_bar_data(NULL, PROGRESS_RESET);
+	gettimeofday(&t_start, NULL);
+	args->retval = 0;
+
+	if (args->description && verbose) {
+		gchar *msg = g_strdup_printf(_("%s: processing layer...\n"), args->description);
+		siril_log_color_message(msg, "green");
+		g_free(msg);
+	}
+
+	set_progress_bar_data(_("Processing layer..."), 0.1f);
+
+	if (args->layer_hook(args)) {
+		siril_log_color_message(_("%s layer processing failed.\n"), "red", args->description);
+		args->retval = 1;
+	} else {
+		args->retval = 0;
+		if (args->description && verbose) {
+			siril_log_color_message(_("%s succeeded.\n"), "green", args->description);
+			gettimeofday(&t_end, NULL);
+			show_time(t_start, t_end);
+		}
+	}
+
+	int retval = args->retval;
+
+	if (retval) {
+		set_progress_bar_data(_("Layer processing failed. Check the log."), PROGRESS_RESET);
+	} else {
+		set_progress_bar_data(_("Layer processing succeeded."), PROGRESS_DONE);
+	}
+
+	if (args->command) {
+		execute_idle_and_wait_for_it(end_generic_layer, args);
+	} else if (args->idle_function) {
+		siril_add_idle(args->idle_function, args);
+	} else {
+		siril_add_idle(end_generic_layer, args);
+	}
+
+	g_free(desc);
 	return GINT_TO_POINTER(retval);
 }

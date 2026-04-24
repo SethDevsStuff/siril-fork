@@ -36,6 +36,7 @@
 #include "gui/cut.h"
 #include "gui/callbacks.h"
 #include "gui/dialogs.h"
+#include "gui/flis_gui.h"
 #include "gui/icc_profile.h"
 #include "gui/message_dialog.h"
 #include "gui/plot.h"
@@ -45,6 +46,7 @@
 #include "gui/siril_preview.h"
 #include "io/conversion.h"
 #include "io/sequence.h"
+#include "io/image_format_flis.h"
 #include "io/image_format_fits.h"
 #include "io/single_image.h"
 #include "gui/PSF_list.h"
@@ -142,6 +144,7 @@ static gboolean free_image_data_gui(gpointer p) {
 	}
 	clear_previews();
 	free_reference_image();
+	flis_gui_update();
 	siril_debug_print("free_image_data_gui() complete\n");
 	return FALSE;
 }
@@ -160,6 +163,16 @@ void free_image_data() {
 	invalidate_gfit_histogram();
 
 	if (com.uniq) {
+		if (is_current_image_flis()) {
+			flis_composite_free();
+			/* gfit points at the active layer's fits* (set by
+			 * uniq_set_active_layer).  NULL it out before flis_layer_free()
+			 * runs so that clearfits(gfit) below remains the sole owner. */
+			flis_layer_t *active = flis_active_layer();
+			if (active && active->fit == gfit)
+				active->fit = NULL;
+			flis_free_layers(com.uniq);
+		}
 		free(com.uniq->filename);
 		com.uniq->fileexist = FALSE;
 		free(com.uniq->comment);
@@ -264,7 +277,7 @@ int create_uniq_from_gfit(char *filename, gboolean exists) {
 	}
 	com.uniq->filename = filename;
 	com.uniq->fileexist = exists;
-	com.uniq->nb_layers = gfit->naxes[2];
+	com.uniq->chans = gfit->naxes[2];
 	com.uniq->fit = gfit;
 	return 0;
 }
@@ -305,9 +318,19 @@ int open_single_image(const char* filename) {
 	if (!is_single_sequence) {
 		siril_debug_print("Loading image OK, now displaying\n");
 
-		/* Now initializing com struct */
+		/* Now initializing com struct.
+		 * For a FLIS file, load_flis() has already allocated com.uniq and
+		 * populated com.uniq->layers; create_uniq_from_gfit() must not be
+		 * called or it will overwrite com.uniq and leak the layer stack. */
 		com.seq.current = UNRELATED_IMAGE;
-		create_uniq_from_gfit(realname, get_type_from_filename(realname) == TYPEFITS);
+		if (!is_current_image_flis()) {
+			create_uniq_from_gfit(realname, get_type_from_filename(realname) == TYPEFITS);
+		} else {
+			g_free(com.uniq->filename);
+			com.uniq->filename = realname;
+			com.uniq->fileexist = TRUE;
+			realname = NULL; /* ownership transferred */
+		}
 		if (!com.headless)
 			execute_idle_and_wait_for_it(end_open_single_image, NULL);
 	} else {
@@ -317,6 +340,7 @@ int open_single_image(const char* filename) {
 	check_gfit_profile_identical_to_monitor();
 	return retval;
 }
+
 
 /* updates the GUI to reflect the opening of a single image, found in gfit and com.uniq */
 gboolean open_single_image_from_gfit(gpointer user_data) {
@@ -344,11 +368,43 @@ gboolean open_single_image_from_gfit(gpointer user_data) {
 	/* update menus */
 	update_MenuItem(NULL);
 
+	/* For a FLIS image, com.uniq->chans reflects the active layer's channel
+	 * count, which is 1 for mono even when tinted layers make the composite
+	 * RGB.  close_tab() reads chans to decide which viewport tabs to show,
+	 * so update it to reflect the composite output before calling it. */
+	if (is_current_image_flis() && com.uniq) {
+		gboolean composite_rgb = FALSE;
+		for (GSList *l = com.uniq->layers; l && !composite_rgb; l = l->next) {
+			flis_layer_t *lay = (flis_layer_t *)l->data;
+			if (!lay || !lay->fit) continue;
+			if (lay->fit->naxes[2] >= 3) composite_rgb = TRUE;
+			if (lay->has_tint)           composite_rgb = TRUE;
+		}
+		com.uniq->chans = composite_rgb ? 3 : 1;
+	}
+
 	close_tab(NULL);
 	init_right_tab(NULL);
 
+	/* For a FLIS image whose composite is RGB (tinted mono or actual RGB
+	 * layers), activate the RGB viewport so the user sees the colour output
+	 * immediately rather than the first mono channel tab. */
+	if (is_current_image_flis() && com.uniq && com.uniq->chans >= 3)
+		activate_tab(RGB_VPORT);
+
+	/* Build the FLIS composite before remapping so remap_all_vports() uses
+	 * the composited image (not just the active layer) and remaprgb() is
+	 * called for RGB composites, giving the RGB vport a valid buffer. */
+	if (is_current_image_flis())
+		flis_composite_build();
 	remap_all();
 	update_gfit_histogram_if_needed();
+	flis_gui_update();
+
+	/* Auto-open the layers panel when a FLIS file is loaded. */
+	if (is_current_image_flis() && !com.headless)
+		siril_open_dialog("flis_layers_window");
+
 	redraw(REMAP_ALL);
 	return FALSE;
 }
@@ -367,9 +423,23 @@ gboolean update_single_image_from_gfit(gpointer user_data) {
 
 	set_precision_switch(NULL); // set precision on screen
 
+	/* Same composite colour model check as open_single_image_from_gfit */
+	if (is_current_image_flis() && com.uniq) {
+		gboolean composite_rgb = FALSE;
+		for (GSList *l = com.uniq->layers; l && !composite_rgb; l = l->next) {
+			flis_layer_t *lay = (flis_layer_t *)l->data;
+			if (!lay || !lay->fit) continue;
+			if (lay->fit->naxes[2] >= 3) composite_rgb = TRUE;
+			if (lay->has_tint)           composite_rgb = TRUE;
+		}
+		com.uniq->chans = composite_rgb ? 3 : 1;
+	}
+
 	close_tab(NULL);
 	init_right_tab(NULL);
 
+	if (is_current_image_flis())
+		flis_composite_build();
 	remap_all();
 	update_gfit_histogram_if_needed();
 	g_rw_lock_reader_unlock(&gfit->rwlock);
@@ -428,7 +498,7 @@ void init_layers_hi_and_lo_values(sliders_mode force_minmax) {
 }
 
 int single_image_is_loaded() {
-	return (com.uniq != NULL && com.uniq->nb_layers > 0);
+	return (com.uniq != NULL && com.uniq->chans > 0);
 }
 
 /**************** updating the single image *******************/
@@ -522,11 +592,20 @@ void notify_gfit_data_modified() {
 			copy_roi_into_gfit();
 		compute_histo_for_fit(gfit); // reads gfit pixel data; GTK toggle update deferred to idle
 		g_mutex_unlock(&com.histogram_mutex);
+		/* For FLIS, ensure the composite is current before remap_all() fills
+		 * the Cairo buffers.  This must happen after histogram computation
+		 * (which uses the active layer) and before the remap (which must see
+		 * the up-to-date composite). */
+		if (is_current_image_flis())
+			flis_composite_build();
 		remap_all(); // Updates the Cairo image buffers based on applying the remap LUT to gfit
 		/* gui.hi / gui.lo are read on the GTK main thread (set_cutoff_sliders_values);
-		 * protect the write with com.mutex to prevent a data race. */
+		 * protect the write with com.mutex to prevent a data race.
+		 * For FLIS, flis_init_display_levels() calibrates from the composite
+		 * (RGB) so the stretch sliders reflect the displayed image, not the
+		 * mono active layer. */
 		g_mutex_lock(&com.mutex);
-		init_layers_hi_and_lo_values(gui.sliders);
+		flis_init_display_levels(gui.sliders);
 		g_mutex_unlock(&com.mutex);
 	}
 }
@@ -560,4 +639,3 @@ gboolean enforce_area_in_fits(fits *fit, rectangle *area) {
         }
         return has_crossed;
 }
-

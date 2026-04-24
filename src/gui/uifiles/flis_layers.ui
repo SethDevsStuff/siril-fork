@@ -1,0 +1,638 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- FLIS Layers panel - GTK3 UI definition.
+     Add to the Siril GResource bundle (siril.gresource.xml) so it is
+     processed at startup alongside all other UI files. -->
+<interface>
+  <requires lib="gtk+" version="3.20"/>
+
+  <!-- Shared opacity adjustment: 0-100 (percentage), shared by scale and spin -->
+  <object class="GtkAdjustment" id="flis_opacity_adj">
+    <property name="lower">0</property>
+    <property name="upper">100</property>
+    <property name="value">100</property>
+    <property name="step-increment">1</property>
+    <property name="page-increment">10</property>
+  </object>
+
+  <!-- FLIS Layers dialog.
+       modal=False: the user can still interact with the main image window.
+       keep-above=True: the panel floats above the main application window.
+       The transient-for parent is set in code (flis_gui_open) so the
+       window manager knows which application window it belongs to. -->
+  <object class="GtkDialog" id="flis_layers_window">
+    <property name="title" translatable="yes">Layers</property>
+    <property name="default-width">270</property>
+    <property name="default-height">-1</property>
+    <property name="resizable">True</property>
+    <property name="modal">False</property>
+    <property name="skip-taskbar-hint">True</property>
+    <property name="type-hint">dialog</property>
+    <property name="use-header-bar">0</property>
+    <signal name="delete-event" handler="on_flis_layers_window_delete_event"/>
+    <signal name="show" handler="on_flis_layers_window_show"/>
+    <child internal-child="vbox">
+      <object class="GtkBox" id="flis_dialog_vbox">
+        <property name="visible">True</property>
+        <property name="orientation">vertical</property>
+        <property name="spacing">0</property>
+
+        <!-- Empty action area: no OK/Cancel buttons needed -->
+        <child internal-child="action_area">
+          <object class="GtkButtonBox" id="flis_dialog_action_area">
+            <property name="visible">True</property>
+            <property name="layout-style">end</property>
+          </object>
+          <packing>
+            <property name="expand">False</property>
+            <property name="fill">True</property>
+            <property name="pack-type">end</property>
+          </packing>
+        </child>
+
+        <!-- Main content -->
+        <child>
+          <object class="GtkBox" id="flis_main_box">
+            <property name="visible">True</property>
+            <property name="orientation">vertical</property>
+            <property name="spacing">0</property>
+
+            <!-- Header bar -->
+            <child>
+              <object class="GtkBox">
+                <property name="visible">True</property>
+                <property name="orientation">horizontal</property>
+                <property name="spacing">6</property>
+                <property name="margin-start">8</property>
+                <property name="margin-end">8</property>
+                <property name="margin-top">4</property>
+                <property name="margin-bottom">4</property>
+                <child>
+                  <object class="GtkLabel">
+                    <property name="visible">True</property>
+                    <property name="label" translatable="yes">&lt;b&gt;Layers&lt;/b&gt;</property>
+                    <property name="use-markup">True</property>
+                    <property name="xalign">0</property>
+                    <property name="hexpand">True</property>
+                  </object>
+                </child>
+                <child>
+                  <object class="GtkLabel" id="flis_mode_label">
+                    <property name="visible">True</property>
+                    <property name="label">FITS</property>
+                    <property name="xalign">1</property>
+                    <property name="width-chars">4</property>
+                    <style><class name="dim-label"/></style>
+                  </object>
+                </child>
+              </object>
+              <packing><property name="expand">False</property></packing>
+            </child>
+
+            <child>
+              <object class="GtkSeparator">
+                <property name="visible">True</property>
+                <property name="orientation">horizontal</property>
+              </object>
+              <packing><property name="expand">False</property></packing>
+            </child>
+
+            <!-- Layer list -->
+            <child>
+              <object class="GtkScrolledWindow" id="flis_list_scroll">
+                <property name="visible">True</property>
+                <property name="min-content-height">100</property>
+                <property name="hscrollbar-policy">never</property>
+                <property name="vscrollbar-policy">automatic</property>
+                <property name="shadow-type">in</property>
+                <property name="vexpand">True</property>
+                <child>
+                  <object class="GtkListBox" id="flis_layer_list">
+                    <property name="visible">True</property>
+                    <property name="selection-mode">single</property>
+                    <property name="activate-on-single-click">True</property>
+                    <signal name="row-selected" handler="on_flis_layer_row_selected"/>
+                  </object>
+                </child>
+              </object>
+              <packing>
+                <property name="expand">True</property>
+                <property name="fill">True</property>
+              </packing>
+            </child>
+
+            <!-- Toolbar -->
+            <child>
+              <object class="GtkBox" id="flis_toolbar">
+                <property name="visible">True</property>
+                <property name="orientation">horizontal</property>
+                <property name="spacing">2</property>
+                <property name="homogeneous">False</property>
+                <property name="margin-start">4</property>
+                <property name="margin-end">4</property>
+                <property name="margin-top">3</property>
+                <property name="margin-bottom">3</property>
+                <child>
+                  <object class="GtkButton" id="flis_add_btn">
+                    <property name="visible">True</property>
+                    <property name="tooltip-text" translatable="yes">Add layer from FITS file (converts to FLIS if needed)</property>
+                    <property name="relief">none</property>
+                    <child>
+                      <object class="GtkImage">
+                        <property name="visible">True</property>
+                        <property name="icon-name">list-add-symbolic</property>
+                        <property name="icon-size">1</property>
+                      </object>
+                    </child>
+                    <signal name="clicked" handler="on_flis_add_layer_clicked"/>
+                  </object>
+                </child>
+                <child>
+                  <object class="GtkButton" id="flis_remove_btn">
+                    <property name="visible">True</property>
+                    <property name="tooltip-text" translatable="yes">Remove selected layer</property>
+                    <property name="relief">none</property>
+                    <property name="sensitive">False</property>
+                    <child>
+                      <object class="GtkImage">
+                        <property name="visible">True</property>
+                        <property name="icon-name">list-remove-symbolic</property>
+                        <property name="icon-size">1</property>
+                      </object>
+                    </child>
+                    <signal name="clicked" handler="on_flis_remove_layer_clicked"/>
+                  </object>
+                </child>
+                <child>
+                  <object class="GtkButton" id="flis_duplicate_btn">
+                    <property name="visible">True</property>
+                    <property name="tooltip-text" translatable="yes">Duplicate selected layer</property>
+                    <property name="relief">none</property>
+                    <property name="sensitive">False</property>
+                    <child>
+                      <object class="GtkImage">
+                        <property name="visible">True</property>
+                        <property name="icon-name">edit-copy-symbolic</property>
+                        <property name="icon-size">1</property>
+                      </object>
+                    </child>
+                    <signal name="clicked" handler="on_flis_duplicate_layer_clicked"/>
+                  </object>
+                </child>
+                <child>
+                  <object class="GtkButton" id="flis_group_btn">
+                    <property name="visible">True</property>
+                    <property name="tooltip-text" translatable="yes">Create a new layer group</property>
+                    <property name="relief">none</property>
+                    <property name="sensitive">False</property>
+                    <child>
+                      <object class="GtkImage">
+                        <property name="visible">True</property>
+                        <property name="icon-name">folder-new-symbolic</property>
+                        <property name="icon-size">1</property>
+                      </object>
+                    </child>
+                    <signal name="clicked" handler="on_flis_new_group_clicked"/>
+                  </object>
+                </child>
+                <child>
+                  <object class="GtkToggleButton" id="flis_drag_toggle_btn">
+                    <property name="visible">True</property>
+                    <property name="label">✥</property>
+                    <property name="tooltip-text" translatable="yes">Move layer by dragging in the image</property>
+                    <property name="relief">none</property>
+                    <property name="sensitive">False</property>
+                    <signal name="toggled" handler="on_flis_move_layer_toggled"/>
+                  </object>
+                </child>
+                <child>
+                  <object class="GtkLabel">
+                    <property name="visible">True</property>
+                    <property name="hexpand">True</property>
+                  </object>
+                </child>
+                <child>
+                  <object class="GtkButton" id="flis_move_up_btn">
+                    <property name="visible">True</property>
+                    <property name="tooltip-text" translatable="yes">Move layer up (renders on top of more layers)</property>
+                    <property name="relief">none</property>
+                    <property name="sensitive">False</property>
+                    <child>
+                      <object class="GtkImage">
+                        <property name="visible">True</property>
+                        <property name="icon-name">go-up-symbolic</property>
+                        <property name="icon-size">1</property>
+                      </object>
+                    </child>
+                    <signal name="clicked" handler="on_flis_move_up_clicked"/>
+                  </object>
+                </child>
+                <child>
+                  <object class="GtkButton" id="flis_move_down_btn">
+                    <property name="visible">True</property>
+                    <property name="tooltip-text" translatable="yes">Move layer down</property>
+                    <property name="relief">none</property>
+                    <property name="sensitive">False</property>
+                    <child>
+                      <object class="GtkImage">
+                        <property name="visible">True</property>
+                        <property name="icon-name">go-down-symbolic</property>
+                        <property name="icon-size">1</property>
+                      </object>
+                    </child>
+                    <signal name="clicked" handler="on_flis_move_down_clicked"/>
+                  </object>
+                </child>
+                <child>
+                  <object class="GtkMenuButton" id="flis_layer_menu_btn">
+                    <property name="visible">True</property>
+                    <property name="tooltip-text" translatable="yes">Layer actions</property>
+                    <property name="relief">none</property>
+                    <property name="sensitive">False</property>
+                    <property name="popup">flis_layer_context_menu</property>
+                    <child>
+                      <object class="GtkImage">
+                        <property name="visible">True</property>
+                        <property name="icon-name">open-menu-symbolic</property>
+                        <property name="icon-size">1</property>
+                      </object>
+                    </child>
+                  </object>
+                </child>
+              </object>
+              <packing><property name="expand">False</property></packing>
+            </child>
+
+            <child>
+              <object class="GtkSeparator">
+                <property name="visible">True</property>
+                <property name="orientation">horizontal</property>
+              </object>
+              <packing><property name="expand">False</property></packing>
+            </child>
+
+            <!-- Properties panel -->
+            <child>
+              <object class="GtkBox" id="flis_props_box">
+                <property name="visible">True</property>
+                <property name="orientation">vertical</property>
+                <property name="spacing">5</property>
+                <property name="margin-start">8</property>
+                <property name="margin-end">8</property>
+                <property name="margin-top">6</property>
+                <property name="margin-bottom">6</property>
+                <property name="sensitive">False</property>
+
+                <!-- Name row -->
+                <child>
+                  <object class="GtkBox">
+                    <property name="visible">True</property>
+                    <property name="orientation">horizontal</property>
+                    <property name="spacing">6</property>
+                    <child>
+                      <object class="GtkLabel">
+                        <property name="visible">True</property>
+                        <property name="label" translatable="yes">Name</property>
+                        <property name="xalign">0</property>
+                        <property name="width-chars">8</property>
+                      </object>
+                    </child>
+                    <child>
+                      <object class="GtkEntry" id="flis_name_entry">
+                        <property name="visible">True</property>
+                        <property name="hexpand">True</property>
+                        <property name="max-length">32</property>
+                        <property name="tooltip-text" translatable="yes">Layer name (press Enter to apply)</property>
+                        <signal name="activate"        handler="on_flis_name_activate"/>
+                        <signal name="focus-out-event" handler="on_flis_name_focus_out"/>
+                      </object>
+                    </child>
+                  </object>
+                  <packing><property name="expand">False</property></packing>
+                </child>
+
+                <!-- Blend mode row -->
+                <child>
+                  <object class="GtkBox">
+                    <property name="visible">True</property>
+                    <property name="orientation">horizontal</property>
+                    <property name="spacing">6</property>
+                    <child>
+                      <object class="GtkLabel">
+                        <property name="visible">True</property>
+                        <property name="label" translatable="yes">Blend</property>
+                        <property name="xalign">0</property>
+                        <property name="width-chars">8</property>
+                      </object>
+                    </child>
+                    <child>
+                      <object class="GtkComboBoxText" id="flis_blend_combo">
+                        <property name="visible">True</property>
+                        <property name="hexpand">True</property>
+                        <property name="tooltip-text" translatable="yes">Blending mode. For tinted mono narrowband layers over a broadband base, Screen is recommended (adds emission without clipping). Normal with reduced opacity also works well for controlled mixing. For LRGB composition, place the colour layer over the luminance layer and use LRGB Color mode.</property>
+                        <items>
+                          <item translatable="yes">Normal</item>
+                          <item translatable="yes">Multiply</item>
+                          <item translatable="yes">Screen</item>
+                          <item translatable="yes">Overlay</item>
+                          <item translatable="yes">Soft Light</item>
+                          <item translatable="yes">Hard Light</item>
+                          <item translatable="yes">Color Dodge</item>
+                          <item translatable="yes">Color Burn</item>
+                          <item translatable="yes">Darken</item>
+                          <item translatable="yes">Lighten</item>
+                          <item translatable="yes">Difference</item>
+                          <item translatable="yes">Exclusion</item>
+                          <item translatable="yes">Hue</item>
+                          <item translatable="yes">Saturation</item>
+                          <item translatable="yes">Color</item>
+                          <item translatable="yes">Luminosity</item>
+                          <item translatable="yes">LRGB Color</item>
+                          <item translatable="yes">Pass-through</item>
+                        </items>
+                        <signal name="changed" handler="on_flis_blend_mode_changed"/>
+                      </object>
+                    </child>
+                  </object>
+                  <packing><property name="expand">False</property></packing>
+                </child>
+
+                <!-- Opacity row -->
+                <child>
+                  <object class="GtkBox">
+                    <property name="visible">True</property>
+                    <property name="orientation">horizontal</property>
+                    <property name="spacing">6</property>
+                    <child>
+                      <object class="GtkLabel">
+                        <property name="visible">True</property>
+                        <property name="label" translatable="yes">Opacity</property>
+                        <property name="xalign">0</property>
+                        <property name="width-chars">8</property>
+                      </object>
+                    </child>
+                    <child>
+                      <object class="GtkScale" id="flis_opacity_scale">
+                        <property name="visible">True</property>
+                        <property name="adjustment">flis_opacity_adj</property>
+                        <property name="hexpand">True</property>
+                        <property name="draw-value">False</property>
+                        <property name="round-digits">0</property>
+                      </object>
+                    </child>
+                    <child>
+                      <object class="GtkSpinButton" id="flis_opacity_spin">
+                        <property name="visible">True</property>
+                        <property name="adjustment">flis_opacity_adj</property>
+                        <property name="digits">0</property>
+                        <property name="width-chars">4</property>
+                        <property name="numeric">True</property>
+                        <property name="tooltip-text" translatable="yes">Opacity %</property>
+                      </object>
+                    </child>
+                  </object>
+                  <packing><property name="expand">False</property></packing>
+                </child>
+
+                <!-- Tint section — always visible; insensitive for RGB layers -->
+                <child>
+                  <object class="GtkFrame" id="flis_tint_frame">
+                    <property name="visible">True</property>
+                    <property name="label" translatable="yes">Tint (mono layer)</property>
+                    <property name="shadow-type">etched-in</property>
+                    <child>
+                      <object class="GtkBox">
+                        <property name="visible">True</property>
+                        <property name="orientation">horizontal</property>
+                        <property name="spacing">6</property>
+                        <property name="margin-start">4</property>
+                        <property name="margin-end">4</property>
+                        <property name="margin-top">4</property>
+                        <property name="margin-bottom">4</property>
+                        <child>
+                          <object class="GtkCheckButton" id="flis_tint_check">
+                            <property name="visible">True</property>
+                            <property name="label" translatable="yes">Enable</property>
+                            <property name="tooltip-text" translatable="yes">Apply a colour tint when compositing this mono layer into the RGB stack</property>
+                            <signal name="toggled" handler="on_flis_tint_toggled"/>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkColorButton" id="flis_tint_color_btn">
+                            <property name="visible">True</property>
+                            <property name="use-alpha">False</property>
+                            <property name="sensitive">False</property>
+                            <property name="tooltip-text" translatable="yes">Tint colour (e.g. red for Ha, blue-green for Oiii)</property>
+                            <signal name="color-set" handler="on_flis_tint_color_set"/>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkLabel" id="flis_tint_hint_label">
+                            <property name="visible">True</property>
+                            <property name="label" translatable="yes">e.g. red for Ha</property>
+                            <property name="hexpand">True</property>
+                            <property name="xalign">0</property>
+                            <style><class name="dim-label"/></style>
+                          </object>
+                        </child>
+                      </object>
+                    </child>
+                  </object>
+                  <packing><property name="expand">False</property></packing>
+                </child>
+
+                <!-- Layer mask section -->
+                <child>
+                  <object class="GtkFrame">
+                    <property name="visible">True</property>
+                    <property name="label" translatable="yes">Layer Mask</property>
+                    <property name="shadow-type">etched-in</property>
+                    <child>
+                      <object class="GtkBox">
+                        <property name="visible">True</property>
+                        <property name="orientation">vertical</property>
+                        <property name="spacing">0</property>
+                        <!-- Row 1: status label + add/remove + move buttons -->
+                        <child>
+                          <object class="GtkBox">
+                            <property name="visible">True</property>
+                            <property name="orientation">horizontal</property>
+                            <property name="spacing">4</property>
+                            <property name="margin-start">4</property>
+                            <property name="margin-end">4</property>
+                            <property name="margin-top">4</property>
+                            <property name="margin-bottom">4</property>
+                            <child>
+                              <object class="GtkButton" id="flis_mask_status_btn">
+                                <property name="visible">True</property>
+                                <property name="label" translatable="yes">None</property>
+                                <property name="relief">none</property>
+                                <property name="hexpand">True</property>
+                                <property name="xalign">0</property>
+                                <property name="sensitive">False</property>
+                                <property name="tooltip-text" translatable="yes">Click to toggle layer mask active/inactive</property>
+                                <signal name="clicked" handler="on_flis_lmask_active_toggle_clicked"/>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="GtkButton" id="flis_mask_toggle_btn">
+                                <property name="visible">True</property>
+                                <property name="label" translatable="yes">Add...</property>
+                                <property name="tooltip-text" translatable="yes">Add layer mask from file, or remove existing mask</property>
+                                <signal name="clicked" handler="on_flis_mask_toggle_clicked"/>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="GtkButton" id="flis_mask_move_btn">
+                                <property name="visible">True</property>
+                                <property name="label" translatable="yes">Move...</property>
+                                <property name="sensitive">False</property>
+                                <property name="tooltip-text" translatable="yes">Move this layer mask to another compatible layer</property>
+                                <signal name="clicked" handler="on_flis_mask_move_clicked"/>
+                              </object>
+                            </child>
+                          </object>
+                        </child>
+                        <!-- Row 2: view toggle — only shown when both mask types present -->
+                        <child>
+                          <object class="GtkBox" id="flis_mask_view_row">
+                            <property name="visible">False</property>
+                            <property name="orientation">horizontal</property>
+                            <property name="spacing">4</property>
+                            <property name="margin-start">4</property>
+                            <property name="margin-end">4</property>
+                            <property name="margin-bottom">4</property>
+                            <child>
+                              <object class="GtkLabel">
+                                <property name="visible">True</property>
+                                <property name="label" translatable="yes">View:</property>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="GtkRadioButton" id="flis_mask_view_proc_radio">
+                                <property name="visible">True</property>
+                                <property name="label" translatable="yes">Processing</property>
+                                <property name="active">True</property>
+                                <property name="draw-indicator">True</property>
+                                <property name="tooltip-text" translatable="yes">Show the processing mask in the mask tab and as tint overlay</property>
+                                <signal name="toggled" handler="on_flis_mask_view_toggled"/>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="GtkRadioButton" id="flis_mask_view_layer_radio">
+                                <property name="visible">True</property>
+                                <property name="label" translatable="yes">Layer</property>
+                                <property name="draw-indicator">True</property>
+                                <property name="group">flis_mask_view_proc_radio</property>
+                                <property name="tooltip-text" translatable="yes">Show the layer mask in the mask tab and as tint overlay</property>
+                                <signal name="toggled" handler="on_flis_mask_view_toggled"/>
+                              </object>
+                            </child>
+                          </object>
+                        </child>
+                      </object>
+                    </child>
+                  </object>
+                  <packing><property name="expand">False</property></packing>
+                </child>
+
+              </object><!-- flis_props_box -->
+              <packing><property name="expand">False</property></packing>
+            </child>
+
+          </object><!-- flis_main_box -->
+          <packing><property name="expand">True</property></packing>
+        </child>
+
+      </object><!-- flis_dialog_vbox -->
+    </child>
+  </object><!-- flis_layers_window -->
+
+  <!-- Context menu for right-click on a layer row or the toolbar ⋮ button -->
+  <object class="GtkMenu" id="flis_layer_context_menu">
+    <property name="visible">True</property>
+    <child>
+      <object class="GtkMenuItem" id="flis_export_layer_item">
+        <property name="visible">True</property>
+        <property name="label" translatable="yes">Export current layer as FITS…</property>
+        <signal name="activate" handler="on_flis_export_layer_activate"/>
+      </object>
+    </child>
+    <child>
+      <object class="GtkSeparatorMenuItem">
+        <property name="visible">True</property>
+      </object>
+    </child>
+    <child>
+      <object class="GtkMenuItem" id="flis_register_layers_item">
+        <property name="visible">True</property>
+        <property name="label" translatable="yes">Register layers…</property>
+        <signal name="activate" handler="on_flis_register_layers_activate"/>
+      </object>
+    </child>
+    <child>
+      <object class="GtkMenuItem" id="flis_background_neutralise_item">
+        <property name="visible">True</property>
+        <property name="label" translatable="yes">Layers match…</property>
+        <signal name="activate" handler="on_flis_background_neutralise_activate"/>
+      </object>
+    </child>
+    <child>
+      <object class="GtkSeparatorMenuItem">
+        <property name="visible">True</property>
+      </object>
+    </child>
+    <child>
+      <object class="GtkMenuItem" id="flis_assign_group_item">
+        <property name="visible">True</property>
+        <property name="label" translatable="yes">Move layer to group…</property>
+        <signal name="activate" handler="on_flis_assign_group_activate"/>
+      </object>
+    </child>
+    <child>
+      <object class="GtkSeparatorMenuItem">
+        <property name="visible">True</property>
+      </object>
+    </child>
+    <child>
+      <object class="GtkMenuItem" id="flis_expand_canvas_item">
+        <property name="visible">True</property>
+        <property name="label" translatable="yes">Expand Canvas to All Layers</property>
+        <signal name="activate" handler="on_flis_expand_canvas_activate"/>
+      </object>
+    </child>
+    <child>
+      <object class="GtkMenuItem" id="flis_clip_canvas_item">
+        <property name="visible">True</property>
+        <property name="label" translatable="yes">Clip Canvas to Current Layer</property>
+        <signal name="activate" handler="on_flis_clip_canvas_activate"/>
+      </object>
+    </child>
+    <child>
+      <object class="GtkMenuItem" id="flis_crop_to_selection_item">
+        <property name="visible">True</property>
+        <property name="label" translatable="yes">Crop All Layers to Selection</property>
+        <signal name="activate" handler="on_flis_crop_to_selection_activate"/>
+      </object>
+    </child>
+    <child>
+      <object class="GtkSeparatorMenuItem">
+        <property name="visible">True</property>
+      </object>
+    </child>
+    <child>
+      <object class="GtkMenuItem" id="flis_merge_down_item">
+        <property name="visible">True</property>
+        <property name="label" translatable="yes">Merge Down</property>
+        <signal name="activate" handler="on_flis_merge_down_activate"/>
+      </object>
+    </child>
+    <child>
+      <object class="GtkMenuItem" id="flis_flatten_item">
+        <property name="visible">True</property>
+        <property name="label" translatable="yes">Flatten Image</property>
+        <signal name="activate" handler="on_flis_flatten_activate"/>
+      </object>
+    </child>
+  </object>
+
+</interface>

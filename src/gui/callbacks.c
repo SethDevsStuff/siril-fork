@@ -38,6 +38,7 @@
 #include "gui/cut.h"
 #include "gui/keywords_tree.h"
 #include "gui/registration.h"
+#include "gui/flis_gui.h"
 #include "gui/photometric_cc.h"
 #include "gui/stacking.h"
 #include "gui/python_gui.h"
@@ -45,6 +46,7 @@
 #include "io/annotation_catalogues.h"
 #include "io/films.h"
 #include "io/image_format_fits.h"
+#include "io/image_format_flis.h"
 #include "io/sequence.h"
 #include "io/single_image.h"
 #include "io/siril_git.h"
@@ -245,8 +247,29 @@ int populate_roi() {
 		return 1;
 	if (gui.roi.selection.w == 0 || gui.roi.selection.h == 0)
 		return 1;
+	/* When a FLIS sub-layer is active, gui.roi.selection is in canvas (composite)
+	 * coordinates but gfit is the sub-layer.  Compute layer-local coords for
+	 * data access; gui.roi.selection itself stays in canvas coords for drawing. */
+	rectangle lsel = gui.roi.selection;
+	if (is_current_image_flis() && com.uniq && com.uniq->layers) {
+		for (GSList *node = com.uniq->layers; node; node = node->next) {
+			flis_layer_t *lay = (flis_layer_t *)node->data;
+			if (lay && lay->fit == gfit) {
+				lsel.x -= lay->position_x;
+				lsel.y -= lay->position_y;
+				break;
+			}
+		}
+	}
+	/* Bounds guard: layer-local selection must lie within gfit dimensions */
+	if (lsel.x < 0 || lsel.y < 0 ||
+	    (guint)(lsel.x + lsel.w) > gfit->rx ||
+	    (guint)(lsel.y + lsel.h) > gfit->ry) {
+		siril_debug_print("populate_roi: selection out of bounds for current image, skipping\n");
+		return 1;
+	}
 	int retval = 0;
-	size_t npixels_roi = gui.roi.selection.w * gui.roi.selection.h;
+	size_t npixels_roi = lsel.w * lsel.h;
 	size_t npixels_gfit = gfit->rx * gfit->ry;
 	size_t nchans = gfit->naxes[2];
 	g_assert(nchans == 1 || nchans == 3);
@@ -255,8 +278,8 @@ int populate_roi() {
 	clearfits(&gui.roi.fit);
 	copyfits(gfit, &gui.roi.fit, CP_FORMAT, -1);
 
-	gui.roi.fit.rx = gui.roi.fit.naxes[0] = gui.roi.selection.w;
-	gui.roi.fit.ry = gui.roi.fit.naxes[1] = gui.roi.selection.h;
+	gui.roi.fit.rx = gui.roi.fit.naxes[0] = lsel.w;
+	gui.roi.fit.ry = gui.roi.fit.naxes[1] = lsel.h;
 	gui.roi.fit.naxes[2] = nchans;
 	gui.roi.fit.naxis = (nchans == 1 ? 2 : 3);
 
@@ -271,19 +294,19 @@ int populate_roi() {
 		gui.roi.fit.fpdata[2] = rgb ? gui.roi.fit.fdata + 2 * npixels_roi : gui.roi.fit.fdata;
 
 		for (uint32_t c = 0; c < nchans; c++) {
-			for (uint32_t y = 0; y < gui.roi.selection.h; y++) {
+			for (uint32_t y = 0; y < (uint32_t)lsel.h; y++) {
 				float *srcindex =
 					gfit->fdata +
 					(npixels_gfit * c) +
-					((gfit->ry - y - (gui.roi.selection.y + 1)) * gfit->rx) +
-					gui.roi.selection.x;
+					((gfit->ry - y - (lsel.y + 1)) * gfit->rx) +
+					lsel.x;
 
 				float *destindex =
 					gui.roi.fit.fdata +
 					(npixels_roi * c) +
 					(gui.roi.fit.rx * y);
 
-				memcpy(destindex, srcindex, gui.roi.selection.w * sizeof(float));
+				memcpy(destindex, srcindex, lsel.w * sizeof(float));
 			}
 		}
 	} else {
@@ -296,19 +319,19 @@ int populate_roi() {
 		gui.roi.fit.pdata[2] = rgb ? gui.roi.fit.data + 2 * npixels_roi : gui.roi.fit.data;
 
 		for (uint32_t c = 0; c < nchans; c++) {
-			for (uint32_t y = 0; y < gui.roi.selection.h; y++) {
+			for (uint32_t y = 0; y < (uint32_t)lsel.h; y++) {
 				WORD *srcindex =
 					gfit->data +
 					(npixels_gfit * c) +
-					((gfit->ry - y - (gui.roi.selection.y + 1)) * gfit->rx) +
-					gui.roi.selection.x;
+					((gfit->ry - y - (lsel.y + 1)) * gfit->rx) +
+					lsel.x;
 
 				WORD *destindex =
 					gui.roi.fit.data +
 					(npixels_roi * c) +
 					(y * gui.roi.fit.rx);
 
-				memcpy(destindex, srcindex, gui.roi.selection.w * sizeof(WORD));
+				memcpy(destindex, srcindex, lsel.w * sizeof(WORD));
 			}
 		}
 	}
@@ -318,7 +341,7 @@ int populate_roi() {
 	gui.roi.fit.mask = NULL;
 
 	if (gfit->mask && gfit->mask->data) {
-		size_t n = gui.roi.selection.w * gui.roi.selection.h;
+		size_t n = lsel.w * lsel.h;
 		size_t src_w = gfit->rx;
 		size_t src_h = gfit->ry;
 
@@ -350,17 +373,17 @@ int populate_roi() {
 		}
 
 		/* Copy mask ROI with same flip logic as image */
-		for (uint32_t y = 0; y < gui.roi.selection.h; y++) {
-			size_t src_y = src_h - y - (gui.roi.selection.y + 1);
-			size_t src_x = gui.roi.selection.x;
+		for (uint32_t y = 0; y < (uint32_t)lsel.h; y++) {
+			size_t src_y = src_h - y - (lsel.y + 1);
+			size_t src_x = lsel.x;
 
 			void *src = (uint8_t*)gfit->mask->data +
 						(src_y * src_w + src_x) * elem_size;
 
 			void *dst = (uint8_t*)gui.roi.fit.mask->data +
-						(y * gui.roi.selection.w) * elem_size;
+						(y * lsel.w) * elem_size;
 
-			memcpy(dst, src, gui.roi.selection.w * elem_size);
+			memcpy(dst, src, lsel.w * elem_size);
 		}
 
 		gui.roi.fit.mask_active = gfit->mask_active;
@@ -450,6 +473,31 @@ gpointer on_set_roi() {
 	// Must copy the whole backup to gfit and gui.roi.fit to account
 	// for switching between full image and ROI
 	memcpy(&gui.roi.selection, &sel, sizeof(rectangle));
+
+	/* When a FLIS sub-layer is active, sel is in canvas (composite) coordinates
+	 * but gfit is the sub-layer.  Check the selection intersects the layer;
+	 * abort cleanly if not.  gui.roi.selection is kept in canvas coords so that
+	 * draw_roi renders it at the correct on-screen position. */
+	if (is_current_image_flis() && com.uniq && com.uniq->layers) {
+		for (GSList *node = com.uniq->layers; node; node = node->next) {
+			flis_layer_t *lay = (flis_layer_t *)node->data;
+			if (lay && lay->fit == gfit) {
+				int lx = sel.x - lay->position_x;
+				int ly = sel.y - lay->position_y;
+				if (lx < 0 || ly < 0 ||
+				    (guint)(lx + sel.w) > lay->fit->rx ||
+				    (guint)(ly + sel.h) > lay->fit->ry) {
+					gui.roi.active = FALSE;
+					clearfits(&gui.roi.fit);
+					memset(&gui.roi.selection, 0, sizeof(rectangle));
+					g_mutex_unlock(&roi_mutex);
+					return GINT_TO_POINTER(0);
+				}
+				break;
+			}
+		}
+	}
+
 	gui.roi.active = TRUE;
 	if (gui.roi.selection.w > 0 && gui.roi.selection.h > 0 && is_preview_active())
 		copy_backup_to_gfit();
@@ -629,6 +677,12 @@ void on_mask_show_toggled(GtkToggleButton *button, gpointer user_data) {
 }
 
 void on_mask_clear_clicked(GtkButton *button, gpointer user_data) {
+	if (get_flis_show_layer_mask() && is_current_image_flis()) {
+		/* Route to layer mask removal via flis_gui */
+		flis_remove_selected_lmask();
+		return;
+	}
+
 	if (!gfit || !gfit->mask) {
 		return;
 	}
@@ -1203,7 +1257,7 @@ static void update_roi_from_selection() {
 	}
 	memcpy(&gui.roi.selection, &com.selection, sizeof(rectangle));
 	gboolean active = (gui.roi.selection.w > 0 && gui.roi.selection.h > 0);
-	if (active)
+	if (active && flis_get_selected_group())
 		on_set_roi();
 	else
 		on_clear_roi();
@@ -1228,7 +1282,38 @@ void update_display_fwhm() {
 	} else if (com.selection.w && com.selection.h) {// Now we don't care about the size of the sample. Minimization checks that
 		if (com.selection.w < 300 && com.selection.h < 300 && com.selection.w > 5 && com.selection.h > 5) {
 			double roundness;
-			double fwhm_val = psf_get_fwhm(gfit, select_vport(gui.cvport), &com.selection, &roundness);
+			rectangle sel = com.selection;
+			int chan = select_vport(gui.cvport);
+			/* In FLIS mode, translate canvas selection to layer-local coords and
+			 * clamp channel index to the sub-layer's channel count. */
+			if (is_current_image_flis() && com.uniq && com.uniq->layers) {
+				gboolean found = FALSE;
+				for (GSList *node = com.uniq->layers; node; node = node->next) {
+					flis_layer_t *lay = (flis_layer_t *)node->data;
+					if (lay && lay->fit == gfit) {
+						sel.x -= lay->position_x;
+						sel.y -= lay->position_y;
+						if (sel.x < 0) { sel.w += sel.x; sel.x = 0; }
+						if (sel.y < 0) { sel.h += sel.y; sel.y = 0; }
+						if (sel.w <= 0 || sel.h <= 0 ||
+						    (guint)(sel.x + sel.w) > gfit->rx ||
+						    (guint)(sel.y + sel.h) > gfit->ry) {
+							g_sprintf(fwhm_buffer, _("fwhm: N/A"));
+							gtk_label_set_text(GTK_LABEL(lookup_widget(label_fwhm[gui.cvport])), fwhm_buffer);
+							return;
+						}
+						chan = MIN(chan, (int)gfit->naxes[2] - 1);
+						found = TRUE;
+						break;
+					}
+				}
+				if (!found) {
+					g_sprintf(fwhm_buffer, _("fwhm: N/A"));
+					gtk_label_set_text(GTK_LABEL(lookup_widget(label_fwhm[gui.cvport])), fwhm_buffer);
+					return;
+				}
+			}
+			double fwhm_val = psf_get_fwhm(gfit, chan, &sel, &roundness);
 			g_sprintf(fwhm_buffer, _("fwhm: %.2f px, r: %.2f"), fwhm_val, roundness);
 		} else
 			g_sprintf(fwhm_buffer, _("fwhm: N/A"));
@@ -1250,7 +1335,7 @@ void display_filename() {
 	if (single_image_is_loaded() && com.uniq->filename && com.uniq->filename[0] != '\0') {	// unique image
 		filename = com.uniq->filename;
 		orig_filename = g_file_read_link(filename, &error);
-		nb_layers = com.uniq->nb_layers;
+		nb_layers = com.uniq->chans;
 	} else if (sequence_is_loaded()) {	// sequence
 		filename = malloc(256);
 		strcpy(filename, " ");
@@ -1542,12 +1627,54 @@ void set_output_filename_to_sequence_name() {
 gboolean show_or_hide_mask_tab_idle(gpointer p) {
 	if (com.headless) return FALSE;
 	g_rw_lock_reader_lock(&gfit->rwlock);
-	gboolean has_mask = (gfit->mask != NULL);
+	gboolean has_proc_mask = (gfit->mask != NULL);
 	g_rw_lock_reader_unlock(&gfit->rwlock);
 	GtkNotebook* Color_Layers = GTK_NOTEBOOK(lookup_widget("notebook1"));
 	GtkWidget *page = gtk_notebook_get_nth_page(Color_Layers, MASK_VPORT);
-	if (has_mask) {
+
+	gboolean has_layer_mask = FALSE;
+
+	if (is_current_image_flis() && com.uniq && com.uniq->layers) {
+		for (GSList *node = com.uniq->layers; node; node = node->next) {
+			flis_layer_t *lay = (flis_layer_t *)node->data;
+			if (lay && lay->fit == gfit) {
+				has_layer_mask = (lay->lmask != NULL);
+				break;
+			}
+		}
+	}
+
+	if (has_proc_mask || has_layer_mask) {
+		/* Auto-correct flis_show_layer_mask if the selected type is absent
+		 * (e.g. a layer mask was just added when no processing mask exists,
+		 * or was just removed leaving only a processing mask). */
+		if (is_current_image_flis()) {
+			if (!get_flis_show_layer_mask() && !has_proc_mask && has_layer_mask)
+				set_flis_show_layer_mask(TRUE);
+			else if (get_flis_show_layer_mask() && !has_layer_mask && has_proc_mask)
+				set_flis_show_layer_mask(FALSE);
+		}
 		gtk_widget_show(page);
+
+		/* Update the tab button label to reflect what is being shown */
+		GtkWidget *btn = lookup_widget("mask_menu_button");
+		if (btn) {
+			if (is_current_image_flis()) {
+				gtk_button_set_label(GTK_BUTTON(btn),
+				    get_flis_show_layer_mask() ? _("Layer Mask") : _("Processing Mask"));
+			} else {
+				gtk_button_set_label(GTK_BUTTON(btn), _("Mask"));
+			}
+		}
+
+		/* "Mask active" checkbox applies to the processing mask only;
+		 * hide it when the tab is showing a layer mask (the layer mask
+		 * active toggle lives in the Layers dialog instead). */
+		GtkWidget *enable_check = lookup_widget("mask_enable_check");
+		if (enable_check) {
+			gboolean showing_lmask = get_flis_show_layer_mask() && is_current_image_flis();
+			gtk_widget_set_visible(enable_check, !showing_lmask);
+		}
 	} else {
 		gtk_widget_hide(page);
 	}
@@ -1563,7 +1690,7 @@ gboolean close_tab(gpointer user_data) {
 	GtkNotebook* Color_Layers = GTK_NOTEBOOK(lookup_widget("notebook1"));
 	GtkWidget* page;
 
-	if (com.seq.nb_layers == 1 || gfit->naxes[2] == 1) {
+	if (com.seq.nb_layers == 1 || (!com.uniq && gfit->naxes[2] == 1) || (com.uniq && com.uniq->chans == 1)) {
 		page = gtk_notebook_get_nth_page(Color_Layers, RGB_VPORT);
 		gtk_widget_hide(page);
 		page = gtk_notebook_get_nth_page(Color_Layers, GREEN_VPORT);
@@ -2025,6 +2152,9 @@ void initialize_all_GUI(gchar *supported_files) {
 
 	/* Initialize ROI settings */
 	update_roi_config();
+
+	/* Initialize FLIS GUI signal handlers */
+	flis_gui_init();
 
 	/* register some callbacks */
 	register_selection_update_callback(update_export_crop_label);

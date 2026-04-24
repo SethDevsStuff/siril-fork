@@ -488,13 +488,48 @@ struct sequ {
 	double photometry_colors[MAX_SEQPSF][3]; // colors for each photometry curve
 };
 
-/* this struct is used to manage data associated with a single image loaded, outside a sequence */
 typedef struct {
-	char *filename;		// the name of the file
-	gboolean fileexist;// flag of existing file
-	char *comment;		// comment on how the file got there (user load, result...)
-	int nb_layers;		// number of layers embedded in each image file
-	fits *fit;		// the fits is still gfit, but a reference doesn't hurt
+	char       *filename;
+	gboolean    fileexist;
+	char       *comment;
+
+	/* ---- Canvas size -------------------------------------------------- */
+	guint       canvas_rx;          /* Canvas width in pixels.  Initialised
+									from the base layer on file open or
+									promotion and stored in FLISSIZX.
+									Maintained independently: moving the
+									base layer does not change this value;
+									only explicit canvas operations (expand,
+									clip) or a geometric transform applied
+									to the base layer updates it.         */
+	guint       canvas_ry;          /* Canvas height in pixels (FLISSIZY). */
+
+	/* ---- Layer list --------------------------------------------------- */
+	GSList     *layers;             /* Ordered list of flis_layer_t*.
+									Sorted ascending by layer_order
+									for compositing; lowest order is
+									the base layer.                    */
+	GSList     *groups;             /* List of flis_group_t*, unsorted.
+									Each group is a named container for
+									a subset of layers.                */
+	gint        active_layer;       /* Index into layers of the layer
+									currently bound to gfit.           */
+	gint        next_item_id;       /* Next ITEM_ID to assign.  Init to 1;
+									increment after each allocation.   */
+
+	/* ---- Channel count of the active layer ---------------------------- */
+	int         chans;              /* Number of channels in the active
+									layer: 1 for mono, 3 for RGB.
+									Formerly nb_layers — renamed for
+									clarity.  Derived from:
+									active flis_layer_t->fit->naxes[2]
+									Keep in sync when active_layer
+									changes.                           */
+
+	/* ---- Retained for backward compatibility -------------------------- */
+	fits       *fit;                /* == active flis_layer_t->fit.
+									Keep in sync when active_layer
+									changes.  Equals gfit.            */
 } single;
 
 typedef struct {
@@ -750,11 +785,55 @@ typedef struct _child_info {
 	GDateTime *datetime; // start time of program - distinguishes between multiple children with the same argv0
 } child_info;
 
+/* Forward declaration — full definition is in io/image_format_flis.h */
+typedef struct flis_layer_props_t flis_layer_props_t;
+
+/* Per-layer snapshot within a compound (multi-layer) undo entry.
+ * Used by undo_save_flis_multi_layer() for operations such as registration
+ * or layer matching that atomically change multiple layers at once. */
+typedef struct {
+	gint            flis_layer_id;   /* item_id of the layer */
+	char           *filename;        /* pixel swap file path, or NULL */
+	char           *mask_filename;   /* processing mask swap file, or NULL */
+	uint8_t         mask_bitpix;
+	int             rx, ry, nchans;
+	data_type       type;
+	wcs_info        wcsdata;
+	struct wcsprm  *wcslib;
+	double          focal_length;
+	cmsHPROFILE     icc_profile;
+	gint            position_x;
+	gint            position_y;
+	flis_layer_props_t *layer_props; /* full props snapshot, always set */
+	/* If TRUE, only layer_props is restored on undo; pixel, mask, and lmask
+	 * data are not touched.  Used by undo_save_flis_multi_layer_props(). */
+	gboolean            props_only;
+	/* Layer mask snapshot for compound undo (NULL = no lmask at save time) */
+	gchar          *lmask_filename;
+	size_t          lmask_w;
+	size_t          lmask_h;
+	guint8          lmask_bitpix;
+} historic_layer_entry_t;
+
 struct historic_struct {
 	char *filename;
 	char *mask_filename;
 	char history[FLEN_VALUE];
 	int rx, ry, nchans;
+	gint flis_layer_id;
+	flis_layer_props_t *layer_props;
+	gchar  *lmask_filename;   /* swap file path, or NULL for "no mask" state */
+	gint    lmask_layer_id;   /* item_id of the layer; FLIS_UNDO_LAYER_NONE if unused */
+	size_t  lmask_w;
+	size_t  lmask_h;
+	guint8  lmask_bitpix;
+	gint    lmask_dest_layer_id;
+	gint    reorder_layer_a_id;
+	gint    reorder_layer_a_order;
+	gint    reorder_layer_b_id;
+	gint    reorder_layer_b_order;
+	gint   flis_position_x;   /* layer offset at time of save; 0 for plain FITS */
+	gint   flis_position_y;
 	data_type type;
 	uint8_t mask_bitpix;
 	wcs_info wcsdata;
@@ -762,6 +841,18 @@ struct historic_struct {
 	double focal_length;
 	cmsHPROFILE icc_profile;
 	gboolean spcc_applied;
+	/* Processing-mask-only state.  No pixel swap file; only mask data is
+	 * restored on undo.  Analogous to the layer-mask undo mechanism. */
+	gboolean pmask_only;
+	/* Full single-layer FLIS geometry state.  Saves pixels, processing mask,
+	 * layer mask, and layer properties in one atomic entry.  Used by
+	 * geometry-changing operations so that lmask and offset are also undone. */
+	gboolean full_layer;
+	/* Compound multi-layer state.  Non-NULL only when this entry was saved
+	 * via undo_save_flis_multi_layer().  When set, all single-layer fields
+	 * above (filename, mask_filename, flis_layer_id, …) are unused. */
+	historic_layer_entry_t *multi_entries;
+	guint                   n_multi_entries;
 };
 
 /* the structure storing information for each layer to be composed
@@ -925,6 +1016,13 @@ struct guiinf {
 	GSList *drawing_polypoints; // list of points drawn in MOUSE_ACTION_DRAW_POLY mode
 	GdkRGBA poly_ink; // Color and alpha for drawing polygons
 	gboolean poly_fill; // Whether to fill drawn polygons
+
+	/* FLIS layer drag state */
+	gboolean flis_layer_dragging;   // TRUE while button is down in drag-layer mode
+	gint     flis_drag_origin_x;    // layer position_x at drag start
+	gint     flis_drag_origin_y;    // layer position_y at drag start (FITS convention)
+	gint     flis_drag_group_id;    // item_id of group being dragged, 0 = single-layer drag
+
 	// cairo_mutex guards gui.view[].buf and Cairo display surfaces;
 	// held by display-update code on main thread and any worker that composites into the buffers
 	GMutex cairo_mutex;
@@ -1008,6 +1106,7 @@ struct cominf {
 	// or freeing the star list; reader lock when iterating or reading star data from any other thread
 	GRWLock stars_lock;
 	psf_star **stars;		// list of stars detected in the current image
+	gint stars_layer_id;	// layer ID for star positions
 	gboolean star_is_seqdata;	// the only star in stars belongs to seq, don't free it
 
 	double magOffset;		// offset to reduce the real magnitude, single image

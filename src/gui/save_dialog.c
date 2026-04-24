@@ -41,11 +41,17 @@
 #include "io/sequence.h"
 #include "io/single_image.h"
 #include "io/image_format_fits.h"
+#include "io/image_format_flis.h"
 
 #include "save_dialog.h"
 
-static image_type type_of_image = TYPEUNDEF;
-static SirilWidget *saveDialog = NULL;
+static image_type  type_of_image = TYPEUNDEF;
+static SirilWidget *saveDialog   = NULL;
+
+/* TRUE when the user has chosen to save a FLIS image as a full FLIS file
+ * rather than as a flattened FITS.  Set in on_header_save_as_button_clicked
+ * and consumed in mini_save_dialog. */
+static gboolean    save_as_flis  = FALSE;
 
 static void set_filters_save_dialog(GtkFileChooser *chooser) {
 	GString *all_filter = NULL;
@@ -669,6 +675,38 @@ static gpointer mini_save_dialog(gpointer p) {
 			type_of_image = TYPEFITS;
 			/* no break */
 		case TYPEFITS:
+			if (save_as_flis) {
+				/* If the image is a plain FITS (has a processing mask and the user
+				 * chose to preserve it), promote to single-layer FLIS first. */
+				if (!is_current_image_flis()) {
+					if (flis_promote_from_gfit(NULL)) {
+						args->retval = 1;
+						break;
+					}
+				}
+				/* Save the complete layer stack as a FLIS file */
+				args->retval = save_flis(args->filename);
+				if (!args->retval && single_image_is_loaded()) {
+					free(com.uniq->filename);
+					com.uniq->filename = strdup(args->filename);
+					com.uniq->fileexist = TRUE;
+				}
+				break;
+			}
+			/* For FLIS images saved as flat FITS: render the full composite
+			 * rather than saving just the active layer. */
+			if (is_current_image_flis() && com.uniq && com.uniq->layers) {
+				fits *composite = flis_render_layers(com.uniq->layers);
+				if (!composite) {
+					args->retval = 1;
+					break;
+				}
+				composite->bitpix = args->bitpix;
+				args->retval = savefits(args->filename, composite);
+				clearfits(composite);
+				free(composite);
+				break;
+			}
 			gfit->bitpix = args->bitpix;
 			/* Check if MIPS-HI and MIPS-LO must be updated. If yes,
 			 * Values are taken from the layer 0 */
@@ -831,6 +869,78 @@ void on_header_save_as_button_clicked() {
 		GtkWidget *savepopup = lookup_widget("savepopup");
 
 		if (save_dialog() == GTK_RESPONSE_ACCEPT) {
+			/* Always reset the FLIS-save flag; it is only set below when the
+			 * user explicitly chooses to save the full FLIS layer stack. */
+			save_as_flis = FALSE;
+
+			if (is_current_image_flis()) {
+				if (type_of_image == TYPEFITS || type_of_image == TYPEUNDEF) {
+					/* FITS target: offer a choice between flattened and full FLIS */
+					GtkWidget *dlg = gtk_message_dialog_new(
+						GTK_WINDOW(lookup_widget("control_window")),
+						GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+						GTK_MESSAGE_QUESTION,
+						GTK_BUTTONS_NONE,
+						_("Save FLIS image as FITS"));
+					gtk_message_dialog_format_secondary_text(
+						GTK_MESSAGE_DIALOG(dlg),
+						_("This is a multi-layer FLIS image. How would you like to save it?"));
+					gtk_dialog_add_button(GTK_DIALOG(dlg),
+						_("Save flattened composite as FITS"), GTK_RESPONSE_NO);
+					gtk_dialog_add_button(GTK_DIALOG(dlg),
+						_("Save all layers as FLIS"),          GTK_RESPONSE_YES);
+					gtk_dialog_add_button(GTK_DIALOG(dlg),
+						_("Cancel"),                           GTK_RESPONSE_CANCEL);
+					gtk_dialog_set_default_response(GTK_DIALOG(dlg), GTK_RESPONSE_YES);
+
+					gint response = gtk_dialog_run(GTK_DIALOG(dlg));
+					gtk_widget_destroy(dlg);
+
+					if (response == GTK_RESPONSE_CANCEL) {
+						return;
+					}
+					save_as_flis = (response == GTK_RESPONSE_YES);
+				} else {
+					/* Non-FITS target: warn that only the flattened composite will be saved */
+					gboolean proceed = siril_confirm_dialog(
+						_("Saving flattened image"),
+						_("This is a multi-layer FLIS image. Saving to this format will export "
+						  "only the flattened composite image. The individual layers and masks "
+						  "will not be preserved. Continue?"),
+						_("Save Flattened Image"));
+					if (!proceed)
+						return;
+				}
+			} else if ((type_of_image == TYPEFITS || type_of_image == TYPEUNDEF) &&
+			           gfit && gfit->mask) {
+				/* Plain FITS with a processing mask: offer to save as FLIS so the
+				 * mask is not silently discarded */
+				GtkWidget *dlg = gtk_message_dialog_new(
+					GTK_WINDOW(lookup_widget("control_window")),
+					GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+					GTK_MESSAGE_QUESTION,
+					GTK_BUTTONS_NONE,
+					_("Save image with processing mask"));
+				gtk_message_dialog_format_secondary_text(
+					GTK_MESSAGE_DIALOG(dlg),
+					_("This image has a processing mask which cannot be preserved "
+					  "in a plain FITS file. How would you like to save it?"));
+				gtk_dialog_add_button(GTK_DIALOG(dlg),
+					_("Save as FITS (discard mask)"), GTK_RESPONSE_NO);
+				gtk_dialog_add_button(GTK_DIALOG(dlg),
+					_("Save with mask as FLIS"),      GTK_RESPONSE_YES);
+				gtk_dialog_add_button(GTK_DIALOG(dlg),
+					_("Cancel"),                      GTK_RESPONSE_CANCEL);
+				gtk_dialog_set_default_response(GTK_DIALOG(dlg), GTK_RESPONSE_YES);
+
+				gint response = gtk_dialog_run(GTK_DIALOG(dlg));
+				gtk_widget_destroy(dlg);
+
+				if (response == GTK_RESPONSE_CANCEL)
+					return;
+				save_as_flis = (response == GTK_RESPONSE_YES);
+			}
+
 			/* now it is not needed for some formats */
 			if (type_of_image & (TYPEBMP | TYPEPNG | TYPEPNM)) {
 				struct savedial_data *args = calloc(1, sizeof(struct savedial_data));
@@ -857,7 +967,7 @@ void on_header_save_as_button_clicked() {
 				}
 				gtk_window_set_transient_for(GTK_WINDOW(savepopup), parent);
 				gtk_widget_show(savepopup);
-				gtk_window_present_with_time(GTK_WINDOW(savepopup),	GDK_CURRENT_TIME);
+				gtk_window_present_with_time(GTK_WINDOW(savepopup), GDK_CURRENT_TIME);
 			}
 		}
 	}
@@ -972,7 +1082,12 @@ void on_header_snapshot_button_clicked(gboolean clipboard) {
 
 void on_header_save_button_clicked() {
 	if (single_image_is_loaded() && com.uniq->fileexist) {
-		savefits(com.uniq->filename, gfit);
+		if (is_current_image_flis()) {
+			/* Save the complete layer stack, not just the active layer */
+			save_flis(com.uniq->filename);
+		} else {
+			savefits(com.uniq->filename, gfit);
+		}
 	}
 }
 
