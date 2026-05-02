@@ -389,7 +389,7 @@ static void remap(int vport) {
 		/* Widget-sensitivity changes must happen on the GTK main thread. */
 		siril_add_idle(viewer_mode_sensitive_idle, GINT_TO_POINTER(FALSE));
 	} else {
-		if (gui.rendering_mode == STF_DISPLAY && !stf_computed) {
+		if (gui.rendering_mode == STF_DISPLAY && !stf_computed && !gui.freeze_autostretch) {
 			if (gui.unlink_channels)
 				find_unlinked_midtones_balance_default(gfit, stf);
 			else find_linked_midtones_balance_default(gfit, stf);

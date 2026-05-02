@@ -788,6 +788,13 @@ void on_autohd_item_toggled(GtkCheckMenuItem *menuitem, gpointer user_data) {
 	}
 }
 
+void on_autofreeze_item_toggled(GtkCheckMenuItem *menuitem, gpointer user_data) {
+	gui.freeze_autostretch = gtk_check_menu_item_get_active(menuitem);
+	if (gui.rendering_mode == STF_DISPLAY) {
+		redraw(REMAP_ALL);
+	}
+}
+
 void on_button_apply_hd_bitdepth_clicked(GtkSpinButton *button, gpointer user_data) {
 	int bitdepth = (int) gtk_spin_button_get_value(GTK_SPIN_BUTTON(lookup_widget("spin_hd_bitdepth")));
 	siril_debug_print("bitdepth: %d\n", bitdepth);
@@ -2375,7 +2382,7 @@ void gtk_main_quit() {
 	 * the main thread deadlocks: worker holds the write lock waiting for an
 	 * idle, main thread waits for the write lock. */
 	gint64 deadline = g_get_monotonic_time() + 2 * G_TIME_SPAN_SECOND;
-	siril_log_color_message(_("### Application Quit ###\n\nShutting down the processing subsystem..."), "blue");
+	siril_log_color_message(_("### Application Quit ###\n\nShutting down the processing subsystem...\n"), "blue");
 	while (processing_is_job_active() && g_get_monotonic_time() < deadline) {
 		if (g_main_context_pending(g_main_context_default()))
 			g_main_context_iteration(g_main_context_default(), FALSE);
@@ -2643,6 +2650,8 @@ void on_checkseqbutton_clicked(GtkButton *button, gpointer user_data) {
 
 	args->retvalue = 0;
 	set_cursor_waiting(TRUE);
+	/* checkSeq uses start_in_new_thread directly: scans the filesystem for
+	 * sequences; no gfit access. */
 	if (!start_in_new_thread(checkSeq, args)) {
 		free(args);
 	}

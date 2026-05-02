@@ -713,6 +713,7 @@ typedef struct {
 } version_number;
 
 typedef struct cut_struct {
+	destructor destroy_fn; // must be first — called by free_generic_img_args
 	point cut_start;			// point marking start of cut line
 	point cut_end;			// point dragged while selecting the cut line
 	point cut_wn1;				// point for wavenumber 1 for spectroscopic cut
@@ -925,6 +926,9 @@ struct guiinf {
 	GSList *drawing_polypoints; // list of points drawn in MOUSE_ACTION_DRAW_POLY mode
 	GdkRGBA poly_ink; // Color and alpha for drawing polygons
 	gboolean poly_fill; // Whether to fill drawn polygons
+	gboolean freeze_autostretch; // freeze the autostretch parameters. Useful for loading
+								// a starless result and seeing it with the same stretch as the original, etc.
+
 	// cairo_mutex guards gui.view[].buf and Cairo display surfaces;
 	// held by display-update code on main thread and any worker that composites into the buffers
 	GMutex cairo_mutex;
