@@ -4542,8 +4542,44 @@ int process_ls(int nb){
 	return CMD_OK;
 }
 
+static void copy_lst_file(gchar *filename, gchar *outname, int written_frames) {
+	/* Copy lst files if exist */
+	gchar *lst_file_base = remove_ext_from_filename(filename);
+	gchar *lst_file = NULL;
+	int lst_index = 0;
+	gboolean file_found = FALSE;
+
+	/* Loop to find the correct lst file */
+	do {
+		g_free(lst_file);
+		lst_file = g_strdup_printf("%s%d.lst", lst_file_base, lst_index);
+		if (g_file_test(lst_file, G_FILE_TEST_EXISTS)) {
+			file_found = TRUE;
+		}
+		lst_index++;
+	} while (!file_found && lst_index < USHRT_MAX); // safety limit to avoid infinite loops
+
+	if (file_found) {
+		gchar *dest_file = g_strdup_printf("%s%d.lst", outname, written_frames);
+		GFile *source = g_file_new_for_path(lst_file);
+		GFile *destination = g_file_new_for_path(dest_file);
+
+		GError *error = NULL;
+		if (!g_file_copy(source, destination, G_FILE_COPY_OVERWRITE, NULL, NULL, NULL, &error)) {
+			siril_debug_print("Error in the file copy: %s\n", error->message);
+			g_clear_error(&error);
+		}
+
+		g_object_unref(source);
+		g_object_unref(destination);
+	}
+
+	g_free(lst_file);
+	g_free(lst_file_base);
+}
+
 int process_merge(int nb) {
-	int retval = 0, nb_seq = nb-2;
+	int retval = 0, nb_seq = nb - 2;
 	if (!com.wd) {
 		siril_log_message(_("Merge: no working directory set.\n"));
 		gui_iface.set_busy(FALSE);
@@ -4558,9 +4594,8 @@ int process_merge(int nb) {
 	sequence **seqs = calloc(nb_seq, sizeof(sequence *));
 	GList *list = NULL;
 	for (int i = 0; i < nb_seq; i++) {
-		char *seqpath1 = strdup(word[i + 1]), *seqpath2 = strdup(word[i + 1]);
-		char *dir = g_path_get_dirname(seqpath1);
-		char *seqname = g_path_get_basename(seqpath2);
+		char *dir = g_path_get_dirname(word[i + 1]);
+		char *seqname = g_path_get_basename(word[i + 1]);
 #ifdef _WIN32
 		gchar **token = g_strsplit(dir, "/", -1);
 		g_free(dir);
@@ -4571,15 +4606,15 @@ int process_merge(int nb) {
 			siril_change_dir(dir, NULL);
 		if (!(seqs[i] = load_sequence(seqname, NULL))) {
 			siril_log_message(_("Could not open sequence `%s' for merging\n"), word[i + 1]);
+			g_free(seqname); g_free(dir);
 			retval = CMD_SEQUENCE_NOT_FOUND;
-			free(seqpath1); free(seqpath2);	g_free(seqname); g_free(dir);
 			goto merge_clean_up;
 		}
 		g_free(seqname);
 		if (seq_check_basic_data(seqs[i], FALSE) < 0) {
 			siril_log_message(_("Sequence `%s' is invalid, could not merge\n"), word[i + 1]);
+			g_free(dir);
 			retval = CMD_GENERIC_ERROR;
-			free(seqpath1); free(seqpath2); g_free(dir);
 			goto merge_clean_up;
 		}
 
@@ -4589,8 +4624,8 @@ int process_merge(int nb) {
 					seqs[i]->bitpix != seqs[0]->bitpix ||
 					seqs[i]->type != seqs[0]->type)) {
 			siril_log_message(_("All sequences must be the same format for merging. Sequence `%s' is different\n"), word[i + 1]);
+			g_free(dir);
 			retval = CMD_GENERIC_ERROR;
-			free(seqpath1); free(seqpath2); g_free(dir);
 			goto merge_clean_up;
 		}
 
@@ -4603,7 +4638,7 @@ int process_merge(int nb) {
 				list = g_list_append(list, g_build_filename(dir, filename, NULL));
 			}
 		}
-		free(seqpath1); free(seqpath2); g_free(dir);
+		g_free(dir);
 		siril_change_dir(dest_dir, NULL);	// they're all relative to this one
 	}
 
@@ -4611,9 +4646,36 @@ int process_merge(int nb) {
 	struct _convert_data *args = NULL;
 	fitseq out_fitseq;
 	char *destroot;
+	int c = 1;
 	switch (seqs[0]->type) {
 		case SEQ_REGULAR:
-			// use the conversion, it makes symbolic links or copies as a fallback
+			/* First, check for lst files if any */
+			for (GList *l = list; l != NULL; l = l->next, c++) {
+				gchar *lst_file = replace_ext((gchar*) l->data, ".lst");
+				if (!g_file_test(lst_file, G_FILE_TEST_EXISTS)) {
+					g_free(lst_file);
+					/* at least one file is missing it is probably safer to stop here */
+					break;
+				}
+
+				gchar *dest_file = g_strdup_printf("%s_%05d.lst", word[nb - 1], c);
+				GFile *source = g_file_new_for_path(lst_file);
+				GFile *destination = g_file_new_for_path(dest_file);
+				g_free(lst_file);
+				g_free(dest_file);
+
+				GError *error = NULL;
+				if (!g_file_copy(source, destination, G_FILE_COPY_OVERWRITE, NULL, NULL, NULL, &error)) {
+					siril_debug_print("Error in the file copy: %s\n", error->message);
+					g_clear_error(&error);
+				}
+
+				g_object_unref(source);
+				g_object_unref(destination);
+			}
+
+			/* then copy the FITS files by using the conversion
+			 * it makes symbolic links or copies as a fallback */
 			destroot = strdup(word[nb - 1]);
 			args = calloc(1, sizeof(struct _convert_data));
 			args->start = 0;
@@ -4664,6 +4726,9 @@ int process_merge(int nb) {
 						ser_close_and_delete_file(&out_ser);
 						goto merge_clean_up;
 					}
+
+					copy_lst_file(seqs[i]->ser_file->filename, word[nb - 1], written_frames);
+
 					written_frames++;
 				}
 			}
@@ -4705,6 +4770,9 @@ int process_merge(int nb) {
 						fitseq_close_and_delete_file(&out_fitseq);
 						goto merge_clean_up;
 					}
+
+					copy_lst_file(seqs[i]->fitseq_file->filename, word[nb - 1], written_frames);
+
 					written_frames++;
 				}
 			}
