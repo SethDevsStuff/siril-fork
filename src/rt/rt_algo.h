@@ -23,6 +23,10 @@
 extern "C" {
 #endif
 void findMinMaxPercentile(const float* data, size_t size, float minPrct, float* minOut, float maxPrct, float* maxOut, int threads);
+/* Same as findMinMaxPercentile but skips the initial min/max scan when the
+ * caller already knows the data's range. minVal/maxVal must bound every
+ * sample; passing the actual data range gives the most accurate histogram. */
+void findMinMaxPercentileFromMinMax(const float* data, size_t size, float minVal, float maxVal, float minPrct, float* minOut, float maxPrct, float* maxOut, int threads);
 #ifdef __cplusplus
 }
 #endif

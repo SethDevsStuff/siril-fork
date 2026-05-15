@@ -648,6 +648,13 @@ double histogram_median_float(float *a, size_t n, threading_type threading) {
 	return median;
 }
 
+double histogram_median_float_known_minmax(float *a, size_t n, float min, float max, threading_type threading) {
+	float median;
+	int threads = check_threading(&threading);
+	findMinMaxPercentileFromMinMax(a, n, min, max, 0.5f, &median, 0.5f, &median, threads);
+	return median;
+}
+
 /**
  * Compares a and b like strcmp()
  * @param a a gconstpointer

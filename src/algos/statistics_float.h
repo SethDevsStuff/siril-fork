@@ -10,6 +10,9 @@ int compute_means_from_flat_cfa_float(fits *fit, double mean[36]);
 int IKSS(float *data, size_t n, double *location, double *scale, gboolean multithread);
 #endif
 int IKSSlite(float *data, size_t n, const float median, float mad, double *location, double *scale, threading_type threads);
+/* Same as IKSSlite but reuses caller-provided scratch buffer for the internal
+ * MAD computation. buffer must be at least n floats. Pass NULL to allocate. */
+int IKSSlite_buf(float *data, size_t n, const float median, float mad, double *location, double *scale, threading_type threads, float *buffer);
 
 float siril_stats_robust_mean(const float sorted_data[],
 		const size_t stride, const size_t size, double *deviation);

@@ -19,6 +19,7 @@ siril-1.5.0
 * Separation of GUI and processing code (!1025)
 * Refactored the undo/redo mechanism. A right click displays the history list. The command line now supports undo and redo functions.
 * Adding TIFF support in Pixelmath (#1726)
+* Sped up stacking normalization by skipping redundant min/max scans and reusing the MAD scratch buffer in statistics_internal_float (!1030)
 
 **Fixes**
 * Fixed full-resolution rendering at zoom ≥ 100% for images exceeding Cairo's 32767-pixel limit

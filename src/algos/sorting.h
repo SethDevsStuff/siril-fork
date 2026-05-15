@@ -17,6 +17,9 @@ double quickmedian_int(int *a, size_t n);
 /* Histogram median for very large array of unsigned short */
 double histogram_median(WORD *a, size_t n, threading_type threading);
 double histogram_median_float(float *a, size_t n, threading_type threading);
+/* Histogram median when caller already knows the data's value range.
+ * Saves a full pass over the array. min/max must bound every sample. */
+double histogram_median_float_known_minmax(float *a, size_t n, float min, float max, threading_type threading);
 
 /* Sorting netnork */
 double sortnet_median(WORD *a, size_t n);
