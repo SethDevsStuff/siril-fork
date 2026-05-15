@@ -82,22 +82,25 @@ static void select_area_float(fits *fit, float *data, int layer, const rectangle
 #if defined(__GNUC__) && defined(__x86_64__)
 __attribute__((target("avx2")))
 static float siril_stats_float_sd_avx2(const float data[], const int N, float *m) {
+	// Pass 1: sum — load 8 floats, widen to double, accumulate in two independent lanes
 	__m256d acc0 = _mm256_setzero_pd();
 	__m256d acc1 = _mm256_setzero_pd();
 	int i = 0;
 	for (; i <= N - 8; i += 8) {
 		__m256 v8 = _mm256_loadu_ps(data + i);
-		acc0 = _mm256_add_pd(acc0, _mm256_cvtps_pd(_mm256_castps256_ps128(v8)));
-		acc1 = _mm256_add_pd(acc1, _mm256_cvtps_pd(_mm256_extractf128_ps(v8, 1)));
+		acc0 = _mm256_add_pd(acc0, _mm256_cvtps_pd(_mm256_castps256_ps128(v8)));    // low 4
+		acc1 = _mm256_add_pd(acc1, _mm256_cvtps_pd(_mm256_extractf128_ps(v8, 1))); // high 4
 	}
+	// Horizontal reduction: merge lanes, then fold 256→128→scalar
 	__m256d acc = _mm256_add_pd(acc0, acc1);
 	__m128d s = _mm_add_pd(_mm256_castpd256_pd128(acc), _mm256_extractf128_pd(acc, 1));
 	s = _mm_hadd_pd(s, s);
 	double sum = _mm_cvtsd_f64(s);
-	for (; i < N; i++) sum += data[i];
+	for (; i < N; i++) sum += data[i]; // scalar tail
 
 	float mean = (float)(sum / N);
 
+	// Pass 2: variance — subtract mean, square, accumulate in double (same two-lane pattern)
 	__m256d vacc0 = _mm256_setzero_pd();
 	__m256d vacc1 = _mm256_setzero_pd();
 	__m256 vmean = _mm256_set1_ps(mean);
