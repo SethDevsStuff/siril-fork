@@ -2,6 +2,7 @@ siril-1.5.0
 --/--/--
 
 **Improvements**
+* AVX2 two-lane double-precision reduction in siril_stats_float_sd with runtime dispatch, ~14% stacking speedup on x86-64 hardware
 * Introduced generic_image_worker to standardize image operations (!965)
 * Added splashscreen at startup (!975)
 * Added caching of online GAIA database (!985)
