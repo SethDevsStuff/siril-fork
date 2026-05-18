@@ -451,16 +451,12 @@ imstats* statistics_internal_float(fits *fit, int layer, rectangle *selection, i
 		}
 		free_data = 1;
 		have_filt_minmax = TRUE;
-	} else if (compute_median && data && stat->min != NULL_STATS && stat->max != NULL_STATS) {
-		/* No filtering was needed: stat->total == stat->ngoodpix means the
-		 * data buffer we'll pass to histogram_median is the same one
-		 * siril_stats_float_minmax just scanned above, so its min/max apply
-		 * here verbatim. stat->min/max are scaled by normValue; the data
-		 * buffer is in the unscaled domain, so divide back. This shortcut
-		 * relies on the filtering branch above being the *only* path that
-		 * mutates `data` before the median call -- if a future change adds
-		 * another transformation here, drop this else-if. */
-		g_assert(stat->total == stat->ngoodpix);
+	}
+	/* When no filtering was needed, reuse the earlier minmax scan result.
+	 * stat->total == stat->ngoodpix guarantees the data buffer is unchanged. */
+	if (!have_filt_minmax && compute_median && data &&
+			stat->total == stat->ngoodpix &&
+			stat->min != NULL_STATS && stat->max != NULL_STATS) {
 		filt_min = (float)(stat->min / stat->normValue);
 		filt_max = (float)(stat->max / stat->normValue);
 		have_filt_minmax = TRUE;
