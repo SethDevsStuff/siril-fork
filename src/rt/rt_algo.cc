@@ -34,8 +34,21 @@ namespace rtengine
 {
 
 extern "C" void findMinMaxPercentile(const float* data, size_t size, float minPrct, float* minOut, float maxPrct, float* maxOut, int threads);
+extern "C" void findMinMaxPercentileFromMinMax(const float* data, size_t size, float minVal, float maxVal, float minPrct, float* minOut, float maxPrct, float* maxOut, int threads);
+
+static void findMinMaxPercentile_impl(const float* data, size_t size, float minVal, float maxVal, float minPrct, float* minOut, float maxPrct, float* maxOut, int threads, bool haveRange);
 
 void findMinMaxPercentile(const float* data, size_t size, float minPrct, float* minOut, float maxPrct, float* maxOut, int threads)
+{
+    findMinMaxPercentile_impl(data, size, 0.f, 0.f, minPrct, minOut, maxPrct, maxOut, threads, false);
+}
+
+void findMinMaxPercentileFromMinMax(const float* data, size_t size, float minVal, float maxVal, float minPrct, float* minOut, float maxPrct, float* maxOut, int threads)
+{
+    findMinMaxPercentile_impl(data, size, minVal, maxVal, minPrct, minOut, maxPrct, maxOut, threads, true);
+}
+
+static void findMinMaxPercentile_impl(const float* data, size_t size, float minVal, float maxVal, float minPrct, float* minOut, float maxPrct, float* maxOut, int threads, bool haveRange)
 {
     // Copyright (c) 2017 Ingo Weyrich <heckflosse67@gmx.de>
     // We need to find the (minPrct*size) smallest value and the (maxPrct*size) smallest value in data.
@@ -65,15 +78,17 @@ void findMinMaxPercentile(const float* data, size_t size, float minPrct, float* 
     }
 #endif
 
-    // We need min and max value of data to calculate the scale factor for the histogram
-    float minVal = data[0];
-    float maxVal = data[0];
+    if (!haveRange) {
+        // We need min and max value of data to calculate the scale factor for the histogram
+        minVal = data[0];
+        maxVal = data[0];
 #ifdef _OPENMP
-    #pragma omp parallel for reduction(min:minVal) reduction(max:maxVal) num_threads(numThreads)
+        #pragma omp parallel for reduction(min:minVal) reduction(max:maxVal) num_threads(numThreads)
 #endif
-    for (size_t i = 1; i < size; ++i) {
-        minVal = std::min(minVal, data[i]);
-        maxVal = std::max(maxVal, data[i]);
+        for (size_t i = 1; i < size; ++i) {
+            minVal = std::min(minVal, data[i]);
+            maxVal = std::max(maxVal, data[i]);
+        }
     }
 
     if (std::fabs(maxVal - minVal) == 0.f) { // fast exit, also avoids division by zero in calculation of scale factor

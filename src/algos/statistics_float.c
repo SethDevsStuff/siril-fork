@@ -85,15 +85,25 @@ double siril_stats_float_mad(const float *data, const size_t n, const double m, 
 		return 0.0;
 	}
 
+	/* Fill |data - median| and track its range in the same pass so the
+	 * subsequent histogram_median can skip its own min/max scan. tmp values
+	 * are all >= 0, but for tightly-clustered data the actual min can be
+	 * well above 0, so we track it explicitly to give the histogram a tight
+	 * range and avoid wasting bins on an empty bottom region. */
+	float min_abs = FLT_MAX;
+	float max_abs = 0.f;
 #ifdef _OPENMP
 	threads = limit_threading(&threads, 400000, n);
-#pragma omp parallel for num_threads(threads) if(threads>1) schedule(static)
+#pragma omp parallel for num_threads(threads) if(threads>1) schedule(static) reduction(min:min_abs) reduction(max:max_abs)
 #endif
 	for (size_t i = 0; i < n; i++) {
-		tmp[i] = fabsf(data[i] - median);
+		const float v = fabsf(data[i] - median);
+		tmp[i] = v;
+		if (v < min_abs) min_abs = v;
+		if (v > max_abs) max_abs = v;
 	}
 
-	mad = histogram_median_float(tmp, n, threads);
+	mad = histogram_median_float_known_minmax(tmp, n, (n > 0) ? min_abs : 0.f, max_abs, threads);
 	if (!buffer) {
 	    free(tmp);
 	}
@@ -196,7 +206,7 @@ int IKSS(float *data, size_t n, double *location, double *scale, gboolean multit
 }
 #endif
 
-int IKSSlite(float *data, size_t n, const float median, float mad, double *location, double *scale, threading_type threads) {
+int IKSSlite_buf(float *data, size_t n, const float median, float mad, double *location, double *scale, threading_type threads, float *buffer) {
 	size_t i, kept;
 	float xlow, xhigh;
 
@@ -204,20 +214,28 @@ int IKSSlite(float *data, size_t n, const float median, float mad, double *locat
 	xhigh = median + 6.0 * mad;
 
 	kept = 0;
+	/* Track min/max of kept values in the same pass so the histogram_median
+	 * below can skip its own min/max scan. xlow/xhigh already bound the kept
+	 * range, but the tighter actual min/max gives a denser histogram. */
+	float kept_min = FLT_MAX;
+	float kept_max = -FLT_MAX;
 	// removing pixels outside of +/- 6mad from median
 	for (i = 0; i < n; i++) {
-		if ((data[i] >= xlow) && (data[i] <= xhigh)) {
+		const float v = data[i];
+		if ((v >= xlow) && (v <= xhigh)) {
 			if (i != kept) {
-				data[kept] = data[i];
+				data[kept] = v;
 			}
+			if (v < kept_min) kept_min = v;
+			if (v > kept_max) kept_max = v;
 			kept++;
 		}
 	}
 	if (kept == 0)
 		return 1;
 
-	*location = histogram_median_float(data, kept, threads);
-	mad = siril_stats_float_mad(data, kept, *location, threads, NULL);
+	*location = histogram_median_float_known_minmax(data, kept, kept_min, kept_max, threads);
+	mad = siril_stats_float_mad(data, kept, *location, threads, buffer);
 	if (mad == 0.0f) {
 		siril_log_error(_("MAD is null. Statistics cannot be computed.\n"));
 		return 1;
@@ -228,7 +246,11 @@ int IKSSlite(float *data, size_t n, const float median, float mad, double *locat
 	return 0;
 }
 
-static float* reassign_to_non_null_data_float(float *data, size_t inputlen, size_t outputlen, int free_input) {
+int IKSSlite(float *data, size_t n, const float median, float mad, double *location, double *scale, threading_type threads) {
+	return IKSSlite_buf(data, n, median, mad, location, scale, threads, NULL);
+}
+
+static float* reassign_to_non_null_data_float_minmax(float *data, size_t inputlen, size_t outputlen, int free_input, float *out_min, float *out_max) {
 	size_t i, j = 0;
 	float *ndata = malloc(outputlen * sizeof(float));
 	if (!ndata) {
@@ -236,19 +258,29 @@ static float* reassign_to_non_null_data_float(float *data, size_t inputlen, size
 		return NULL;
 	}
 
+	float mn = FLT_MAX, mx = -FLT_MAX;
 	for (i = 0; i < inputlen; i++) {
-		if (data[i] != 0.f && !isnan(data[i])) {
+		const float v = data[i];
+		if (v != 0.f && !isnan(v)) {
 			if (j >= outputlen) {
 				fprintf(stderr, "\n- stats MISMATCH in sizes (in: %zu, out: %zu), THIS IS A BUG: seqfile is wrong *********\n\n", inputlen, outputlen);
 				break;
 			}
-			ndata[j] = data[i];
+			ndata[j] = v;
+			if (v < mn) mn = v;
+			if (v > mx) mx = v;
 			j++;
 		}
 	}
 	if (free_input)
 		free(data);
+	if (out_min) *out_min = (j > 0) ? mn : 0.f;
+	if (out_max) *out_max = (j > 0) ? mx : 0.f;
 	return ndata;
+}
+
+static float* reassign_to_non_null_data_float(float *data, size_t inputlen, size_t outputlen, int free_input) {
+	return reassign_to_non_null_data_float_minmax(data, inputlen, outputlen, free_input, NULL, NULL);
 }
 
 static void siril_stats_float_minmax(float *min_out, float *max_out,
@@ -407,14 +439,27 @@ imstats* statistics_internal_float(fits *fit, int layer, rectangle *selection, i
 
 
 	/* we exclude 0 and nans if some computations remain to be done or copy data if
-	 * median has to be computed */
+	 * median has to be computed. We also capture the filtered min/max so the
+	 * histogram median below can skip its own min/max scan. */
+	float filt_min = 0.f, filt_max = 0.f;
+	gboolean have_filt_minmax = FALSE;
 	if (fit && compute_median && stat->total != stat->ngoodpix) {
-		data = reassign_to_non_null_data_float(data, stat->total, stat->ngoodpix, free_data);
+		data = reassign_to_non_null_data_float_minmax(data, stat->total, stat->ngoodpix, free_data, &filt_min, &filt_max);
 		if (!data) {
 			if (stat_is_local) free(stat);
 			return NULL;
 		}
 		free_data = 1;
+		have_filt_minmax = TRUE;
+	}
+	/* When no filtering was needed, reuse the earlier minmax scan result.
+	 * stat->total == stat->ngoodpix guarantees the data buffer is unchanged. */
+	if (!have_filt_minmax && compute_median && data &&
+			stat->total == stat->ngoodpix &&
+			stat->min != NULL_STATS && stat->max != NULL_STATS) {
+		filt_min = (float)(stat->min / stat->normValue);
+		filt_max = (float)(stat->max / stat->normValue);
+		have_filt_minmax = TRUE;
 	}
 
 
@@ -425,7 +470,11 @@ imstats* statistics_internal_float(fits *fit, int layer, rectangle *selection, i
 			return NULL;	// not in cache, don't compute
 		}
 		siril_log_debug("- stats %p fit %p (%d): computing median\n", stat, fit, layer);
-		stat->median = histogram_median_float(data, stat->ngoodpix, threads) * stat->normValue;
+		if (have_filt_minmax) {
+			stat->median = histogram_median_float_known_minmax(data, stat->ngoodpix, filt_min, filt_max, threads) * stat->normValue;
+		} else {
+			stat->median = histogram_median_float(data, stat->ngoodpix, threads) * stat->normValue;
+		}
 	}
 
 	/* Calculation of average absolute deviation from the median */
@@ -438,19 +487,33 @@ imstats* statistics_internal_float(fits *fit, int layer, rectangle *selection, i
 		stat->avgDev = gsl_stats_float_absdev_m(data, 1, stat->ngoodpix, stat->median / stat->normValue) * stat->normValue;
 	}
 
+	/* Allocate a scratch buffer reused by MAD (and IKSSlite's inner MAD).
+	 * Each call to siril_stats_float_mad otherwise mallocs ngoodpix*4 bytes
+	 * (~32MB per channel for an 8MP frame), which shows up as page-zeroing
+	 * in the kernel under heavy stacking. */
+	float *mad_scratch = NULL;
+	gboolean needs_mad = ((option & STATS_MAD) || (option & STATS_BWMV) || (option & STATS_IKSS)) && stat->mad == NULL_STATS;
+	gboolean needs_ikss = (option & STATS_IKSS) && (stat->location == NULL_STATS || stat->scale == NULL_STATS);
+	if ((needs_mad || needs_ikss) && data && stat->ngoodpix > 0) {
+		mad_scratch = malloc(stat->ngoodpix * sizeof(float));
+		/* fall through on alloc failure; the inner funcs will retry malloc */
+	}
+
 	/* Calculation of median absolute deviation */
-	if (((option & STATS_MAD) || (option & STATS_BWMV) || (option & STATS_IKSS)) && stat->mad == NULL_STATS) {
+	if (needs_mad) {
 		if (!data) {
+			free(mad_scratch);
 			if (stat_is_local) free(stat);
 			return NULL;	// not in cache, don't compute
 		}
 		siril_log_debug("- stats %p fit %p (%d): computing mad\n", stat, fit, layer);
-		stat->mad = siril_stats_float_mad(data, stat->ngoodpix, stat->median / stat->normValue, threads, NULL) * stat->normValue;
+		stat->mad = siril_stats_float_mad(data, stat->ngoodpix, stat->median / stat->normValue, threads, mad_scratch) * stat->normValue;
 	}
 
 	/* Calculation of Bidweight Midvariance */
 	if ((option & STATS_BWMV) && stat->sqrtbwmv == NULL_STATS) {
 		if (!data) {
+			free(mad_scratch);
 			if (stat_is_local) free(stat);
 			return NULL;	// not in cache, don't compute
 		}
@@ -460,13 +523,15 @@ imstats* statistics_internal_float(fits *fit, int layer, rectangle *selection, i
 	}
 
 	/* Calculation of IKSS. Only used for stacking normalization */
-	if ((option & STATS_IKSS) && (stat->location == NULL_STATS || stat->scale == NULL_STATS)) {
+	if (needs_ikss) {
 		if (!data) {
+			free(mad_scratch);
 			if (stat_is_local) free(stat);
 			return NULL;	// not in cache, don't compute
 		}
 		siril_log_debug("- stats %p fit %p (%d): computing ikss\n", stat, fit, layer);
-		if (IKSSlite(data, stat->ngoodpix, stat->median / stat->normValue, stat->mad / stat->normValue, &stat->location, &stat->scale, threads)) {
+		if (IKSSlite_buf(data, stat->ngoodpix, stat->median / stat->normValue, stat->mad / stat->normValue, &stat->location, &stat->scale, threads, mad_scratch)) {
+			free(mad_scratch);
 			if (stat_is_local) free(stat);
 			if (free_data) free(data);
 			return
@@ -476,6 +541,7 @@ imstats* statistics_internal_float(fits *fit, int layer, rectangle *selection, i
 		stat->scale *= stat->normValue;
 	}
 
+	free(mad_scratch);
 	if (free_data) free(data);
 	return stat;
 }
