@@ -1,7 +1,7 @@
 /*
  * This file is part of Siril, an astronomy image processor.
  * Copyright (C) 2005-2011 Francois Meyer (dulle at free.fr)
- * Copyright (C) 2012-2025 team free-astro (see more in AUTHORS file)
+ * Copyright (C) 2012-2026 team free-astro (see more in AUTHORS file)
  * Reference site is https://siril.org
  *
  * Siril is free software: you can redistribute it and/or modify
@@ -30,6 +30,7 @@
 
 #include "core/siril.h"
 #include "core/proto.h"
+#include "core/gui_iface.h"
 #include "core/siril_log.h"
 #include "core/siril_world_cs.h"
 #include "algos/photometry.h"
@@ -49,7 +50,7 @@
 
 #define DEBUG_PSF 0 // flag to show progress of fitting process - may flood output if numerous stars
 
-const double radian_conversion = ((3600.0 * 180.0) / M_PI) / 1.0E3;
+const double radian_conversion = ((3600.0 * 180.0) / G_PI) / 1.0E3;
 
 // we also zero at bg level so that we don't have to bother substracting bg
 // in all the subsequent operations
@@ -311,7 +312,7 @@ static gsl_vector* psf_init_data(gsl_matrix* z, double bg, gboolean frompeaker) 
 	double Su01 = (Ixx + Iyy) * Ixy;
 	double Su11 = Iyy * Iyy + Ixy * Ixy;
 
-	double ang = 90 + 0.5 * atan2( 2 * Su01, Su00 - Su11) * 180. / M_PI; //(eq 4)
+	double ang = 90 + 0.5 * atan2( 2 * Su01, Su00 - Su11) * 180. / G_PI; //(eq 4)
 	double SUsum = Su00 + Su11; // (eq7)
 	double SUdif = sqrt(SQR(Su00 - Su11) + 4 * SQR(Su01)); // (eq7)
 
@@ -320,7 +321,7 @@ static gsl_vector* psf_init_data(gsl_matrix* z, double bg, gboolean frompeaker) 
 	Ixx = sqrt((SUsum - SUdif) * 0.5); // (eq6)
 
 	double r = sqrt(Ixx / Iyy);
-	double FWHM = 2 * sqrt(S / M_PI / r);
+	double FWHM = 2 * sqrt(S / G_PI / r);
 
 	// vector init
 	gsl_vector_set(MaxV, 1, x0 + 0.5); //x0
@@ -345,7 +346,7 @@ static double psf_get_mag(gsl_matrix* z, double B) {
 			intensity += gsl_matrix_get(z, i, j) - B;
 	}
 	if (intensity <= 0.0) {
-		siril_debug_print("psf_get_mag: intensity is <= 0, returning default value\n");
+		siril_log_debug("psf_get_mag: intensity is <= 0, returning default value\n");
 		return -DEFAULT_DOUBLE_VALUE; // no star, returning an unmistakable value
 	}
 	return -2.5 * log10(intensity);
@@ -552,7 +553,7 @@ static void callback(const size_t iter, void *params, const gsl_multifit_nlinear
 						gsl_vector_get(x, 3),
 						FWHM_from_S(fabs(gsl_vector_get(x, 4)), 0.5 * MOFFAT_BETA_UBOUND * (cos(gsl_vector_get(x, 7)) + 1.), PSF_MOFFAT_BFREE), // FWHM
 						0.5 * (cos(gsl_vector_get(x, 5)) + 1.), // roundness
-						gsl_vector_get(x, 6) * 180. / M_PI,
+						gsl_vector_get(x, 6) * 180. / G_PI,
 						0.5 * MOFFAT_BETA_UBOUND * (cos(gsl_vector_get(x, 7)) + 1.), // beta
 						gsl_blas_dnrm2(f));
 	} else {
@@ -567,7 +568,7 @@ static void callback(const size_t iter, void *params, const gsl_multifit_nlinear
 						gsl_vector_get(x, 3),
 						FWHM_from_S(fabs(gsl_vector_get(x, 4)), 0., PSF_GAUSSIAN), // FWHM
 						0.5 * (cos(gsl_vector_get(x, 5)) + 1.), // roundness
-						gsl_vector_get(x, 6) * 180. / M_PI,
+						gsl_vector_get(x, 6) * 180. / G_PI,
 						gsl_blas_dnrm2(f));
 
 	}
@@ -640,7 +641,7 @@ static psf_star *psf_minimiz_angle(gsl_matrix* z, double background, double sat,
 	struct PSF_data d = { n, y, NbRows, NbCols, 0. , mask };
 	double FWHM = gsl_vector_get(MaxV, 3);
 	double roundness = gsl_vector_get(MaxV, 4) / gsl_vector_get(MaxV, 3);
-	double a_init = gsl_vector_get(MaxV, 5) * M_PI / 180.; // angle in radians
+	double a_init = gsl_vector_get(MaxV, 5) * G_PI / 180.; // angle in radians
 	// if roundness is 1., we decrease it a bit so as not to be stuck on the boundary
 	// as it is messes up the initial gradient calcs
 	if (roundness == 1.) {
@@ -707,7 +708,7 @@ static psf_star *psf_minimiz_angle(gsl_matrix* z, double background, double sat,
 		if (error) *error = PSF_ERR_DIVERGED;
 	}
 #if DEBUG_PSF
-	siril_debug_print("Successful criterion#:%d\n",info);
+	siril_log_debug("Successful criterion#:%d\n",info);
 #endif
 
 	/* computing the covariance to estimate the errors*/
@@ -731,7 +732,7 @@ static psf_star *psf_minimiz_angle(gsl_matrix* z, double background, double sat,
 	psf->sy = psf->sx * r;
 	psf->fwhmx = FWHM_from_s(psf->sx, psf->beta, profile);	//Set the real FWHMx with regards to the sx parameter
 	psf->fwhmy = FWHM_from_s(psf->sy, psf->beta, profile);	//Set the real FWHMy with regards to the Sy parameter
-	psf->angle = -FIT(6) * 180.0 / M_PI;
+	psf->angle = -FIT(6) * 180.0 / G_PI;
 
 	/* In some cases convergence give crazy values
 	 * very high. Here we add a sanity check to avoid
@@ -900,13 +901,11 @@ psf_star *psf_global_minimisation(gsl_matrix* z, double bg, double sat, int conv
 		gboolean from_peaker, gboolean for_photometry, struct phot_config *phot_set, gboolean verbose,
 		starprofile profile, psf_error *error) {
 	if (error) *error = PSF_NO_ERR;
-//	gboolean photometry_computed = FALSE; // This is never used except in the dead code commented out later
 
 	psf_star *psf = NULL;
 	if (!(psf = psf_minimiz_angle(z, bg, sat, convergence, from_peaker, for_photometry, phot_set, verbose, profile, error))) {
 		return NULL;
 	}
-//	photometry_computed = TRUE;
 
 	/* We quickly test the result. If it is bad we return NULL */
 	if (!isfinite(psf->fwhmx) || !isfinite(psf->fwhmy) ||
@@ -916,32 +915,13 @@ psf_star *psf_global_minimisation(gsl_matrix* z, double bg, double sat, int conv
 			*error = PSF_ERR_DIVERGED;
 		return NULL;
 	}
-
-/* This code is logically dead. Commenting out prior to removal.
- *	// Photometry
-	if (for_photometry && !photometry_computed &&
-			(!error || *error == PSF_NO_ERR || *error == PSF_ERR_DIVERGED)) {
-		psf->phot = getPhotometryData(z, psf, phot_set, verbose, error);
-		if (psf->phot) {
-			psf->mag = psf->phot->mag;
-			psf->s_mag = psf->phot->s_mag;
-			psf->SNR = psf->phot->SNR;
-			psf->phot_is_valid = psf->phot->valid;
-		}
-		else {
-			psf->phot_is_valid = FALSE;
-			psf->s_mag = 9.999;
-			psf->SNR = 0;
-		}
-	}
-*/
 	return psf;
 }
 
 static gchar *build_wcs_url(gchar *ra, gchar *dec) {
-	if (!has_wcs(&gfit)) return NULL;
+	if (!has_wcs(gfit)) return NULL;
 
-	double resolution = get_wcs_image_resolution(&gfit);
+	double resolution = get_wcs_image_resolution(gfit);
 
 	gchar *tol = g_strdup_printf("%lf", resolution * 3600 * 15);
 
@@ -984,13 +964,13 @@ gchar *format_psf_result(psf_star *result, const rectangle *area, fits *fit, gch
 	double xpos = result->x0 + area->x;
 	double ypos = area->y + area->h - result->y0;
 
-	if (has_wcs(&gfit)) {
+	if (has_wcs(gfit)) {
 		// coordinates of the star in FITS/WCS coordinates
 		double fx, fy;
-		display_to_siril(xpos, ypos, &fx, &fy, gfit.ry);
+		display_to_siril(xpos, ypos, &fx, &fy, gfit->ry);
 
 		double ra, dec;
-		pix2wcs(&gfit, fx, fy, &ra, &dec);
+		pix2wcs(gfit, fx, fy, &ra, &dec);
 		SirilWorldCS *world_cs = siril_world_cs_new_from_a_d(ra, dec);
 		if (world_cs) {
 			gchar *strra, *strdec;
@@ -1034,12 +1014,12 @@ gchar *format_psf_result(psf_star *result, const rectangle *area, fits *fit, gch
 	else {
 		g_snprintf(buffer2, 50, _(", %s channel"), chan);
 	}
-	msg = g_strdup_printf(_("PSF %s Result (%s%s):\n\n"
-				"Centroid Coordinates:\n\t\t%s\n\n"
+	msg = g_strdup_printf(_("PSF %s result (%s%s):\n\n"
+				"Centroid coordinates:\n\t\t%s\n\n"
 				"Full Width Half Maximum:\n\t\tFWHMx=%.2f%s\n\t\tFWHMy=%.2f%s\n\t\tr=%.2f\n"
 				"Angle:\n\t\t%0.2fdeg\n\n"
-				"Background Value:\n\t\tB=%.6f\n\n"
-				"Maximal Intensity:\n\t\tA=%.6f\n\n"
+				"Background value:\n\t\tB=%.6f\n\n"
+				"Maximal intensity:\n\t\tA=%.6f\n\n"
 				"Magnitude (%s):\n\t\tm=%.4f\u00B1%.4f\n\n"
 				"Signal-to-noise ratio:\n\t\tSNR=%.1fdB (%s)\n\n"
 				"RMSE:\n\t\tRMSE=%.3e"),
@@ -1139,4 +1119,38 @@ void free_psf(psf_star *psf) {
 	if (psf->phot) free(psf->phot);
 	if (psf->star_name) g_free(psf->star_name);
 	free(psf);
+}
+
+/* ── Stars list management (moved from gui/PSF_list.c) ──────────────────── */
+
+void clear_stars_list(gboolean refresh_GUI) {
+	g_rw_lock_writer_lock(&com.stars_lock);
+	psf_star **stars = com.stars;
+	if (stars) {
+		com.stars = NULL;
+		g_rw_lock_writer_unlock(&com.stars_lock);
+
+		if (stars[0]) {
+			/* Do not free when the only star is the seq data pointer —
+			 * it will be reused.  Free all other cases. */
+			if (stars[1] || !com.star_is_seqdata) {
+				int i = 0;
+				while (i < MAX_STARS && stars[i])
+					free_psf(stars[i++]);
+			}
+			free(stars);
+		}
+	} else {
+		g_rw_lock_writer_unlock(&com.stars_lock);
+	}
+
+	com.star_is_seqdata = FALSE;
+	if (refresh_GUI && !com.headless)
+		gui_iface.clear_star_list();
+}
+
+gboolean clear_stars_list_as_idle(gpointer user_data) {
+	gboolean refresh = (gboolean)GPOINTER_TO_INT(user_data);
+	clear_stars_list(refresh);
+	return FALSE;
 }

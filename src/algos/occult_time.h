@@ -20,7 +20,7 @@ struct occ_res {
 	int valid_images;	// Number of valid images in the sequence
 };
 
-gpointer occultation_worker(gpointer arg);
+struct light_curve_args;
 
 int time_resync(struct light_curve_args *lcargs);
 

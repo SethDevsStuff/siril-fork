@@ -1,7 +1,7 @@
 /*
  * This file is part of Siril, an astronomy image processor.
  * Copyright (C) 2005-2011 Francois Meyer (dulle at free.fr)
- * Copyright (C) 2012-2025 team free-astro (see more in AUTHORS file)
+ * Copyright (C) 2012-2026 team free-astro (see more in AUTHORS file)
  * Reference site is https://siril.org
  *
  * Siril is free software: you can redistribute it and/or modify
@@ -21,19 +21,30 @@
 #ifdef HAVE_CONFIG_H
 #include <config.h>
 #endif
-#if defined(HAVE_LIBCURL)
-#include <curl/curl.h>
 
 #include <string.h>
+
+#if defined(HAVE_LIBCURL)
+#include <curl/curl.h>
+#endif
 
 #include "core/siril.h"
 #include "core/siril_networking.h"
 #include "core/proto.h"
 #include "core/siril_log.h"
 #include "core/processing.h"
-#include "gui/progress_and_log.h"
+#include "core/gui_iface.h"
+
+#define STR_INDIR(x) #x 
+#define STR(x) STR_INDIR(x)
+#define SIRIL_USER_AGENT "siril/" STR(SIRIL_MAJOR_VERSION) "." STR(SIRIL_MINOR_VERSION) " (https://gitlab.com/free-astro/siril/)"
+
+// Uncomment the next line for some additional debug printing
+// #define NETWORKING_DEBUG
 
 static gboolean online_status = TRUE;
+
+#if defined(HAVE_LIBCURL)
 
 static size_t cbk_curl(void *buffer, size_t size, size_t nmemb, void *userp) {
 	size_t realsize = size * nmemb;
@@ -53,7 +64,7 @@ typedef enum {
 static CURL* initialize_curl(const gchar *url, struct ucontent *content, HttpRequestType request_type, const gchar *post_data) {
 	CURL *curl = curl_easy_init();
 	if (!curl) {
-		siril_log_color_message(_("Error initialising CURL handle, URL functionality unavailable.\n"), "red");
+		siril_log_error(_("Error initialising CURL handle, URL functionality unavailable.\n"));
 		return NULL;
 	}
 	CURLcode retval;
@@ -61,20 +72,20 @@ static CURL* initialize_curl(const gchar *url, struct ucontent *content, HttpReq
 	retval |= curl_easy_setopt(curl, CURLOPT_VERBOSE, 0L);
 	retval |= curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, cbk_curl);
 	retval |= curl_easy_setopt(curl, CURLOPT_WRITEDATA, content);
-	retval |= curl_easy_setopt(curl, CURLOPT_USERAGENT, "siril/0.0");
+	retval |= curl_easy_setopt(curl, CURLOPT_USERAGENT, SIRIL_USER_AGENT);
 	retval |= curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
 	if (request_type == HTTP_POST) {
 		retval |= curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_data);
 		retval |= curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)strlen(post_data));
 	}
 	if (retval) {
-		siril_debug_print("Error in curl_easy_setopt()\n");
+		siril_log_debug("Error in curl_easy_setopt()\n");
 		curl_easy_cleanup(curl);
 		return NULL;
 	}
 	if (g_getenv("CURL_CA_BUNDLE")) {
 		if (curl_easy_setopt(curl, CURLOPT_CAINFO, g_getenv("CURL_CA_BUNDLE"))) {
-			siril_log_color_message(_("Error configuring CURL with CA bundle. https functionality unavailable.\n"), "red");
+			siril_log_error(_("Error configuring CURL with CA bundle. https functionality unavailable.\n"));
 		}
 	}
 	return curl;
@@ -106,8 +117,8 @@ static char* handle_curl_response(CURL *curl, struct ucontent *content, const gc
 			// No need to handle 3xx status codes as CURLOPT_FOLLOWLOCATION is set TRUE and these should be dealt with internally
 			// Codes >= 400 are error codes
 				if (verbose) {
-					siril_debug_print("Fetch failed with code %ld for URL %s\n", *code, url);
-					siril_log_color_message(_("Server unreachable or unresponsive (HTTP code %ld - for details see https://developer.mozilla.org/en-US/docs/Web/HTTP/Status)\n"), "red", *code);
+					siril_log_debug("Fetch failed with code %ld for URL %s\n", *code, url);
+					siril_log_error(_("Server unreachable or unresponsive (HTTP code %ld - for details see https://developer.mozilla.org/en-US/docs/Web/HTTP/Status)\n"), *code);
 					if (content->data) {
 						gchar **lines = g_strsplit(content->data, "\n", 4);
 						for (int i = 0; i < 3 && lines[i] != NULL; i++) {
@@ -115,11 +126,11 @@ static char* handle_curl_response(CURL *curl, struct ucontent *content, const gc
 						}
 						g_strfreev(lines);
 					}
-					set_progress_bar_data(_("Server unreachable or unresponsive"), 1.0);
+					gui_iface.set_progress(1.0, _("Server unreachable or unresponsive"));
 				}
 		}
 	} else {
-		siril_log_color_message(_("URL retrieval failed. libcurl error: [%ld]\n"), "red", retval);
+		siril_log_error(_("URL retrieval failed. libcurl error: [%ld]\n"), retval);
 	}
 	return result;
 }
@@ -128,7 +139,7 @@ gpointer fetch_url_async(gpointer p) {
 	fetch_url_async_data *args = (fetch_url_async_data *) p;
 	g_assert(args->idle_function != NULL);
 	struct ucontent content = {NULL, 0};
-	set_progress_bar_data(NULL, 0.1);
+	gui_iface.set_progress(0.1, NULL);
 	CURL *curl = initialize_curl(args->url, &content, HTTP_GET, NULL);
 	if (!curl) {
 		g_free(args->url);
@@ -141,7 +152,7 @@ gpointer fetch_url_async(gpointer p) {
 	args->url = NULL;
 	args->length = content.len;
 	args->content = result;
-	set_progress_bar_data(NULL, PROGRESS_DONE);
+	gui_iface.set_progress(PROGRESS_DONE, NULL);
 	siril_add_idle(args->idle_function, args);
 	return NULL;
 }
@@ -149,17 +160,17 @@ gpointer fetch_url_async(gpointer p) {
 char* fetch_url(const gchar *url, gsize *length, int *error, gboolean quiet) {
 	*error = 0;
 	struct ucontent content = {NULL, 0};
-	set_progress_bar_data(NULL, 0.1);
+	gui_iface.set_progress(0.1, NULL);
 	CURL *curl = initialize_curl(url, &content, HTTP_GET, NULL);
 	if (!curl) {
 		*error = 1;
-		set_progress_bar_data(NULL, PROGRESS_DONE);
+		gui_iface.set_progress(PROGRESS_DONE, NULL);
 		return NULL;
 	}
 	long code;
 	char *result = handle_curl_response(curl, &content, url, &code, (!quiet));
 	curl_easy_cleanup(curl);
-	set_progress_bar_data(NULL, PROGRESS_DONE);
+	gui_iface.set_progress(PROGRESS_DONE, NULL);
 	*length = content.len;
 	if (!result || content.len == 0 || code != 200) {
 		free(content.data);
@@ -167,6 +178,109 @@ char* fetch_url(const gchar *url, gsize *length, int *error, gboolean quiet) {
 		*error = 1;
 	}
 	return result;
+}
+
+char* fetch_url_range_with_curl(void* curlp, const gchar *url, size_t start, size_t length,
+                                gsize *response_length, int *error, gboolean quiet) {
+	*error = 0;
+	*response_length = 0;
+	struct ucontent content = {NULL, 0};
+
+	if (!curlp) {
+		if (!quiet) {
+			siril_log_error(_("Error: NULL CURL handle provided.\n"));
+		}
+		*error = 1;
+		return NULL;
+	}
+	CURL *curl = (CURL *) curlp;
+
+	// Construct the range header
+	gchar *range_header = g_strdup_printf("%zu-%zu", start, start + length - 1);
+
+	CURLcode retval;
+	retval = curl_easy_setopt(curl, CURLOPT_URL, url);
+	retval |= curl_easy_setopt(curl, CURLOPT_VERBOSE, 0L);
+	retval |= curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, cbk_curl);
+	retval |= curl_easy_setopt(curl, CURLOPT_WRITEDATA, &content);
+	retval |= curl_easy_setopt(curl, CURLOPT_USERAGENT, SIRIL_USER_AGENT);
+	retval |= curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+	retval |= curl_easy_setopt(curl, CURLOPT_RANGE, range_header);
+
+	g_free(range_header);
+
+	if (retval) {
+		if (!quiet) {
+			siril_log_error(_("Error in curl_easy_setopt() for range request\n"));
+		}
+		*error = 1;
+		return NULL;
+	}
+
+	if (g_getenv("CURL_CA_BUNDLE")) {
+		if (curl_easy_setopt(curl, CURLOPT_CAINFO, g_getenv("CURL_CA_BUNDLE"))) {
+			if (!quiet) {
+				siril_log_error(_("Error configuring CURL with CA bundle.\n"));
+			}
+		}
+	}
+
+	content.data = calloc(1, 1);
+	if (content.data == NULL) {
+		PRINT_ALLOC_ERR;
+		*error = 1;
+		return NULL;
+	}
+
+	CURLcode res = curl_easy_perform(curl);
+	char *result = NULL;
+
+	if (res == CURLE_OK) {
+		long code;
+		curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+
+		// A range response will always be 206. Don't accept 200 because that will be the entire file
+		if (code == 206) {
+			result = content.data;
+			*response_length = content.len;
+#ifdef NETWORKING_DEBUG
+			siril_log_debug("Retrieved result from %s, length %lu\n", url, content.len);
+#endif
+		} else {
+			if (!quiet) {
+				siril_log_error(_("HTTP range request failed with code %ld for URL %s\n"), code, url);
+			}
+			free(content.data);
+			*error = 1;
+		}
+	} else {
+		if (!quiet) {
+			siril_log_error(_("URL range request failed. libcurl error: %s\n"), curl_easy_strerror(res));
+		}
+		free(content.data);
+		*error = 1;
+	}
+
+	return result;
+}
+
+char* fetch_url_range(const gchar *url, size_t start, size_t length,
+                      gsize *response_length, int *error, gboolean quiet) {
+    CURL *curl = curl_easy_init();
+    if (!curl) {
+        if (!quiet) {
+            siril_log_error(_("Error initialising CURL handle.\n"));
+        }
+        if (error) *error = 1;
+        return NULL;
+    }
+
+    char *result = fetch_url_range_with_curl(curl, url, start, length, response_length, error, quiet);
+
+    // Clean up the local handle
+    curl_easy_cleanup(curl);
+
+    return result;
 }
 
 int submit_post_request(const char *url, const char *post_data, char **post_response) {
@@ -178,7 +292,7 @@ int submit_post_request(const char *url, const char *post_data, char **post_resp
 	}
 	CURLcode res = curl_easy_perform(curl);
 	if (res != CURLE_OK) {
-		siril_log_color_message(_("Error fetching URL: %s\n"), "red", curl_easy_strerror(res));
+		siril_log_error(_("Error fetching URL: %s\n"), curl_easy_strerror(res));
 	} else {
 		*post_response = g_strdup(chunk.data);
 	}
@@ -187,14 +301,144 @@ int submit_post_request(const char *url, const char *post_data, char **post_resp
 	return (res != CURLE_OK ? 1 : 0);
 }
 
+// abort callback
+static size_t cbk_abort(void *ptr, size_t size, size_t nmemb, void *data) {
+	size_t total = size * nmemb;
+	
+	// If it's exactly 1 byte, we assume it's our requested range.
+	// We "consume" it to let the connection close gracefully (CURLE_OK).
+	if (total == 1) {
+		return total;
+	}
+
+	// If it's anything else, it's likely the entire request body so we
+	// return zero to kill the connection immediately (CURLE_WRITE_ERROR).
+	return 0;
+}
+
+/**
+ * Checks if a URL is up and supports Range requests.
+ * Returns:
+ * - >0 (ms) if UP and supports Range (206)
+ * - -2      if UP but NO Range support (200)
+ * - -1      if DOWN or Error
+ */
+int http_check(const gchar *url) {
+	CURL *curl;
+	CURLcode res;
+	int result_val = -1;
+
+	if (!url) return -1;
+
+	curl = curl_easy_init();
+	if (!curl) return -1;
+
+	CURLcode retval;
+	retval = curl_easy_setopt(curl, CURLOPT_URL, url);
+	retval |= curl_easy_setopt(curl, CURLOPT_VERBOSE, 0L);
+	retval |= curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, cbk_abort);
+	retval |= curl_easy_setopt(curl, CURLOPT_USERAGENT, SIRIL_USER_AGENT);
+	retval |= curl_easy_setopt(curl, CURLOPT_RANGE, "0-0");
+	retval |= curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+	retval |= curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);
+	retval |= curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+
+	if (retval) {
+		siril_log_debug("Error in curl_easy_setopt()\n");
+		curl_easy_cleanup(curl);
+		return -1;
+	}
+
+	res = curl_easy_perform(curl);
+
+	if (res == CURLE_OK || res == CURLE_WRITE_ERROR) {
+		long response_code;
+		curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
+
+		if (response_code == 206) {
+			// Success: Server is up and handled the range request
+			double total_time = 0;
+			curl_easy_getinfo(curl, CURLINFO_TOTAL_TIME, &total_time);
+			result_val = (int)(total_time * 1000.0);
+		}
+		else if (response_code == 200) {
+			// Server is up, but ignored the Range header
+			result_val = -2;
+		}
+	}
+
+	curl_easy_cleanup(curl);
+	return result_val;
+}
+
 gboolean siril_compiled_with_networking() {
 	return TRUE;
 }
 
 #else
 
+// Stub functions when libcurl is not available
+// These return errors but allow the code to compile and link
+
+gpointer fetch_url_async(gpointer p) {
+	fetch_url_async_data *args = (fetch_url_async_data *) p;
+	g_assert(args->idle_function != NULL);
+
+	siril_log_error(_("Error: Siril was compiled without libcurl support. Network features are unavailable.\n"));
+
+	// Clean up and call the idle function with NULL content to signal failure
+	g_free(args->url);
+	args->url = NULL;
+	args->length = 0;
+	args->content = NULL;
+	args->code = 0;
+
+	siril_add_idle(args->idle_function, args);
+	return NULL;
+}
+
+char* fetch_url(const gchar *url, gsize *length, int *error, gboolean quiet) {
+	if (!quiet) {
+		siril_log_error(_("Error: Siril was compiled without libcurl support. Cannot fetch URL: %s\n"), url);
+	}
+	*error = 1;
+	*length = 0;
+	return NULL;
+}
+
+char* fetch_url_range_with_curl(void* curlp, const gchar *url, size_t start, size_t length,
+                                gsize *response_length, int *error, gboolean quiet) {
+	if (!quiet) {
+		siril_log_error(_("Error: Siril was compiled without libcurl support. Cannot fetch URL range: %s\n"), url);
+	}
+	*error = 1;
+	*response_length = 0;
+	return NULL;
+}
+
+
+char* fetch_url_range(const gchar *url, size_t start, size_t length,
+                      gsize *response_length, int *error, gboolean quiet) {
+	if (!quiet) {
+		siril_log_error(_("Error: Siril was compiled without libcurl support. Cannot fetch URL range: %s\n"), url);
+	}
+	*error = 1;
+	*response_length = 0;
+	return NULL;
+}
+
+int submit_post_request(const char *url, const char *post_data, char **post_response) {
+	siril_log_error(_("Error: Siril was compiled without libcurl support. Cannot submit POST request to: %s\n"), url);
+	*post_response = NULL;
+	return 1;
+}
+
 gboolean siril_compiled_with_networking() {
 	return FALSE;
+}
+
+int http_check(const gchar *url) {
+	return -1;
 }
 
 #endif

@@ -1,8 +1,8 @@
 dnl Process this file with autoconf to produce a configure script.
 m4_define([siril_major_version], [1])
-m4_define([siril_minor_version], [4])
+m4_define([siril_minor_version], [5])
 m4_define([siril_micro_version], [0])
-m4_define([siril_prerelease_version], [beta4])
+m4_define([siril_prerelease_version], [rc1])
 m4_define([siril_version],
           [siril_major_version.siril_minor_version.siril_micro_version])
 m4_define([siril_version_full],
@@ -13,7 +13,7 @@ m4_define([siril_unstable],
 m4_define([siril_stable],
           m4_if(m4_eval(siril_minor_version % 2), [0], [yes], [no]))
 
-dnl change siril_version_full by siril_version for stable release
+change siril_version_full by siril_version for stable release
 AC_INIT([siril], [siril_version_full],
 dnl AC_INIT([siril], [siril_version],
         [https://gitlab.com/free-astro/siril/issues],
@@ -137,14 +137,47 @@ case "$host_os" in
     ;;
 esac
 
-dnl check GTK
-PKG_CHECK_MODULES(GTK, gtk+-3.0 >= 3.20.0)
+dnl ================ OPTIONAL GTK GUI ================
+dnl --enable-gtk (default) builds the GTK4 GUI executable from src/gui-gtk4;
+dnl --disable-gtk (or --enable-gtk=no) produces a headless CLI-only build
+dnl with only the siril-cli target.  Mirrors meson's -Dgtk=true|false.
+AC_ARG_ENABLE(gtk,
+              [AS_HELP_STRING([--enable-gtk],
+                              [build the GTK4 GUI (default); use --disable-gtk for a headless CLI-only build])],
+              [enable_gtk="$enableval"],
+              [enable_gtk="yes"])
+
+case "x$enable_gtk" in
+  xno|xfalse)
+    enable_gtk="no"
+    ;;
+  xyes|xtrue|xgtk4)
+    enable_gtk="yes"
+    ;;
+  *)
+    AC_MSG_ERROR([--enable-gtk: invalid value '$enable_gtk'; must be yes or no])
+    ;;
+esac
+
+if test "x$enable_gtk" = "xyes"; then
+  PKG_CHECK_MODULES(GTK, [gtk4 >= 4.12.0])
+  PKG_CHECK_MODULES(GTKSOURCEVIEW, [gtksourceview-5])
+  AC_DEFINE([HAVE_GTK],  [1], [Build with GTK GUI support])
+  AC_DEFINE([USE_GTK4],  [1], [Build the GTK4 GUI])
+fi
+AM_CONDITIONAL([ENABLE_GTK], [test "x$enable_gtk" = "xyes"])
+AM_CONDITIONAL([USE_GTK4],   [test "x$enable_gtk" = "xyes"])
 
 dnl check lcms2
 PKG_CHECK_MODULES(LCMS2, lcms2 >= 2.14)
 
-dnl check cairo
+dnl check cairo, pango and gdk-pixbuf
+dnl These are needed unconditionally by core code (io/siril_plot.c, io/ser.c,
+dnl FITS thumbnails); they were previously pulled in transitively via GTK.
 PKG_CHECK_MODULES(CAIRO, cairo)
+PKG_CHECK_MODULES(PANGO, pango)
+PKG_CHECK_MODULES(PANGOCAIRO, pangocairo)
+PKG_CHECK_MODULES(GDK_PIXBUF, gdk-pixbuf-2.0 >= 2.36.0)
 
 dnl check wcslib
 PKG_CHECK_MODULES(WCSLIB, wcslib >= 7.12)
@@ -161,9 +194,6 @@ PKG_CHECK_MODULES(GSL, [gsl < 2],
 
 dnl check cfitsio
 PKG_CHECK_MODULES(CFITSIO, [cfitsio])
-
-dnl Check for gtksourceview-4
-PKG_CHECK_MODULES(GTKSOURCEVIEW, [gtksourceview-4])
 
 dnl check opencv
 AC_PROG_CXX
@@ -337,6 +367,19 @@ PKG_CHECK_MODULES([LIBGIT], [libgit2],
 		  [AC_DEFINE([HAVE_LIBGIT2], [1], [Using online scripts])],
 		  AC_MSG_WARN([libgit2 was not found. Not using online scripts.]))
 
+dnl check sqlite3 (used by online catalog cache)
+PKG_CHECK_MODULES([SQLITE], [sqlite3 >= 3.0],
+		  [AC_DEFINE([HAVE_SQLITE], [1], [Using SQLite for online catalog cache])],
+		  AC_MSG_WARN([sqlite3 not found. Online catalog cache disabled.]))
+
+dnl check libjxl (JPEG XL support)
+PKG_CHECK_MODULES([LIBJXL], [libjxl],
+		  [AC_DEFINE([HAVE_LIBJXL], [1], [Using JPEG XL images])
+		   PKG_CHECK_MODULES([LIBJXL_THREADS], [libjxl_threads],
+		                     [AC_DEFINE([HAVE_LIBJXL_THREADS], [1], [Using JPEG XL threaded decoder])],
+		                     [:])],
+		  AC_MSG_WARN([libjxl not found. Not using JPEG XL importer and exporter.]))
+
 dnl ================================================================
 dnl Collect some arguments.
 dnl ================================================================
@@ -401,6 +444,34 @@ AM_CONDITIONAL([PLATFORM_OSX], [test "$platform" = "osx"])
 AC_DEFINE_UNQUOTED(CPU_ARCH, "$host_cpu", [The CPU family this was built for])
 AC_DEFINE_UNQUOTED(SIRIL_BUILD_PLATFORM_FAMILY, "$platform_family", [The OS family this was built for])
 
+# Check if we're on Windows and get MSYSTEM
+case "$host_os" in
+  mingw*|msys*|cygwin*)
+    # We're on Windows, get the MSYSTEM environment variable
+    MSYSTEM="${MSYSTEM:-unknown}"
+    AC_MSG_NOTICE([Building on Windows with MSYSTEM: $MSYSTEM])
+    
+    # Check if using UCRT runtime
+    case "$MSYSTEM" in
+      UCRT64|CLANG64|CLANGARM64)
+        AC_DEFINE([USE_UCRT], [1], [Define if building with UCRT runtime])
+        AC_MSG_NOTICE([Building with UCRT runtime])
+        ;;
+      *)
+        AC_MSG_NOTICE([Building with MSVCRT runtime])
+        ;;
+    esac
+    
+    # Convert to lowercase and define
+    msystem_lower=$(echo "$MSYSTEM" | tr '[:upper:]' '[:lower:]')
+    AC_DEFINE_UNQUOTED([SIRIL_BUILD_PLATFORM_ENV], "$msystem_lower", [The Windows MSYSTEM environment])
+    ;;
+  *)
+    # Not Windows
+    AC_DEFINE([SIRIL_BUILD_PLATFORM_ENV], "", [The Windows MSYSTEM environment])
+    ;;
+esac
+
 AC_SUBST(WIN32_LARGE_ADDRESS_AWARE)
 AC_SUBST(PATHSEP)
 
@@ -420,22 +491,33 @@ AC_SUBST(WINDRES)
 #####################################
 # Check for gdk windowing style
 #####################################
-AC_MSG_CHECKING([for native gdk windows style])
-gdk_targets=`$PKG_CONFIG --variable=targets gdk-3.0`
 gdk_windowing="x11"
-for target in $gdk_targets;
-do
-	case "$target" in
-		quartz)
-			gdk_windowing=quartz
-			;;
-		win32)
-			gdk_windowing=win32
-			;;
-	esac
-done
-
-AC_MSG_RESULT([$gdk_windowing])
+if test "x$enable_gtk" = "xyes"; then
+	AC_MSG_CHECKING([for native gdk windows style])
+	# gtk4 ships gdk inside the same pkg-config file; macOS uses the
+	# 'macos' target name (gdk4 / gtk-mac-integration was renamed
+	# from 'quartz' upstream).  Fall back to the host_os we already
+	# detected if pkg-config does not provide 'targets'.
+	gdk_targets=`$PKG_CONFIG --variable=targets gtk4 2>/dev/null`
+	for target in $gdk_targets;
+	do
+		case "$target" in
+			quartz|macos)
+				gdk_windowing=quartz
+				;;
+			win32)
+				gdk_windowing=win32
+				;;
+		esac
+	done
+	if test "x$gdk_targets" = "x"; then
+		case "$platform" in
+			osx)     gdk_windowing=quartz ;;
+			windows) gdk_windowing=win32  ;;
+		esac
+	fi
+	AC_MSG_RESULT([$gdk_windowing])
+fi
 AM_CONDITIONAL(GDK_WINDOWING_QUARTZ, test "$gdk_windowing" = "quartz")
 AM_CONDITIONAL(GDK_WINDOWING_WIN32, test "$gdk_windowing" = "win32")
 AM_CONDITIONAL(GDK_WINDOWING_X11, test "$gdk_windowing" = "x11")
@@ -443,10 +525,8 @@ AM_CONDITIONAL(GDK_WINDOWING_X11, test "$gdk_windowing" = "x11")
 if test "$platform" = "osx"; then
 	AC_DEFINE([OS_OSX],[1],[Defined if os is Mac OSX])
 
-	PKG_CHECK_MODULES(GTK_MAC, gtk-mac-integration-gtk3 >= 2.0.8)
-
-	AC_SUBST(GTK_MAC_CFLAGS)
-	AC_SUBST(GTK_MAC_LIBS)
+	dnl The GTK4 backend relies on the GTK4 GdkMacosDisplay integration;
+	dnl no gtk-mac-integration pkg-config dependency is required.
 fi
 
 if test `uname` != "Darwin"; then
@@ -454,6 +534,33 @@ if test `uname` != "Darwin"; then
 		AC_SUBST(EXTRA_LIBS,'-lpsapi')
 	fi
 fi
+
+dnl ================ OPTIONAL GTK4 X11 DND FALLBACK ================
+dnl GTK4-only.  Works around an upstream GTK X11 bug whereby
+dnl gdk_drop_read_value_async never completes (see src/gui-gtk4/single_image.c).
+dnl Linux/BSD only — ignored on macOS/Windows.
+AC_ARG_ENABLE(legacy-x11-support,
+              [AS_HELP_STRING([--disable-legacy-x11-support],
+                              [GTK4 only: do not build the X11 drag-and-drop fallback (skips the libX11 dependency)])],
+              [enable_x11_dnd_fallback="$enableval"],
+              [enable_x11_dnd_fallback="yes"])
+
+case "$platform" in
+  osx|windows)
+    enable_x11_dnd_fallback="no"
+    ;;
+esac
+if test "x$enable_gtk" != "xyes"; then
+    enable_x11_dnd_fallback="no"
+fi
+
+if test "x$enable_x11_dnd_fallback" = "xyes"; then
+    PKG_CHECK_MODULES(X11, [x11],
+                      [AC_DEFINE([HAVE_X11_DND_FALLBACK], [1],
+                                 [GTK4 X11 drag-and-drop fallback compiled in (libX11 linked).])],
+                      [enable_x11_dnd_fallback="no"])
+fi
+AM_CONDITIONAL([HAVE_X11_DND_FALLBACK], [test "x$enable_x11_dnd_fallback" = "xyes"])
 
 #################
 # Bundle packages
@@ -488,5 +595,15 @@ AC_MSG_RESULT([$enable_relocatable_bundle])
 
 AC_SUBST([AM_LDFLAGS])
 
-AC_CONFIG_FILES([Makefile src/Makefile subprojects/Makefile data/Makefile pixmaps/Makefile pixmaps/icons/Makefile platform-specific/Makefile platform-specific/linux/Makefile po/Makefile.in])
+AC_CONFIG_FILES([Makefile src/Makefile subprojects/Makefile data/Makefile pixmaps/Makefile pixmaps/icons/Makefile platform-specific/Makefile platform-specific/linux/Makefile po/Makefile.in python_module/Makefile python_module/sirilpy/Makefile])
 AC_OUTPUT
+
+if test "x$enable_gtk" = "xyes"; then
+  siril_targets="siril siril-cli"
+else
+  siril_targets="siril-cli (headless)"
+fi
+AC_MSG_NOTICE([Build configuration:])
+AC_MSG_NOTICE([  GTK GUI support  : $enable_gtk])
+AC_MSG_NOTICE([  X11 DND fallback : $enable_x11_dnd_fallback])
+AC_MSG_NOTICE([  Targets          : $siril_targets])

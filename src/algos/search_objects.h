@@ -1,7 +1,7 @@
 /*
  * This file is part of Siril, an astronomy image processor.
  * Copyright (C) 2005-2011 Francois Meyer (dulle at free.fr)
- * Copyright (C) 2012-2025 team free-astro (see more in AUTHORS file)
+ * Copyright (C) 2012-2026 team free-astro (see more in AUTHORS file)
  * Reference site is https://siril.org
  *
  * Siril is free software: you can redistribute it and/or modify
@@ -23,6 +23,7 @@
 
 #include <glib.h>
 #include "core/siril.h"
+#include "core/gtk_forward_decls.h"
 #include "core/siril_world_cs.h"
 #include "io/annotation_catalogues.h"
 #include "algos/PSF.h"
@@ -64,13 +65,13 @@ struct sky_object {
 int parse_catalog_buffer(const gchar *buffer, sky_object_query_args *args);
 int cached_object_lookup(sky_object_query_args *args);
 char *search_in_online_catalogs(sky_object_query_args *args);
-void search_object(GtkEntry *entry);
 
 void add_plated_from_annotations(const cat_item *obj);
 void free_Platedobject();
 gboolean has_nonzero_coords();
 int parse_resolver_buffer(const gchar *buffer, struct sky_object *obj);
-
+int catsearch_image_hook(struct generic_img_args *args, fits *fit, int threads);
+gchar *catsearch_log_hook(gpointer p, log_hook_detail detail);
 gpointer catsearch_worker(gpointer p);
 
 #endif
