@@ -15,6 +15,7 @@
 #include "core/siril_log.h"
 #include "core/initfile.h"
 #include "io/avi_preview.h"
+#include "io/image_format_fits.h"
 #include "gui-gtk4/file_browser.h"
 #include "gui-gtk4/image_interactions.h"
 #include "gui-gtk4/message_dialog.h"
@@ -33,6 +34,9 @@ extern guchar *extract_thumbnail_from_fits(const char *filename, gchar **descr,
  * as the FITS extractor. */
 extern guchar *extract_thumbnail_from_ser(const char *filename, gchar **descr,
                                            int *width_out, int *height_out);
+
+/* From io/image_format_fits.c - reads the fits headers from the file*/
+extern int read_fits_metadata_from_path_first_HDU(const char *filename, fits *fit);										   
 
 typedef struct {
 	gchar *title;
@@ -2060,6 +2064,7 @@ void siril_file_browser_default_preview(const gchar *path,
 	/* Try to fill in dimensions / extra info via a preview load. */
 	gchar *dims_str = NULL;        /* "1024 x 1024 pixels" */
 	gchar *extra_str = NULL;       /* e.g. "3 channels (16 bits)" */
+	gchar *filter_str = NULL;      /* Holds FITS filter info if available */
 	gboolean got_texture = FALSE;
 
 	/* FITS / SER / AVI thumbnails go through Siril-side extractors.  All
@@ -2146,6 +2151,24 @@ void siril_file_browser_default_preview(const gchar *path,
 		}
 	}
 
+	/* Read the FITS filter metadata key only if this file is a FITS image */
+	if (itype == TYPEFITS) {
+			fits fit = { 0 };
+			int statusread = read_fits_metadata_from_path_first_HDU(path, &fit);
+			if (!statusread) {
+					/* Ensure the filter keyword isn't completely empty or unassigned */
+					if (fit.keywords.filter[0] != '\0') {
+							gchar *currfilter = g_strstrip(g_strdup(fit.keywords.filter));
+							if (currfilter && *currfilter) {
+									/* Translators: e.g., "Filter: Ha" */
+									filter_str = g_strdup_printf("%s: %s", _("Filter"), currfilter);
+							}
+							g_free(currfilter);
+					}       
+					clearfits(&fit);
+			}
+	}     
+
 	/* No thumbnail available — show a type-appropriate icon so the
 	 * preview area isn't a blank rectangle. */
 	if (!got_texture)
@@ -2183,6 +2206,12 @@ void siril_file_browser_default_preview(const gchar *path,
 			g_string_append_printf(meta, "\n%s", e);
 			g_free(e);
 		}
+		if (filter_str && *filter_str) {
+			gchar *e = g_markup_escape_text(filter_str, -1);
+			g_string_append_printf(meta, "\n%s", e);
+			g_free(e);
+		}
+
 		gtk_label_set_markup(metadata_label, meta->str);
 		g_string_free(meta, TRUE);
 	}
@@ -2190,6 +2219,7 @@ void siril_file_browser_default_preview(const gchar *path,
 	g_free(dims_str);
 	g_free(extra_str);
 	g_free(size_str);
+	g_free(filter_str);
 }
 
 /* ── debayer toggle (cross-tab sync) ──────────────────────────────── */
