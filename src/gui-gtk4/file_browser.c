@@ -2160,7 +2160,6 @@ void siril_file_browser_default_preview(const gchar *path,
 					if (fit.keywords.filter[0] != '\0') {
 							gchar *currfilter = g_strstrip(g_strdup(fit.keywords.filter));
 							if (currfilter && *currfilter) {
-									/* Translators: e.g., "Filter: Ha" */
 									filter_str = g_strdup_printf("%s: %s", _("Filter"), currfilter);
 							}
 							g_free(currfilter);
@@ -2211,7 +2210,6 @@ void siril_file_browser_default_preview(const gchar *path,
 			g_string_append_printf(meta, "\n%s", e);
 			g_free(e);
 		}
-
 		gtk_label_set_markup(metadata_label, meta->str);
 		g_string_free(meta, TRUE);
 	}
