@@ -2971,6 +2971,28 @@ guchar *extract_thumbnail_from_fits(const char *filename, gchar **descr,
 	}
 	*descr = description;
 
+	/* Read the FITS header and append the filter details to the description */
+	fits tmpfit = { 0 };
+	tmpfit.fptr = fp;
+	read_fits_keywords(&tmpfit);
+
+	if (tmpfit.keywords.filter[0] != '\0') {
+                gchar *currfilter = g_strstrip(g_strdup(tmpfit.keywords.filter));
+                if (currfilter && *currfilter) {
+                        /* Create a localized filter string line */
+                        gchar *filter_line = g_strdup_printf("\n%s: %s", _("Filter"), currfilter);
+
+                        /* Concatenate it to our existing description */
+                        gchar *combined = g_strconcat(description, filter_line, NULL);
+
+                        g_free(description);
+                        g_free(filter_line);
+                        description = combined;
+                }
+                g_free(currfilter);
+        }
+	clearfits(&tmpfit);
+
 	size_t sz = (size_t)w * h * n_channels;
 	/* Skip pixel loading for images too large to thumbnail (>256 M floats ≈ 1 GB) */
 	if (sz > 256UL * 1024 * 1024) {
