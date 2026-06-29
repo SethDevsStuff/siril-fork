@@ -15,7 +15,6 @@
 #include "core/siril_log.h"
 #include "core/initfile.h"
 #include "io/avi_preview.h"
-#include "io/image_format_fits.h"
 #include "gui-gtk4/file_browser.h"
 #include "gui-gtk4/image_interactions.h"
 #include "gui-gtk4/message_dialog.h"
@@ -34,9 +33,6 @@ extern guchar *extract_thumbnail_from_fits(const char *filename, gchar **descr,
  * as the FITS extractor. */
 extern guchar *extract_thumbnail_from_ser(const char *filename, gchar **descr,
                                            int *width_out, int *height_out);
-
-/* From io/image_format_fits.c - reads the fits headers from the file*/
-extern int read_fits_metadata_from_path_first_HDU(const char *filename, fits *fit);										   
 
 typedef struct {
 	gchar *title;
