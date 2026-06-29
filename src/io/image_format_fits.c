@@ -2969,7 +2969,6 @@ guchar *extract_thumbnail_from_fits(const char *filename, gchar **descr,
 				h, ngettext("pixel", "pixels", h), n_channels,
 				ngettext("channel", "channels", n_channels), abs(dtype));
 	}
-	*descr = description;
 
 	/* Read the FITS header and append the filter details to the description */
 	fits tmpfit = { 0 };
@@ -2992,6 +2991,8 @@ guchar *extract_thumbnail_from_fits(const char *filename, gchar **descr,
                 g_free(currfilter);
         }
 	clearfits(&tmpfit);
+
+	*descr = description;
 
 	size_t sz = (size_t)w * h * n_channels;
 	/* Skip pixel loading for images too large to thumbnail (>256 M floats ≈ 1 GB) */
