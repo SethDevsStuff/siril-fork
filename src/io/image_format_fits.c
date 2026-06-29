@@ -2958,39 +2958,35 @@ guchar *extract_thumbnail_from_fits(const char *filename, gchar **descr,
 	if (w <= 0 || h <= 0)
 		return NULL;
 
-	/* Build description from header data — always available regardless of image size */
-	if (fitseq_is_fitseq(filename, &frames)) {
-		description = g_strdup_printf("%d x %d %s\n%d %s (%d bits)\n%d %s", w,
-				h, ngettext("pixel", "pixels", h), n_channels,
-				ngettext("channel", "channels", n_channels), abs(dtype), frames,
-				ngettext("frame", "frames", frames));
-	} else {
-		description = g_strdup_printf("%d x %d %s\n%d %s (%d bits)", w,
-				h, ngettext("pixel", "pixels", h), n_channels,
-				ngettext("channel", "channels", n_channels), abs(dtype));
-	}
+	/* Read the FITS keywords and extract the filter string */
+        fits tmpfit = { 0 };
+        tmpfit.fptr = fp;
+        read_fits_keywords(&tmpfit);
 
-	/* Read the FITS header and append the filter details to the description */
-	fits tmpfit = { 0 };
-	tmpfit.fptr = fp;
-	read_fits_keywords(&tmpfit);
-
-	if (tmpfit.keywords.filter[0] != '\0') {
+        gchar *filter_str = NULL;
+        if (tmpfit.keywords.filter[0] != '\0') {
                 gchar *currfilter = g_strstrip(g_strdup(tmpfit.keywords.filter));
                 if (currfilter && *currfilter) {
-                        /* Create a localized filter string line */
-                        gchar *filter_line = g_strdup_printf("\n%s: %s", _("Filter"), currfilter);
-
-                        /* Concatenate it to our existing description */
-                        gchar *combined = g_strconcat(description, filter_line, NULL);
-
-                        g_free(description);
-                        g_free(filter_line);
-                        description = combined;
+                        filter_str = g_strdup_printf("\n%s: %s", _("Filter"), currfilter);
                 }
                 g_free(currfilter);
         }
-	clearfits(&tmpfit);
+        clearfits(&tmpfit);
+
+        /* Build description from header data — always available regardless of image size */
+        if (fitseq_is_fitseq(filename, &frames)) {
+                description = g_strdup_printf("%d x %d %s\n%d %s (%d bits)\n%d %s%s", w,
+                                h, ngettext("pixel", "pixels", h), n_channels,
+                                ngettext("channel", "channels", n_channels), abs(dtype), frames,
+                                ngettext("frame", "frames", frames),
+                                filter_str ? filter_str : "");
+        } else {
+                description = g_strdup_printf("%d x %d %s\n%d %s (%d bits)%s", w,
+                                h, ngettext("pixel", "pixels", h), n_channels,
+                                ngettext("channel", "channels", n_channels), abs(dtype),
+                                filter_str ? filter_str : "");
+        }
+        g_free(filter_str);
 
 	*descr = description;
 
