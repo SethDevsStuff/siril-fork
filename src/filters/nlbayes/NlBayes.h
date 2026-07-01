@@ -168,6 +168,8 @@ void estimateSimilarPatchesStep1(
 ,	std::vector<unsigned> &o_index
 ,	const unsigned p_ij
 ,	const nlbParams &p_params
+,   std::vector<std::pair<float, unsigned> > &distance_buffer
+,   std::vector<float> &ref_patch_buffer
 );
 
 /**
@@ -192,6 +194,7 @@ unsigned estimateSimilarPatchesStep2(
 ,	std::vector<unsigned> &o_index
 ,	const unsigned p_ij
 ,	const nlbParams &p_params
+,   std::vector<std::pair<float, unsigned> > &distance_buffer
 );
 
 /**
