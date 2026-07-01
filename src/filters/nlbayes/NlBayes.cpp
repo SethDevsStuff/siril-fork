@@ -387,7 +387,7 @@ int processNlBayes(
 	const unsigned nSP		= p_params.nSimilarPatches;
 	unsigned nInverseFailed	= 0;
 	const float threshold	= p_params.sigma * p_params.sigma * p_params.gamma *
-								(p_params.isFirstStep ? chnls : 1.f);
+				(p_params.isFirstStep ? chnls : 1.f);
 
 	//! Allocate Sizes
 	if (p_params.isFirstStep) {
@@ -410,6 +410,7 @@ int processNlBayes(
 	std::vector<pair<float, unsigned> > distance_buffer(sW * sW);
 	std::vector<float> ref_patch_buffer(sP2);
 
+	//! ponderation: weight sum per pixel
 	img_t<float> weight(width, height, chnls);
 	weight.set_value(0.f);
 
