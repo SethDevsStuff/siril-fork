@@ -375,6 +375,7 @@ int processNlBayes(
 ,	int thread
 ,	int pass
 ){
+	//! Parameters initialization
 	const unsigned width	= i_imNoisy.w;
 	const unsigned height	= i_imNoisy.h;
 	const unsigned chnls	= i_imNoisy.d;
@@ -388,11 +389,13 @@ int processNlBayes(
 	const float threshold	= p_params.sigma * p_params.sigma * p_params.gamma *
 								(p_params.isFirstStep ? chnls : 1.f);
 
+	//! Allocate Sizes
 	if (p_params.isFirstStep) {
 		io_imBasic.resize(width, height, chnls);
 	}
 	o_imFinal.resize(width, height, chnls);
 
+	//! Used matrices during Bayes' estimate
 	vector<vector<float> > group3d(chnls, vector<float> (nSP * sP2));
 	vector<float> group3dNoisy(sW * sW * sPC), group3dBasic(sW * sW * sPC);
 	vector<unsigned> index(p_params.isFirstStep ? nSP : sW * sW);
@@ -403,14 +406,17 @@ int processNlBayes(
 	mat.covMat          .resize(p_params.isFirstStep ? sP2 * sP2 : sPC * sPC);
 	mat.covMatTmp       .resize(p_params.isFirstStep ? sP2 * sP2 : sPC * sPC);
 
-	// LOW HANGING FRUIT: Allocate scratchpad vectors ONCE per thread execution context
+	// Allocate scratchpad vectors ONCE per thread execution context
 	std::vector<pair<float, unsigned> > distance_buffer(sW * sW);
 	std::vector<float> ref_patch_buffer(sP2);
 
 	img_t<float> weight(width, height, chnls);
 	weight.set_value(0.f);
 
+	//! Mask: non-already processed patches
 	vector<bool> mask(wh, false);
+
+	//! Only pixels of the center of the image must be processed (not the boundaries)
 	for (unsigned i = sW; i < height - sW; i++) {
 		for (unsigned j = sW; j < width - sW; j++) {
 			mask[i * width + j] = true;
@@ -421,7 +427,10 @@ int processNlBayes(
 	for (unsigned ij = 0; ij < wh; ij += p_params.offSet) {
 		if (!processing_should_continue())
 			return 1;
+
+		//! Only non-seen patches are processed
 		if (mask[ij]) {
+			//! Search for similar patches around the reference one
 			unsigned nSimP = p_params.nSimilarPatches;
 			if (p_params.isFirstStep) {
 				// Reusing pre-allocated vectors to avoid heap allocation thrashing
@@ -433,7 +442,10 @@ int processNlBayes(
 				nSimP = (nSimP < 1 ? 1 : nSimP);
 			}
 
+			//! Initialization
 			bool doBayesEstimate = true;
+
+			//! If we use the homogeneous area trick
 			if (p_params.useHomogeneousArea) {
 				if (p_params.isFirstStep) {
 					doBayesEstimate = !computeHomogeneousAreaStep1(group3d, sP, nSP,
@@ -445,6 +457,7 @@ int processNlBayes(
 				}
 			}
 
+			//! Else, use Bayes' estimate
 			if (doBayesEstimate) {
 				if (p_params.isFirstStep) {
 					computeBayesEstimateStep1(group3d, mat, nInverseFailed, p_params);
@@ -455,6 +468,7 @@ int processNlBayes(
 				}
 			}
 
+			//! Aggregation
 			if (p_params.isFirstStep) {
 				computeAggregationStep1(io_imBasic, weight, mask, group3d, index,
 					p_params);
@@ -474,6 +488,7 @@ int processNlBayes(
 		}
 	}
 
+	//! Weighted aggregation
 	computeWeightedAggregation(i_imNoisy, io_imBasic, o_imFinal, weight, p_params);
 
 	if (nInverseFailed > 0 && p_params.verbose) {
@@ -500,9 +515,10 @@ void estimateSimilarPatchesStep1(
 ,	std::vector<unsigned> &o_index
 ,	const unsigned p_ij
 ,	const nlbParams &p_params
-,	std::vector<pair<float, unsigned> > &distance // Passed by reference
-,	std::vector<float> &ref_patch                // Passed by reference
+,	std::vector<pair<float, unsigned> > &distance
+,	std::vector<float> &ref_patch
 ){
+	//! Initialization
 	const unsigned sW		= p_params.sizeSearchWindow;
 	const unsigned sP		= p_params.sizePatch;
 	const unsigned width	= i_im.w;
@@ -516,6 +532,7 @@ void estimateSimilarPatchesStep1(
 		for (unsigned q = 0; q < sP; q++)
 			ref_patch[p * sP + q] = i_im[p_ij + p * width + q];
 
+	//! Compute distance between patches
 	for (unsigned i = 0; i < sW; i++) {
 		for (unsigned j = 0; j < sW; j++) {
 			const unsigned k = i * width + j + ind;
@@ -535,13 +552,16 @@ void estimateSimilarPatchesStep1(
 		}
 	}
 
+	//! Keep only the N2 best similar patches
 	std::nth_element(distance.begin(), distance.begin() + nSimP, distance.end(), comparaisonFirst);
 	std::sort(distance.begin(), distance.begin() + nSimP, comparaisonFirst);
 
+	//! Register position of patches
 	for (unsigned n = 0; n < nSimP; n++) {
 		o_index[n] = distance[n].second;
 	}
 
+	//! Register similar patches into the 3D group
 	for (unsigned c = 0; c < chnls; c++) {
 		for (unsigned p = 0, k = 0; p < sP; p++) {
 			for (unsigned q = 0; q < sP; q++) {
@@ -575,8 +595,9 @@ unsigned estimateSimilarPatchesStep2(
 ,	std::vector<unsigned> &o_index
 ,	const unsigned p_ij
 ,	const nlbParams &p_params
-,	std::vector<pair<float, unsigned> > &distance // Passed by reference
+,	std::vector<pair<float, unsigned> > &distance
 ){
+	//! Initialization
 	const unsigned width	= i_imNoisy.w;
 	const unsigned chnls	= i_imNoisy.d;
 	const unsigned wh		= width * i_imNoisy.h;
@@ -584,6 +605,7 @@ unsigned estimateSimilarPatchesStep2(
 	const unsigned sW		= p_params.sizeSearchWindow;
 	const unsigned ind		= p_ij - (sW - 1) * (width + 1) / 2;
 
+	//! Compute distance between patches
 	for (unsigned i = 0; i < sW; i++) {
 		for (unsigned j = 0; j < sW; j++) {
 			const unsigned k = i * width + j + ind;
@@ -599,17 +621,22 @@ unsigned estimateSimilarPatchesStep2(
 					}
 				}
 			}
+
+			//! Save all distances
 			distance[i * sW + j] = make_pair(diff, k);
 		}
 	}
 
+	//! Keep only the nSimilarPatches best similar patches
 	std::nth_element(distance.begin(), distance.begin() + p_params.nSimilarPatches, distance.end(), comparaisonFirst);
 	std::sort(distance.begin(), distance.begin() + p_params.nSimilarPatches, comparaisonFirst);
 
+	//! Save index of similar patches
 	const float threshold = (p_params.tau > distance[p_params.nSimilarPatches - 1].first ?
 							p_params.tau : distance[p_params.nSimilarPatches - 1].first);
 	unsigned nSimP = 0;
 
+	//! Register position of similar patches
 	// Only loop up to top-K cutoff
 	for (unsigned n = 0; n < p_params.nSimilarPatches; n++) {
 		if (distance[n].first < threshold) {
@@ -617,6 +644,7 @@ unsigned estimateSimilarPatchesStep2(
 		}
 	}
 
+	//! Save similar patches into 3D groups
 	for (unsigned c = 0, k = 0; c < chnls; c++) {
 		for (unsigned p = 0; p < sP; p++) {
 			for (unsigned q = 0; q < sP; q++) {
