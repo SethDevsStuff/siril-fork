@@ -2998,9 +2998,13 @@ guchar *extract_thumbnail_from_fits(const char *filename, gchar **descr,
 	*descr = description;
 
 	// Dimensions calibrated exactly to match CFITSIO striding
-	const int x = (int) ceil((float) w / MAX_SIZE);
-	const int y = (int) ceil((float) h / MAX_SIZE);
-	const int pixScale = (x > y) ? x : y;
+	const float scale_x = (float)w / MAX_SIZE;
+	const float scale_y = (float)h / MAX_SIZE;
+	const float max_scale = (scale_x > scale_y) ? scale_x : scale_y;
+
+	// If max_scale is less than 1.0 (image is smaller than thumbnail size), step is 1
+	const int pixScale = (max_scale > 1.0f) ? (int)max_scale : 1;
+
 	const int Ws = ((w - 1) / pixScale) + 1;
 	const int Hs = ((h - 1) / pixScale) + 1;
 	size_t prev_size = (size_t)Ws * Hs;
