@@ -2930,12 +2930,6 @@ static GdkPixbufDestroyNotify free_preview_data(guchar *pixels, gpointer data) {
  * string with image dimensions / channel count.  *width_out and
  * *height_out are set to the thumbnail's dimensions on success.
  */
-/*
-*/
-
-#if defined(__GNUC__) || defined(__clang__)
-__attribute__((optimize("Ofast")))
-#endif
 guchar *extract_thumbnail_from_fits(const char *filename, gchar **descr,
                                      int *width_out, int *height_out) {
 	fitsfile *fp;
