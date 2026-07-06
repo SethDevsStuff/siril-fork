@@ -23,22 +23,19 @@
  */
 
 /*
- * Phase 5a: multipoint stacking.
+ * Multipoint stacking — the engine-independent pieces:
  *
- * Builds the final stacked image by:
- *   1) Compute per-AP per-frame qualities; keep top-N per AP.
- *   2) Pre-compute per-AP weights_yx and the global sum_single_frame_weights
- *      buffer (prepare_for_stack_blending).
- *   3) For each frame: brightness-equalise to the per-frame brightness
- *      median, resize for drizzle (INTER_LINEAR), recompute per-AP shift
- *      with the weight_matrix_first_phase penalty, then remap_rigid the
- *      patch into the AP's stacking buffer.
- *   4) Merge AP buffers into the global stacking buffer with the weights
- *      from (2), blend in the background where APs don't cover, trim
- *      shift-induced borders, scale + clip to uint16.
+ *   - per-AP per-frame quality ranking and soft selection (with spatial
+ *     harmonisation of weak-structure APs),
+ *   - Stage B per-(frame, AP) shift measurement (with escalation retry),
+ *   - the blend-window / patch-bound geometry and level-ramp helpers the
+ *     warp engine builds its dense fields from.
  *
- * Each piece lives behind a small C++ entry point in mpp_stack_priv.hpp
- * with its own oracle equivalence test.
+ * Stage C accumulation itself lives in mpp_warp_stack.cpp: the per-AP
+ * patch-blend engine (the PSS architecture this port started from) was
+ * retired once the warp-field engine matched or beat it on solar, lunar
+ * and planetary data. Each piece here sits behind a small C++ entry
+ * point in mpp_stack_priv.hpp with its own unit test.
  */
 
 #include <algorithm>
@@ -231,130 +228,6 @@ cv::Mat stack_build_first_phase_weight_matrix(const mpp_config_t &cfg) {
 	return m;
 }
 
-void stack_remap_rigid(const cv::Mat &frame, cv::Mat &buffer,
-                       int shift_y, int shift_x,
-                       int y_low, int y_high, int x_low, int x_high,
-                       RemapBorder &border, float weight) {
-	/* Rigid remap of the AP's patch into its stacking buffer. Tracks the
-	 * maximum clipped extent on each border so the final trim step can
-	 * remove the resulting artefact ring. */
-	const int frame_h = frame.rows, frame_w = frame.cols;
-	int y_low_src  = y_low  + shift_y;
-	int y_high_src = y_high + shift_y;
-	int y_low_dst  = 0;
-	if (y_low_src < 0) {
-		y_low_dst = -y_low_src;
-		y_low_src = 0;
-		border.y_low = std::max(border.y_low, y_low_dst);
-	}
-	if (y_high_src > frame_h) {
-		border.y_high = std::max(border.y_high, y_high_src - frame_h);
-		y_high_src = frame_h;
-	}
-	const int y_high_dst = y_low_dst + (y_high_src - y_low_src);
-
-	int x_low_src  = x_low  + shift_x;
-	int x_high_src = x_high + shift_x;
-	int x_low_dst  = 0;
-	if (x_low_src < 0) {
-		x_low_dst = -x_low_src;
-		x_low_src = 0;
-		border.x_low = std::max(border.x_low, x_low_dst);
-	}
-	if (x_high_src > frame_w) {
-		border.x_high = std::max(border.x_high, x_high_src - frame_w);
-		x_high_src = frame_w;
-	}
-	const int x_high_dst = x_low_dst + (x_high_src - x_low_src);
-
-	if (y_high_dst <= y_low_dst || x_high_dst <= x_low_dst)
-		return;
-	const cv::Mat src = frame(cv::Range(y_low_src, y_high_src),
-	                          cv::Range(x_low_src, x_high_src));
-	cv::Mat dst = buffer(cv::Range(y_low_dst, y_high_dst),
-	                     cv::Range(x_low_dst, x_high_dst));
-	if (weight == 1.0f)
-		dst += src;
-	else
-		cv::scaleAdd(src, weight, dst, dst);
-}
-
-void stack_remap_subpixel(const cv::Mat &frame, cv::Mat &buffer,
-                          double shift_y, double shift_x,
-                          int y_low, int y_high, int x_low, int x_high,
-                          RemapBorder &border, float weight) {
-	/* Fractional-shift companion to stack_remap_rigid: adds
-	 * frame[y_low+shift_y : y_high+shift_y, ...] into the buffer with the
-	 * fractional part of the shift resolved by Lanczos interpolation
-	 * instead of being rounded away. A shift within EPS of an integer
-	 * takes the exact integer blit — no interpolation softening, and the
-	 * historic path stays bit-reproducible for integer data. */
-	const double EPS = 1e-3;
-	const double fy = shift_y - std::floor(shift_y);
-	const double fx = shift_x - std::floor(shift_x);
-	if ((fy < EPS || fy > 1.0 - EPS) && (fx < EPS || fx > 1.0 - EPS)) {
-		stack_remap_rigid(frame, buffer,
-		                  (int) std::lround(shift_y), (int) std::lround(shift_x),
-		                  y_low, y_high, x_low, x_high, border, weight);
-		return;
-	}
-
-	/* Clip the destination so every sample position stays inside the
-	 * frame; track the clipped extent for the final border trim, mirroring
-	 * the integer path. */
-	const int patch_h = y_high - y_low;
-	const int patch_w = x_high - x_low;
-	int y_low_dst = 0;
-	const double y_first = (double) y_low + shift_y;
-	if (y_first < 0.0) {
-		y_low_dst = (int) std::ceil(-y_first);
-		border.y_low = std::max(border.y_low, y_low_dst);
-	}
-	int y_high_dst = patch_h;
-	const double y_last = y_first + (double) (patch_h - 1);
-	if (y_last > (double) (frame.rows - 1)) {
-		const int clip = (int) std::ceil(y_last - (double) (frame.rows - 1));
-		y_high_dst = patch_h - clip;
-		border.y_high = std::max(border.y_high, clip);
-	}
-	int x_low_dst = 0;
-	const double x_first = (double) x_low + shift_x;
-	if (x_first < 0.0) {
-		x_low_dst = (int) std::ceil(-x_first);
-		border.x_low = std::max(border.x_low, x_low_dst);
-	}
-	int x_high_dst = patch_w;
-	const double x_last = x_first + (double) (patch_w - 1);
-	if (x_last > (double) (frame.cols - 1)) {
-		const int clip = (int) std::ceil(x_last - (double) (frame.cols - 1));
-		x_high_dst = patch_w - clip;
-		border.x_high = std::max(border.x_high, clip);
-	}
-	if (y_high_dst <= y_low_dst || x_high_dst <= x_low_dst)
-		return;
-
-	/* Inverse-map translation: dst(x', y') samples frame at
-	 * (x' + x_low + x_low_dst + shift_x, y' + y_low + y_low_dst + shift_y).
-	 * Lanczos support pixels that fall just outside the frame (≤3 px,
-	 * only at frame edges) are replicated — the affected ring is inside
-	 * the border trim. warpAffine's cost scales with the dst patch, not
-	 * the frame, so passing the whole frame as src costs nothing. */
-	const cv::Mat M = (cv::Mat_<double>(2, 3)
-	    << 1.0, 0.0, (double) (x_low + x_low_dst) + shift_x,
-	       0.0, 1.0, (double) (y_low + y_low_dst) + shift_y);
-	cv::Mat patch;
-	cv::warpAffine(frame, patch, M,
-	               cv::Size(x_high_dst - x_low_dst, y_high_dst - y_low_dst),
-	               cv::INTER_LANCZOS4 | cv::WARP_INVERSE_MAP,
-	               cv::BORDER_REPLICATE);
-	cv::Mat dst = buffer(cv::Range(y_low_dst, y_high_dst),
-	                     cv::Range(x_low_dst, x_high_dst));
-	if (weight == 1.0f)
-		dst += patch;
-	else
-		cv::scaleAdd(patch, weight, dst, dst);
-}
-
 APQualities ap_compute_frame_qualities_streamed(const FrameProvider &provider,
                                                 int N,
                                                 const std::vector<double> &frame_brightness,
@@ -364,7 +237,9 @@ APQualities ap_compute_frame_qualities_streamed(const FrameProvider &provider,
                                                 const mpp_config_t &cfg,
                                                 progress_cb_fn progress,
                                                 void *progress_user,
-                                                const std::vector<int> &included) {
+                                                const std::vector<int> &included,
+                                                int max_threads,
+                                                bool provider_thread_safe) {
 	APQualities out;
 	const int M = aps.count;
 	const int stride = cfg.align_frames_sampling_stride;
@@ -394,58 +269,169 @@ APQualities ap_compute_frame_qualities_streamed(const FrameProvider &provider,
 
 	out.qualities.assign(M, std::vector<double>(N, 0.0));
 
+	/* Frame-parallel: each frame writes its own column out.qualities[*][f], so
+	 * the result is independent of thread count. The heavy per-frame work
+	 * (read + optional derotation remap + Laplacian + per-AP meanStdDev)
+	 * dominates once derotation is active, so spreading frames across cores is
+	 * what keeps them busy. Only engaged when the provider is reentrant.
+	 * Cancellation / OOM leave the region via flags, never a return or an
+	 * escaping exception. */
+	const int nt = (provider_thread_safe && max_threads > 1) ? max_threads : 1;
+	/* The frame loop is the parallel level — stop OpenCV from *also* threading
+	 * each per-frame op (the derot remap, the Laplacian, every meanStdDev).
+	 * With OpenCV's TBB backend, nt OpenMP workers each submitting to TBB's one
+	 * global arena oversubscribe and stall on the arena, so utilisation
+	 * collapses to a fraction of the cores. Pinning OpenCV to one thread makes
+	 * each frame's ops run inline in their OpenMP worker; the cores stay busy
+	 * because many frames are in flight. Restored right after the loop. When
+	 * nt==1 we leave OpenCV alone so the lone frame still uses every core. */
+	const int cv_saved_threads = cv::getNumThreads();
+	if (nt > 1) cv::setNumThreads(1);
+	gint cancelled = 0, cur_nb = 0;
+#ifdef _OPENMP
+#pragma omp parallel for num_threads(nt) schedule(dynamic) if (nt > 1)
+#endif
 	for (int f = 0; f < N; ++f) {
-		if (!processing_should_continue()) {
-			out.stack_size = 0;   /* cancellation sentinel */
-			return out;
-		}
+		if (g_atomic_int_get(&cancelled)) continue;
+		if (!processing_should_continue()) { g_atomic_int_set(&cancelled, 1); continue; }
 		if (!is_included(f)) {
 			/* Sentinel below the lowest real σ — never selected. No read. */
 			for (int a = 0; a < M; ++a) out.qualities[a][f] = -1.0;
-			if (progress) progress((double)(f + 1) / (double) N, progress_user);
+			if (progress) progress((double) (g_atomic_int_add(&cur_nb, 1) + 1)
+			                       / (double) N, progress_user);
 			continue;
 		}
-		const cv::Mat frame = provider(f);
-		if (frame.empty()) {
-			if (progress) progress((double)(f + 1) / (double) N, progress_user);
-			continue;
-		}
-		const cv::Mat lap = rank_blurred_laplacian_u8(frame, cfg);
-		/* Round sub-pixel offsets — Stage A's box-slicing math wants
-		 * integer indices; the sub-pixel residual matters only at the
-		 * drizzle pixmap stage. */
-		const int dy = (int) std::lround(offsets[f].dy);
-		const int dx = (int) std::lround(offsets[f].dx);
-		if (progress) progress((double)(f + 1) / (double) N, progress_user);
-		for (int a = 0; a < M; ++a) {
-			const auto &ap = aps.records[a];
-			/* y_low  = int(max(0, patch_y_low  + dy) / stride);
-			 * y_high = int(min(frame_h, patch_y_high + dy) / stride);
-			 * Python `int()` truncates toward zero. C integer division
-			 * does the same for non-negatives, so / stride matches. */
-			const int yl_raw = ap.patch_y_low  + dy;
-			const int yh_raw = ap.patch_y_high + dy;
-			const int xl_raw = ap.patch_x_low  + dx;
-			const int xh_raw = ap.patch_x_high + dx;
-			const int yl = std::max(0, yl_raw) / stride;
-			const int yh = std::min(frame_rows, yh_raw) / stride;
-			const int xl = std::max(0, xl_raw) / stride;
-			const int xh = std::min(frame_cols, xh_raw) / stride;
-			double sigma = 0.0;
-			if (yh > yl && xh > xl
-			 && yh <= lap.rows && xh <= lap.cols) {
-				const cv::Mat box = lap(cv::Range(yl, yh), cv::Range(xl, xh));
-				cv::Scalar mean, stddev;
-				cv::meanStdDev(box, mean, stddev);
-				sigma = stddev[0];
+		try {
+			const cv::Mat frame = provider(f);
+			if (!frame.empty()) {
+				const cv::Mat lap = rank_blurred_laplacian_u8(frame, cfg);
+				/* Round sub-pixel offsets — Stage A's box-slicing math wants
+				 * integer indices; the sub-pixel residual matters only at the
+				 * drizzle pixmap stage. */
+				const int dy = (int) std::lround(offsets[f].dy);
+				const int dx = (int) std::lround(offsets[f].dx);
+				for (int a = 0; a < M; ++a) {
+					const auto &ap = aps.records[a];
+					/* y_low  = int(max(0, patch_y_low  + dy) / stride);
+					 * y_high = int(min(frame_h, patch_y_high + dy) / stride);
+					 * Python `int()` truncates toward zero. C integer division
+					 * does the same for non-negatives, so / stride matches. */
+					const int yl_raw = ap.patch_y_low  + dy;
+					const int yh_raw = ap.patch_y_high + dy;
+					const int xl_raw = ap.patch_x_low  + dx;
+					const int xh_raw = ap.patch_x_high + dx;
+					const int yl = std::max(0, yl_raw) / stride;
+					const int yh = std::min(frame_rows, yh_raw) / stride;
+					const int xl = std::max(0, xl_raw) / stride;
+					const int xh = std::min(frame_cols, xh_raw) / stride;
+					double sigma = 0.0;
+					if (yh > yl && xh > xl
+					 && yh <= lap.rows && xh <= lap.cols) {
+						const cv::Mat box = lap(cv::Range(yl, yh), cv::Range(xl, xh));
+						cv::Scalar mean, stddev;
+						cv::meanStdDev(box, mean, stddev);
+						sigma = stddev[0];
+					}
+					out.qualities[a][f] = normalise ? sigma / frame_brightness[f] : sigma;
+				}
 			}
-			out.qualities[a][f] = normalise ? sigma / frame_brightness[f] : sigma;
+		} catch (const std::exception &) {
+			/* OOM in a worker: abandon the pass cleanly (sentinel below). */
+			g_atomic_int_set(&cancelled, 1);
 		}
+		if (progress) progress((double) (g_atomic_int_add(&cur_nb, 1) + 1)
+		                       / (double) N, progress_user);
+	}
+	if (nt > 1) cv::setNumThreads(cv_saved_threads);
+	if (g_atomic_int_get(&cancelled)) {
+		out.stack_size = 0;   /* cancellation / OOM sentinel */
+		return out;
+	}
+
+	/* Selection harmonisation for weak-structure APs. At APs whose box
+	 * holds little rankable structure (solar limb, prominence fringes,
+	 * near-sky patches) the per-frame Laplace σ is noise, so adjacent APs
+	 * pick gratuitously different frame subsets; each subset carries its
+	 * own seeing mix, the aureole each AP stacks differs in blur profile,
+	 * and the blend imprints AP-pitch scallops along the limb — a shape
+	 * difference no level matching can remove. Blend such APs' quality
+	 * vectors toward a structure-weighted consensus of their neighbours:
+	 * α = clamp(1 − 2·s/median(s), 0, 1) is zero for anything at or above
+	 * half the grid's median structure (object selection untouched) and
+	 * approaches full consensus for structure-free APs, whose ranking
+	 * then follows the regional seeing measured by the nearest APs that
+	 * can measure it — and converges across the ring. The published
+	 * qualities stay raw (diagnostic contract); only the ranking below
+	 * uses the harmonised copy. */
+	const std::vector<std::vector<double>> *rank_q = &out.qualities;
+	std::vector<std::vector<double>> harmonised;
+	{
+		std::vector<double> sv(M);
+		for (int a = 0; a < M; ++a) sv[a] = aps.records[a].structure;
+		std::vector<double> tmp(sv);
+		std::nth_element(tmp.begin(), tmp.begin() + M / 2, tmp.end());
+		const double med = tmp[M / 2];
+		const int thr = (mpp_cfg_step_size(&cfg) * 5) / 2;
+		bool any = false;
+		if (med > 0.0) {
+			harmonised = out.qualities;
+			for (int a = 0; a < M; ++a) {
+				const auto &ra = aps.records[a];
+				/* Structure-weighted consensus of the neighbourhood
+				 * (~2 grid rings). */
+				std::vector<double> cons(N, 0.0);
+				double wsum = 0.0;
+				for (int b = 0; b < M; ++b) {
+					if (b == a) continue;
+					const auto &rb = aps.records[b];
+					if (std::abs(ra.y - rb.y) > thr
+					 || std::abs(ra.x - rb.x) > thr)
+						continue;
+					const double w = sv[b] + 1e-6;
+					for (int f = 0; f < N; ++f)
+						cons[f] += w * out.qualities[b][f];
+					wsum += w;
+				}
+				if (wsum <= 0.0) continue;
+				for (int f = 0; f < N; ++f) cons[f] /= wsum;
+				/* Rank coherence: Pearson correlation of this AP's
+				 * quality vector against the consensus over included
+				 * frames. Seeing is regional at grid-step scale, so a
+				 * measurable AP tracks its neighbours closely; a low
+				 * correlation means the ranking is noise (limb-edge
+				 * boxes score high structure yet rank incoherently). */
+				double sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0;
+				int n = 0;
+				for (int f = 0; f < N; ++f) {
+					if (!is_included(f)) continue;
+					const double x = out.qualities[a][f], y = cons[f];
+					sx += x; sy += y; sxx += x * x; syy += y * y;
+					sxy += x * y; ++n;
+				}
+				if (n < 8) continue;
+				const double vx = sxx - sx * sx / n, vy = syy - sy * sy / n;
+				const double cov = sxy - sx * sy / n;
+				const double r = (vx > 0 && vy > 0)
+				    ? cov / std::sqrt(vx * vy) : 1.0;
+				const double alpha_corr =
+				    std::min(1.0, std::max(0.0, (0.9 - r) / 0.5));
+				const double alpha_struct =
+				    std::min(1.0, std::max(0.0, 1.0 - 2.0 * sv[a] / med));
+				const double alpha = std::max(alpha_corr, alpha_struct);
+				if (alpha <= 0.0) continue;
+				auto &dst = harmonised[a];
+				for (int f = 0; f < N; ++f)
+					dst[f] = (1.0 - alpha) * out.qualities[a][f]
+					       + alpha * cons[f];
+				any = true;
+			}
+		}
+		if (any) rank_q = &harmonised;
 	}
 
 	/* Soft-selection taper (0 in explicit frame-number mode and whenever
 	 * there is no room above the cut — e.g. the default 100%). */
-	out.taper = stack_compute_selection_taper(out.qualities, aps, N,
+	out.taper = stack_compute_selection_taper(*rank_q, aps, N,
 	                                          out.stack_size, cfg);
 	const int selected = std::min(n_included, out.stack_size + out.taper);
 
@@ -457,7 +443,7 @@ APQualities ap_compute_frame_qualities_streamed(const FrameProvider &provider,
 	for (int a = 0; a < M; ++a) {
 		std::vector<int> indices(N);
 		std::iota(indices.begin(), indices.end(), 0);
-		const auto &q = out.qualities[a];
+		const auto &q = (*rank_q)[a];
 		std::partial_sort(indices.begin(), indices.begin() + selected,
 		                  indices.end(),
 		                  [&q](int x, int y) {
@@ -490,121 +476,70 @@ APQualities ap_compute_frame_qualities(const std::vector<cv::Mat> &frames,
 	    frame_rows, frame_cols, cfg, progress, progress_user, included);
 }
 
-StackState stack_prepare_for_blending(const mpp_aps_t &aps,
-                                      const cv::Vec4i &intersection,
-                                      int stack_size,
-                                      double drizzle_scale,
-                                      int num_layers,
-                                      const mpp_config_t &cfg,
-                                      const std::vector<float> *ap_effective_counts) {
-	StackState s;
-	s.drizzle_scale  = drizzle_scale;
-	s.stack_size     = stack_size;
-	s.num_layers     = num_layers;
-	s.dim_y = intersection[1] - intersection[0];
-	s.dim_x = intersection[3] - intersection[2];
-	/* Output (drizzled) dimensions. drizzle_scale may be fractional (e.g.
-	 * 1.5); every coordinate below is the original × scale rounded to the
-	 * nearest pixel. lround is monotonic so patch bounds never exceed the
-	 * canvas. */
-	auto scl = [drizzle_scale](int v) { return (int) std::lround((double) v * drizzle_scale); };
-	s.dim_y_drizzled = scl(s.dim_y);
-	s.dim_x_drizzled = scl(s.dim_x);
-	const int buf_type = (num_layers == 3) ? CV_32FC3 : CV_32F;
-
+/* Boundary-patch extension. The AP grid stops where the reference frame
+ * has structure, so along an object's rim (e.g. the solar limb) the
+ * coverage boundary — where Stage C hands over to the softer,
+ * global-aligned background — runs right across the faint structure just
+ * outside it (spicule layer, prominence fringes), and the hand-off band
+ * follows the scalloped outer window contours, imprinting AP-pitch arcs
+ * under sharpening. Push that boundary one grid step outward wherever no
+ * other AP's patch covers the space beyond an edge: the extended area
+ * stacks the AP's own frames at its own measured shifts (locally
+ * aligned, unlike the background), and the hand-off moves into empty sky
+ * where it is invisible. Interior edges (fully covered by a neighbour's
+ * patch) are left untouched, so the mosaic's overlap topology on the
+ * object is unchanged. Returns per-AP extended bounds in ORIGINAL frame
+ * coordinates; shared by both Stage C engines. */
+std::vector<cv::Vec4i> stack_extended_patch_bounds(const mpp_aps_t &aps,
+                                                   int dim_y, int dim_x,
+                                                   const mpp_config_t &cfg) {
 	const int M = aps.count;
-	s.patch_drizzled.reserve(M);
-	s.ap_drizzled.reserve(M);
-	s.weights_yx.reserve(M);
-	s.stacking_buffers.reserve(M);
-	s.ap_frame_counts.reserve(M);
-	s.sum_single_frame_weights.create(s.dim_y_drizzled, s.dim_x_drizzled, CV_32F);
-	s.sum_single_frame_weights.setTo(cv::Scalar(1e-30f));
-
-	const float stack_size_f = (float) stack_size;
-
+	const int ext_step = mpp_cfg_step_size(&cfg);
+	std::vector<cv::Vec4i> patch(M), ext(M);
 	for (int a = 0; a < M; ++a) {
 		const auto &ap = aps.records[a];
-		const int py_lo = scl(ap.patch_y_low);
-		const int py_hi = scl(ap.patch_y_high);
-		const int px_lo = scl(ap.patch_x_low);
-		const int px_hi = scl(ap.patch_x_high);
-		const int yc    = scl(ap.y);
-		const int xc    = scl(ap.x);
-
-		s.patch_drizzled.push_back(cv::Vec4i(py_lo, py_hi, px_lo, px_hi));
-		s.ap_drizzled.push_back(cv::Vec2i(yc, xc));
-
-		const bool extend_y_low  = (py_lo == 0);
-		const bool extend_y_high = (py_hi == s.dim_y_drizzled);
-		const bool extend_x_low  = (px_lo == 0);
-		const bool extend_x_high = (px_hi == s.dim_x_drizzled);
-		const auto wy = stack_one_dim_weight(py_lo, py_hi, yc, extend_y_low,  extend_y_high);
-		const auto wx = stack_one_dim_weight(px_lo, px_hi, xc, extend_x_low,  extend_x_high);
-
-		/* Separable product, not PSS's min(wy, wx): the product of two
-		 * C1 Hann tapers is C1 everywhere, while min() recreates
-		 * diagonal derivative creases along |wy| = |wx|. */
-		cv::Mat wyx((int) wy.size(), (int) wx.size(), CV_32F);
-		for (int y = 0; y < (int) wy.size(); ++y) {
-			float *row = wyx.ptr<float>(y);
-			for (int x = 0; x < (int) wx.size(); ++x)
-				row[x] = wy[y] * wx[x];
-		}
-		s.weights_yx.push_back(wyx);
-		s.stacking_buffers.push_back(cv::Mat(wyx.rows, wyx.cols, buf_type,
-		                                     cv::Scalar(0, 0, 0)));
-
-		/* Accumulate (per-AP weight total) × weights_yx into the global
-		 * buffer.  The caller passes the per-AP accumulated-weight totals
-		 * (soft selection weights over included frames, less any dropped
-		 * failed pairs) so the normalisation matches exactly what gets
-		 * accumulated; stack_size is the fallback for direct callers. */
-		const float ap_count_f = ap_effective_counts
-		    ? (*ap_effective_counts)[a] : stack_size_f;
-		s.ap_frame_counts.push_back(ap_count_f);
-		cv::Mat dst = s.sum_single_frame_weights(
-		    cv::Range(py_lo, py_hi), cv::Range(px_lo, px_hi));
-		dst += ap_count_f * wyx;
+		patch[a] = cv::Vec4i(ap.patch_y_low, ap.patch_y_high,
+		                     ap.patch_x_low, ap.patch_x_high);
+		ext[a] = patch[a];
 	}
-
-	cv::Mat hole_mask;
-	cv::compare(s.sum_single_frame_weights, 1e-10, hole_mask, cv::CMP_LT);
-	s.number_stacking_holes = cv::countNonZero(hole_mask);
-	if (s.number_stacking_holes == 0)
-		return s;
-
-	/* Background buffer (pre-drizzle). */
-	s.averaged_background = cv::Mat::zeros(s.dim_y, s.dim_x, buf_type);
-
-	/* Count pixels where sum_weights < background_blend_threshold *
-	 * stack_size; if a small fraction, subdivide the intersection into
-	 * background_patch_size patches and keep only those patches that
-	 * contain at least one such pixel. */
-	const float blend_t = (float) cfg.stack_frames_background_blend_threshold;
-	cv::Mat needed_mask;
-	cv::compare(s.sum_single_frame_weights, blend_t * stack_size_f, needed_mask, cv::CMP_LT);
-	const int points_where_used = cv::countNonZero(needed_mask);
-	const double total_drizzled = (double) s.dim_y_drizzled * (double) s.dim_x_drizzled;
-	if ((double) points_where_used / total_drizzled
-	    < cfg.stack_frames_background_fraction) {
-		const int patch_size = cfg.stack_frames_background_patch_size;
-		for (int py = 0; py < s.dim_y; py += patch_size) {
-			/* Use `dim_y - 1` as the cap to match the reference algorithm. */
-			const int py_hi = std::min(py + patch_size, s.dim_y - 1);
-			if (py == py_hi) continue;
-			for (int px = 0; px < s.dim_x; px += patch_size) {
-				const int px_hi = std::min(px + patch_size, s.dim_x - 1);
-				if (px == px_hi) continue;
-				const cv::Mat slice = needed_mask(
-				    cv::Range(scl(py), scl(py_hi)),
-				    cv::Range(scl(px), scl(px_hi)));
-				if (cv::countNonZero(slice) > 0)
-					s.background_patches.push_back({py, py_hi, px, px_hi});
-			}
+	/* Is the 1-px strip beyond `edge` (a row for horiz_strip, else a
+	 * column), across [lo, hi) of the perpendicular axis, ≥98 % covered
+	 * by the union of the OTHER patches? */
+	auto covered = [&](int a, int lo, int hi, int edge, bool horiz_strip) {
+		std::vector<std::pair<int, int>> iv;
+		for (int b = 0; b < M; ++b) {
+			if (b == a) continue;
+			const auto &p = patch[b];
+			const int b_lo  = horiz_strip ? p[2] : p[0];
+			const int b_hi  = horiz_strip ? p[3] : p[1];
+			const int b_plo = horiz_strip ? p[0] : p[2];
+			const int b_phi = horiz_strip ? p[1] : p[3];
+			if (b_plo > edge || b_phi < edge + 1) continue;
+			const int s0 = std::max(lo, b_lo), s1 = std::min(hi, b_hi);
+			if (s1 > s0) iv.emplace_back(s0, s1);
 		}
+		std::sort(iv.begin(), iv.end());
+		long len = 0;
+		int cur = lo;
+		for (const auto &v : iv) {
+			if (v.second <= cur) continue;
+			len += v.second - std::max(cur, v.first);
+			cur = std::max(cur, v.second);
+		}
+		return (double) len >= 0.98 * (double) (hi - lo);
+	};
+	for (int a = 0; a < M; ++a) {
+		const auto &p = patch[a];
+		if (p[0] > 0     && !covered(a, p[2], p[3], p[0] - 1, true))
+			ext[a][0] = std::max(0, p[0] - ext_step);
+		if (p[1] < dim_y && !covered(a, p[2], p[3], p[1], true))
+			ext[a][1] = std::min(dim_y, p[1] + ext_step);
+		if (p[2] > 0     && !covered(a, p[0], p[1], p[2] - 1, false))
+			ext[a][2] = std::max(0, p[2] - ext_step);
+		if (p[3] < dim_x && !covered(a, p[0], p[1], p[3], false))
+			ext[a][3] = std::min(dim_x, p[3] + ext_step);
 	}
-	return s;
+	return ext;
 }
 
 mpp_shifts_t *stack_compute_shifts_streamed(const FrameProvider &provider,
@@ -614,14 +549,15 @@ mpp_shifts_t *stack_compute_shifts_streamed(const FrameProvider &provider,
                                             const APQualities &apq,
                                             const std::vector<FrameOffset> &offsets,
                                             const mpp_config_t &cfg,
-                                            const int *included) {
+                                            const int *included,
+                                            int max_threads,
+                                            bool provider_thread_safe) {
 	const int M = aps.count;
-	/* Sub-pixel correlation is always on: the accumulation path places
-	 * each patch at its fractional shift (stack_remap_subpixel), so an
-	 * integer-only fit would quantise every AP to the pixel grid and
-	 * re-introduce the block-lattice phase noise the sub-pixel paste
-	 * exists to remove. The parabolic refinement is a 3×3 fit on the
-	 * already-computed correlation surface — negligible cost. */
+	/* Sub-pixel correlation is always on: the warp engine samples each
+	 * frame at the fractional displacement field, so an integer-only fit
+	 * would quantise every AP to the pixel grid and re-introduce
+	 * block-lattice phase noise. The parabolic refinement is a 3×3 fit on
+	 * the already-computed correlation surface — negligible cost. */
 	const bool use_subpixel = true;
 
 	mpp_shifts_t *out = (mpp_shifts_t *) std::calloc(1, sizeof(*out));
@@ -636,73 +572,140 @@ mpp_shifts_t *stack_compute_shifts_streamed(const FrameProvider &provider,
 	}
 
 	const cv::Mat weight_matrix = stack_build_first_phase_weight_matrix(cfg);
+	/* Escalation retry for failed local searches. A failure means the
+	 * correlation peak railed at the search border — usually because the
+	 * true local shift exceeds the window (large radial limb excursions
+	 * in poor solar frames rail phase 1, whose {0,0} fallback then stacks
+	 * the patch at global-only alignment and imprints AP-pitch beads
+	 * along the limb). Re-measure just the failed pairs with a wider
+	 * phase-1 window; only they pay the extra cost. +8 raises the
+	 * phase-1 reach from ±(search_width−4) to ±(search_width+4) px. */
+	mpp_config_t cfg_retry = cfg;
+	cfg_retry.alignment_points_search_width = cfg.alignment_points_search_width + 8;
+	const cv::Mat weight_matrix_retry = stack_build_first_phase_weight_matrix(cfg_retry);
 	const auto ref_boxes = shift_prepare_ref_boxes(mean_frame_raw, aps);
-	int failures = 0;
-
 	int n_included = 0;
 	if (included) {
 		for (int f = 0; f < N; ++f) if (included[f]) ++n_included;
 	} else {
 		n_included = N;
 	}
-	int cur_nb = 0;
+	if (n_included <= 0) n_included = 1;
+
+	/* Frame-parallel: every (frame, AP) shift is written to a disjoint slot, so
+	 * the result is independent of thread count — bit-identical to the serial
+	 * loop. The heavy per-frame work (read + optional derotation remap + blur)
+	 * dominates once derotation is active, so spreading frames across cores is
+	 * what keeps them busy. Only engaged when the provider is reentrant
+	 * (cached frames or thread-safe reads); otherwise nt collapses to 1.
+	 * Cancellation and OOM leave the OpenMP region via flags — never a bare
+	 * return or an escaping exception, both of which are UB inside a parallel
+	 * for. */
+	const int nt = (provider_thread_safe && max_threads > 1) ? max_threads : 1;
+	/* See ap_compute_frame_qualities_streamed: the frame loop is the parallel
+	 * level, so pin OpenCV to one thread for the per-frame ops (derot remap +
+	 * blur + the multilevel correlation's cv calls). Otherwise nt OpenMP
+	 * workers contend on OpenCV's single TBB arena and utilisation collapses.
+	 * Restored right after the loop; left untouched when nt==1. */
+	const int cv_saved_threads = cv::getNumThreads();
+	if (nt > 1) cv::setNumThreads(1);
+	gint cancelled = 0, failures = 0, cur_nb = 0;
+	gint retried = 0, recovered = 0;
+#ifdef _OPENMP
+#pragma omp parallel for num_threads(nt) schedule(dynamic) if (nt > 1)
+#endif
 	for (int f = 0; f < N; ++f) {
 		if (included && !included[f]) continue;
-		if (!processing_should_continue()) {
-			out->failure_counter = -1;   /* cancellation sentinel */
-			return out;
+		if (g_atomic_int_get(&cancelled)) continue;
+		if (!processing_should_continue()) { g_atomic_int_set(&cancelled, 1); continue; }
+		try {
+			/* Stage B correlation works at integer pixel grids — search-box
+			 * cropping needs integer indices. Round the sub-pixel global
+			 * offset; the rounded-away residual is the sub-pixel position
+			 * where the AP's content actually sits relative to the integer
+			 * search box. Sign trace for global_shifts = -0.3 (frame
+			 * content drifted DOWN by 0.3):
+			 *   offsets[f].dy = intersection[0] - (-0.3) = +0.3.
+			 *   dy_rounded     = 0.
+			 *   sub_y          = +0.3.
+			 *   Search box at frame_y = ap.box_y_low + 0.
+			 *   AP content sits at ap.box_y_low + 0.3 → correlation peak
+			 *     at +0.3 from search centre → r.dy = -0.3 (matches the
+			 *     algorithm's sign convention).
+			 *   We want stored per-AP shift = 0 so that drizzle's
+			 *     gdy + weighted_ap = -0.3 + 0 = -0.3 (matches the true
+			 *     alignment correction). That means r.dy + sub_y = 0. ✓
+			 * If we used r.dy − sub_y the sub-pixel global residual would
+			 * be DOUBLED in the paste and you get high-frequency CFA-phase
+			 * striping on real data. The stack path places each patch at
+			 * offsets.dy − shift (sub-pixel, see stack_apply_shifts), so
+			 * this ≤0.5 px correction lands directly in the output. */
+			const double dy_full = offsets[f].dy;
+			const double dx_full = offsets[f].dx;
+			const int dy = (int) std::lround(dy_full);
+			const int dx = (int) std::lround(dx_full);
+			const double sub_y = dy_full - (double) dy;
+			const double sub_x = dx_full - (double) dx;
+			const cv::Mat frame = provider(f);   /* fresh blur in streaming mode;
+			                                      * cached vector view in cached mode */
+			if (!frame.empty()) {
+				for (const auto &u : apq.used_alignment_points[f]) {
+					const int a = u.ap;
+					const auto &ap = aps.records[a];
+					MultilevelShiftResult r = multilevel_correlation(
+					    ref_boxes[a].second_phase, ref_boxes[a].first_phase,
+					    frame,
+					    ap.box_y_low + dy, ap.box_y_high + dy,
+					    ap.box_x_low + dx, ap.box_x_high + dx,
+					    cfg.frames_gauss_width, cfg.alignment_points_search_width,
+					    use_subpixel, weight_matrix);
+					if (!r.success) {
+						const MultilevelShiftResult r2 = multilevel_correlation(
+						    ref_boxes[a].second_phase, ref_boxes[a].first_phase,
+						    frame,
+						    ap.box_y_low + dy, ap.box_y_high + dy,
+						    ap.box_x_low + dx, ap.box_x_high + dx,
+						    cfg.frames_gauss_width,
+						    cfg_retry.alignment_points_search_width,
+						    use_subpixel, weight_matrix_retry);
+						/* Keep the original coarse estimate over a retry
+						 * that produced none (railed again / window
+						 * off-frame). */
+						const bool r2_useless = !r2.success
+						    && r2.dy == 0.0 && r2.dx == 0.0
+						    && (r.dy != 0.0 || r.dx != 0.0);
+						if (!r2_useless) r = r2;
+						g_atomic_int_inc(&retried);
+						if (r.success) g_atomic_int_inc(&recovered);
+					}
+					const size_t off = (size_t) (f * M + a) * 2;
+					out->shifts[off + 0] = r.dy + sub_y;
+					out->shifts[off + 1] = r.dx + sub_x;
+					out->success[f * M + a] = r.success ? 1 : 0;
+					if (!r.success) g_atomic_int_inc(&failures);
+				}
+			}
+		} catch (const std::exception &) {
+			/* OOM in a worker: abandon the pass cleanly (sentinel below). */
+			g_atomic_int_set(&cancelled, 1);
 		}
-		/* Stage B correlation works at integer pixel grids — search-box
-		 * cropping needs integer indices. Round the sub-pixel global
-		 * offset; the rounded-away residual is the sub-pixel position
-		 * where the AP's content actually sits relative to the integer
-		 * search box. Sign trace for global_shifts = -0.3 (frame
-		 * content drifted DOWN by 0.3):
-		 *   offsets[f].dy = intersection[0] - (-0.3) = +0.3.
-		 *   dy_rounded     = 0.
-		 *   sub_y          = +0.3.
-		 *   Search box at frame_y = ap.box_y_low + 0.
-		 *   AP content sits at ap.box_y_low + 0.3 → correlation peak
-		 *     at +0.3 from search centre → r.dy = -0.3 (matches the
-		 *     algorithm's sign convention).
-		 *   We want stored per-AP shift = 0 so that drizzle's
-		 *     gdy + weighted_ap = -0.3 + 0 = -0.3 (matches the true
-		 *     alignment correction). That means r.dy + sub_y = 0. ✓
-		 * If we used r.dy − sub_y the sub-pixel global residual would
-		 * be DOUBLED in the paste and you get high-frequency CFA-phase
-		 * striping on real data. The stack path places each patch at
-		 * offsets.dy − shift (sub-pixel, see stack_apply_shifts), so
-		 * this ≤0.5 px correction lands directly in the output. */
-		const double dy_full = offsets[f].dy;
-		const double dx_full = offsets[f].dx;
-		const int dy = (int) std::lround(dy_full);
-		const int dx = (int) std::lround(dx_full);
-		const double sub_y = dy_full - (double) dy;
-		const double sub_x = dx_full - (double) dx;
-		const cv::Mat frame = provider(f);   /* fresh blur in streaming mode;
-		                                      * cached vector view in cached mode */
-		for (const auto &u : apq.used_alignment_points[f]) {
-			const int a = u.ap;
-			const auto &ap = aps.records[a];
-			const MultilevelShiftResult r = multilevel_correlation(
-			    ref_boxes[a].second_phase, ref_boxes[a].first_phase,
-			    frame,
-			    ap.box_y_low + dy, ap.box_y_high + dy,
-			    ap.box_x_low + dx, ap.box_x_high + dx,
-			    cfg.frames_gauss_width, cfg.alignment_points_search_width,
-			    use_subpixel, weight_matrix);
-			const size_t off = (size_t) (f * M + a) * 2;
-			out->shifts[off + 0] = r.dy + sub_y;
-			out->shifts[off + 1] = r.dx + sub_x;
-			out->success[f * M + a] = r.success ? 1 : 0;
-			if (!r.success) ++failures;
-		}
-		g_atomic_int_inc(&cur_nb);
 		/* Single streaming pass (read + blur + correlate happen together),
 		 * so map progress across Stage B's whole 0..1 bar. */
-		gui_iface.set_progress((double) cur_nb / (double) n_included, NULL);
+		gui_iface.set_progress((double) (g_atomic_int_add(&cur_nb, 1) + 1)
+		                       / (double) n_included, NULL);
 	}
-	out->failure_counter = failures;
+	if (nt > 1) cv::setNumThreads(cv_saved_threads);
+	if (g_atomic_int_get(&cancelled)) {
+		out->failure_counter = -1;   /* cancellation / OOM sentinel */
+		return out;
+	}
+	out->failure_counter = (int) g_atomic_int_get(&failures);
+	if (retried > 0)
+		siril_log_message(_("Register: %d failed local searches retried at "
+		                    "width %d, %d recovered\n"),
+		                  g_atomic_int_get(&retried),
+		                  cfg_retry.alignment_points_search_width,
+		                  g_atomic_int_get(&recovered));
 	return out;
 }
 
@@ -719,557 +722,24 @@ mpp_shifts_t *stack_compute_shifts(const std::vector<cv::Mat> &frames_mono_blurr
 	    mean_frame_raw, aps, apq, offsets, cfg, included);
 }
 
-StackLoopOutput stack_apply_shifts_streamed(const FrameProvider &provider,
-                                            int N,
-                                            int num_layers,
-                                            const mpp_aps_t &aps,
-                                            const APQualities &apq,
-                                            const mpp_shifts_t *shifts,
-                                            const std::vector<FrameOffset> &offsets,
-                                            const std::vector<double> &frame_brightness,
-                                            const std::vector<int> &quality_sorted_idx,
-                                            const cv::Vec4i &intersection,
-                                            const mpp_config_t &cfg,
-                                            const int *included,
-                                            int max_threads,
-                                            bool provider_thread_safe,
-                                            size_t mem_budget_bytes) {
-	StackLoopOutput out;
-	/* Two parallelism axes, both bit-identical to the serial result:
-	 *   - Decode (the dominant per-frame cost: read + debayer + float
-	 *     convert + optional resize) is done a batch at a time across
-	 *     threads, when the provider is reentrant.
-	 *   - The per-frame AP accumulation parallelises over the disjoint
-	 *     per-AP stacking buffers (each AP appears at most once in
-	 *     used_alignment_points[f] and writes only its own buffer).
-	 * Frames are accumulated serially in index order, so every buffer sees
-	 * the same summation order ⇒ deterministic regardless of thread count. */
-	const int nt = max_threads > 0 ? max_threads : 1;
-	/* Output scale. Fractional values (e.g. 1.5) are supported: every
-	 * coordinate is original × S rounded to the nearest pixel, and each
-	 * frame is cv::resize'd to S× before its patches are accumulated. */
-	const double S = std::max(1.0, cfg.drizzle_scale);
-	const int M = aps.count;
-
-	/* Per-AP accumulated-weight totals (selection weights over included
-	 * frames). These feed stack_prepare_for_blending so the normalisation
-	 * matches exactly what the loop below accumulates — both for soft
-	 * selection (fractional weights) and for frames excluded after
-	 * Analyze (whose missing contributions would otherwise render the
-	 * patch dark).
-	 *
-	 * Optional drop of failed (frame, AP) contributions.  Decided up
-	 * front from shifts->success so (a) the weight totals can be reduced
-	 * to match, and (b) the frame-parallel accumulation below needs no
-	 * extra synchronisation.  An AP whose used pairs ALL failed keeps
-	 * stacking everything: a coarsely aligned patch beats a hole in the
-	 * output. */
-	const bool skip_failed = cfg.stack_skip_failed_aps && shifts != nullptr;
-	std::vector<uint8_t> ap_skip_enabled;
-	std::vector<float> ap_eff_counts(M, 0.0f);
-	for (int f = 0; f < N; ++f) {
-		if (included && !included[f]) continue;
-		for (const auto &u : apq.used_alignment_points[f])
-			ap_eff_counts[u.ap] += u.weight;
-	}
-	if (skip_failed) {
-		std::vector<float> failed_w(M, 0.0f);
-		std::vector<int> failed_n(M, 0);
-		for (int f = 0; f < N; ++f) {
-			if (included && !included[f]) continue;
-			for (const auto &u : apq.used_alignment_points[f]) {
-				if (!shifts->success[(size_t) f * M + u.ap]) {
-					failed_w[u.ap] += u.weight;
-					++failed_n[u.ap];
-				}
-			}
-		}
-		ap_skip_enabled.assign(M, 0);
-		int dropped = 0, saturated_aps = 0, skipped_aps = 0;
-		for (int a = 0; a < M; ++a) {
-			if (failed_n[a] == 0) continue;
-			if (failed_w[a] >= ap_eff_counts[a] - 1e-6f) {
-				++saturated_aps;   /* nothing measurable at this AP */
-				continue;
-			}
-			ap_skip_enabled[a] = 1;
-			++skipped_aps;
-			ap_eff_counts[a] -= failed_w[a];
-			dropped += failed_n[a];
-		}
-		if (dropped > 0)
-			siril_log_message(_("Stack: skipped failed shift measurements at "
-			                    "%d of %d alignment points (%d frame/alignment-"
-			                    "point pairs dropped)\n"),
-			                  skipped_aps, M, dropped);
-		if (saturated_aps > 0)
-			siril_log_message(_("Stack: %d alignment point(s) had no "
-			                    "successful shifts — stacking them "
-			                    "unfiltered\n"), saturated_aps);
-	}
-
-	out.state = stack_prepare_for_blending(aps, intersection, apq.stack_size,
-	                                       S, num_layers, cfg,
-	                                       &ap_eff_counts);
-	out.shift_failure_counter = shifts ? shifts->failure_counter : 0;
-
-	double median_brightness = 0.0;
-	if (cfg.frames_normalization) {
-		std::vector<double> sorted_b(frame_brightness);
-		std::sort(sorted_b.begin(), sorted_b.end());
-		const size_t n = sorted_b.size();
-		median_brightness = (n % 2 == 1)
-		    ? sorted_b[n / 2]
-		    : 0.5 * (sorted_b[n / 2 - 1] + sorted_b[n / 2]);
-	}
-
-	std::set<int> top_for_bg;
-	for (int i = 0; i < apq.stack_size && i < (int) quality_sorted_idx.size(); ++i)
-		top_for_bg.insert(quality_sorted_idx[i]);
-
-	/* Frames that actually participate, in index order. */
-	std::vector<int> work;
-	work.reserve(N);
-	for (int f = 0; f < N; ++f)
-		if (!included || included[f]) work.push_back(f);
-	const int W = (int) work.size();
-	const int n_included = W > 0 ? W : 1;
-	const bool holes = out.state.number_stacking_holes > 0;
-
-	/* Frame-parallel accumulation. Each thread runs the full per-frame
-	 * pipeline (read + brightness + resize + per-AP remap) for its share of
-	 * frames into PRIVATE per-AP buffers, then the buffers are summed. This
-	 * keeps every core busy on both the (cheap, I/O-bound for mono) decode
-	 * and the heavier AP accumulation without a phase barrier or a fixed
-	 * I/O-vs-AP pool split — a thread blocked on the SER read lock simply
-	 * lets others get on with AP work. The float sum is reordered by the
-	 * reduction, so the output is not bit-identical across thread counts —
-	 * measured ≤1 16-bit LSB (~1 % of pixels off by one) on an 8000-frame
-	 * stack, negligible for a statistical mean. Reads must be reentrant to
-	 * parallelise; otherwise run single-threaded. */
-	const bool par = provider_thread_safe && nt > 1;
-	int n_threads = par ? nt : 1;
-	if (par && mem_budget_bytes > 0) {
-		/* Per thread: one private copy of all per-AP buffers (+ background)
-		 * plus one in-flight frame (float + resized). */
-		size_t set_bytes = 0;
-		for (const auto &b : out.state.stacking_buffers)
-			set_bytes += b.total() * b.elemSize();
-		if (holes && !out.state.averaged_background.empty())
-			set_bytes += out.state.averaged_background.total()
-			           * out.state.averaged_background.elemSize();
-		const size_t frame_bytes = (size_t) out.state.dim_x_drizzled
-		                         * (size_t) out.state.dim_y_drizzled
-		                         * (size_t) num_layers * sizeof(float) * 2;
-		const size_t per_thread = set_bytes + frame_bytes;
-		int fit = (int) (mem_budget_bytes / std::max<size_t>(1, per_thread));
-		if (fit < 1) fit = 1;
-		if (fit < n_threads) n_threads = fit;
-	}
-
-	auto clamped_blit = [](const cv::Mat &src, cv::Mat &dst,
-	                       int src_y, int src_x, int len_y, int len_x) {
-		const int src_y_lo = std::max(0, src_y);
-		const int src_y_hi = std::min(src.rows, src_y + len_y);
-		const int src_x_lo = std::max(0, src_x);
-		const int src_x_hi = std::min(src.cols, src_x + len_x);
-		if (src_y_hi <= src_y_lo || src_x_hi <= src_x_lo) return;
-		const int dst_y_lo = src_y_lo - src_y;
-		const int dst_x_lo = src_x_lo - src_x;
-		cv::Mat dst_view = dst(
-		    cv::Range(dst_y_lo, dst_y_lo + (src_y_hi - src_y_lo)),
-		    cv::Range(dst_x_lo, dst_x_lo + (src_x_hi - src_x_lo)));
-		dst_view += src(cv::Range(src_y_lo, src_y_hi),
-		                cv::Range(src_x_lo, src_x_hi));
-	};
-
-	/* Single streaming pass (read + drizzle + remap happen together), so
-	 * per-frame progress maps across Stage C's whole 0..1 bar. */
-	gint cur_nb = 0;
-	gint cancelled = 0;
-	gint oom = 0;
-#ifdef _OPENMP
-#pragma omp parallel num_threads(n_threads) if (n_threads > 1)
-#endif
-	{
-		/* Per-thread private accumulators (zero-init). Allocation and the
-		 * per-frame work below are try/catch-contained: an exception
-		 * escaping an OpenMP region is std::terminate(), and on Windows
-		 * (no overcommit) cv allocations genuinely fail under memory
-		 * pressure. A thread that trips the flag keeps encountering the
-		 * worksharing constructs (required by OpenMP) but skips the work;
-		 * the caller discards the partial result. */
-		bool local_ok = true;
-		std::vector<cv::Mat> lbuf(M);
-		cv::Mat lbg;
-		try {
-			for (int a = 0; a < M; ++a)
-				lbuf[a] = cv::Mat::zeros(out.state.stacking_buffers[a].size(),
-				                         out.state.stacking_buffers[a].type());
-			if (holes)
-				lbg = cv::Mat::zeros(out.state.averaged_background.size(),
-				                     out.state.averaged_background.type());
-		} catch (const std::exception &) {
-			local_ok = false;
-			g_atomic_int_set(&oom, 1);
-		}
-		RemapBorder lb;
-
-#ifdef _OPENMP
-#pragma omp for schedule(dynamic) nowait
-#endif
-		for (int wi = 0; wi < W; ++wi) {
-			if (g_atomic_int_get(&cancelled) || g_atomic_int_get(&oom)) continue;
-			if (!processing_should_continue()) { g_atomic_int_set(&cancelled, 1); continue; }
-			const int f = work[wi];
-			try {
-
-			const cv::Mat frame_raw = provider(f);
-			if (frame_raw.empty()) {
-				gui_iface.set_progress((double) g_atomic_int_add(&cur_nb, 1)
-				                       / (double) n_included, NULL);
-				continue;
-			}
-			cv::Mat frame_f32;
-			if (cfg.frames_normalization) {
-				const double sc = median_brightness / (frame_brightness[f] + 1e-7);
-				frame_raw.convertTo(frame_f32, CV_32F, sc);
-			} else {
-				frame_raw.convertTo(frame_f32, CV_32F);
-			}
-			cv::Mat frame_drizzled;
-			if (S != 1.0)
-				cv::resize(frame_f32, frame_drizzled,
-				           cv::Size((int) std::lround(frame_f32.cols * S),
-				                    (int) std::lround(frame_f32.rows * S)),
-				           0, 0, cv::INTER_LINEAR);
-			else
-				frame_drizzled = frame_f32;
-			/* Sub-pixel rigid placement in drizzled coords. The full
-			 * source position for a patch is (offsets − per-AP shift) ×
-			 * scale; stack_remap_subpixel resolves the fractional part by
-			 * interpolation, so neighbouring APs no longer disagree by the
-			 * up-to-±0.5 px rounding that imprints the AP lattice on the
-			 * stack. The background blit below stays integer — it is a
-			 * heavily blended fallback where sub-pixel accuracy is moot. */
-			const int dy = (int) std::lround(offsets[f].dy);
-			const int dx = (int) std::lround(offsets[f].dx);
-
-			for (const auto &u : apq.used_alignment_points[f]) {
-				const int a = u.ap;
-				if (skip_failed && ap_skip_enabled[a]
-				    && !shifts->success[(size_t) f * M + a])
-					continue;
-				const size_t soff = (size_t) (f * M + a) * 2;
-				const double shift_y = shifts ? shifts->shifts[soff + 0] : 0.0;
-				const double shift_x = shifts ? shifts->shifts[soff + 1] : 0.0;
-				const auto &p = out.state.patch_drizzled[a];
-				stack_remap_subpixel(frame_drizzled, lbuf[a],
-				                     (offsets[f].dy - shift_y) * S,
-				                     (offsets[f].dx - shift_x) * S,
-				                     p[0], p[1], p[2], p[3], lb, u.weight);
-			}
-
-			if (holes && top_for_bg.find(f) != top_for_bg.end()) {
-				if (!out.state.background_patches.empty()) {
-					for (const auto &bp : out.state.background_patches) {
-						cv::Mat dst = lbg(cv::Range(bp.y_low, bp.y_high),
-						                  cv::Range(bp.x_low, bp.x_high));
-						clamped_blit(frame_f32, dst, bp.y_low + dy, bp.x_low + dx,
-						             bp.y_high - bp.y_low, bp.x_high - bp.x_low);
-					}
-				} else {
-					clamped_blit(frame_f32, lbg, dy, dx,
-					             out.state.dim_y, out.state.dim_x);
-				}
-			}
-			gui_iface.set_progress((double) g_atomic_int_add(&cur_nb, 1)
-			                       / (double) n_included, NULL);
-
-			} catch (const std::exception &) {
-				g_atomic_int_set(&oom, 1);
-				continue;
-			}
-		}
-
-		/* Sum the private buffers into the shared accumulators (border is
-		 * order-independent max). Skipped once oom trips — the result is
-		 * discarded anyway, and a thread whose lbuf allocation failed
-		 * holds empty Mats that cv refuses to add. */
-#ifdef _OPENMP
-#pragma omp critical(mpp_stack_reduce)
-#endif
-		{
-			if (local_ok && !g_atomic_int_get(&oom)) {
-				try {
-					for (int a = 0; a < M; ++a)
-						out.state.stacking_buffers[a] += lbuf[a];
-					if (holes)
-						out.state.averaged_background += lbg;
-					out.border.y_low  = std::max(out.border.y_low,  lb.y_low);
-					out.border.y_high = std::max(out.border.y_high, lb.y_high);
-					out.border.x_low  = std::max(out.border.x_low,  lb.x_low);
-					out.border.x_high = std::max(out.border.x_high, lb.x_high);
-				} catch (const std::exception &) {
-					g_atomic_int_set(&oom, 1);
-				}
-			}
-		}
-	}
-
-	if (g_atomic_int_get(&oom)) {
-		out.oom = true;
-		return out;
-	}
-	if (cancelled) {
-		out.state.dim_y = 0;   /* cancellation sentinel — outer caller checks */
-		return out;
-	}
-
-	if (out.state.number_stacking_holes > 0) {
-		if (S != 1.0) {
-			cv::Mat r;
-			cv::resize(out.state.averaged_background, r,
-			           cv::Size(out.state.dim_x_drizzled, out.state.dim_y_drizzled),
-			           0, 0, cv::INTER_CUBIC);
-			out.state.averaged_background = r;
-		}
-		out.state.averaged_background /= (float) apq.stack_size;
-	}
-
-	return out;
+/* Signal ramp for the brightness-aware background blend:
+ * s = clamp((v − lo) / lo, 0, 1), i.e. 0 at/below the background line
+ * `lo`, full weight from 2·lo up. `v` is a single-channel CV_32F
+ * luminance; returns CV_32F. */
+cv::Mat dc_signal_ramp(const cv::Mat &v_gray, double lo) {
+	cv::Mat s;
+	v_gray.convertTo(s, CV_32F, 1.0 / lo, -1.0);
+	cv::min(s, 1.0f, s);
+	cv::max(s, 0.0f, s);
+	return s;
 }
 
-StackLoopOutput stack_apply_shifts(const std::vector<cv::Mat> &frames_raw,
-                                   const mpp_aps_t &aps,
-                                   const APQualities &apq,
-                                   const mpp_shifts_t *shifts,
-                                   const std::vector<FrameOffset> &offsets,
-                                   const std::vector<double> &frame_brightness,
-                                   const std::vector<int> &quality_sorted_idx,
-                                   const cv::Vec4i &intersection,
-                                   const mpp_config_t &cfg,
-                                   const int *included,
-                                   int max_threads,
-                                   size_t mem_budget_bytes) {
-	const int N = (int) frames_raw.size();
-	const int num_layers = N == 0 ? 1 : frames_raw[0].channels();
-	/* In-memory frames are trivially safe to read concurrently. */
-	return stack_apply_shifts_streamed(
-	    [&frames_raw](int i) -> cv::Mat { return frames_raw[i]; },
-	    N, num_layers, aps, apq, shifts, offsets, frame_brightness,
-	    quality_sorted_idx, intersection, cfg, included, max_threads,
-	    /*provider_thread_safe=*/true, mem_budget_bytes);
-}
-
-StackLoopOutput stack_frames_loop(const std::vector<cv::Mat> &frames_raw,
-                                  const std::vector<cv::Mat> &frames_mono_blurred,
-                                  const cv::Mat &mean_frame_raw,
-                                  const mpp_aps_t &aps,
-                                  const APQualities &apq,
-                                  const std::vector<FrameOffset> &offsets,
-                                  const std::vector<double> &frame_brightness,
-                                  const std::vector<int> &quality_sorted_idx,
-                                  const cv::Vec4i &intersection,
-                                  const mpp_config_t &cfg) {
-	/* Thin wrapper preserving the Phase-5a API: Stage B then Stage C. */
-	mpp_shifts_t *shifts = stack_compute_shifts(frames_mono_blurred,
-	                                            mean_frame_raw, aps, apq,
-	                                            offsets, cfg);
-	StackLoopOutput out = stack_apply_shifts(frames_raw, aps, apq, shifts,
-	                                         offsets, frame_brightness,
-	                                         quality_sorted_idx, intersection, cfg);
-	mpp_shift_free(shifts);
-	return out;
-}
-
-namespace {
-/* Replicate a single-channel matrix into a multi-channel one of the same
- * spatial size, so cv::multiply / cv::divide can be used against a
- * multi-channel partner. No-op for n=1. */
-cv::Mat broadcast_channels(const cv::Mat &single, int n) {
-	if (n <= 1) return single;
-	std::vector<cv::Mat> chans(n, single);
-	cv::Mat out;
-	cv::merge(chans, out);
-	return out;
-}
-
-/* Per-AP DC equalisation offsets (Siril enhancement; PSS has no
- * equivalent). Each AP buffer is a mean over its own top-N frame subset,
- * so neighbouring APs settle at slightly different local levels
- * (disjoint frame picks, transparency drift); the blend window then
- * turns each level step into block-pitch shading. Over the overlap of
- * two patches the scene content is identical, so the mean difference of
- * the two normalised buffers there is pure stacking inconsistency:
- *   d_ab = mean_overlap(B_a / c_a − B_b / c_b)   (per channel).
- * Solve the least-squares offsets δ minimising
- *   Σ_pairs n_ab (δ_a − δ_b + d_ab)²
- * (n_ab = overlap area) by Gauss-Seidel — the normal equations are
- *   δ_a = Σ_b n_ab (δ_b − d_ab) / Σ_b n_ab,
- * a strictly diagonally dominant relaxation that converges in a few
- * dozen sweeps for any AP graph. The system is invariant under a global
- * constant, so pin the mean δ of connected APs to zero (preserves the
- * overall brightness). APs with no overlapping neighbour keep δ = 0. */
-std::vector<cv::Scalar> stack_solve_ap_dc_offsets(const mpp::StackState &state) {
-	const int M = (int) state.stacking_buffers.size();
-	std::vector<cv::Scalar> delta(M, cv::Scalar::all(0.0));
-	if (M < 2 || (int) state.ap_frame_counts.size() != M)
-		return delta;
-
-	struct Edge { int b; double n; cv::Scalar d; };
-	std::vector<std::vector<Edge>> nbrs(M);
-	for (int a = 0; a < M; ++a) {
-		const auto &pa = state.patch_drizzled[a];
-		const double ca = state.ap_frame_counts[a];
-		if (ca <= 0.0) continue;
-		for (int b = a + 1; b < M; ++b) {
-			const double cb = state.ap_frame_counts[b];
-			if (cb <= 0.0) continue;
-			const auto &pb = state.patch_drizzled[b];
-			const int y0 = std::max(pa[0], pb[0]), y1 = std::min(pa[1], pb[1]);
-			const int x0 = std::max(pa[2], pb[2]), x1 = std::min(pa[3], pb[3]);
-			if (y1 <= y0 || x1 <= x0) continue;
-			const cv::Mat sa = state.stacking_buffers[a](
-			    cv::Range(y0 - pa[0], y1 - pa[0]),
-			    cv::Range(x0 - pa[2], x1 - pa[2]));
-			const cv::Mat sb = state.stacking_buffers[b](
-			    cv::Range(y0 - pb[0], y1 - pb[0]),
-			    cv::Range(x0 - pb[2], x1 - pb[2]));
-			const double n = (double) (y1 - y0) * (double) (x1 - x0);
-			const cv::Scalar d = cv::sum(sa) * (1.0 / (ca * n))
-			                   - cv::sum(sb) * (1.0 / (cb * n));
-			nbrs[a].push_back({b, n, d});
-			nbrs[b].push_back({a, n, -d});
-		}
-	}
-
-	for (int it = 0; it < 32; ++it) {
-		for (int a = 0; a < M; ++a) {
-			if (nbrs[a].empty()) continue;
-			cv::Scalar acc = cv::Scalar::all(0.0);
-			double nsum = 0.0;
-			for (const auto &e : nbrs[a]) {
-				acc += (delta[e.b] - e.d) * e.n;
-				nsum += e.n;
-			}
-			/* nbrs[a] is non-empty here and every edge weight e.n is a positive
-			 * overlap area (>= 1), so nsum > 0; guard anyway to keep the
-			 * division provably safe. */
-			if (nsum > 0.0)
-				delta[a] = acc * (1.0 / nsum);
-		}
-	}
-
-	cv::Scalar mean = cv::Scalar::all(0.0);
-	int connected = 0;
-	for (int a = 0; a < M; ++a) {
-		if (nbrs[a].empty()) continue;
-		mean += delta[a];
-		++connected;
-	}
-	if (connected > 0) {
-		mean *= 1.0 / connected;
-		for (int a = 0; a < M; ++a)
-			if (!nbrs[a].empty()) delta[a] -= mean;
-	}
-	return delta;
-}
-}  // namespace
-
-cv::Mat stack_merge_alignment_point_buffers(const StackState &state,
-                                            const RemapBorder &border,
-                                            const mpp_aps_t &aps,
-                                            const mpp_config_t &cfg) {
-	const int C = state.num_layers;
-	const int buf_type = (C == 3) ? CV_32FC3 : CV_32F;
-
-	/* Global drizzled image buffer. */
-	cv::Mat buf = cv::Mat::zeros(state.dim_y_drizzled, state.dim_x_drizzled, buf_type);
-
-	/* DC equalisation offsets — see stack_solve_ap_dc_offsets. */
-	const std::vector<cv::Scalar> dc = stack_solve_ap_dc_offsets(state);
-	{
-		double max_dc = 0.0;
-		for (const auto &d : dc)
-			for (int c = 0; c < C; ++c)
-				max_dc = std::max(max_dc, std::abs(d[c]));
-		if (max_dc >= 0.005)
-			siril_log_debug("Stack (mpp): AP DC equalisation, max "
-			                "correction %.2f ADU (16-bit)\n", max_dc);
-	}
-
-	/* For each AP: buf[patch] += (stacking_buffer + c_a·δ_a) * weights_yx.
-	 * The δ term rides under the same window, so after the division by
-	 * sum_single_frame_weights it contributes exactly +δ_a wherever the
-	 * AP carries weight. */
-	for (int a = 0; a < aps.count; ++a) {
-		const auto &p = state.patch_drizzled[a];
-		cv::Mat dst = buf(cv::Range(p[0], p[1]), cv::Range(p[2], p[3]));
-		cv::Mat weighted;
-		const cv::Mat w = broadcast_channels(state.weights_yx[a], C);
-		cv::multiply(state.stacking_buffers[a], w, weighted);
-		dst += weighted;
-		if (a < (int) state.ap_frame_counts.size()) {
-			const cv::Scalar term = dc[a] * (double) state.ap_frame_counts[a];
-			if (std::abs(term[0]) + std::abs(term[1]) + std::abs(term[2]) > 0.0) {
-				cv::Mat corr(w.rows, w.cols, buf_type, term);
-				cv::multiply(corr, w, corr);
-				dst += corr;
-			}
-		}
-	}
-
-	/* buf /= sum_single_frame_weights. sum_weights was initialised to
-	 * 1e-30, so we never divide by zero. */
-	const cv::Mat sw = broadcast_channels(state.sum_single_frame_weights, C);
-	cv::divide(buf, sw, buf);
-
-	/* Background blend: compute a foreground_weight ramp and lerp. */
-	if (state.number_stacking_holes > 0) {
-		const float denom = (float) (cfg.stack_frames_background_blend_threshold
-		                            * (double) state.stack_size);
-		cv::Mat fg_weight;
-		state.sum_single_frame_weights.convertTo(fg_weight, CV_32F, 1.0 / denom);
-		cv::min(fg_weight, 1.0f, fg_weight);
-		cv::max(fg_weight, 0.0f, fg_weight);
-		const cv::Mat fgw = broadcast_channels(fg_weight, C);
-		cv::Mat diff;
-		cv::subtract(buf, state.averaged_background, diff);
-		cv::multiply(diff, fgw, diff);
-		cv::add(state.averaged_background, diff, buf);
-	}
-
-	/* Border trim. */
-	const int trim_y_lo = border.y_low;
-	const int trim_y_hi = state.dim_y_drizzled - border.y_high;
-	const int trim_x_lo = border.x_low;
-	const int trim_x_hi = state.dim_x_drizzled - border.x_high;
-	if (border.y_low || border.y_high || border.x_low || border.x_high)
-		buf = buf(cv::Range(trim_y_lo, trim_y_hi),
-		          cv::Range(trim_x_lo, trim_x_hi)).clone();
-
-	const double in_max = (cfg.bitdepth == 8) ? 255.0 : 65535.0;
-	cv::Mat normalised;
-	buf.convertTo(normalised, buf_type, 1.0 / in_max);
-	cv::min(normalised, 1.0f, normalised);
-	cv::max(normalised, 0.0f, normalised);
-
-	const int out_type = (C == 3) ? CV_16UC3 : CV_16U;
-	cv::Mat out(normalised.rows, normalised.cols, out_type);
-	/* skimage img_as_uint does floor(x * 65535 + 0.5). Multi-channel-aware
-	 * flat iteration over `cols × channels()`. */
-	for (int y = 0; y < normalised.rows; ++y) {
-		const float *src = normalised.ptr<float>(y);
-		uint16_t *dst = out.ptr<uint16_t>(y);
-		const int n = normalised.cols * C;
-		for (int x = 0; x < n; ++x) {
-			const double v = (double) src[x] * 65535.0 + 0.5;
-			const int iv = (int) v;
-			dst[x] = (uint16_t) std::clamp(iv, 0, 65535);
-		}
-	}
-	return out;
+/* Background line for the signal ramp, in pixel units. Reuses the
+ * AP-placement brightness threshold — the existing "background vs
+ * structure" knob — so ≤ 0 disables the ramped blend boost. */
+double dc_signal_floor(const mpp_config_t &cfg) {
+	return (double) cfg.alignment_points_brightness_threshold
+	     * mpp_cfg_threshold_scale(&cfg);
 }
 
 }  // namespace mpp

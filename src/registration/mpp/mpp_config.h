@@ -113,6 +113,16 @@ struct mpp_config {
 	 * and Stage C through the dobox Bayer path. Only consulted for
 	 * SEQ_AVI sequences; ignored for SER / FITS. */
 	int avi_bayer_pattern;     /* enum mpp_avi_bayer; default MPP_AVI_BAYER_AUTO */
+
+	/* Stage C stacking engine (enum mpp_stack_method). WARP builds a
+	 * smooth dense displacement field from the per-AP shifts and warps
+	 * each frame once with cv::remap; a .derot plan folds into the same
+	 * remap. The PATCH engine (rigid per-AP patches mosaiced with blend
+	 * windows — the PSS architecture) was retired once WARP matched or
+	 * beat it on solar, lunar and planetary data; the field and enum slot
+	 * are kept so persisted configs (sidecar v10+) keep their layout and
+	 * meaning, but the value is ignored — Stage C always warps. */
+	int stack_method;          /* default (and only) MPP_STACK_WARP */
 };
 
 /* Global frame alignment mode (PSS configuration.align_frames_mode).
@@ -133,6 +143,12 @@ enum mpp_drizzle_mode {
 	 * upscale better. Numbering preserved so saved configs keep meaning. */
 	MPP_DRIZZLE_STSCI   = 2,  /* dobox with debayered / mono / RGB input */
 	MPP_DRIZZLE_BAYER   = 3,  /* dobox with raw Bayer input → 3-channel output */
+};
+
+/* Stage C stacking engine (see mpp_config.stack_method). */
+enum mpp_stack_method {
+	MPP_STACK_PATCH = 0,   /* retired (slot kept for persisted configs) */
+	MPP_STACK_WARP  = 1,   /* dense warp-field accumulation (the engine) */
 };
 
 /* AVI Bayer-pattern hint values. Ordering matches the GUI combo's item

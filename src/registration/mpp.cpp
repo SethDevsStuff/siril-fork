@@ -71,15 +71,18 @@ extern "C" {
 #include "registration/mpp/mpp_frames.h"
 #include "registration/mpp/mpp_shift.h"
 #include "registration/mpp/mpp_sidecar.h"
+#include "registration/mpp/mpp_derot_sidecar.h"
 #include "registration/registration.h"
 }
 
+#include "registration/mpp/mpp_derot.h"   /* C++ (cv::Mat) — outside extern "C" */
 #include "registration/mpp/mpp_align_priv.hpp"
 #include "registration/mpp/mpp_ap_priv.hpp"
 #include "registration/mpp/mpp_image_priv.hpp"
 #include "registration/mpp/mpp_rank_priv.hpp"
 #include "registration/mpp/mpp_shift_priv.hpp"
 #include "registration/mpp/mpp_stack_priv.hpp"
+#include "registration/mpp/mpp_multistack.hpp"
 
 /* mpp_run_alloc / mpp_run_free live in mpp_run.c (no Siril runtime deps). */
 
@@ -842,6 +845,97 @@ cv::Mat guarded_frame(Fn &&fn) {
 }
 }  // namespace
 
+/* Derotation-aware registration (5b): when a .derot plan is active, every
+ * analysis frame is warped to the reference epoch before global alignment,
+ * mean-frame building and per-AP shift measurement. The disk position is
+ * rotation-invariant, so global alignment still recovers per-frame jitter on
+ * the derotated frames; the mean is then sharp (not rotationally smeared) and
+ * the per-AP shifts are small epoch-space residuals. Stage C composes the same
+ * derotation with those residuals in one resample, so the rotation is applied
+ * exactly once and is not double-counted. Disk fit is in full-frame pixels, so
+ * the map is sized to the frame itself (org 0,0, scale 1). */
+/* A .derot plan applies to this run only if its frame count AND the frame
+ * dimensions its disk fit was measured in both match — otherwise the disk would
+ * be mis-placed (e.g. a plan from a different-resolution capture with the same
+ * frame count). */
+/* Pack a stacked canvas (CV_16U / CV_16UC3 for 16-bit output, CV_32F /
+ * CV_32FC3 normalised [0,1] for 32-bit float output) into the caller's
+ * fits. The caller supplies an empty shell (`fits out = {0};`); we fill
+ * its members and own the pixel buffer. Siril expects PLANAR layout
+ * (R plane, G plane, B plane); cv::Mat stores interleaved, so multi-
+ * channel input is split + repacked. Mono convention: pdata[1]/pdata[2]
+ * (and fpdata) alias plane 0, not NULL — remap_all_vports's per-vport
+ * memcpy loops c=0..2 unconditionally, so a NULL plane pointer crashes
+ * the GUI refresh that runs right after the stack swaps gfit. */
+static mpp_status_t mpp_pack_stacked(const cv::Mat &stacked, fits *out) {
+	clearfits(out);
+	const int H = stacked.rows;
+	const int W = stacked.cols;
+	const int C = stacked.channels();
+	const size_t plane = (size_t) H * W;
+	out->rx = W;
+	out->ry = H;
+	out->naxes[0] = W;
+	out->naxes[1] = H;
+	out->naxes[2] = C;
+	out->naxis = (C == 1) ? 2 : 3;
+
+	if (stacked.depth() == CV_32F) {
+		/* 32-bit float output: the accumulation's precision, no uint16
+		 * quantisation round-trip. fit_replace_buffer wires fdata/fpdata
+		 * from the dims set above. */
+		float *fbuf = (float *) std::malloc(plane * C * sizeof(float));
+		if (!fbuf) return MPP_ENOMEM;
+		if (C == 1) {
+			std::memcpy(fbuf, stacked.data, plane * sizeof(float));
+		} else {
+			std::vector<cv::Mat> planes;
+			cv::split(stacked, planes);
+			for (int c = 0; c < C; ++c)
+				std::memcpy(fbuf + c * plane, planes[c].data,
+				            plane * sizeof(float));
+		}
+		fit_replace_buffer(out, fbuf, DATA_FLOAT);
+		siril_log_message(_("Stacking result will be stored as a 32-bit image\n"));
+		return MPP_OK;
+	}
+
+	out->data = (WORD *) std::calloc(plane * C, sizeof(WORD));
+	if (!out->data) return MPP_ENOMEM;
+	if (C == 1) {
+		std::memcpy(out->data, stacked.data, plane * sizeof(WORD));
+	} else {
+		std::vector<cv::Mat> planes;
+		cv::split(stacked, planes);
+		for (int c = 0; c < C; ++c)
+			std::memcpy(out->data + c * plane, planes[c].data,
+			            plane * sizeof(WORD));
+	}
+	out->bitpix = USHORT_IMG;
+	out->orig_bitpix = USHORT_IMG;
+	out->type = DATA_USHORT;
+	out->pdata[0] = out->data;
+	out->pdata[1] = (C >= 2) ? out->data + plane     : out->data;
+	out->pdata[2] = (C >= 3) ? out->data + plane * 2 : out->data;
+	return MPP_OK;
+}
+
+static bool mpp_derot_applies(const struct mpp_derot *d, int num_frames,
+                              int rows, int cols) {
+	return d && d->num_frames == num_frames
+	        && d->frame_rows == rows && d->frame_cols == cols;
+}
+
+static cv::Mat mpp_derot_warp_frame(const struct mpp_derot *d, int frame,
+                                    const cv::Mat &m) {
+	if (!d || m.empty()) return m;
+	cv::Mat mapx, mapy, mu, out;
+	mpp_derot_frame_map(d, frame, m.cols, m.rows, 0.0, 0.0, 1.0, mapx, mapy, mu);
+	cv::remap(m, out, mapx, mapy, cv::INTER_LANCZOS4, cv::BORDER_CONSTANT,
+	          cv::Scalar(0));
+	return out;
+}
+
 /* -------------------- Stage A: mpp_analyze -------------------- */
 
 /* Driver state for the sub-range scaled progress callback. The C++
@@ -873,11 +967,21 @@ static void stage_progress_cb(double fraction, void *user) {
 #define MPP_PROG_AVERAGE_END      1.00   /* per-frame accumulator */
 
 static mpp_status_t mpp_analyze_impl(sequence *seq, const mpp_config_t *cfg,
-                                     mpp_run_t **run_out) {
+                                     mpp_run_t **run_out,
+                                     const struct mpp_derot *derot) {
 	if (!seq || !cfg || !run_out)
 		return MPP_EINVAL;
 	if (seq->number <= 0)
 		return MPP_ENODATA;
+	const bool derot_active = mpp_derot_applies(derot, seq->number,
+	                                            seq->ry, seq->rx);
+	if (derot && !derot_active)
+		siril_log_warning(_("Analyze: the .derot plan does not match this "
+		                    "sequence (frame count or dimensions); derotation "
+		                    "skipped.\n"));
+	if (derot_active)
+		siril_log_message(_("Analyze: derotation active — registering in the "
+		                    "reference-epoch frame.\n"));
 
 	/* Pin CFA SERs to raw-mosaic reads for the whole stage — all passes
 	 * and the persistent analysis cache they populate go through
@@ -1084,17 +1188,23 @@ static mpp_status_t mpp_analyze_impl(sequence *seq, const mpp_config_t *cfg,
 	 * if populated; otherwise re-read from disk. Works identically for
 	 * HALF_CACHED (every slot hits), PARTIAL_CACHED (first K hit), and
 	 * STREAMING (every slot misses since analysis_frames is empty). */
-	auto raw_provider = [&analysis_frames, seq, cfg](int i) -> cv::Mat {
+	auto raw_provider = [&analysis_frames, seq, cfg, derot, derot_active](int i) -> cv::Mat {
 		return guarded_frame([&]() -> cv::Mat {
+			cv::Mat m;
 			if (i >= 0 && i < (int) analysis_frames.size()
 			 && !analysis_frames[i].empty())
-				return analysis_frames[i];
-			return mpp::read_analysis_frame(seq, i, cfg->avi_bayer_pattern, cfg->bitdepth);
+				m = analysis_frames[i];
+			else
+				m = mpp::read_analysis_frame(seq, i, cfg->avi_bayer_pattern, cfg->bitdepth);
+			return derot_active ? mpp_derot_warp_frame(derot, i, m) : m;
 		});
 	};
-	auto blurred_provider = [&analysis_frames, &blurred_frames, seq, cfg](int i) -> cv::Mat {
+	/* When derotation is active the pre-blurred cache (blurred raw frames) no
+	 * longer matches — the frame must be derotated before blurring — so that
+	 * cache is bypassed and each blurred frame is built fresh. */
+	auto blurred_provider = [&analysis_frames, &blurred_frames, seq, cfg, derot, derot_active](int i) -> cv::Mat {
 		return guarded_frame([&]() -> cv::Mat {
-			if (i >= 0 && i < (int) blurred_frames.size()
+			if (!derot_active && i >= 0 && i < (int) blurred_frames.size()
 			 && !blurred_frames[i].empty())
 				return blurred_frames[i];
 			cv::Mat m;
@@ -1103,7 +1213,9 @@ static mpp_status_t mpp_analyze_impl(sequence *seq, const mpp_config_t *cfg,
 				m = analysis_frames[i];
 			else
 				m = mpp::read_analysis_frame(seq, i, cfg->avi_bayer_pattern, cfg->bitdepth);
-			return m.empty() ? cv::Mat() : mpp::blur_mono_for_align(m, *cfg);
+			if (m.empty()) return cv::Mat();
+			if (derot_active) m = mpp_derot_warp_frame(derot, i, m);
+			return mpp::blur_mono_for_align(m, *cfg);
 		});
 	};
 
@@ -1248,6 +1360,11 @@ static mpp_status_t mpp_analyze_impl(sequence *seq, const mpp_config_t *cfg,
 		}
 	}
 
+	/* Stamp the fingerprint of the derotation plan the AP geometry was
+	 * registered in (0 when derotation was off) so Stage C can detect a
+	 * mismatched/added/edited .derot. */
+	run->derot_fingerprint = derot_active ? mpp_derot_fingerprint(derot) : 0;
+
 	*run_out = run;
 	return MPP_OK;
 }
@@ -1258,9 +1375,10 @@ static mpp_status_t mpp_analyze_impl(sequence *seq, const mpp_config_t *cfg,
  * (undefined behaviour / terminate). Out-of-memory is the realistic
  * thrower — map it to MPP_ENOMEM. */
 extern "C" mpp_status_t mpp_analyze(sequence *seq, const mpp_config_t *cfg,
-                                    mpp_run_t **run_out) {
+                                    mpp_run_t **run_out,
+                                    const struct mpp_derot *derot) {
 	try {
-		return mpp_analyze_impl(seq, cfg, run_out);
+		return mpp_analyze_impl(seq, cfg, run_out, derot);
 	} catch (const std::exception &e) {
 		siril_log_error(_("Analyze: failed (%s) — likely out of memory; "
 		                  "reduce the memory ratio in Preferences.\n"), e.what());
@@ -1271,8 +1389,11 @@ extern "C" mpp_status_t mpp_analyze(sequence *seq, const mpp_config_t *cfg,
 /* -------------------- Stage B: mpp_compute_shifts -------------------- */
 
 static mpp_status_t mpp_compute_shifts_impl(sequence *seq, const mpp_config_t *cfg,
-                                            mpp_run_t *run) {
+                                            mpp_run_t *run,
+                                            const struct mpp_derot *derot) {
 	if (!seq || !cfg || !run || !run->aps) return MPP_EINVAL;
+	const bool derot_active = mpp_derot_applies(derot, run->num_frames,
+	                                            run->frame_rows, run->frame_cols);
 
 	/* Stage B re-reads analysis frames on cache misses — pin CFA SERs to
 	 * raw-mosaic reads so those reads match the Stage A frames
@@ -1280,12 +1401,25 @@ static mpp_status_t mpp_compute_shifts_impl(sequence *seq, const mpp_config_t *c
 	SerAnalysisRawGuard raw_guard;
 	maybe_engage_ser_raw_for_analysis(raw_guard, seq);
 
-	/* Stage B streams: each frame is read + blurred inside the
-	 * correlation loop and discarded at iteration end. Sequential, so
-	 * max_threads=1 — the picker just verifies that a single in-flight
-	 * read (including decode intermediates, see
-	 * mpp_analysis_in_flight_slots) fits. Disk traffic is identical to
-	 * the previous cached two-pass design (1 read per included frame). */
+	/* Stage B streams: each frame is read + (optionally derotated) + blurred
+	 * inside the correlation loop and discarded at iteration end. The frame
+	 * loop is frame-parallel (each (frame, AP) shift is a disjoint slot), so
+	 * the picker is asked for up to max_threads in-flight reads — the per-AP
+	 * correlation plus the per-frame derotation remap then run across cores
+	 * instead of serialising behind OpenCV's internal threading. Disk traffic
+	 * is still 1 read per included frame. */
+#ifdef _OPENMP
+	const int stageb_max_threads = std::max(1, com.max_thread);
+#else
+	const int stageb_max_threads = 1;
+#endif
+	/* The provider is reentrant when its reads are: cache hits are trivially
+	 * so, and disk-read misses are reentrant for SER / reentrant-FITS — same
+	 * predicate Stage A uses for its parallel sweeps. */
+	const bool stageb_provider_safe =
+	    (seq->type == SEQ_SER
+	     || ((seq->type == SEQ_REGULAR || seq->type == SEQ_FITSEQ
+	          || seq->type == SEQ_INTERNAL) && fits_is_reentrant()));
 	mpp_mem_pick mem_pick{MPP_MEM_STREAMING, 1, 0, 0};
 	{
 		const int bps = (cfg->bitdepth == 8) ? 1 : 2;
@@ -1294,13 +1428,13 @@ static mpp_status_t mpp_compute_shifts_impl(sequence *seq, const mpp_config_t *c
 		    bps,
 		    /*cached_copies=*/0,
 		    /*half_cached_copies=*/0,
-		    /*max_threads=*/1,
+		    stageb_provider_safe ? stageb_max_threads : 1,
 		    mpp_analysis_in_flight_slots(seq, cfg),
 		    /*output_bytes=*/0,
 		    _("Register"), &mem_pick);
 		if (mem != MPP_OK) return mem;
 	}
-	(void) mem_pick;
+	const int stageb_threads = std::max(1, mem_pick.threads);
 
 	const auto apq = mpp::apq_from_run(run);
 	const auto offsets = mpp::offsets_from_run(run);
@@ -1319,7 +1453,7 @@ static mpp_status_t mpp_compute_shifts_impl(sequence *seq, const mpp_config_t *c
 		                    "(%d/%d frames in memory)\n"),
 		                  cache->populated_count, run->num_frames);
 	}
-	auto provider = [seq, cfg, cache, cache_N](int f) -> cv::Mat {
+	auto provider = [seq, cfg, cache, cache_N, derot, derot_active](int f) -> cv::Mat {
 		return guarded_frame([&]() -> cv::Mat {
 			cv::Mat mono;
 			if (cache && f >= 0 && f < cache_N
@@ -1330,12 +1464,15 @@ static mpp_status_t mpp_compute_shifts_impl(sequence *seq, const mpp_config_t *c
 				                                cfg->bitdepth);
 			}
 			if (mono.empty()) return cv::Mat();
+			/* Match Stage A: shifts are measured against the (derotated) mean
+			 * in epoch space, so each frame is derotated before correlation. */
+			if (derot_active) mono = mpp_derot_warp_frame(derot, f, mono);
 			return mpp::blur_mono_for_align(mono, *cfg);
 		});
 	};
 	mpp_shifts_t *shifts = mpp::stack_compute_shifts_streamed(
 	    provider, run->num_frames, mean_raw, *run->aps, apq, offsets,
-	    *cfg, run->included);
+	    *cfg, run->included, stageb_threads, stageb_provider_safe);
 	if (!shifts) return MPP_ENOMEM;
 	if (shifts->failure_counter == -1) {   /* cancellation sentinel */
 		mpp_shift_free(shifts);
@@ -1350,9 +1487,10 @@ static mpp_status_t mpp_compute_shifts_impl(sequence *seq, const mpp_config_t *c
  * serial, so any cv:: allocation failure unwinds to here instead of
  * terminating inside an OpenMP region. */
 extern "C" mpp_status_t mpp_compute_shifts(sequence *seq, const mpp_config_t *cfg,
-                                           mpp_run_t *run) {
+                                           mpp_run_t *run,
+                                           const struct mpp_derot *derot) {
 	try {
-		return mpp_compute_shifts_impl(seq, cfg, run);
+		return mpp_compute_shifts_impl(seq, cfg, run, derot);
 	} catch (const std::exception &e) {
 		siril_log_error(_("Register: failed (%s) — likely out of memory; "
 		                  "reduce the memory ratio in Preferences.\n"), e.what());
@@ -1380,7 +1518,9 @@ extern "C" mpp_input_type mpp_classify_sequence_input(const sequence *seq) {
 }
 
 static mpp_status_t mpp_stack_apply_impl(sequence *seq, const mpp_config_t *cfg,
-                                         mpp_run_t *run, fits *out) {
+                                         mpp_run_t *run,
+                                         const struct mpp_derot *derot,
+                                         fits *out) {
 	/* seq->imgparam is required: every downstream consumer reads frames by
 	 * filename through it (the classify probe below via mpp_seq_read_frame ->
 	 * fit_sequence_get_image_filename_checkext, and the streamed stacker), so a
@@ -1468,10 +1608,15 @@ static mpp_status_t mpp_stack_apply_impl(sequence *seq, const mpp_config_t *cfg,
 	mpp_run_t *cached = mpp_get_cached_run();
 	if (cached && cached != run) mpp_run_drop_cache(cached);
 
-	/* Dispatch: all stacking goes through the classical engine
-	 * (stack_apply_shifts_streamed) — sub-pixel rigid-shift per-AP patch
-	 * accumulation + Hann-weight mosaic, parallelised over frames, with
-	 * cv::resize interpolation for scale > 1.
+	/* Dispatch: all stacking goes through the warp-field engine
+	 * (stack_warp_apply_streamed) — per frame the per-AP shifts are
+	 * interpolated into a dense displacement field, the frame is warped
+	 * once (folding in any derotation base) and accumulated under the
+	 * dense selection-weight field, with cv::resize interpolation for
+	 * scale > 1. The per-AP patch-blend engine ("impulse engine", the PSS
+	 * architecture) was retired once the warp engine matched or beat it
+	 * on solar, lunar and planetary test data — one Stage C, one artefact
+	 * surface.
 	 *
 	 * The STScI / Bayer dobox drizzle backends were removed: both produced
 	 * sampling / mosaic-phase artefacts on planetary data. (The code is
@@ -1480,7 +1625,7 @@ static mpp_status_t mpp_stack_apply_impl(sequence *seq, const mpp_config_t *cfg,
 	 *
 	 * CFA input is debayered first (read_full_frame forces ser_read_frame
 	 * to debayer regardless of the user's debayer-on-open pref), then
-	 * stacked classically like any RGB sequence. */
+	 * stacked like any RGB sequence. */
 	/* AVI Bayer routing: an AVI marked as a raw mosaic (cfg->avi_bayer_pattern
 	 * RGGB/BGGR/GBRG/GRBG) is the AVI analogue of MPP_INPUT_CFA. The
 	 * classifier can't see this (sequence-only signature) so it's
@@ -1574,12 +1719,12 @@ static mpp_status_t mpp_stack_apply_impl(sequence *seq, const mpp_config_t *cfg,
 	    (seq->type == SEQ_SER
 	     || ((seq->type == SEQ_REGULAR || seq->type == SEQ_FITSEQ
 	          || seq->type == SEQ_INTERNAL) && fits_is_reentrant()));
-	siril_log_message(_("Stack (mpp): classical accumulation, %d thread(s), "
+	siril_log_message(_("Stack (mpp): warp-field accumulation, %d thread(s), "
 	                    "%s frame reads\n"),
 	                  stack_threads,
 	                  stack_provider_safe ? _("parallel") : _("serial"));
 	/* Memory budget for the per-thread private accumulators: 80% of the
-	 * lesser of free RAM and the configured cap. stack_apply_shifts_streamed
+	 * lesser of free RAM and the configured cap. stack_warp_apply_streamed
 	 * clamps its thread count to what fits. */
 	size_t stack_mem_budget = 0;
 	{
@@ -1591,82 +1736,371 @@ static mpp_status_t mpp_stack_apply_impl(sequence *seq, const mpp_config_t *cfg,
 		}
 		stack_mem_budget = (size_t) ((long double) budget_b * 0.8L);
 	}
-	const auto loop = mpp::stack_apply_shifts_streamed(
-	    provider, run->num_frames, num_layers, *run->aps, apq,
-	    run->shifts, offsets, frame_brightness, sorted_idx,
-	    intersection, *cfg, run->included, stack_threads, stack_provider_safe,
-	    stack_mem_budget);
-	if (loop.oom) {
-		siril_log_error(_("Stack (mpp): out of memory while accumulating "
-		                  "frames — reduce the memory ratio in Preferences.\n"));
-		return MPP_ENOMEM;
+	/* Per-frame derotation maps in the drizzled intersection canvas: pixel
+	 * (0,0) is original-frame coord (intersection x_low, y_low), scaled by
+	 * the drizzle factor. Only built when a valid .derot plan is present;
+	 * with no plan the warp engine runs on its identity base (pure
+	 * de-warp). */
+	cv::Mat stacked;
+	{
+		const double S = std::max(1.0, cfg->drizzle_scale);
+		mpp::DerotMapProvider derot_provider =
+		    [derot, &intersection, S](int f, int DY, int DX,
+		                              cv::Mat &mx, cv::Mat &my, cv::Mat &mu) {
+			mpp_derot_frame_map(derot, f, DX, DY,
+			                    (double) intersection[2], (double) intersection[0],
+			                    S, mx, my, mu);
+			return true;
+		};
+		const bool use_derot = mpp_derot_applies(derot, run->num_frames,
+		                                         run->frame_rows, run->frame_cols);
+		if (derot && !use_derot)
+			siril_log_warning(_("Stack (mpp): the .derot plan does not match this "
+			                    "sequence (frame count or dimensions); derotation "
+			                    "skipped.\n"));
+		const mpp::DerotMapProvider *derot_pp = use_derot ? &derot_provider : nullptr;
+		const mpp::WarpStackResult wr = mpp::stack_warp_apply_streamed(
+		    provider, run->num_frames, num_layers, *run->aps, apq,
+		    run->shifts, offsets, frame_brightness, sorted_idx,
+		    intersection, *cfg, run->included, stack_threads, stack_provider_safe,
+		    stack_mem_budget, derot_pp);
+		if (wr.oom) {
+			siril_log_error(_("Stack (mpp): out of memory while accumulating "
+			                  "frames — reduce the memory ratio in Preferences.\n"));
+			return MPP_ENOMEM;
+		}
+		if (wr.cancelled || wr.image.empty()) return MPP_EINTR;
+		stacked = wr.image;
 	}
-	if (loop.state.dim_y == 0) return MPP_EINTR;   /* cancellation sentinel */
-	const cv::Mat stacked = mpp::stack_merge_alignment_point_buffers(
-	    loop.state, loop.border, *run->aps, *cfg);
 
-	/* Pack stacked into the caller-supplied fits. The caller allocates the
-	 * shell (`fits out = {0};`); we fill its members and own `data`. For
-	 * multi-channel stacked (CV_16UC3), Siril expects PLANAR layout in
-	 * `data` (R plane then G plane then B plane), with pdata[0..2]
-	 * pointing into the contiguous buffer. cv::Mat stores interleaved
-	 * BGRBGR... — we split + repack. */
-	clearfits(out);
-	const int H = stacked.rows;
-	const int W = stacked.cols;
-	const int C = stacked.channels();
-	const size_t plane = (size_t) H * W;
-	out->data = (WORD *) std::calloc(plane * C, sizeof(WORD));
-	if (!out->data) return MPP_ENOMEM;
-	if (C == 1) {
-		std::memcpy(out->data, stacked.data, plane * sizeof(WORD));
-	} else {
-		std::vector<cv::Mat> planes;
-		cv::split(stacked, planes);
-		for (int c = 0; c < C; ++c)
-			std::memcpy(out->data + c * plane, planes[c].data, plane * sizeof(WORD));
-	}
-	out->rx = W;
-	out->ry = H;
-	out->naxes[0] = W;
-	out->naxes[1] = H;
-	out->naxes[2] = C;
-	out->naxis = (C == 1) ? 2 : 3;
-	out->bitpix = USHORT_IMG;
-	out->orig_bitpix = USHORT_IMG;
-	out->type = DATA_USHORT;
-	out->pdata[0] = out->data;
-	/* Siril's mono convention: pdata[1]/pdata[2] alias pdata[0] (not
-	 * NULL). remap_all_vports's per-vport memcpy loops c=0..2
-	 * unconditionally, so a NULL plane pointer crashes the GUI
-	 * refresh that runs immediately after stack_function_handler
-	 * swaps gfit. */
-	out->pdata[1] = (C >= 2) ? out->data + plane     : out->data;
-	out->pdata[2] = (C >= 3) ? out->data + plane * 2 : out->data;
-
-	/* Optional 32-bit float output. The merge above runs in 16-bit; when
-	 * requested (`-32b` / "Force 32b output") convert the packed USHORT
-	 * buffer to normalised float in place. fit_replace_buffer frees the
-	 * old WORD buffer and rewires pdata/fpdata. */
-	if (cfg->output_32bit) {
-		float *fbuf = ushort_buffer_to_float(out->data, plane * C);
-		if (!fbuf) return MPP_ENOMEM;
-		fit_replace_buffer(out, fbuf, DATA_FLOAT);
-		siril_log_message(_("Stacking result will be stored as a 32-bit image\n"));
-	}
-	return MPP_OK;
+	/* Pack stacked into the caller-supplied fits. */
+	return mpp_pack_stacked(stacked, out);
 }
 
 /* Exception boundary — see mpp_analyze. */
 extern "C" mpp_status_t mpp_stack_apply(sequence *seq, const mpp_config_t *cfg,
-                                        mpp_run_t *run, fits *out) {
+                                        mpp_run_t *run,
+                                        const struct mpp_derot *derot,
+                                        fits *out) {
 	try {
-		return mpp_stack_apply_impl(seq, cfg, run, out);
+		return mpp_stack_apply_impl(seq, cfg, run, derot, out);
 	} catch (const std::exception &e) {
 		siril_log_error(_("Stack (mpp): failed (%s) — likely out of memory; "
 		                  "reduce the memory ratio in Preferences.\n"), e.what());
 		return MPP_ENOMEM;
 	}
+}
+
+/* -------------------- Multi-source derotation stack (Option B) --------------
+ *
+ * Combine several sequences — each with its own <seqname>.derot referencing a
+ * common epoch — into one stack in the reference sequence's epoch canvas. Wraps
+ * mpp::multistack_channel with real-sequence frame readers (the same
+ * read_analysis_frame / read_full_frame the single-sequence pipeline uses) and
+ * packs the result into the caller's fits. `seqs[ref]` defines the output
+ * geometry and channel count. */
+namespace {
+/* Shared setup for the multi-source bridge entries: cfg localisation, CFA
+ * raw-read guards (restored when the setup object goes out of scope), the
+ * MsSource list, output channel count and threading. */
+struct MsBridgeSetup {
+	mpp_config_t lcfg;
+	std::vector<SerAnalysisRawGuard> raw_guards;
+	std::vector<mpp::MsSource> srcs;
+	int num_layers = 1;
+	int nt = 1;
+	bool provider_thread_safe = false;
+};
+}  // namespace
+
+static mpp_status_t ms_bridge_setup(sequence **seqs, mpp_derot_t **derots, int n,
+                                    const mpp_derot_t *out_derot,
+                                    const mpp_config_t *cfg, MsBridgeSetup &su) {
+	if (!seqs || !derots || n <= 0 || !out_derot || !cfg)
+		return MPP_EINVAL;
+	for (int i = 0; i < n; ++i)
+		if (!seqs[i] || !derots[i]) return MPP_EINVAL;
+
+	/* The caller built cfg from defaults, which assume 16-bit; the analysis
+	 * reader stores frames at cfg.bitdepth, so an 8-bit source read as 16-bit is
+	 * near-black and finds no structure. Derive the real bit depth from the
+	 * sources (all share it — the GUI checks compatibility). */
+	su.lcfg = *cfg;
+	su.lcfg.bitdepth = mpp_bitdepth_from_fits_bitpix(seqs[0]->bitpix);
+
+	/* Pin CFA SER sources to raw-mosaic reads for the analysis passes, like the
+	 * single-sequence pipeline, so read_analysis_frame demosaics deterministically
+	 * regardless of the debayer-on-open preference. Restored when `su` dies. */
+	su.raw_guards.resize(n);
+	for (int i = 0; i < n; ++i)
+		maybe_engage_ser_raw_for_analysis(su.raw_guards[i], seqs[i]);
+
+	su.srcs.resize(n);
+	for (int i = 0; i < n; ++i) {
+		sequence *s = seqs[i];
+		const int avi = su.lcfg.avi_bayer_pattern;
+		const int bd  = su.lcfg.bitdepth;
+		su.srcs[i].derot = derots[i];
+		su.srcs[i].num_frames = s->number;
+		su.srcs[i].analysis_read = [s, avi, bd](int l) -> cv::Mat {
+			return mpp::read_analysis_frame(s, l, avi, bd);
+		};
+		su.srcs[i].full_read = [s, avi](int l) -> cv::Mat {
+			return mpp::read_full_frame(s, l, avi);
+		};
+		/* Honour each sequence's frame-selector state, like the
+		 * single-sequence pipeline. */
+		if (s->imgparam) {
+			su.srcs[i].included.assign(s->number, 1);
+			for (int l = 0; l < s->number; ++l)
+				su.srcs[i].included[l] = s->imgparam[l].incl ? 1 : 0;
+		}
+		/* Off-globe passthrough for sources whose plan is content-identical
+		 * to the output canvas plan (fingerprint, not pointer identity —
+		 * a re-read copy of the reference plan behaves the same as the
+		 * reference itself). */
+		su.srcs[i].shares_output_disk =
+		    mpp_derot_fingerprint(derots[i]) == mpp_derot_fingerprint(out_derot);
+	}
+
+	/* output channel count from the channel's own sequences (CFA decodes to 3).
+	 * The reference sequence supplies only the canvas geometry — it may belong
+	 * to a different channel — so the layer count is taken from the sources. */
+	const bool avi_cfa = (seqs[0]->type == SEQ_AVI
+	                      && su.lcfg.avi_bayer_pattern >= MPP_AVI_BAYER_RGGB
+	                      && su.lcfg.avi_bayer_pattern <= MPP_AVI_BAYER_GRBG);
+	const bool is_cfa = (mpp_classify_sequence_input(seqs[0]) == MPP_INPUT_CFA)
+	                  || avi_cfa;
+	su.num_layers = is_cfa ? 3
+	              : (seqs[0]->nb_layers > 0 ? seqs[0]->nb_layers : 1);
+
+#ifdef _OPENMP
+	su.nt = std::max(1, com.max_thread);
+#else
+	su.nt = 1;
+#endif
+
+	/* Parallelise the streamed passes only when every source's reads are
+	 * reentrant — SER (serialises just the fread) or reentrant-built FITS — the
+	 * same predicate the single-sequence pipeline uses. Otherwise the frame
+	 * loops stay serial (the multi-source throughput limiter). */
+	su.provider_thread_safe = true;
+	for (int i = 0; i < n; ++i) {
+		const sequence *s = seqs[i];
+		const bool safe = (s->type == SEQ_SER)
+		    || ((s->type == SEQ_REGULAR || s->type == SEQ_FITSEQ
+		         || s->type == SEQ_INTERNAL) && fits_is_reentrant());
+		if (!safe) { su.provider_thread_safe = false; break; }
+	}
+	return MPP_OK;
+}
+
+static mpp_status_t mpp_multistack_impl(sequence **seqs, mpp_derot_t **derots,
+                                        int n, const mpp_derot_t *out_derot,
+                                        sequence *ref_seq, const mpp_config_t *cfg,
+                                        fits *out) {
+	if (!ref_seq || !out)
+		return MPP_EINVAL;
+	MsBridgeSetup su;
+	const mpp_status_t rc = ms_bridge_setup(seqs, derots, n, out_derot, cfg, su);
+	if (rc != MPP_OK) return rc;
+
+	siril_log_message(_("Derotation stack: combining %d sequence(s), reference "
+	                    "canvas '%s', %d output channel(s), %s reads\n"),
+	                  n, ref_seq->seqname, su.num_layers,
+	                  su.provider_thread_safe ? _("parallel") : _("serial"));
+
+	const mpp::MultiStackResult res =
+	    mpp::multistack_channel(su.srcs, out_derot, su.num_layers, su.lcfg, su.nt,
+	                            su.provider_thread_safe);
+	if (res.error) return MPP_EINVAL;
+	if (res.oom) return MPP_ENOMEM;
+	if (res.cancelled || res.image.empty()) return MPP_EINTR;
+
+	siril_log_message(_("Derotation stack: %d frames combined over %d alignment "
+	                    "points\n"), res.num_frames, res.num_aps);
+
+	/* Pack into the caller's fits (shared with mpp_stack_apply_impl; the
+	 * warp engine already emitted float when output_32bit is set). */
+	return mpp_pack_stacked(res.image, out);
+}
+
+extern "C" mpp_status_t mpp_multistack(sequence **seqs, mpp_derot_t **derots,
+                                       int n, int ref, const mpp_config_t *cfg,
+                                       fits *out) {
+	if (ref < 0 || ref >= n || !derots) return MPP_EINVAL;
+	try {
+		/* CLI/single-channel: the reference is one of the sources and supplies
+		 * both the canvas and its own frames. */
+		return mpp_multistack_impl(seqs, derots, n, derots[ref], seqs[ref], cfg, out);
+	} catch (const std::exception &e) {
+		siril_log_error(_("Derotation stack: failed (%s) — likely out of memory; "
+		                  "reduce the memory ratio in Preferences.\n"), e.what());
+		return MPP_ENOMEM;
+	}
+}
+
+/* Multi-channel entry: the output canvas is `out_derot` / `ref_seq` (the
+ * user-designated reference sequence's plan and geometry), while `seqs`/`derots`
+ * are one channel's own sources. The reference need not be among them, so every
+ * channel stacks into the same canvas and the results compose to RGB. */
+extern "C" mpp_status_t mpp_multistack_to(sequence **seqs, mpp_derot_t **derots,
+                                          int n, sequence *ref_seq,
+                                          const mpp_derot_t *out_derot,
+                                          const mpp_config_t *cfg, fits *out) {
+	try {
+		return mpp_multistack_impl(seqs, derots, n, out_derot, ref_seq, cfg, out);
+	} catch (const std::exception &e) {
+		siril_log_error(_("Derotation stack: failed (%s) — likely out of memory; "
+		                  "reduce the memory ratio in Preferences.\n"), e.what());
+		return MPP_ENOMEM;
+	}
+}
+
+/* -------------------- Two-phase multi-source combine --------------------
+ *
+ * The GUI's Analyze / Register-and-stack split: the analysis phase (rank +
+ * global align + combined reference + AP grid) runs first, its grid is
+ * exposed through a GUI-cached mpp_run_t so the standard AP editor and
+ * overlay work on the combined reference, and the stack phase then consumes
+ * the (possibly edited) grid. The opaque state carries the C++ analysis
+ * products between the two calls; it holds NO sequence pointers — both
+ * phases rebuild their frame providers from the caller's seqs/derots. */
+
+struct mpp_ms_analysis {
+	mpp::MultiStackAnalysis an;
+};
+
+/* Build a GUI-cache run from the analysis so the AP editor / overlay / mean
+ * display work exactly as after a single-sequence Analyze. Takes ownership
+ * of an.aps (nulled in `an`). */
+static mpp_run_t *ms_run_from_analysis(mpp::MultiStackAnalysis &an,
+                                       const mpp_config_t &lcfg,
+                                       const mpp_derot_t *out_derot) {
+	mpp_run_t *run = mpp_run_alloc();
+	if (!run) return nullptr;
+	const int N = an.num_frames;
+	run->cfg = (mpp_config_t *) malloc(sizeof(mpp_config_t));
+	run->quality = (double *) malloc((size_t) N * sizeof(double));
+	run->frame_brightness = (double *) malloc((size_t) N * sizeof(double));
+	run->included = (int *) malloc((size_t) N * sizeof(int));
+	run->global_shifts = (double *) malloc((size_t) N * 2 * sizeof(double));
+	const size_t npix = (size_t) an.mean_frame.rows * an.mean_frame.cols;
+	run->mean_frame_data = (int32_t *) malloc(npix * sizeof(int32_t));
+	if (!run->cfg || !run->quality || !run->frame_brightness || !run->included
+	    || !run->global_shifts || !run->mean_frame_data) {
+		mpp_run_free(run);
+		return nullptr;
+	}
+	*run->cfg = lcfg;
+	run->num_frames = N;
+	run->frame_rows = out_derot->frame_rows;
+	run->frame_cols = out_derot->frame_cols;
+	run->num_layers = 1;   /* analysis reference is mono luminance */
+	run->bitdepth = lcfg.bitdepth;
+	for (int i = 0; i < N; ++i) {
+		run->quality[i] = an.quality[i];
+		run->frame_brightness[i] = an.brightness[i];
+		run->included[i] = 1;
+		run->global_shifts[2 * i + 0] = an.shifts[i][0];
+		run->global_shifts[2 * i + 1] = an.shifts[i][1];
+	}
+	run->best_frame_idx = an.best_frame_idx;
+	for (int k = 0; k < 4; ++k)
+		run->intersection[k] = an.intersection[k];
+	CV_Assert(an.mean_frame.isContinuous() && an.mean_frame.type() == CV_32S);
+	memcpy(run->mean_frame_data, an.mean_frame.ptr<int32_t>(0),
+	       npix * sizeof(int32_t));
+	run->mean_frame_rows = an.mean_frame.rows;
+	run->mean_frame_cols = an.mean_frame.cols;
+	run->aps = an.aps;
+	an.aps = nullptr;
+	run->stack_size = mpp::register_stack_size_from_cfg(lcfg, N);
+	run->derot_fingerprint = mpp_derot_fingerprint(out_derot);
+	return run;
+}
+
+extern "C" mpp_status_t mpp_multistack_analyze_to(sequence **seqs,
+                                                  mpp_derot_t **derots, int n,
+                                                  sequence *ref_seq,
+                                                  const mpp_derot_t *out_derot,
+                                                  const mpp_config_t *cfg,
+                                                  mpp_ms_analysis_t **out_state,
+                                                  mpp_run_t **out_run) {
+	try {
+		if (!ref_seq || !out_state || !out_run)
+			return MPP_EINVAL;
+		*out_state = nullptr;
+		*out_run = nullptr;
+		MsBridgeSetup su;
+		const mpp_status_t rc = ms_bridge_setup(seqs, derots, n, out_derot, cfg, su);
+		if (rc != MPP_OK) return rc;
+
+		siril_log_message(_("Derotation analyze: %d sequence(s), reference "
+		                    "canvas '%s', %s reads\n"),
+		                  n, ref_seq->seqname,
+		                  su.provider_thread_safe ? _("parallel") : _("serial"));
+
+		mpp::MultiStackAnalysis an = mpp::multistack_analyze(
+		    su.srcs, out_derot, su.lcfg, su.nt, su.provider_thread_safe);
+		if (an.oom) return MPP_ENOMEM;
+		if (an.cancelled) return MPP_EINTR;
+		if (an.error || !an.aps) return MPP_EINVAL;
+
+		mpp_run_t *run = ms_run_from_analysis(an, su.lcfg, out_derot);
+		if (!run) {
+			if (an.aps) mpp_ap_free(an.aps);
+			return MPP_ENOMEM;
+		}
+		mpp_ms_analysis_t *st = new mpp_ms_analysis();
+		st->an = std::move(an);
+		*out_state = st;
+		*out_run = run;
+		return MPP_OK;
+	} catch (const std::exception &e) {
+		siril_log_error(_("Derotation analyze: failed (%s) — likely out of "
+		                  "memory; reduce the memory ratio in Preferences.\n"),
+		                e.what());
+		return MPP_ENOMEM;
+	}
+}
+
+extern "C" mpp_status_t mpp_multistack_apply_to(sequence **seqs,
+                                                mpp_derot_t **derots, int n,
+                                                sequence *ref_seq,
+                                                const mpp_derot_t *out_derot,
+                                                const mpp_config_t *cfg,
+                                                mpp_ms_analysis_t *state,
+                                                const mpp_aps_t *aps,
+                                                fits *out) {
+	try {
+		if (!ref_seq || !state || !aps || !out)
+			return MPP_EINVAL;
+		MsBridgeSetup su;
+		const mpp_status_t rc = ms_bridge_setup(seqs, derots, n, out_derot, cfg, su);
+		if (rc != MPP_OK) return rc;
+
+		const mpp::MultiStackResult res = mpp::multistack_stack(
+		    su.srcs, out_derot, su.num_layers, su.lcfg, state->an, *aps,
+		    su.nt, su.provider_thread_safe);
+		if (res.error) return MPP_EINVAL;
+		if (res.oom) return MPP_ENOMEM;
+		if (res.cancelled || res.image.empty()) return MPP_EINTR;
+
+		siril_log_message(_("Derotation stack: %d frames combined over %d "
+		                    "alignment points\n"), res.num_frames, res.num_aps);
+		return mpp_pack_stacked(res.image, out);
+	} catch (const std::exception &e) {
+		siril_log_error(_("Derotation stack: failed (%s) — likely out of memory; "
+		                  "reduce the memory ratio in Preferences.\n"), e.what());
+		return MPP_ENOMEM;
+	}
+}
+
+extern "C" void mpp_ms_analysis_free(mpp_ms_analysis_t *state) {
+	if (!state) return;
+	if (state->an.aps) mpp_ap_free(state->an.aps);
+	delete state;
 }
 
 /* -------------------- GUI cache for the current run --------------------
@@ -1695,12 +2129,15 @@ extern "C" void mpp_clear_cached_run(void) {
 	if (prev) mpp_run_free(prev);
 }
 
-static mpp_status_t mpp_recompute_qualities_impl(sequence *seq, mpp_run_t *run) {
+static mpp_status_t mpp_recompute_qualities_impl(sequence *seq, mpp_run_t *run,
+                                                 const struct mpp_derot *derot) {
 	if (!seq || !run || !run->aps || run->aps->count <= 0 || !run->cfg)
 		return MPP_EINVAL;
 	if (run->best_frame_indices) return MPP_OK;   /* nothing to do */
 	if (!run->frame_brightness || !run->global_shifts) return MPP_EINVAL;
 	if (run->num_frames != seq->number) return MPP_EINVAL;
+	const bool derot_active = mpp_derot_applies(derot, run->num_frames,
+	                                            run->frame_rows, run->frame_cols);
 
 	/* Analysis-frame reads — pin CFA SERs to raw-mosaic reads so they
 	 * match Stage A's cv::cvtColor demosaic. */
@@ -1818,22 +2255,36 @@ static mpp_status_t mpp_recompute_qualities_impl(sequence *seq, mpp_run_t *run) 
 	stage_progress_range rp{qual_base, 1.0 - qual_base};
 	const mpp_cache_t *cache = run->cache;
 	const int cache_N = cache ? (int) cache->raw_frames.size() : 0;
-	auto raw_provider = [cache, cache_N, seq, run](int i) -> cv::Mat {
+	auto raw_provider = [cache, cache_N, seq, run, derot, derot_active](int i) -> cv::Mat {
 		return guarded_frame([&]() -> cv::Mat {
+			cv::Mat m;
 			if (cache && i >= 0 && i < cache_N
 			 && !cache->raw_frames[i].empty())
-				return cache->raw_frames[i];
-			return mpp::read_analysis_frame(seq, i, run->cfg->avi_bayer_pattern,
-			                                run->cfg->bitdepth);
+				m = cache->raw_frames[i];
+			else
+				m = mpp::read_analysis_frame(seq, i, run->cfg->avi_bayer_pattern,
+				                             run->cfg->bitdepth);
+			/* Per-AP ranking samples the AP boxes, so it must see the same
+			 * (derotated) frames as the mean and the shift stage. */
+			return derot_active ? mpp_derot_warp_frame(derot, i, m) : m;
 		});
 	};
 	/* Rank only included frames — excluded frames must not occupy any AP's
 	 * top-N slot (they'd be dropped at Stage C anyway, wasting the slot). */
 	const std::vector<int> included(run->included, run->included + N);
+	/* Frame-parallel quality compute when the provider is reentrant — same
+	 * predicate as Stage A / Stage B (cache hits trivially, SER / reentrant-
+	 * FITS on disk-read misses). Heavy once derotation adds a per-frame
+	 * remap, so this is what keeps the cores busy here. */
+	const bool quality_provider_safe =
+	    (seq->type == SEQ_SER
+	     || ((seq->type == SEQ_REGULAR || seq->type == SEQ_FITSEQ
+	          || seq->type == SEQ_INTERNAL) && fits_is_reentrant()));
 	const auto apq = mpp::ap_compute_frame_qualities_streamed(
 	    raw_provider, N, frame_brightness, *run->aps, offsets,
 	    run->frame_rows, run->frame_cols, *run->cfg,
-	    stage_progress_cb, &rp, included);
+	    stage_progress_cb, &rp, included,
+	    quality_provider_safe ? max_threads : 1, quality_provider_safe);
 	if (apq.stack_size <= 0) return MPP_EINTR;
 
 	const int stack_size = apq.stack_size > 0 ? apq.stack_size : run->stack_size;
@@ -1861,9 +2312,10 @@ static mpp_status_t mpp_recompute_qualities_impl(sequence *seq, mpp_run_t *run) 
 }
 
 /* Exception boundary — see mpp_analyze. */
-extern "C" mpp_status_t mpp_recompute_qualities(sequence *seq, mpp_run_t *run) {
+extern "C" mpp_status_t mpp_recompute_qualities(sequence *seq, mpp_run_t *run,
+                                                const struct mpp_derot *derot) {
 	try {
-		return mpp_recompute_qualities_impl(seq, run);
+		return mpp_recompute_qualities_impl(seq, run, derot);
 	} catch (const std::exception &e) {
 		siril_log_error(_("Register: per-AP quality refresh failed (%s) — "
 		                  "likely out of memory; reduce the memory ratio in "
@@ -2214,7 +2666,14 @@ extern "C" int register_mpp(struct registration_args *regargs) {
 		gui_iface.set_progress(PROGRESS_RESET,
 		                       stage_a_only ? _("Analyze: ranking frames")
 		                                    : _("Register: ranking frames"));
-		const int rc_a = mpp_analyze(regargs->seq, &cfg, &run);
+		mpp_derot_t *derot_a = NULL;
+		{
+			gchar *dp = g_strdup_printf("%s.derot", regargs->seq->seqname);
+			mpp_derot_read(dp, &derot_a);
+			g_free(dp);
+		}
+		const int rc_a = mpp_analyze(regargs->seq, &cfg, &run, derot_a);
+		mpp_derot_free(derot_a);
 		if (rc_a == MPP_EINTR) {
 			siril_log_message(_("mpp: Stage A cancelled by user.\n"));
 			gui_iface.set_progress(PROGRESS_DONE, _("Cancelled"));
@@ -2318,21 +2777,38 @@ extern "C" int register_mpp(struct registration_args *regargs) {
 		}
 	}
 
+	/* One derotation plan for the whole of Stage B (per-AP ranking + shifts). */
+	mpp_derot_t *derot_b = NULL;
+	{
+		gchar *dp = g_strdup_printf("%s.derot", regargs->seq->seqname);
+		mpp_derot_read(dp, &derot_b);
+		g_free(dp);
+	}
+
 	/* Per-AP frame ranking — deferred from Stage A. Runs here for a fresh
 	 * Analyze (best_frame_indices null) and for a reused cached run (edited
 	 * or not); an idempotent no-op for a sidecar-loaded run that already
 	 * carries the ranking. */
-	const int rc_q = mpp_recompute_qualities(regargs->seq, run);
+	const int rc_q = mpp_recompute_qualities(regargs->seq, run, derot_b);
+	if (rc_q == MPP_EINTR) {
+		siril_log_message(_("mpp: per-AP frame ranking cancelled by user.\n"));
+		gui_iface.set_progress(PROGRESS_DONE, _("Cancelled"));
+		mpp_derot_free(derot_b);
+		if (run_owned) mpp_run_free(run);
+		return rc_q;
+	}
 	if (rc_q != MPP_OK) {
 		siril_log_error(_("mpp: per-AP frame ranking failed (code %d)\n"), rc_q);
 		gui_iface.set_progress(PROGRESS_DONE, _("Failed"));
+		mpp_derot_free(derot_b);
 		if (run_owned) mpp_run_free(run);
 		return rc_q;
 	}
 
 	siril_log_message(_("mpp: Stage B — per-AP per-frame shifts\n"));
 	gui_iface.set_progress(PROGRESS_RESET, _("Register: computing per-AP shifts"));
-	const int rc_b = mpp_compute_shifts(regargs->seq, &cfg, run);
+	const int rc_b = mpp_compute_shifts(regargs->seq, &cfg, run, derot_b);
+	mpp_derot_free(derot_b);
 	if (rc_b == MPP_EINTR) {
 		siril_log_message(_("mpp: Stage B cancelled by user.\n"));
 		gui_iface.set_progress(PROGRESS_DONE, _("Cancelled"));

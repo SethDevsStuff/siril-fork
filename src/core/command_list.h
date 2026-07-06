@@ -43,6 +43,9 @@ static command commands[] = {
 
 	{"ddp", 3, "ddp level coef sigma [-mask]", process_ddp, STR_DDP, FALSE, REQ_CMD_SINGLE_IMAGE},
 	{"denoise", 0, "denoise [-nocosmetic] [-mod=m] [ -vst | -da3d | -sos=n [-rho=r] ] [-indep] [-mask]", process_denoise, STR_DENOISE, TRUE, REQ_CMD_SINGLE_IMAGE},
+	{"derotate", 1, "derotate seqname -body={jupiter|saturn|mars} -center=x,y -radius=R [-system={1|2|3}] [-epoch=YYYY-MM-DDTHH:MM:SS] [-epoch-from=seq1,seq2,...] [-pa=deg] [-parity={1|-1}] [-fps=F] [-start=YYYY-MM-DDTHH:MM:SS] [-obs-lat=D] [-obs-lon=D] [-obs-elev=M] [-field-rotation={none|altaz}] [-out=file]", process_derotate, STR_DEROTATE, TRUE, REQ_CMD_NO_THREAD},
+	{"derotate_stack", 1, "derotate_stack seq1 [seq2 ...] [-ref=N] [-stack-percent=N] [-stack-frames=N] [-drizzle=S] [-out=file] [-32b]", process_derotate_stack, STR_DEROTATE_STACK, TRUE, REQ_CMD_NO_THREAD},
+	{"ser_fix_timestamps", 1, "ser_fix_timestamps seqname -fps=F [-start=YYYY-MM-DDTHH:MM:SS] [-force]", process_ser_fix_timestamps, STR_SER_FIX_TIMESTAMPS, TRUE, REQ_CMD_NO_THREAD},
 #ifdef _WIN32
 	{"dir", 0, "dir", process_ls, STR_LS, FALSE, REQ_CMD_NONE},
 #endif
@@ -135,7 +138,7 @@ static command commands[] = {
 	{"mirrorx_single", 1, "mirrorx_single image", process_mirrorx_single, STR_MIRRORX_SINGLE, TRUE, REQ_CMD_NONE},
 	{"mirrory", 0, "mirrory", process_mirrory, STR_MIRRORY, TRUE, REQ_CMD_SINGLE_IMAGE},
 	{"modasinh", 1, "modasinh -D= [-LP=] [-SP=] [-HP=] [-clipmode=] [-human | -even | -independent | -sat] [channels] [-mask]", process_modasinh, STR_MODASINH, TRUE, REQ_CMD_SINGLE_IMAGE},
-	{"mpp", 1, "mpp seqname [-out=file] [-scale=N (1.0..3.0)] [-stack-percent=N] [-stack-frames=N] [-bg-fraction=F] [-bg-blend=F] [-skip-failed-aps] [-align={planet|surface}] [-half-box=N] [-search-width=N] [-search-global=N] [-register-percent=N] [-ref-percent=N] [-fast-changing] [-min-brightness=N] [-min-contrast=N] [-min-structure=F] [-no-shifts] [-no-normalize] [-noseed] [-avi-bayer={auto|none|rggb|bggr|gbrg|grbg}]", process_mpp, STR_MPP, TRUE, REQ_CMD_NO_THREAD},
+	{"mpp", 1, "mpp seqname [-out=file] [-scale=N (1.0..3.0)] [-stack-percent=N] [-stack-frames=N] [-bg-fraction=F] [-bg-blend=F] [-align={planet|surface}] [-half-box=N] [-search-width=N] [-search-global=N] [-register-percent=N] [-ref-percent=N] [-fast-changing] [-min-brightness=N] [-min-contrast=N] [-min-structure=F] [-no-shifts] [-no-normalize] [-noseed] [-avi-bayer={auto|none|rggb|bggr|gbrg|grbg}]", process_mpp, STR_MPP, TRUE, REQ_CMD_NO_THREAD},
 	{"mtf", 3, "mtf low mid high [channels] [-mask]", process_mtf, STR_MTF, TRUE, REQ_CMD_SINGLE_IMAGE | REQ_CMD_SEQUENCE},
 
 	{"neg", 0, "neg [-mask]", process_neg, STR_NEG, TRUE, REQ_CMD_SINGLE_IMAGE},
@@ -166,7 +169,8 @@ static command commands[] = {
 	{"register_mpp", 1, "register_mpp seqname [-align={planet|surface}] [-half-box=N] [-search-width=N] [-search-global=N]\n"
 					"register_mpp seqname ... [-register-percent=N] [-ref-percent=N] [-fast-changing] [-min-brightness=N]\n"
 					"register_mpp seqname ... [-min-contrast=N] [-min-structure=F] [-no-shifts] [-no-normalize] [-noseed]\n"
-					"register_mpp seqname ,,, [-avi-bayer={auto|none|rggb|bggr|gbrg|grbg}]", process_register_mpp, STR_REGISTER_MPP, TRUE, REQ_CMD_NO_THREAD},
+					"register_mpp seqname ... [-avi-bayer={auto|none|rggb|bggr|gbrg|grbg}]\n"
+				"register_mpp seqname ... [-field-rotation={none|altaz} -target={sun|moon|jupiter|saturn|mars} -obs-lat=D -obs-lon=D]", process_register_mpp, STR_REGISTER_MPP, TRUE, REQ_CMD_NO_THREAD},
 	{"reloadscripts", 0, "reloadscripts", process_reloadscripts, STR_RELOADSCRIPTS, FALSE, REQ_CMD_NONE},
 	{"requires", 1, "requires min_version [obsolete_version]", process_requires, STR_REQUIRES, TRUE, REQ_CMD_NONE},
 	{"resample", 1, "resample { factor | -width= | -height= | -maxdim= } [-interp=] [-noclamp]", process_resample, STR_RESAMPLE, TRUE, REQ_CMD_SINGLE_IMAGE},
@@ -271,7 +275,7 @@ static command commands[] = {
 			"stackall { sum | min | max } [-maximize] [-upscale] [-32b]\n"
 			"stackall { med | median } [-nonorm, norm=] [-32b]\n"
 			"stackall { rej | mean } [rejection type] [sigma_low sigma_high] [-nonorm, norm=] [-overlap_norm] [-weight={noise|wfwhm|nbstars|nbstack}] [-feather=] [-rgb_equal] [-out=filename] [-maximize] [-upscale] [-32b]", process_stackall, STR_STACKALL, TRUE, REQ_CMD_NONE},
-	{"stack_mpp", 1, "stack_mpp seqname [-out=file] [-scale=N (1.0..3.0)] [-stack-percent=N] [-stack-frames=N] [-bg-fraction=F] [-bg-blend=F] [-skip-failed-aps]", process_stack_mpp, STR_STACK_MPP, TRUE, REQ_CMD_NO_THREAD},
+	{"stack_mpp", 1, "stack_mpp seqname [-out=file] [-scale=N (1.0..3.0)] [-stack-percent=N] [-stack-frames=N] [-bg-fraction=F] [-bg-blend=F]", process_stack_mpp, STR_STACK_MPP, TRUE, REQ_CMD_NO_THREAD},
 #ifdef HAVE_LIBTIFF
 #endif
 	{"start_ls", 0, "start_ls [-dark=filename] [-flat=filename] [-rotate] [-32bits]", process_start_ls, STR_START_LS, TRUE, REQ_CMD_NO_THREAD},

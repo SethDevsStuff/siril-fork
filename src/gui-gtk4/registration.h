@@ -53,9 +53,20 @@ void mpp_update_edit_button_sensitivity(void);
  * no cached run. Defined in registration.c. */
 void mpp_sync_widgets_from_cached_run(void);
 
+/* Sync the alt-az field-rotation checkbox (and its target/site row) from
+ * the loaded sequence's .derot state. Called on sequence open. Defined in
+ * registration.c. */
+void mpp_sync_altaz_from_plan(void);
+
 /* Paint the multipoint reference frame when entering the Registration or
  * Stacking tab, if the cached run carries one and a sequence frame is
  * currently shown. Called from the main control-tab switch handler. */
 void mpp_show_reference_frame_for_tab(void);
+
+/* Paint an analysis-built mean reference frame (CV_32S layout, 16-bit range)
+ * into gfit and label it "REFERENCE IMAGE". Used after single-sequence
+ * Analyze (end_register_idle) and by the multi-sequence derotation Analyze
+ * so the AP editor operates over the combined reference. GTK thread only. */
+void paint_mpp_ref_frame_into_gfit(const int32_t *src, int rows, int cols);
 
 #endif /* SRC_GUI_REGISTRATION_H_ */

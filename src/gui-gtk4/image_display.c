@@ -43,6 +43,7 @@
 #include "registration/mpp/mpp_config.h"
 #include "registration/mpp/mpp_shift.h"
 #include "gui-gtk4/mpp_ap_editor.h"
+#include "gui-gtk4/derotation.h"
 #include "gui-gtk4/mpp_shift_viewer.h"
 #include "io/image_format_fits.h"
 #include "io/sequence.h"
@@ -2486,6 +2487,7 @@ static void draw_brg_boxes(const draw_data_t* dd);
 static void draw_regframe(const draw_data_t* dd);
 static void draw_rgb_centers(const draw_data_t* dd);
 static void draw_mpp_aps(const draw_data_t* dd);
+static void draw_derot_disk(const draw_data_t* dd);
 
 /* ── SirilImageView: GTK4 snapshot-based image viewport ───────────────────
  *
@@ -2881,6 +2883,8 @@ static void siril_image_view_snapshot(GtkWidget *widget, GtkSnapshot *snapshot) 
 	draw_brg_boxes(&dd);
 	/* multipoint planetary alignment-point grid (active after Analyze) */
 	draw_mpp_aps(&dd);
+	/* planet disk outline while the derotation window is open */
+	draw_derot_disk(&dd);
 	draw_regframe(&dd);
 	draw_rgb_centers(&dd);
 	if (gui.draw_extra)
@@ -3676,11 +3680,16 @@ static void draw_mpp_aps(const draw_data_t* dd) {
 	/* Only paint the AP overlay while the user is on the Registration
 	 * tab and MPP is selected — the overlay is a registration-workflow tool, and once the
 	 * user has switched to Plot / Stacking / etc. the boxes are visual
-	 * clutter that confuses what they're looking at. */
-	if (gtk_notebook_get_current_page(center_notebook) != (int) REGISTRATION)
-		return;
-	if (gtk_drop_down_get_selected(comboboxregmethod) != REG_MPP)
-		return;
+	 * clutter that confuses what they're looking at. Exception: a
+	 * multi-sequence derotation Analyze installed its combined-reference run
+	 * in the cache — the user is editing APs from the derotation tool, which
+	 * is tab/method-independent. */
+	if (!derotation_combine_run_active()) {
+		if (gtk_notebook_get_current_page(center_notebook) != (int) REGISTRATION)
+			return;
+		if (gtk_drop_down_get_selected(comboboxregmethod) != REG_MPP)
+			return;
+	}
 
 	mpp_run_t *run = mpp_get_cached_run();
 	if (!run || !run->aps || run->aps->count <= 0 || !run->cfg) return;
@@ -3826,6 +3835,105 @@ static void draw_mpp_aps(const draw_data_t* dd) {
 				cairo_fill(dd->cr);
 			}
 		}
+	}
+}
+
+/* Live planet-fit overlay while the derotation window is open: the fitted
+ * ellipse (equatorial x polar radius, oriented to the pole), a centre cross, a
+ * north-pole marker, an equator/ring guide, and draggable cardinal handles.
+ * Coordinates are full-frame pixels, Y-flipped to the Cairo top-left origin. */
+static void draw_derot_disk(const draw_data_t* dd) {
+	if (!derotation_overlay_visible() || !gfit || gfit->ry <= 0)
+		return;
+	double cx, cy, req, rpol, pa_deg;
+	gboolean mirror = FALSE;
+	if (!derotation_get_disk(&cx, &cy, &req, &rpol, &pa_deg, &mirror) || req < 1.0)
+		return;
+	if (rpol < 1.0) rpol = req;
+	const double yc = (double) (gfit->ry - 1) - cy;   /* pdata row -> cairo y */
+	const double par = pa_deg * G_PI / 180.0;
+	const double ex = mirror ? -1.0 : 1.0;
+	const double pux = ex * sin(par), puy = -cos(par);   /* pole unit (cairo) */
+	const double eux = -puy, euy = pux;                  /* equator unit */
+	const int body = derotation_get_body();
+
+	cairo_set_line_width(dd->cr, 1.5 / dd->zoom);
+
+	/* fitted ellipse (cyan) */
+	cairo_set_source_rgba(dd->cr, 0.2, 0.9, 1.0, 0.9);
+	for (int i = 0; i <= 64; ++i) {
+		const double th = 2.0 * G_PI * i / 64.0;
+		const double a = req * cos(th), b = rpol * sin(th);
+		const double px = cx + a * eux + b * pux;
+		const double py = yc + a * euy + b * puy;
+		if (i == 0) cairo_move_to(dd->cr, px, py);
+		else        cairo_line_to(dd->cr, px, py);
+	}
+	cairo_stroke(dd->cr);
+
+	/* centre cross */
+	const double t = req * 0.12;
+	cairo_move_to(dd->cr, cx - t, yc); cairo_line_to(dd->cr, cx + t, yc);
+	cairo_move_to(dd->cr, cx, yc - t); cairo_line_to(dd->cr, cx, yc + t);
+	cairo_stroke(dd->cr);
+
+	/* north-pole marker + rotation grab-handle + "N" label (yellow). The handle
+	 * normally sits beyond the pole tip; for a tightly-cropped planet it falls
+	 * off the image, so the shared helper pulls it (and the "N") to the midpoint
+	 * of the north axis. Hit-test and overlay use the same helper. */
+	cairo_set_source_rgba(dd->cr, 1.0, 0.9, 0.2, 0.9);
+	cairo_move_to(dd->cr, cx, yc);
+	cairo_line_to(dd->cr, cx + rpol * pux, yc + rpol * puy);   /* pole tip at limb */
+	cairo_stroke(dd->cr);
+	double hx, hy; gboolean h_inside = FALSE;
+	if (derotation_rotate_handle(&hx, &hy, &h_inside)) {
+		if (!h_inside) {   /* connector from the limb out to the handle */
+			cairo_move_to(dd->cr, cx + rpol * pux, yc + rpol * puy);
+			cairo_line_to(dd->cr, hx, hy);
+			cairo_stroke(dd->cr);
+		}
+		const double rr = 5.0 / dd->zoom;
+		cairo_arc(dd->cr, hx, hy, rr, 0, 2 * G_PI);
+		cairo_stroke(dd->cr);
+		cairo_set_font_size(dd->cr, 14.0 / dd->zoom);
+		cairo_text_extents_t te;
+		cairo_text_extents(dd->cr, "N", &te);
+		const double lgap = (rr + 9.0 / dd->zoom);
+		const double lx = hx + lgap * pux, ly = hy + lgap * puy;
+		cairo_move_to(dd->cr, lx - te.width / 2 - te.x_bearing,
+		                      ly - te.height / 2 - te.y_bearing);
+		cairo_show_text(dd->cr, "N");
+	}
+
+	/* equator/ring guide (green): align with the belts (Jupiter) or ring plane
+	 * (Saturn); for Saturn it runs out to the A-ring edge (~2.27 Req) with tip
+	 * ticks so the ring tips can be lined up. */
+	const double elen = (body == 1) ? req * 2.27 : req;
+	cairo_set_source_rgba(dd->cr, 0.3, 1.0, 0.4, 0.85);
+	cairo_move_to(dd->cr, cx - elen * eux, yc - elen * euy);
+	cairo_line_to(dd->cr, cx + elen * eux, yc + elen * euy);
+	cairo_stroke(dd->cr);
+	if (body == 1) {
+		const double tk = req * 0.12;
+		for (int s = -1; s <= 1; s += 2) {
+			const double tx = cx + s * elen * eux, ty = yc + s * elen * euy;
+			cairo_move_to(dd->cr, tx - tk * pux, ty - tk * puy);
+			cairo_line_to(dd->cr, tx + tk * pux, ty + tk * puy);
+		}
+		cairo_stroke(dd->cr);
+	}
+
+	/* cardinal resize handles: equatorial (E/W, magenta) and polar (N/S, yellow) */
+	const double hs = 4.0 / dd->zoom;
+	const double hpts[4][3] = {   /* x, y, is_polar */
+		{ cx + req * eux, yc + req * euy, 0 }, { cx - req * eux, yc - req * euy, 0 },
+		{ cx + rpol * pux, yc + rpol * puy, 1 }, { cx - rpol * pux, yc - rpol * puy, 1 },
+	};
+	for (int i = 0; i < 4; ++i) {
+		if (hpts[i][2] != 0.0) cairo_set_source_rgba(dd->cr, 1.0, 0.9, 0.2, 0.95);
+		else                   cairo_set_source_rgba(dd->cr, 1.0, 0.3, 1.0, 0.95);
+		cairo_rectangle(dd->cr, hpts[i][0] - hs, hpts[i][1] - hs, 2 * hs, 2 * hs);
+		cairo_fill(dd->cr);
 	}
 }
 

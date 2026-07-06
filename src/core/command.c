@@ -119,6 +119,13 @@
 #include "registration/mpp/mpp_config.h"
 #include "registration/mpp/mpp_shift.h"
 #include "registration/mpp/mpp_sidecar.h"
+#include "registration/mpp/mpp_derot_sidecar.h"
+#include "registration/mpp/mpp_derot_build.h"
+#include "algos/planet_ephem.h"
+#include "core/siril_date.h"
+#include "io/ser.h"
+#include "io/films.h"
+#include "io/gps_parser.h"
 #include "livestacking/livestacking.h"
 #include "pixelMath/pixel_math_runner.h"
 #include "io/healpix/healpix_cat.h"
@@ -14425,11 +14432,13 @@ static mpp_flag_status apply_mpp_flag(const char *arg, mpp_config_t *cfg,
 		cfg->stack_frame_number = atoi(arg + 14); return MPP_FLAG_OK;
 	}
 	if (accept_stack && !strcmp(arg, "-skip-failed-aps")) {
-		/* Drop (frame, AP) contributions whose Stage B shift measurement
-		 * failed instead of stacking them at the coarse phase-1 estimate.
-		 * Per-AP weight sums are reduced to match, so brightness is
-		 * unaffected. */
-		cfg->stack_skip_failed_aps = TRUE; return MPP_FLAG_OK;
+		/* Patch-engine relic: the warp engine gives failed (frame, AP)
+		 * measurements the neighbour-interpolated displacement instead of
+		 * dropping them, so there is nothing to skip. Accepted (and
+		 * ignored) so existing scripts keep running. */
+		siril_log_message(_("-skip-failed-aps is obsolete with the warp "
+		                    "engine and was ignored\n"));
+		return MPP_FLAG_OK;
 	}
 	if (accept_stack && g_str_has_prefix(arg, "-bg-fraction=")) {
 		cfg->stack_frames_background_fraction = atof(arg + 13); return MPP_FLAG_OK;
@@ -14556,7 +14565,7 @@ static gboolean mpp_should_force_debayer(const char *name) {
  * the user's saved preference. Mono SERs and non-SER inputs are loaded with
  * the saved preference untouched. Returns the sequence (caller may have to
  * substitute `&com.seq` via `check_seq_is_comseq`) or NULL. */
-static sequence *load_sequence_force_debayer(const char *name) {
+sequence *load_sequence_force_debayer(const char *name) {
 	const gboolean want_debayer = mpp_should_force_debayer(name);
 	const gboolean saved = com.pref.debayer.open_debayer;
 	if (want_debayer) com.pref.debayer.open_debayer = TRUE;
@@ -14641,7 +14650,7 @@ int process_mpp(int nb) {
 	                  cfg.drizzle_scale > 1.001 ? " (upscaled)" : "");
 
 	mpp_run_t *run = NULL;
-	int rc = mpp_analyze(seq, &cfg, &run);
+	int rc = mpp_analyze(seq, &cfg, &run, NULL);
 	if (rc != MPP_OK) {
 		siril_log_error(_("pss: Stage A failed (code %d)\n"), rc);
 		g_free(out_path);
@@ -14656,7 +14665,7 @@ int process_mpp(int nb) {
 	mpp_write_quality_to_regdata(seq, seq->nb_layers == 3 ? 1 : 0, run);
 
 	/* Per-AP frame ranking — deferred from Stage A; runs at Stage B entry. */
-	rc = mpp_recompute_qualities(seq, run);
+	rc = mpp_recompute_qualities(seq, run, NULL);
 	if (rc != MPP_OK) {
 		siril_log_error(_("pss: per-AP frame ranking failed (code %d)\n"), rc);
 		mpp_run_free(run);
@@ -14664,7 +14673,7 @@ int process_mpp(int nb) {
 		return CMD_GENERIC_ERROR;
 	}
 
-	rc = mpp_compute_shifts(seq, &cfg, run);
+	rc = mpp_compute_shifts(seq, &cfg, run, NULL);
 	if (rc != MPP_OK) {
 		siril_log_error(_("pss: Stage B failed (code %d)\n"), rc);
 		mpp_run_free(run);
@@ -14675,7 +14684,7 @@ int process_mpp(int nb) {
 	                  run->shifts ? run->shifts->failure_counter : -1);
 
 	fits stacked = {0};
-	rc = mpp_stack_apply(seq, &cfg, run, &stacked);
+	rc = mpp_stack_apply(seq, &cfg, run, NULL, &stacked);
 	if (rc != MPP_OK) {
 		siril_log_error(_("pss: Stage C failed (code %d)\n"), rc);
 		clearfits(&stacked);
@@ -14727,9 +14736,39 @@ int process_register_mpp(int nb) {
 	mpp_config_defaults(&cfg);
 	cfg.bitdepth = mpp_bitdepth_from_fits_bitpix(seq->bitpix);
 
+	int fr_state = -1;   /* -1 = flag absent, 0 = none, 1 = altaz */
+	int fr_target = EPHEM_TARGET_SUN;
+	double fr_lat = NAN, fr_lon = NAN;
 	gchar *out_path = NULL;  /* unused by register; kept for shared parser */
 	for (int i = 2; i < nb; i++) {
-		mpp_flag_status fs = apply_mpp_flag(word[i], &cfg, &out_path,
+		const char *w = word[i];
+		if (g_str_has_prefix(w, "-field-rotation=")) {
+			const char *v = w + 16;
+			if (!g_ascii_strcasecmp(v, "none")) fr_state = 0;
+			else if (!g_ascii_strcasecmp(v, "altaz")) fr_state = 1;
+			else {
+				siril_log_error(_("register_mpp: -field-rotation must be none or altaz\n"));
+				return CMD_ARG_ERROR;
+			}
+			continue;
+		}
+		if (g_str_has_prefix(w, "-target=")) {
+			const char *v = w + 8;
+			if      (!g_ascii_strcasecmp(v, "sun"))     fr_target = EPHEM_TARGET_SUN;
+			else if (!g_ascii_strcasecmp(v, "moon"))    fr_target = EPHEM_TARGET_MOON;
+			else if (!g_ascii_strcasecmp(v, "jupiter")) fr_target = EPHEM_TARGET_JUPITER;
+			else if (!g_ascii_strcasecmp(v, "saturn"))  fr_target = EPHEM_TARGET_SATURN;
+			else if (!g_ascii_strcasecmp(v, "mars"))    fr_target = EPHEM_TARGET_MARS;
+			else {
+				siril_log_error(_("register_mpp: -target must be sun, moon, "
+				                  "jupiter, saturn or mars\n"));
+				return CMD_ARG_ERROR;
+			}
+			continue;
+		}
+		if (g_str_has_prefix(w, "-obs-lat=")) { fr_lat = g_ascii_strtod(w + 9, NULL); continue; }
+		if (g_str_has_prefix(w, "-obs-lon=")) { fr_lon = g_ascii_strtod(w + 9, NULL); continue; }
+		mpp_flag_status fs = apply_mpp_flag(w, &cfg, &out_path,
 		                                    TRUE, FALSE);
 		if (fs == MPP_FLAG_OK) continue;
 		const char *err = (fs == MPP_FLAG_INVALID_VALUE) ? "invalid value for" : "unknown argument";
@@ -14737,13 +14776,32 @@ int process_register_mpp(int nb) {
 		return CMD_ARG_ERROR;
 	}
 
+	/* Universal alt-az field-rotation option: synthesise (or remove) a
+	 * rotation-only derotation plan before registration reads it. Only an
+	 * explicit -field-rotation flag touches the plan state, so plain
+	 * register runs never disturb an existing setup. */
+	if (fr_state >= 0
+	    && mpp_derot_sync_field_rotation_plan(seq, fr_state == 1, fr_target,
+	                                          fr_lat, fr_lon) != MPP_OK)
+		return CMD_ARG_ERROR;
+
 	siril_log_message(_("register_mpp: %d frames, %dx%d, bitdepth=%d\n"),
 	                  seq->number, seq->rx, seq->ry, cfg.bitdepth);
 
+	/* Derotation-aware registration: if a <seqname>.derot plan exists, Stage A
+	 * and Stage B operate in the reference-epoch frame. */
+	mpp_derot_t *derot = NULL;
+	gchar *derot_path = g_strdup_printf("%s.derot", seq->seqname);
+	if (mpp_derot_read(derot_path, &derot) == MPP_OK && derot)
+		siril_log_message(_("register_mpp: derotation plan found (%d frames)\n"),
+		                  derot->num_frames);
+	g_free(derot_path);
+
 	mpp_run_t *run = NULL;
-	int rc = mpp_analyze(seq, &cfg, &run);
+	int rc = mpp_analyze(seq, &cfg, &run, derot);
 	if (rc != MPP_OK) {
 		siril_log_error(_("register_mpp: Stage A failed (code %d)\n"), rc);
+		mpp_derot_free(derot);
 		return CMD_GENERIC_ERROR;
 	}
 	siril_log_message(_("register_mpp: Stage A done — best=%d, %d APs, stack_size=%d\n"),
@@ -14753,14 +14811,16 @@ int process_register_mpp(int nb) {
 	mpp_write_quality_to_regdata(seq, seq->nb_layers == 3 ? 1 : 0, run);
 
 	/* Per-AP frame ranking — deferred from Stage A; runs at Stage B entry. */
-	rc = mpp_recompute_qualities(seq, run);
+	rc = mpp_recompute_qualities(seq, run, derot);
 	if (rc != MPP_OK) {
 		siril_log_error(_("register_mpp: per-AP frame ranking failed (code %d)\n"), rc);
 		mpp_run_free(run);
+		mpp_derot_free(derot);
 		return CMD_GENERIC_ERROR;
 	}
 
-	rc = mpp_compute_shifts(seq, &cfg, run);
+	rc = mpp_compute_shifts(seq, &cfg, run, derot);
+	mpp_derot_free(derot);
 	if (rc != MPP_OK) {
 		siril_log_error(_("register_mpp: Stage B failed (code %d)\n"), rc);
 		mpp_run_free(run);
@@ -14843,8 +14903,33 @@ int process_stack_mpp(int nb) {
 	                  run->aps->count, run->bitdepth,
 	                  run->cfg->drizzle_scale > 1.001 ? " (upscaled)" : "");
 
+	/* Optional derotation plan: if <seqname>.derot exists, force the warp
+	 * engine and derotate every frame to the reference epoch. */
+	mpp_derot_t *derot = NULL;
+	gchar *derot_path = g_strdup_printf("%s.derot", seq->seqname);
+	if (mpp_derot_read(derot_path, &derot) == MPP_OK && derot) {
+		/* Same plan-consistency guard as the GUI handler (stack_mpp.c): the AP
+		 * shifts must have been measured against this exact derotation plan. */
+		if (run->derot_fingerprint != mpp_derot_fingerprint(derot)) {
+			siril_log_error(_("stack_mpp: a derotation plan is present but the "
+			    "registration was %s — re-run register_mpp with the .derot in "
+			    "place, then stack.\n"),
+			    run->derot_fingerprint == 0 ? _("done without derotation")
+			                                : _("done for a different derotation plan"));
+			mpp_derot_free(derot);
+			g_free(derot_path);
+			mpp_run_free(run);
+			return CMD_GENERIC_ERROR;
+		}
+		run->cfg->stack_method = MPP_STACK_WARP;
+		siril_log_message(_("stack_mpp: derotation plan loaded (%d frames) — "
+		                    "using the warp engine.\n"), derot->num_frames);
+	}
+	g_free(derot_path);
+
 	fits stacked = {0};
-	rc = mpp_stack_apply(seq, run->cfg, run, &stacked);
+	rc = mpp_stack_apply(seq, run->cfg, run, derot, &stacked);
+	mpp_derot_free(derot);
 	if (rc != MPP_OK) {
 		siril_log_error(_("stack_mpp: Stage C failed (code %d)\n"), rc);
 		clearfits(&stacked);
@@ -14871,6 +14956,525 @@ int process_stack_mpp(int nb) {
 	mpp_run_free(run);
 	g_free(resolved_out);
 	return CMD_OK;
+}
+
+int process_derotate(int nb) {
+	if (nb < 2) {
+		siril_log_error(_("derotate: missing sequence name\n"));
+		return CMD_WRONG_N_ARG;
+	}
+	sequence *seq = load_sequence_force_debayer(word[1]);
+	if (!seq) return CMD_SEQUENCE_NOT_FOUND;
+	gboolean seq_is_com = check_seq_is_comseq(seq);
+	if (seq_is_com) {
+		free_sequence(seq, TRUE);
+		seq = &com.seq;
+	}
+
+	planet_body_t body = PLANET_JUPITER;
+	int system = 2;                 /* default System II for Jupiter */
+	gboolean system_set = FALSE;
+	double cx = 0, cy = 0, radius = 0, pa_deg = 0.0, parity = 1.0, fps = 0.0;
+	gboolean has_center = FALSE, has_radius = FALSE;
+	double obs_lat = NAN, obs_lon = NAN, obs_elev = NAN;
+	mpp_field_rot_t field_rot = MPP_FIELD_ROT_NONE;
+	GDateTime *epoch_dt = NULL, *start_dt = NULL;
+	gchar *out_path = NULL;
+	gchar *epoch_from = NULL;
+	int ret = CMD_OK;
+
+	for (int i = 2; i < nb; i++) {
+		const char *w = word[i];
+		if (g_str_has_prefix(w, "-body=")) {
+			const char *v = w + 6;
+			if (!g_ascii_strcasecmp(v, "jupiter")) { body = PLANET_JUPITER; if (!system_set) system = 2; }
+			else if (!g_ascii_strcasecmp(v, "saturn")) { body = PLANET_SATURN; if (!system_set) system = 3; }
+			else if (!g_ascii_strcasecmp(v, "mars")) { body = PLANET_MARS; if (!system_set) system = 1; }
+			else { siril_log_error(_("derotate: unknown body '%s'\n"), v); ret = CMD_ARG_ERROR; goto done; }
+		} else if (g_str_has_prefix(w, "-system=")) {
+			system = atoi(w + 8); system_set = TRUE;
+			if (system < 1 || system > 3) { siril_log_error(_("derotate: -system must be 1, 2 or 3\n")); ret = CMD_ARG_ERROR; goto done; }
+		} else if (g_str_has_prefix(w, "-center=")) {
+			if (sscanf(w + 8, "%lf,%lf", &cx, &cy) != 2) { siril_log_error(_("derotate: -center=x,y\n")); ret = CMD_ARG_ERROR; goto done; }
+			has_center = TRUE;
+		} else if (g_str_has_prefix(w, "-radius=")) {
+			radius = g_ascii_strtod(w + 8, NULL); has_radius = (radius > 0);
+			if (!has_radius) { siril_log_error(_("derotate: -radius must be > 0\n")); ret = CMD_ARG_ERROR; goto done; }
+		} else if (g_str_has_prefix(w, "-pa=")) {
+			pa_deg = g_ascii_strtod(w + 4, NULL);
+		} else if (g_str_has_prefix(w, "-parity=")) {
+			parity = (g_ascii_strtod(w + 8, NULL) < 0) ? -1.0 : 1.0;
+		} else if (g_str_has_prefix(w, "-fps=")) {
+			fps = g_ascii_strtod(w + 5, NULL);
+		} else if (g_str_has_prefix(w, "-epoch=")) {
+			epoch_dt = FITS_date_to_date_time((gchar *) (w + 7));
+			if (!epoch_dt) { siril_log_error(_("derotate: bad -epoch (use YYYY-MM-DDTHH:MM:SS)\n")); ret = CMD_ARG_ERROR; goto done; }
+		} else if (g_str_has_prefix(w, "-epoch-from=")) {
+			g_free(epoch_from); epoch_from = g_strdup(w + 12);
+		} else if (g_str_has_prefix(w, "-start=")) {
+			start_dt = FITS_date_to_date_time((gchar *) (w + 7));
+			if (!start_dt) { siril_log_error(_("derotate: bad -start (use YYYY-MM-DDTHH:MM:SS)\n")); ret = CMD_ARG_ERROR; goto done; }
+		} else if (g_str_has_prefix(w, "-obs-lat=")) {
+			obs_lat = g_ascii_strtod(w + 9, NULL);
+		} else if (g_str_has_prefix(w, "-obs-lon=")) {
+			obs_lon = g_ascii_strtod(w + 9, NULL);
+		} else if (g_str_has_prefix(w, "-obs-elev=")) {
+			obs_elev = g_ascii_strtod(w + 10, NULL);
+		} else if (g_str_has_prefix(w, "-field-rotation=")) {
+			const char *v = w + 16;
+			if (!g_ascii_strcasecmp(v, "none")) field_rot = MPP_FIELD_ROT_NONE;
+			else if (!g_ascii_strcasecmp(v, "altaz")) field_rot = MPP_FIELD_ROT_ALTAZ;
+			else {
+				siril_log_error(_("derotate: -field-rotation must be none or altaz\n"));
+				ret = CMD_ARG_ERROR; goto done;
+			}
+		} else if (g_str_has_prefix(w, "-out=")) {
+			g_free(out_path); out_path = g_strdup(w + 5);
+		} else {
+			siril_log_error(_("derotate: unknown argument '%s'\n"), w);
+			ret = CMD_ARG_ERROR; goto done;
+		}
+	}
+	if (!has_center || !has_radius) {
+		siril_log_error(_("derotate: -center=x,y and -radius=R are required\n"));
+		ret = CMD_ARG_ERROR; goto done;
+	}
+
+#ifdef HAVE_FFMS2
+	/* AVI input (not converted to SER): default the cadence to the container
+	 * frame rate and the start to the synthesised first-frame time, so
+	 * derotation works without an explicit -fps. */
+	if (seq->type == SEQ_AVI && seq->film_file) {
+		if (fps <= 0.0 && seq->film_file->fps > 0.0) {
+			fps = seq->film_file->fps;
+			siril_log_message(_("derotate: using the AVI container frame rate "
+			                    "%.4f fps (no per-frame timestamps in AVI)\n"), fps);
+		}
+		if (!start_dt)
+			start_dt = film_synthesize_frame_date(seq->film_file, 0);
+	}
+#endif
+
+	const int N = seq->number;
+	double *jd = malloc((size_t) N * sizeof(double));
+	if (!jd) { ret = CMD_GENERIC_ERROR; goto done; }
+	const double start_jd = start_dt ? date_time_to_Julian(start_dt) : NAN;
+	if (!mpp_derot_frame_times(seq, fps, start_jd, jd)) {
+		siril_log_error(_("derotate: no per-frame timestamps; supply -fps (and "
+		                  "-start for non-SER inputs)\n"));
+		free(jd); ret = CMD_ARG_ERROR; goto done;
+	}
+
+	double epoch_jd;
+	if (epoch_dt) {
+		epoch_jd = date_time_to_Julian(epoch_dt);
+	} else if (epoch_from) {
+		/* Shared reference epoch across a set of sequences (multi-channel /
+		 * multi-session derotation): the midpoint of the union of their spans,
+		 * so every channel presents the same planet face. */
+		gchar **names = g_strsplit(epoch_from, ",", -1);
+		const int nn = (int) g_strv_length(names);
+		double *firsts = malloc((size_t) (nn > 0 ? nn : 1) * sizeof(double));
+		double *lasts  = malloc((size_t) (nn > 0 ? nn : 1) * sizeof(double));
+		int valid = 0;
+		gboolean ok = (firsts && lasts);
+		for (int i = 0; ok && i < nn; i++) {
+			gchar *nm = g_strstrip(names[i]);
+			if (!*nm) continue;
+			sequence *s = load_sequence_force_debayer(nm);
+			if (!s) { siril_log_error(_("derotate: -epoch-from: cannot load '%s'\n"), nm); ok = FALSE; break; }
+			gboolean is_com = check_seq_is_comseq(s);
+			if (is_com) { free_sequence(s, TRUE); s = &com.seq; }
+			/* Each listed sequence spans on its OWN timestamps — mono
+			 * channels are routinely captured at different frame rates
+			 * (fps tuned per filter to centre the histogram), so the main
+			 * sequence's -fps/-start must not be projected onto the
+			 * others. They apply only when the listed sequence IS the one
+			 * being derotated. */
+			const gboolean is_self = g_strcmp0(nm, seq->seqname) == 0
+			                      || g_strcmp0(nm, word[1]) == 0;
+			double f, l;
+			gboolean got = mpp_derot_sequence_span(s,
+			                                       is_self ? fps : 0.0,
+			                                       is_self ? start_jd : NAN,
+			                                       &f, &l);
+			if (!is_com) free_sequence(s, TRUE);
+			if (!got) {
+				siril_log_error(_("derotate: -epoch-from: '%s' has no usable "
+				                  "timestamps — write them first (e.g. "
+				                  "`ser_fix_timestamps %s -fps=F`), since -fps/"
+				                  "-start apply only to the sequence being "
+				                  "derotated\n"), nm, nm);
+				ok = FALSE; break;
+			}
+			firsts[valid] = f; lasts[valid] = l; valid++;
+		}
+		g_strfreev(names);
+		if (!ok || valid == 0) {
+			free(firsts); free(lasts); free(jd); ret = CMD_ARG_ERROR; goto done;
+		}
+		epoch_jd = mpp_derot_union_epoch(firsts, lasts, valid);
+		free(firsts); free(lasts);
+		siril_log_message(_("derotate: shared reference epoch across %d sequence(s)\n"), valid);
+	} else {
+		epoch_jd = mpp_derot_midpoint_epoch(jd, N);
+	}
+
+	mpp_derot_t *d = mpp_derot_build(body, system, epoch_jd, jd, N,
+	                                 (int) seq->ry, (int) seq->rx,
+	                                 cx, cy, radius, pa_deg, parity,
+	                                 obs_lat, obs_lon, obs_elev, field_rot);
+	if (!d) {
+		siril_log_error(_("derotate: ephemeris/plan build failed\n"));
+		free(jd); ret = CMD_GENERIC_ERROR; goto done;
+	}
+	planet_geom_t ge;
+	const gboolean have_ge =
+	    planet_ephemeris(body, epoch_jd, obs_lat, obs_lon, obs_elev, &ge) == 0;
+
+	gchar *derot_path = out_path ? g_strdup(out_path)
+	                             : g_strdup_printf("%s.derot", seq->seqname);
+	mpp_status_t wr = mpp_derot_write(derot_path, d);
+	if (wr != MPP_OK) {
+		siril_log_error(_("derotate: failed to write %s (code %d)\n"), derot_path, wr);
+		ret = CMD_GENERIC_ERROR;
+	} else {
+		/* Chronological extremes, not file positions — quality-sorted SERs
+		 * store frames out of time order with correct per-frame stamps. */
+		int i_first = 0, i_last = 0;
+		for (int i = 1; i < N; i++) {
+			if (jd[i] < jd[i_first]) i_first = i;
+			if (jd[i] > jd[i_last])  i_last = i;
+		}
+		const double span_min = (jd[i_last] - jd[i_first]) * 24.0 * 60.0;
+		const double total_rot = fabs(d->cm[i_last] - d->cm[i_first]);
+		siril_log_message(_("derotate: wrote %s — %d frames, span %.2f min, "
+		                    "System %d rotation %.2f deg, app. diam %.2f\"\n"),
+		                  derot_path, N, span_min, system,
+		                  total_rot > 180.0 ? 360.0 - total_rot : total_rot,
+		                  have_ge ? ge.ang_diam_eq : 0.0);
+	}
+	g_free(derot_path);
+	mpp_derot_free(d);
+	free(jd);
+
+done:
+	if (seq && !seq_is_com) free_sequence(seq, TRUE);
+	g_free(out_path);
+	g_free(epoch_from);
+	if (epoch_dt) g_date_time_unref(epoch_dt);
+	if (start_dt) g_date_time_unref(start_dt);
+	return ret;
+}
+
+/* Strip a trailing ".derot" so an argument can be given either as the sidecar
+ * file or as the bare sequence name. Returns a newly allocated seqname. */
+static gchar *derot_arg_to_seqname(const char *arg) {
+	if (g_str_has_suffix(arg, ".derot"))
+		return g_strndup(arg, strlen(arg) - 6);
+	return g_strdup(arg);
+}
+
+int process_derotate_stack(int nb) {
+	if (nb < 2) {
+		siril_log_error(_("derotate_stack: list at least one sequence "
+		                  "(its .derot sidecar must already exist)\n"));
+		return CMD_WRONG_N_ARG;
+	}
+
+	GPtrArray *names = g_ptr_array_new_with_free_func(g_free);  /* seqnames */
+	gchar *out_path = NULL;
+	gboolean out32 = FALSE;
+	double drizzle = 1.0;
+	int ref = 0;
+	int stack_percent = 0;   /* 0 = keep the default (100) */
+	int stack_frames = 0;
+	int ret = CMD_OK;
+
+	for (int i = 1; i < nb; i++) {
+		const char *w = word[i];
+		if (g_str_has_prefix(w, "-out=")) {
+			g_free(out_path); out_path = g_strdup(w + 5);
+		} else if (!g_strcmp0(w, "-32b") || !g_strcmp0(w, "-32bits")) {
+			out32 = TRUE;
+		} else if (g_str_has_prefix(w, "-drizzle=")) {
+			drizzle = g_ascii_strtod(w + 9, NULL);
+			if (drizzle < 1.0) drizzle = 1.0;
+		} else if (g_str_has_prefix(w, "-ref=")) {
+			ref = atoi(w + 5);
+		} else if (g_str_has_prefix(w, "-stack-percent=")) {
+			stack_percent = atoi(w + 15);
+			if (stack_percent < 1 || stack_percent > 100) {
+				siril_log_error(_("derotate_stack: -stack-percent must be 1..100\n"));
+				ret = CMD_ARG_ERROR; goto done;
+			}
+		} else if (g_str_has_prefix(w, "-stack-frames=")) {
+			stack_frames = atoi(w + 14);
+			if (stack_frames < 1) {
+				siril_log_error(_("derotate_stack: -stack-frames must be >= 1\n"));
+				ret = CMD_ARG_ERROR; goto done;
+			}
+		} else if (w[0] == '-') {
+			siril_log_error(_("derotate_stack: unknown argument '%s'\n"), w);
+			ret = CMD_ARG_ERROR; goto done;
+		} else {
+			g_ptr_array_add(names, derot_arg_to_seqname(w));
+		}
+	}
+
+	const int n = (int) names->len;
+	if (n < 1) {
+		siril_log_error(_("derotate_stack: no sequences given\n"));
+		ret = CMD_ARG_ERROR; goto done;
+	}
+	if (ref < 0 || ref >= n) {
+		siril_log_error(_("derotate_stack: -ref=%d out of range (0..%d)\n"),
+		                ref, n - 1);
+		ret = CMD_ARG_ERROR; goto done;
+	}
+
+	sequence **seqs = g_new0(sequence *, n);
+	mpp_derot_t **derots = g_new0(mpp_derot_t *, n);
+	gboolean *is_com = g_new0(gboolean, n);
+
+	for (int i = 0; i < n; i++) {
+		const char *seqname = g_ptr_array_index(names, i);
+		gchar *derot_path = g_strdup_printf("%s.derot", seqname);
+		if (mpp_derot_read(derot_path, &derots[i]) != MPP_OK || !derots[i]) {
+			siril_log_error(_("derotate_stack: cannot read %s — run `derotate` "
+			                  "on '%s' first (sharing a common epoch via "
+			                  "-epoch-from)\n"), derot_path, seqname);
+			g_free(derot_path);
+			ret = CMD_GENERIC_ERROR; goto stack_cleanup;
+		}
+		g_free(derot_path);
+
+		seqs[i] = load_sequence_force_debayer((char *) seqname);
+		if (!seqs[i]) {
+			siril_log_error(_("derotate_stack: cannot load sequence '%s'\n"), seqname);
+			ret = CMD_SEQUENCE_NOT_FOUND; goto stack_cleanup;
+		}
+		is_com[i] = check_seq_is_comseq(seqs[i]);
+		if (is_com[i]) { free_sequence(seqs[i], TRUE); seqs[i] = &com.seq; }
+
+		if (seqs[i]->number != derots[i]->num_frames
+		    || (int) seqs[i]->ry != derots[i]->frame_rows
+		    || (int) seqs[i]->rx != derots[i]->frame_cols) {
+			siril_log_error(_("derotate_stack: '%s' (%d frames, %dx%d) does not "
+			                  "match its .derot (%d frames, %dx%d) — re-run "
+			                  "`derotate`\n"), seqname, seqs[i]->number,
+			                (int) seqs[i]->rx, (int) seqs[i]->ry,
+			                derots[i]->num_frames, derots[i]->frame_cols,
+			                derots[i]->frame_rows);
+			ret = CMD_INVALID_IMAGE; goto stack_cleanup;
+		}
+
+		/* Cross-source compatibility. Every plan must target the same epoch
+		 * (else each sequence derotates to a different planet face and the
+		 * combine is rotationally misregistered — build the plans with
+		 * -epoch-from), the same body/system, and the sequences must share a
+		 * bit depth and layer count (the analysis reader is configured once
+		 * from the first source). Half a second of epoch slack is far below
+		 * anything the rotation can resolve. */
+		if (i > 0) {
+			if (derots[i]->body != derots[0]->body
+			    || derots[i]->rot_system != derots[0]->rot_system) {
+				siril_log_error(_("derotate_stack: '%s' was derotated for a "
+				                  "different body/system than '%s'\n"),
+				                seqname, (char *) g_ptr_array_index(names, 0));
+				ret = CMD_ARG_ERROR; goto stack_cleanup;
+			}
+			if (fabs(derots[i]->epoch_jd - derots[0]->epoch_jd) > 0.5 / 86400.0) {
+				siril_log_error(_("derotate_stack: '%s' targets a different "
+				                  "reference epoch than '%s' — re-run `derotate` "
+				                  "on every sequence with the same -epoch-from "
+				                  "list\n"),
+				                seqname, (char *) g_ptr_array_index(names, 0));
+				ret = CMD_ARG_ERROR; goto stack_cleanup;
+			}
+			if (seqs[i]->bitpix != seqs[0]->bitpix
+			    || seqs[i]->nb_layers != seqs[0]->nb_layers) {
+				siril_log_error(_("derotate_stack: '%s' does not match '%s' in "
+				                  "bit depth or channel count\n"),
+				                seqname, (char *) g_ptr_array_index(names, 0));
+				ret = CMD_ARG_ERROR; goto stack_cleanup;
+			}
+		}
+	}
+
+	mpp_config_t cfg;
+	mpp_config_defaults(&cfg);
+	cfg.stack_method = MPP_STACK_WARP;   /* derotation requires the warp engine */
+	cfg.drizzle_scale = drizzle;
+	cfg.output_32bit = out32;
+	/* Per-AP lucky-imaging selection, like stack_mpp. The multistack path
+	 * registers and stacks in one pass, so the register-side cap follows
+	 * the requested stack selection. */
+	if (stack_frames > 0) {
+		cfg.alignment_points_frame_number = stack_frames;
+		cfg.stack_frame_number = stack_frames;
+	} else if (stack_percent > 0) {
+		cfg.alignment_points_frame_percent = stack_percent;
+		cfg.stack_frame_percent = stack_percent;
+	}
+
+	fits out = { 0 };
+	const mpp_status_t st = mpp_multistack(seqs, derots, n, ref, &cfg, &out);
+	if (st != MPP_OK) {
+		siril_log_error(_("derotate_stack: failed (code %d)\n"), st);
+		ret = (st == MPP_EINTR) ? CMD_OK : CMD_GENERIC_ERROR;
+		clearfits(&out);
+		goto stack_cleanup;
+	}
+
+	gchar *savename = out_path ? g_strdup(out_path)
+	                           : g_strdup_printf("%s_derot_stack", seqs[ref]->seqname);
+	if (savefits(savename, &out)) {
+		siril_log_error(_("derotate_stack: failed to save %s\n"), savename);
+		ret = CMD_GENERIC_ERROR;
+	} else {
+		siril_log_message(_("derotate_stack: saved %s\n"), savename);
+	}
+	g_free(savename);
+	clearfits(&out);
+
+stack_cleanup:
+	for (int i = 0; i < n; i++) {
+		if (derots[i]) mpp_derot_free(derots[i]);
+		if (seqs[i] && !is_com[i]) free_sequence(seqs[i], TRUE);
+	}
+	g_free(seqs);
+	g_free(derots);
+	g_free(is_com);
+
+done:
+	g_ptr_array_free(names, TRUE);
+	g_free(out_path);
+	return ret;
+}
+
+int process_ser_fix_timestamps(int nb) {
+	if (nb < 2) {
+		siril_log_error(_("ser_fix_timestamps: missing sequence name\n"));
+		return CMD_WRONG_N_ARG;
+	}
+	sequence *seq = load_sequence_force_debayer(word[1]);
+	if (!seq) return CMD_SEQUENCE_NOT_FOUND;
+	gboolean is_com = check_seq_is_comseq(seq);
+	if (is_com) { free_sequence(seq, TRUE); seq = &com.seq; }
+	int ret = CMD_OK;
+	double fps = 0.0;
+	GDateTime *start_dt = NULL;   /* declared before the first goto (done unrefs it) */
+
+	if (seq->type != SEQ_SER || !seq->ser_file) {
+		siril_log_error(_("ser_fix_timestamps: '%s' is not a SER sequence\n"), word[1]);
+		ret = CMD_INVALID_IMAGE; goto done;
+	}
+
+	gboolean force = FALSE;
+	for (int i = 2; i < nb; i++) {
+		const char *w = word[i];
+		if (g_str_has_prefix(w, "-fps=")) {
+			fps = g_ascii_strtod(w + 5, NULL);
+		} else if (g_str_has_prefix(w, "-start=")) {
+			start_dt = FITS_date_to_date_time((gchar *) (w + 7));
+			if (!start_dt) { siril_log_error(_("ser_fix_timestamps: bad -start (use YYYY-MM-DDTHH:MM:SS)\n")); ret = CMD_ARG_ERROR; goto done; }
+		} else if (!strcmp(w, "-force")) {
+			force = TRUE;
+		} else {
+			siril_log_error(_("ser_fix_timestamps: unknown argument '%s'\n"), w);
+			ret = CMD_ARG_ERROR; goto done;
+		}
+	}
+	if (fps <= 0.0) {
+		siril_log_error(_("ser_fix_timestamps: -fps=F (frames per second) is required\n"));
+		ret = CMD_ARG_ERROR; goto done;
+	}
+
+	/* Guard against destroying CORRECT timestamps. Quality-sorted SERs and
+	 * multi-threaded capture writers store frames out of chronological
+	 * order deliberately, each with its correct stamp — the repair this
+	 * command performs (uniform cadence in file order) would replace good
+	 * data with wrong data. Refuse when the existing trailer forms a
+	 * coherent capture timeline; -force overrides. A missing trailer or
+	 * incoherent stamps proceed as before. */
+	if (!force && seq->ser_file->ts && seq->number > 1) {
+		const int N = seq->number;
+		double *jd = malloc((size_t) N * sizeof(double));
+		if (jd) {
+			gboolean have_all = TRUE;
+			for (int i = 0; i < N && have_all; i++) {
+				GDateTime *t = ser_read_frame_date(seq->ser_file, i);
+				if (!t) { have_all = FALSE; break; }
+				jd[i] = date_time_to_Julian(t);
+				g_date_time_unref(t);
+			}
+			double header_jd = NAN;
+			if (seq->ser_file->date_utc != 0) {
+				GDateTime *hd = ser_timestamp_to_date_time(seq->ser_file->date_utc);
+				if (hd) { header_jd = date_time_to_Julian(hd); g_date_time_unref(hd); }
+			}
+			const gboolean coherent = have_all
+			    && mpp_derot_timestamps_coherent(jd, N, header_jd,
+			                                     NULL, NULL, NULL);
+			free(jd);
+			if (coherent) {
+				siril_log_error(_("ser_fix_timestamps: the existing timestamps "
+				                  "form a coherent capture timeline — they look "
+				                  "correct even if the frames are not stored in "
+				                  "chronological order (quality-sorted or "
+				                  "multi-threaded capture output), and rewriting "
+				                  "them would destroy real timing data. Use "
+				                  "-force to overwrite anyway\n"));
+				ret = CMD_GENERIC_ERROR; goto done;
+			}
+		}
+	}
+
+	/* Start instant: explicit -start, else the SER header UTC, else the file's
+	 * modification time. */
+	GDateTime *start = NULL;
+	gboolean own_start = FALSE;
+	if (start_dt) {
+		start = start_dt;
+	} else if (seq->ser_file->date_utc != 0) {
+		start = ser_timestamp_to_date_time(seq->ser_file->date_utc);
+		own_start = TRUE;
+	} else if (seq->ser_file->filename) {
+		GFile *f = g_file_new_for_path(seq->ser_file->filename);
+		GFileInfo *fi = g_file_query_info(f, G_FILE_ATTRIBUTE_TIME_MODIFIED,
+		                                  G_FILE_QUERY_INFO_NONE, NULL, NULL);
+		if (fi) {
+			start = g_file_info_get_modification_date_time(fi);
+			own_start = (start != NULL);
+			g_object_unref(fi);
+		}
+		g_object_unref(f);
+	}
+	if (!start) {
+		siril_log_error(_("ser_fix_timestamps: no start time — supply -start=YYYY-MM-DDTHH:MM:SS\n"));
+		ret = CMD_ARG_ERROR; goto done;
+	}
+
+	siril_log_warning(_("ser_fix_timestamps: assuming all %d frames are in capture "
+	                    "order at a uniform %.4f fps — gaps or dropped frames are "
+	                    "not accounted for.\n"), seq->number, fps);
+	if (ser_rebuild_timestamps(seq->ser_file, start, fps) == SER_OK) {
+		gchar *s = date_time_to_FITS_date(start);
+		siril_log_message(_("ser_fix_timestamps: rebuilt %d timestamps in '%s' "
+		                    "from start %s at %.4f fps\n"),
+		                  seq->number, word[1], s ? s : "?", fps);
+		g_free(s);
+	} else {
+		siril_log_error(_("ser_fix_timestamps: failed to write the timestamps\n"));
+		ret = CMD_GENERIC_ERROR;
+	}
+	if (own_start) g_date_time_unref(start);
+
+done:
+	if (start_dt) g_date_time_unref(start_dt);
+	if (!is_com && seq != &com.seq) free_sequence(seq, TRUE);
+	return ret;
 }
 
 int process_pwd(int nb) {

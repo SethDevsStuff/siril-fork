@@ -34,6 +34,7 @@
 #include "gui-gtk4/progress_and_log.h"
 #include "gui-gtk4/message_dialog.h"
 #include "gui-gtk4/dialogs.h"
+#include "gui-gtk4/derotation.h"
 #include "gui-gtk4/open_dialog.h"
 #include "algos/background_extraction.h"
 #include "algos/ccd-inspector.h"
@@ -445,12 +446,14 @@ static gboolean set_seq_gui(gpointer user_data) {
 	set_GUI_CAMERA();
 	mpp_update_edit_button_sensitivity();         /* sidecar auto-load may have populated com.mpp_run */
 	mpp_sync_widgets_from_cached_run();           /* reflect a loaded sidecar's AP-placement settings */
+	mpp_sync_altaz_from_plan();                   /* reflect a .derot's field-rotation state */
 	mpp_shift_viewer_update_button_sensitivity();
 	gui_function(close_tab, NULL);
 	gui_function(init_right_tab, NULL);
 	notify_gfit_data_modified();
 	gui_iface.redraw_image(REDRAW_ALL);
 	drawPlot();
+	derotation_sequence_changed();   /* refresh the derotation tool if it is open */
 	return FALSE;
 }
 

@@ -40,6 +40,7 @@
 #include "image_interactions.h"
 #include "gui-gtk4/mouse_action_functions.h"
 #include "gui-gtk4/mpp_ap_editor.h"
+#include "gui-gtk4/derotation.h"
 #include "registration/mpp.h"
 #include "registration/mpp/mpp_ap.h"
 #include "gui-gtk4/masks_gui.h"
@@ -380,6 +381,14 @@ gboolean mpp_ap_drag_release(mouse_data *data) {
 	return TRUE;
 }
 
+/* Release callback for the derotation disk-fit drag — ends the drag so motion
+ * events stop moving/resizing the disc. */
+static gboolean derotation_drag_release(mouse_data *data) {
+	(void) data;
+	derotation_set_drag(0);
+	return TRUE;
+}
+
 static gboolean select_reg_area_release(mouse_data *data) {
 	if (gui.drawing) {
 		gui.drawing = FALSE;
@@ -687,6 +696,18 @@ mouse_function_metadata main_action = { main_action_click, NAME_MAIN_ACTION,
 
 gboolean main_action_click(mouse_data *data) {
 	if (data->inside) {
+		/* Derotation disk fit is layered over the normal action: grab the disc
+		 * or a fit handle if one is under the cursor, otherwise fall through to
+		 * the usual selection/sampling behaviour so the main view stays
+		 * interactive while the tool window is open. */
+		if (derotation_overlay_visible()) {
+			int dmode = derotation_hit_test(data->zoomed.x, data->zoomed.y);
+			if (dmode > 0) {
+				derotation_set_drag(dmode);
+				register_release_callback(derotation_drag_release, data->button);
+				return TRUE;
+			}
+		}
 		point pt;
 		int radius, s;
 		gboolean right, left, bottom, top;

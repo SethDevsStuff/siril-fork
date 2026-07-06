@@ -1,0 +1,127 @@
+/*
+ * This file is part of Siril, an astronomy image processor.
+ * Copyright (C) 2005-2011 Francois Meyer (dulle at free.fr)
+ * Copyright (C) 2012-2026 team free-astro (see more in AUTHORS file)
+ * Reference site is https://siril.org
+ *
+ * Siril is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * Siril is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with Siril. If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#ifndef SRC_ALGOS_PLANET_EPHEM_H_
+#define SRC_ALGOS_PLANET_EPHEM_H_
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* Built-in analytic planetary ephemeris for derotation.
+ *
+ * Self-contained (no network, no kernel files): truncated VSOP87A series for
+ * heliocentric positions + the IAU/WGCCRE pole & rotation models. Validated
+ * against the IMCCE Miriade web service (see planet_ephem_test): RA, Dec,
+ * distance, sub-observer latitude, pole position angle and apparent radius all
+ * agree to < 0.01 deg / < 0.03 arcsec at contemporary epochs.
+ *
+ * The quantities needed for derotation are the per-instant disk geometry:
+ * sub-observer latitude (B), central-meridian longitude (CM, one per rotation
+ * system) and the pole position angle (P). Derotation uses *differences* of
+ * these between a frame's time and the reference epoch, so a constant offset
+ * in absolute CM (e.g. from the delta-T model) cancels and does not affect the
+ * result. */
+
+typedef enum {
+	PLANET_JUPITER = 0,
+	PLANET_SATURN  = 1,
+	PLANET_MARS    = 2,
+	PLANET_BODY_COUNT
+} planet_body_t;
+
+/* Rotation system selector for the central-meridian longitude used by
+ * derotation. Jupiter defines all three; Saturn exposes its IAU (System III)
+ * value in all slots; Mars has a single areographic system in all slots. */
+typedef enum {
+	ROT_SYSTEM_I   = 0,
+	ROT_SYSTEM_II  = 1,
+	ROT_SYSTEM_III = 2
+} rot_system_t;
+
+typedef struct {
+	double ra;            /* astrometric J2000 right ascension, degrees [0,360) */
+	double dec;           /* astrometric J2000 declination, degrees [-90,90] */
+	double dist_au;       /* geocentric distance, AU */
+	double sub_obs_lat;   /* B: planetocentric sub-observer latitude, degrees */
+	double cm[3];         /* central-meridian longitude per rotation system, deg */
+	double pole_pa;       /* P: position angle of the north pole, degrees */
+	double ang_diam_eq;   /* apparent equatorial diameter, arcsec */
+	double flattening;    /* geometric flattening f = (Req-Rpol)/Req */
+} planet_geom_t;
+
+/* Compute the geometry of `body` at UTC Julian date `jd_utc`.
+ *
+ * Observer location (geodetic latitude/longitude in degrees, elevation in
+ * metres) refines RA/Dec by topocentric parallax; pass NAN for any of them to
+ * use the geocentre. Parallax shifts the sub-observer geometry by < 0.001 deg
+ * so B/CM/P are effectively observer-independent.
+ *
+ * Returns 0 on success, non-zero on invalid argument. */
+int planet_ephemeris(planet_body_t body, double jd_utc,
+                     double obs_lat, double obs_lon, double obs_elev,
+                     planet_geom_t *out);
+
+/* TT - UTC (delta-T), seconds, for the given UTC Julian date. Exposed for
+ * tests and callers that want the time-scale offset. */
+double planet_ephem_delta_t(double jd_utc);
+
+/* Targets for RA/Dec-only queries (field-rotation correction needs the
+ * target's position but no rotation model). Planet values match
+ * planet_body_t so the two enums can share code. */
+typedef enum {
+	EPHEM_TARGET_JUPITER = 0,
+	EPHEM_TARGET_SATURN  = 1,
+	EPHEM_TARGET_MARS    = 2,
+	EPHEM_TARGET_SUN     = 3,
+	EPHEM_TARGET_MOON    = 4,
+	EPHEM_TARGET_COUNT
+} ephem_target_t;
+
+/* Geocentric astrometric (J2000-frame) RA/Dec of `target` at jd_utc,
+ * degrees. Planets go through the full VSOP + light-time path; the Sun is
+ * the (negated) VSOP Earth vector; the Moon uses a truncated ELP series
+ * (~0.1 deg — ample for the parallactic angle, whose use here tolerates
+ * position errors orders of magnitude larger). Returns 0 on success. */
+int ephem_target_radec(ephem_target_t target, double jd_utc,
+                       double *ra_deg, double *dec_deg);
+
+/* Parallactic angle q of a target at (ra_deg, dec_deg) [J2000, degrees] seen
+ * from geodetic latitude obs_lat_deg / EAST longitude obs_lon_east_deg at UTC
+ * Julian date jd_utc, in degrees:
+ *
+ *   q = atan2(sin H, tan(lat)·cos(dec) − sin(dec)·cos H),   H = LST − RA
+ *
+ * q is the position angle of the zenith at the target, measured from
+ * celestial north through east; 0 on the meridian, negative east of it,
+ * positive west (northern-hemisphere convention). On an alt-az mount the
+ * camera is fixed to the horizon frame, so the sky rotates in the image at
+ * −dq/dt — the basis of the analytic field-rotation correction. Uses the
+ * J2000 RA directly (of-date precession shifts q by well under the model's
+ * needs except within ~1 deg of the zenith, where q is intrinsically
+ * ill-conditioned). */
+double planet_parallactic_angle(double jd_utc, double ra_deg, double dec_deg,
+                                double obs_lat_deg, double obs_lon_east_deg);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* SRC_ALGOS_PLANET_EPHEM_H_ */
