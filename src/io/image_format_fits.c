@@ -41,9 +41,7 @@
 #include "io/sequence.h"
 #include "io/fits_sequence.h"
 #include "core/gui_iface.h"
-/* TODO: thumbnail generation in this file uses GdkPixbuf; these calls
- * should move to gui/ so that image_format_fits.c is GDK-free. */
-#include <gdk-pixbuf/gdk-pixbuf.h>
+#include "io/single_image.h"
 #include "algos/statistics.h"
 #include "algos/demosaicing.h"
 #include "algos/spcc.h"
@@ -588,6 +586,33 @@ static int siril_fits_move_first_image(fitsfile* fp) {
  * currently should be TBYTE or TUSHORT because fit doesn't contain other data.
  * filename is for error reporting
  */
+/* Read `nbdata` image elements into `buffer` with cfitsio, in bands, so the
+ * progress bar can advance during the load of a large image.  fits_read_img()
+ * fills the destination linearly in pixel order, so we simply step the
+ * first-element index forward and report progress after each band.  `elemsize`
+ * is the size in bytes of one destination element for `datatype`.  When the
+ * read isn't flagged as interactive (batch/sequence paths) or the image is
+ * small, this behaves like the single bulk read it replaces. */
+static void read_pix_with_progress(fitsfile *fptr, int datatype, size_t nbdata,
+		size_t elemsize, void *buffer, int *status) {
+	int zero = 0;
+	/* ~8M elements per band: smooth progress on big frames, negligible
+	 * per-call overhead. */
+	const size_t band = 8u * 1024 * 1024;
+	if (!read_progress_active() || nbdata <= band) {
+		fits_read_img(fptr, datatype, 1, nbdata, &zero, buffer, &zero, status);
+		return;
+	}
+	for (size_t off = 0; off < nbdata; off += band) {
+		size_t n = (nbdata - off < band) ? (nbdata - off) : band;
+		fits_read_img(fptr, datatype, (LONGLONG)(off + 1), (LONGLONG)n, &zero,
+				(char *)buffer + off * elemsize, &zero, status);
+		if (*status)
+			return;
+		gui_iface.set_progress((double)(off + n) / (double)nbdata, NULL);
+	}
+}
+
 int read_fits_with_convert(fits* fit, const char* filename, gboolean force_float) {
 	int status = 0, zero = 0, datatype;
 	BYTE *data8;
@@ -650,20 +675,20 @@ int read_fits_with_convert(fits* fit, const char* filename, gboolean force_float
 	case BYTE_IMG:
 		data8 = malloc(nbdata * sizeof(BYTE));
 		datatype = fit->bitpix == BYTE_IMG ? TBYTE : TSBYTE;
-		fits_read_img(fit->fptr, datatype, 1, nbdata, &zero, data8, &zero, &status);
+		read_pix_with_progress(fit->fptr, datatype, nbdata, sizeof(BYTE), data8, &status);
 		if (status) break;
 		convert_data_ushort(fit->bitpix, data8, fit->data, nbdata, FALSE);
 		free(data8);
 		break;
 	case SHORT_IMG:
-		fits_read_img(fit->fptr, TSHORT, 1, nbdata, &zero, fit->data, &zero, &status);
+		read_pix_with_progress(fit->fptr, TSHORT, nbdata, sizeof(WORD), fit->data, &status);
 		if (status) break;
 		convert_data_ushort(fit->bitpix, fit->data, fit->data, nbdata, FALSE);
 		fit->bitpix = USHORT_IMG;
 		break;
 	case USHORT_IMG:
 		// siril 0.9 native, no conversion required
-		fits_read_img(fit->fptr, TUSHORT, 1, nbdata, &zero, fit->data, &zero, &status);
+		read_pix_with_progress(fit->fptr, TUSHORT, nbdata, sizeof(WORD), fit->data, &status);
 		if (status == NUM_OVERFLOW) {
 			// in case there are errors, we try short data
 			status = 0;
@@ -684,7 +709,7 @@ int read_fits_with_convert(fits* fit, const char* filename, gboolean force_float
 	case LONG_IMG:		// 32-bit signed integer pixels
 		pixels_long = malloc(nbdata * sizeof(unsigned long));
 		datatype = fit->bitpix == LONG_IMG ? TLONG : TULONG;
-		fits_read_img(fit->fptr, datatype, 1, nbdata, &zero, pixels_long, &zero, &status);
+		read_pix_with_progress(fit->fptr, datatype, nbdata, sizeof(unsigned long), pixels_long, &status);
 		if (status) break;
 		fits_read_key(fit->fptr, TDOUBLE, "DATAMAX", &data_max, NULL, &status);
 		if (status) {
@@ -702,7 +727,7 @@ int read_fits_with_convert(fits* fit, const char* filename, gboolean force_float
 		/* we assume we are in the range [0, 1]. But, for some images
 		 * some values can be negative
 		 */
-		fits_read_img(fit->fptr, TFLOAT, 1, nbdata, &zero, fit->fdata, &zero, &status);
+		read_pix_with_progress(fit->fptr, TFLOAT, nbdata, sizeof(float), fit->fdata, &status);
 		if ((fit->bitpix == USHORT_IMG || fit->bitpix == SHORT_IMG
 				// needed for some FLOAT_IMG. 10.0 is probably a good number to represent the limit at which we judge that these are not clip-on pixels.
 				|| fit->bitpix == BYTE_IMG) || fit->keywords.data_max > 10.0) {
@@ -2894,24 +2919,6 @@ static inline void set_rgb(float r, float g, float b, guchar *rgb) {
 	*rgb++ = (guchar) roundf_to_BYTE(255.f * b);
 }
 
-// Choose thread count based on workload
-static inline int choose_num_threads(int W, int H, int max_threads) {
-	int pixels = W * H;
-	if (pixels < 65536) { // < 64k pixels → single-thread
-		return 1;
-	}
-	int threads = pixels / 16384; // aim ~16k pixels per thread
-	if (threads > max_threads) threads = max_threads;
-	if (threads < 1) threads = 1;
-	return threads;
-}
-
-static GdkPixbufDestroyNotify free_preview_data(guchar *pixels, gpointer data) {
-	free(pixels);
-	free(data);
-	return FALSE;
-}
-
 #define TRYFITS(f, ...) \
 	do{ \
 		status = FALSE; \
@@ -3202,17 +3209,143 @@ guchar *extract_thumbnail_from_fits(const char *filename, gchar **descr,
 	return pixbuf_data;
 }
 
-/* Pixbuf-returning shim around extract_thumbnail_from_fits, kept for the
- * GTK3 build and for any caller that still wants a GdkPixbuf.  Ownership
- * of the byte buffer is transferred to the pixbuf via free_preview_data. */
-GdkPixbuf* get_thumbnail_from_fits(char *filename, gchar **descr) {
-	int w = 0, h = 0;
-	guchar *data = extract_thumbnail_from_fits(filename, descr, &w, &h);
-	if (!data) return NULL;
-	return gdk_pixbuf_new_from_data(data, GDK_COLORSPACE_RGB, FALSE, 8,
-			w, h, w * 3,
-			(GdkPixbufDestroyNotify) free_preview_data, NULL);
+#ifdef HAVE_LIBTIFF
+/**
+ * Fallback thumbnail extractor for TIFF files that neither exiv2 nor
+ * gdk-pixbuf can decode — notably 32-bit float / 32-bit integer TIFFs,
+ * which are Siril's own default export format.  Siril's libtiff reader
+ * (readtif) handles every TIFF bit depth, so we load the image into a
+ * fits and downsample + MTF-stretch it exactly like the FITS extractor.
+ * Same return contract as extract_thumbnail_from_fits(): a malloc'd
+ * RGB888 buffer (caller frees with free()), or NULL on error.
+ */
+guchar *extract_thumbnail_from_tiff(const char *filename, gchar **descr,
+                                     int *width_out, int *height_out) {
+	const int MAX_SIZE = com.pref.gui.thumbnail_size;
+	fits fit = { 0 };
+
+	/* force_float: 8/16-bit are normalised to [0, 1] float and 32-bit stays
+	 * float, so from here on we only ever deal with planar float channels. */
+	if (readtif(filename, &fit, TRUE, FALSE) <= 0) {
+		clearfits(&fit);
+		return NULL;
+	}
+
+	const int w = fit.rx;
+	const int h = fit.ry;
+	const int n_channels = (fit.naxes[2] >= 3) ? 3 : 1;
+	const gboolean is_color = (n_channels == 3);
+	if (w <= 0 || h <= 0 || !fit.fdata) {
+		clearfits(&fit);
+		return NULL;
+	}
+
+	/* description line mirrors the FITS/SER extractors: "W x H pixels" then
+	 * "N channels (B bits)". */
+	int bits = (fit.orig_bitpix == BYTE_IMG) ? 8
+	         : (fit.orig_bitpix == FLOAT_IMG) ? 32 : 16;
+	*descr = g_strdup_printf("%d x %d %s\n%d %s (%d bits)", w, h,
+			ngettext("pixel", "pixels", h), n_channels,
+			ngettext("channel", "channels", n_channels), bits);
+
+	/* Decimation step, calibrated exactly like the FITS extractor. */
+	const float scale_x = (float)w / MAX_SIZE;
+	const float scale_y = (float)h / MAX_SIZE;
+	const float max_scale = (scale_x > scale_y) ? scale_x : scale_y;
+	const int pixScale = (max_scale > 1.0f) ? (int)max_scale : 1;
+	const int Ws = ((w - 1) / pixScale) + 1;
+	const int Hs = ((h - 1) / pixScale) + 1;
+	const size_t prev_size = (size_t)Ws * Hs;
+	if (Ws <= 0 || Hs <= 0) {
+		clearfits(&fit);
+		return NULL;
+	}
+
+	float *preview_data = malloc(prev_size * n_channels * sizeof(float));
+	if (!preview_data) {
+		clearfits(&fit);
+		return NULL;
+	}
+
+	/* Decimate each channel plane (readtif stores planes contiguously in
+	 * fpdata) into the planar preview buffer. */
+	for (int ch = 0; ch < n_channels; ch++) {
+		const float *src = fit.fpdata[ch];
+		float *dst = preview_data + (size_t)ch * prev_size;
+		for (int iy = 0; iy < Hs; iy++) {
+			const float *srow = src + (size_t)(iy * pixScale) * w;
+			float *drow = dst + (size_t)iy * Ws;
+			for (int ix = 0; ix < Ws; ix++)
+				drow[ix] = srow[ix * pixScale];
+		}
+	}
+	clearfits(&fit);	/* pixels copied out; drop the full-res image */
+
+	/* Auto-scale to [0, 1] from the actual data range: readtif normalises
+	 * 8/16-bit and 32-bit-uint to [0, 1], but a raw 32-bit float TIFF can
+	 * hold anything. */
+	float minv = FLT_MAX, maxv = -FLT_MAX;
+	for (size_t i = 0; i < prev_size * n_channels; i++) {
+		float v = preview_data[i];
+		if (v < minv) minv = v;
+		if (v > maxv) maxv = v;
+	}
+	const float range = (maxv - minv > 1e-6f) ? (maxv - minv) : 1.f;
+	const float inv = 1.f / range;
+	for (size_t i = 0; i < prev_size * n_channels; i++)
+		preview_data[i] = (preview_data[i] - minv) * inv;
+
+	/* Apply Midtone Stretching (MTF), same as the FITS/SER extractors. */
+	fits *tmp = NULL;
+	new_fit_image_with_data(&tmp, Ws, Hs, n_channels, DATA_FLOAT, preview_data);
+	struct mtf_params mtfp[3] = {
+		{ 0.f, 0.f, 0.f, TRUE, TRUE, TRUE },
+		{ 0.f, 0.f, 0.f, TRUE, TRUE, TRUE },
+		{ 0.f, 0.f, 0.f, TRUE, TRUE, TRUE }
+	};
+	find_unlinked_midtones_balance_default(tmp, mtfp);
+	apply_unlinked_mtf_to_fits(tmp, tmp, mtfp);
+	/* preview_data is still ours to free; detach it before clearing tmp. */
+	tmp->fdata = NULL;
+	tmp->fpdata[0] = NULL;
+	tmp->fpdata[1] = NULL;
+	tmp->fpdata[2] = NULL;
+	clearfits(tmp);
+	free(tmp);
+
+	guchar *pixbuf_data = malloc(3 * prev_size * sizeof(guchar));
+	if (!pixbuf_data) {
+		free(preview_data);
+		return NULL;
+	}
+
+	/* Flip vertically (dest row Hs-1-i): readtif conforms the image to
+	 * Siril's internal bottom-up convention, just like a loaded FITS. */
+	for (int i = 0; i < Hs; i++) {
+		int src_row_offset  = i * Ws;
+		int dest_row_offset = (Hs - 1 - i) * Ws * 3;
+		for (int j = 0; j < Ws; j++) {
+			int src_idx  = src_row_offset + j;
+			int dest_idx = dest_row_offset + j * 3;
+
+			if (is_color) {
+				float r = preview_data[src_idx];
+				float g = preview_data[src_idx + prev_size];
+				float b = preview_data[src_idx + prev_size * 2];
+				set_rgb(r, g, b, &pixbuf_data[dest_idx]);
+			} else {
+				gray2rgb(preview_data[src_idx], &pixbuf_data[dest_idx]);
+			}
+		}
+	}
+
+	free(preview_data);
+
+	if (width_out) *width_out = Ws;
+	if (height_out) *height_out = Hs;
+	return pixbuf_data;
 }
+#endif	/* HAVE_LIBTIFF */
 
 /* verify that the parameters of the image pointed by fptr are the same as some reference values */
 int check_fits_params(fitsfile *fptr, int *oldbitpix, int *oldnaxis, long *oldnaxes, gboolean relax_dimcheck) {
