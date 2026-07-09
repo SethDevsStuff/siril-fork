@@ -26,7 +26,6 @@
 #include <math.h>
 #include <lcms2.h>
 #include <time.h>
-#include <zlib.h>
 
 #ifdef HAVE_LIBTIFF
 #define uint64 uint64_hack_
@@ -42,6 +41,7 @@
 #endif
 #ifdef HAVE_LIBPNG
 #include <png.h>
+#include <zlib.h>
 #include <setjmp.h>
 #endif
 #ifdef HAVE_LIBRAW
