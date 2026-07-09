@@ -41,7 +41,6 @@
 #endif
 #ifdef HAVE_LIBPNG
 #include <png.h>
-#include <zlib.h>
 #include <setjmp.h>
 #endif
 #ifdef HAVE_LIBRAW
@@ -1896,7 +1895,6 @@ int savepng(const char *name, fits *fit, uint32_t bytes_per_sample,
 
 	// Set compression settings suitable for astro images
 	png_set_compression_level(png_ptr, 1);        // level 1 is faster and similar file size to level 6
-	png_set_compression_strategy(png_ptr, Z_RLE); // this is much faster but slightly bigger file size
 	png_set_filter(png_ptr, 0, PNG_FILTER_NONE);  // No point in using filters for our use-case
 
 	/* Allocate/initialize the image information data.  REQUIRED */
