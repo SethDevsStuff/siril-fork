@@ -2079,6 +2079,7 @@ int savepng(const char *name, fits *fit, uint32_t bytes_per_sample,
 
 	siril_log_message(_("Saving PNG: file %s, %ld layer(s), %ux%u pixels\n"),
 				filename, fit->naxes[2], fit->rx, fit->ry);
+
 	/* Close the file */
 	fclose(p_png_file);
 	if (data) free(data);
