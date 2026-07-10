@@ -25,7 +25,6 @@
 #include <stdlib.h>
 #include <math.h>
 #include <lcms2.h>
-#include <time.h>
 
 #ifdef HAVE_LIBTIFF
 #define uint64 uint64_hack_
@@ -1844,17 +1843,6 @@ static uint8_t *convert_data8(fits *image) {
 	return buffer;
 }
 
-static double elapsed_since(const struct timespec *start)
-{
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-
-    double seconds = (double)(now.tv_sec - start->tv_sec);
-    double nanoseconds = (double)(now.tv_nsec - start->tv_nsec);
-
-    return seconds + (nanoseconds / 1e9);
-}
-
 int savepng(const char *name, fits *fit, uint32_t bytes_per_sample,
 		gboolean is_colour) {
 	int32_t ret = -1;
@@ -1862,12 +1850,6 @@ int savepng(const char *name, fits *fit, uint32_t bytes_per_sample,
 	png_infop info_ptr;
 	const uint32_t width = fit->rx;
 	const uint32_t height = fit->ry;
-
-	struct timespec start;
-        clock_gettime(CLOCK_MONOTONIC, &start);
-
-	siril_log_debug(_("Started conversion in %.3f s\n"),
-        elapsed_since(&start));
 
 	char *filename = strdup(name);
 	if (!g_str_has_suffix(filename, ".png")) {
@@ -2083,8 +2065,6 @@ int savepng(const char *name, fits *fit, uint32_t bytes_per_sample,
 	/* png_write_image() is just a loop of png_write_row(); doing it by hand
 	 * lets us report progress.  row_pointers already encodes the vertical
 	 * flip, so writing them in order produces byte-identical output. */
-	siril_log_debug(_("Started writing png in %.3f s\n"),
-        elapsed_since(&start));
 	gui_iface.set_progress(PROGRESS_RESET, _("Saving PNG"));
 	for (unsigned y = 0; y < height; y++) {
 		png_write_row(png_ptr, row_pointers[y]);
@@ -2099,9 +2079,6 @@ int savepng(const char *name, fits *fit, uint32_t bytes_per_sample,
 
 	siril_log_message(_("Saving PNG: file %s, %ld layer(s), %ux%u pixels\n"),
 				filename, fit->naxes[2], fit->rx, fit->ry);
-	siril_log_debug(_("Finished writing png in %.3f s\n"),
-        elapsed_since(&start));
-
 	/* Close the file */
 	fclose(p_png_file);
 	if (data) free(data);
