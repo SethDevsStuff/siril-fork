@@ -1898,8 +1898,167 @@ gchar *set_right_extension(const char *name) {
 	return filename;
 }
 
+int write_preview_to_fits(fits *f) {
+	int status = 0;
+	if (!f || !f->fptr) return 1;
+
+	const int MAX_SIZE = 512;
+	const int w = f->rx;
+	const int h = f->ry;
+	const int n_channels = (f->naxis >= 3 && f->naxes[2] >= 3) ? 3 : 1;
+	const gboolean is_color = (n_channels == 3);
+
+	if (w <= 0 || h <= 0) return 1;
+
+	// Calculate scale factor to target 512px max dimension
+        const float scale_x = (float)w / MAX_SIZE;
+        const float scale_y = (float)h / MAX_SIZE;
+        const float max_scale = (scale_x > scale_y) ? scale_x : scale_y;
+
+        // If max_scale is less than 1.0 (image is smaller than thumbnail size), step is 1
+        const int pixScale = (max_scale > 1.0f) ? (int)max_scale : 1;
+
+        const int Ws = ((w - 1) / pixScale) + 1;
+        const int Hs = ((h - 1) / pixScale) + 1;
+        size_t prev_size = (size_t)Ws * Hs;
+
+	if (Ws <= 0 || Hs <= 0) return 1;
+
+	float *preview_data = malloc(prev_size * n_channels * sizeof(float));
+	if (!preview_data) return 1;
+
+	/* Downsample image from memory (f->fpdata) */
+	for (int i = 0; i < Hs; i++) {
+		for (int j = 0; j < Ws; j++) {
+			int M = i * pixScale;
+			int N = j * pixScale;
+
+			for (int ch = 0; ch < n_channels; ch++) {
+				float sum = 0.f;
+				unsigned int count = 0;
+
+				// Safe-check bounds while averaging pixels
+				for (int l = 0; l < pixScale && (M + l) < h; l++) {
+					for (int k = 0; k < pixScale && (N + k) < w; k++) {
+						if (f->fpdata[ch]) {
+							int idx = (M + l) * w + (N + k);
+							sum += f->fpdata[ch][idx];
+							count++;
+						}
+					}
+				}
+
+				int preview_idx = ch * Ws * Hs + i * Ws + j;
+				preview_data[preview_idx] = (count > 0) ? sum / count : 0.0f;
+			}
+		}
+	}
+
+	/* Normalize and stretch the preview data using MTF */
+	float min_vals[3] = {FLT_MAX, FLT_MAX, FLT_MAX};
+	float max_vals[3] = {-FLT_MAX, -FLT_MAX, -FLT_MAX};
+
+	for (int ch = 0; ch < n_channels; ch++) {
+		for (size_t i = 0; i < prev_size; i++) {
+			int idx = ch * prev_size + i;
+			float val = preview_data[idx];
+			if (val < min_vals[ch]) min_vals[ch] = val;
+			if (val > max_vals[ch]) max_vals[ch] = val;
+		}
+	}
+
+	float maxmax = is_color ? fmaxf(fmaxf(max_vals[0], max_vals[1]), max_vals[2]) : max_vals[0];
+	float minmin = is_color ? fminf(fminf(min_vals[0], min_vals[1]), min_vals[2]) : min_vals[0];
+
+	if (maxmax < 10.f) maxmax = 1.f;
+	if (minmin > -1.f) minmin = 0.f;
+
+	float scale = 1.f;
+	if (f->bitpix == FLOAT_IMG) {
+		scale = (maxmax > 10.f) ? INV_USHRT_MAX_SINGLE : 1.f;
+	} else {
+		scale = (maxmax > minmin) ? (1.f / (maxmax - minmin)) : 1.f;
+	}
+
+	for (int idx = 0; idx < (int)(prev_size * n_channels); idx++) {
+		preview_data[idx] = (preview_data[idx] - minmin) * scale;
+	}
+
+	// Apply Siril MTF stretch
+	fits *tmp = NULL;
+	new_fit_image_with_data(&tmp, Ws, Hs, n_channels, DATA_FLOAT, preview_data);
+	struct mtf_params mtfp[3] = {
+		{ 0.f, 0.f, 0.f, TRUE, TRUE, TRUE },
+		{ 0.f, 0.f, 0.f, TRUE, TRUE, TRUE },
+		{ 0.f, 0.f, 0.f, TRUE, TRUE, TRUE }
+	};
+
+	find_unlinked_midtones_balance_default(tmp, mtfp);
+	apply_unlinked_mtf_to_fits(tmp, tmp, mtfp);
+
+	// Clean up tmp wrapper safely
+	tmp->fdata = NULL;
+	tmp->fpdata[0] = NULL;
+	tmp->fpdata[1] = NULL;
+	tmp->fpdata[2] = NULL;
+	clearfits(tmp);
+	free(tmp);
+
+	/* 3. Prepare 8-bit unsigned char buffer for FITS output */
+	guchar *fits_byte_data = malloc(prev_size * n_channels * sizeof(guchar));
+	if (!fits_byte_data) {
+		free(preview_data);
+		return 1;
+	}
+
+	for (int ch = 0; ch < n_channels; ch++) {
+		for (size_t i = 0; i < prev_size; i++) {
+			int idx = ch * prev_size + i;
+			float val = preview_data[idx] * 255.0f;
+			if (val < 0.0f) val = 0.0f;
+			if (val > 255.0f) val = 255.0f;
+			fits_byte_data[idx] = (guchar)roundf(val);
+		}
+	}
+
+	/* Append the PREVIEW HDU to the FITS file */
+	status = 0;
+	long preview_naxes[3] = { Ws, Hs, n_channels };
+	int preview_naxis = is_color ? 3 : 2;
+
+	// Create a new image extension (HDU)
+	if (fits_create_img(f->fptr, BYTE_IMG, preview_naxis, preview_naxes, &status)) {
+		report_fits_error(status);
+		free(preview_data);
+		free(fits_byte_data);
+		return 1;
+	}
+
+	// Set the extension name to "PREVIEW"
+	if (fits_write_key(f->fptr, TSTRING, "EXTNAME", "PREVIEW", "Preview image", &status)) {
+		report_fits_error(status);
+	}
+
+	// Write the 8-bit image pixels
+	if (fits_write_img(f->fptr, TBYTE, 1, prev_size * n_channels, fits_byte_data, &status)) {
+		report_fits_error(status);
+		free(preview_data);
+		free(fits_byte_data);
+		return 1;
+	}
+
+	free(preview_data);
+	free(fits_byte_data);
+	return 0;
+}
+
 /* creates, saves and closes the file associated to f, overwriting previous  */
 int savefits(const char *name, fits *f) {
+	return savefits_with_preview(name, f, FALSE);
+}
+
+/* creates, saves and closes the file associated to f, overwriting previous, with preview  */
+int savefits_with_preview(const char *name, fits *f, gboolean savepreview) {
 	int status;
 
 	f->naxes[0] = f->rx;
@@ -1944,6 +2103,13 @@ int savefits(const char *name, fits *f) {
 		f->fptr = NULL;
 		g_free(filename);
 		return 1;
+	}
+
+	if (savepreview) {
+		if (write_preview_to_fits(f)) {
+			siril_log_debug("Warning: Failed to write preview HDU\n");
+			// We don't abort saving the whole file if only the preview fails
+		}
 	}
 
 	if (com.pref.fits_save_icc && f->color_managed) {
@@ -2982,8 +3148,8 @@ guchar *extract_thumbnail_from_fits(const char *filename, gchar **descr,
 		return NULL;
 	}
 
+	/* Read Primary HDU info and build description immediately */
 	TRYFITS(fits_get_img_param, fp, 4, &dtype, &naxis, naxes);
-
 	const int w = naxes[0];
 	const int h = naxes[1];
 	const int n_channels = (naxis >= 3 && naxes[2] >= 3) ? 3 : 1;
@@ -2994,22 +3160,21 @@ guchar *extract_thumbnail_from_fits(const char *filename, gchar **descr,
 		return NULL;
 	}
 
-	// Read the FITS keywords and extract the filter string 
-	fits tmpfit = { 0 };
-	tmpfit.fptr = fp;
-	read_fits_keywords(&tmpfit);
+	// Read the FITS keywords and extract the filter string
+        fits tmpfit = { 0 };
+        tmpfit.fptr = fp;
+        read_fits_keywords(&tmpfit);
 
-	gchar *filter_str = NULL;
-	if (tmpfit.keywords.filter[0] != '\0') {
-		gchar *currfilter = g_strstrip(g_strdup(tmpfit.keywords.filter));
-		if (currfilter && *currfilter) {
-			filter_str = g_strdup_printf("\n%s: %s", _("Filter"), currfilter);
-		}
-		g_free(currfilter);
-	}
-	clearfits(&tmpfit);
+        gchar *filter_str = NULL;
+        if (tmpfit.keywords.filter[0] != '\0') {
+                gchar *currfilter = g_strstrip(g_strdup(tmpfit.keywords.filter));
+                if (currfilter && *currfilter) {
+                        filter_str = g_strdup_printf("\n%s: %s", _("Filter"), currfilter);
+                }
+                g_free(currfilter);
+        }
+        clearfits(&tmpfit);
 
-	/* Build description from header data — always available regardless of image size */
 	if (fitseq_is_fitseq(filename, &frames)) {
 		description = g_strdup_printf("%d x %d %s\n%d %s (%d bits)\n%d %s%s", w,
 				h, ngettext("pixel", "pixels", h), n_channels,
@@ -3024,6 +3189,113 @@ guchar *extract_thumbnail_from_fits(const char *filename, gchar **descr,
 	}
 	g_free(filter_str);
 	*descr = description;
+
+	// Do we have an embedded preview?
+	status = 0;
+	if (fits_movnam_hdu(fp, IMAGE_HDU, "PREVIEW", 0, &status) == 0) {
+		status = 0;
+		if (fits_get_img_param(fp, 4, &dtype, &naxis, naxes, &status) == 0) {
+			const int pw = naxes[0];
+			const int ph = naxes[1];
+			const int pn_channels = (naxis >= 3 && naxes[2] >= 3) ? 3 : 1;
+			const gboolean pis_color = (pn_channels == 3);
+
+			if (pw > 0 && ph > 0) {
+				size_t prev_sz = (size_t)pw * ph * pn_channels;
+				guchar *raw_preview = malloc(prev_sz * sizeof(guchar));
+				guchar null_byte = 0;
+
+				status = 0;
+				if (fits_read_img(fp, TBYTE, 1, prev_sz, &null_byte, raw_preview, &stat, &status) == 0) {
+					// Determine scaling if the preview HDU exceeds requested MAX_SIZE
+					const float rx = (float)pw / MAX_SIZE;
+					const float ry = (float)ph / MAX_SIZE;
+					const int max_scale = (rx > ry) ? rx : ry;
+					const int pixScale = (max_scale > 1.0f) ? (int)max_scale : 1;
+
+					int final_w = ((pw - 1) / pixScale) + 1;
+					int final_h = ((ph - 1) / pixScale) + 1;
+					guchar *pixbuf_data = NULL;
+
+					if (pixScale > 1) {
+						// Downscale the pre-stretched preview to match MAX_SIZE
+						final_w = pw / pixScale;
+						final_h = ph / pixScale;
+						size_t final_sz = (size_t)final_w * final_h;
+						pixbuf_data = malloc(3 * final_sz * sizeof(guchar));
+
+						if (pixbuf_data) {
+							for (int i = 0; i < final_h; i++) {
+								for (int j = 0; j < final_w; j++) {
+									int M = i * pixScale;
+									int N = j * pixScale;
+									int dest_idx = ((final_h - 1 - i) * final_w + j) * 3;
+
+									int r_sum = 0, g_sum = 0, b_sum = 0;
+									int count = 0;
+
+									for (int l = 0; l < pixScale && (M + l) < ph; l++) {
+										for (int k = 0; k < pixScale && (N + k) < pw; k++) {
+											int src_pixel_offset = (M + l) * pw + (N + k);
+											if (pis_color) {
+												r_sum += raw_preview[src_pixel_offset];
+												g_sum += raw_preview[prev_sz / 3 + src_pixel_offset];
+												b_sum += raw_preview[(2 * prev_sz) / 3 + src_pixel_offset];
+											} else {
+												r_sum += raw_preview[src_pixel_offset];
+											}
+											count++;
+										}
+									}
+
+									if (count > 0) {
+										pixbuf_data[dest_idx]     = (guchar)(r_sum / count);
+										pixbuf_data[dest_idx + 1] = (guchar)(pis_color ? (g_sum / count) : (r_sum / count));
+										pixbuf_data[dest_idx + 2] = (guchar)(pis_color ? (b_sum / count) : (r_sum / count));
+									}
+								}
+							}
+						}
+						free(raw_preview);
+					} else {
+						//Preview is already the right size, just repack to interleaved RGB layout
+						pixbuf_data = malloc(3 * prev_sz * sizeof(guchar));
+						if (pixbuf_data) {
+							for (int i = 0; i < ph; i++) {
+								for (int j = 0; j < pw; j++) {
+									int src_idx = i * pw + j;
+									int dest_idx = ((ph - 1 - i) * pw + j) * 3;
+
+									if (pis_color) {
+										pixbuf_data[dest_idx]     = raw_preview[src_idx];
+										pixbuf_data[dest_idx + 1] = raw_preview[pw * ph + src_idx];
+										pixbuf_data[dest_idx + 2] = raw_preview[2 * pw * ph + src_idx];
+									} else {
+										guchar gray = raw_preview[src_idx];
+										pixbuf_data[dest_idx]     = gray;
+										pixbuf_data[dest_idx + 1] = gray;
+										pixbuf_data[dest_idx + 2] = gray;
+									}
+								}
+							}
+						}
+						free(raw_preview);
+					}
+
+					if (pixbuf_data) {
+						if (width_out) *width_out = final_w;
+        					if (height_out) *height_out = final_h;
+						siril_log_message(_("Preview loaded from HDU\n"));
+						return pixbuf_data;
+					}
+				} else {
+					free(raw_preview);
+				}
+			}
+		}
+	}
+
+	// We didn't have a preview so continue to create one using the primary HDU
 
 	// Dimensions calibrated exactly to match CFITSIO striding
 	const float scale_x = (float)w / MAX_SIZE;

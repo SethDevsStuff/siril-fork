@@ -542,7 +542,7 @@ static gpointer mini_save_dialog(gpointer p) {
 				gfit->keywords.lo = 0;
 			}
 			gfit->checksum = args->checksum;
-			args->retval = savefits(args->filename, gfit);
+			args->retval = savefits_with_preview(args->filename, gfit, TRUE);
 			if (!args->retval && single_image_is_loaded()) {
 				/* Use the same extension logic as savefits() so the tracked
 				 * filename always matches the file actually written on disk. */
@@ -982,7 +982,7 @@ void on_header_snapshot_button_clicked(gboolean clipboard) {
 
 void on_header_save_button_clicked() {
 	if (single_image_is_loaded() && com.uniq->fileexist) {
-		savefits(com.uniq->filename, gfit);
+		savefits_with_preview(com.uniq->filename, gfit, TRUE);
 	}
 }
 
