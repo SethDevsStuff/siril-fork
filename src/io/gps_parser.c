@@ -365,7 +365,7 @@ static gboolean readout_is_by_row_pairs(struct gps_rs_data *data) {	// = non-2CM
 
 /* we currently only compute the timestamp for the row, the change in time for a pixel in column is much
  * less than 1 ms and the meaning of pixel_period is unclear
- * Y is in display coordinates
+ * Y is in display coordinates, X is not currently used because it's usually not significant
  */
 GDateTime *get_timestamp_for_pixel(struct gps_rs_data *data, enum timestamp_type type, int x, int y) {
 	if (!data) return NULL;
