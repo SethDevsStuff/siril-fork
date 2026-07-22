@@ -11901,7 +11901,7 @@ static int stack_one_seq(struct stacking_configuration *arg) {
 			retval = CMD_GENERIC_ERROR;
 		}
 		g_free(dirname);
-		if (savefits(arg->result_file, &args.result)) {
+		if (savefits_with_preview(arg->result_file, &args.result, TRUE)) {
 			siril_log_error(_("Could not save the stacking result %s\n"), arg->result_file);
 			retval = CMD_GENERIC_ERROR;
 		}
