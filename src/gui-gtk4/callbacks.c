@@ -57,6 +57,7 @@ void update_export_crop_label();
 #include "io/annotation_catalogues.h"
 #include "io/films.h"
 #include "io/image_format_fits.h"
+#include "io/image_format_flis.h"
 #include "io/sequence.h"
 #include "io/single_image.h"
 #include "io/siril_git.h"
@@ -308,8 +309,19 @@ int populate_roi() {
 		return 1;
 	if (gui.roi.selection.w == 0 || gui.roi.selection.h == 0)
 		return 1;
+	/* gui.roi.selection is DISPLAY-space; gfit is the active layer.
+	 * Translate and CLIP to the layer (see the coordinate model in
+	 * image_format_flis.h): a selection partially overlapping a sparse
+	 * layer yields an ROI covering the overlapping part.
+	 * copy_roi_into_gfit derives the same clipped rect from the same
+	 * inputs, so the pair stays consistent. */
+	rectangle lsel;
+	if (!flis_display_to_active_layer_rect(&gui.roi.selection, &lsel, TRUE)) {
+		siril_log_debug("populate_roi: selection does not intersect the active layer, skipping\n");
+		return 1;
+	}
 	int retval = 0;
-	size_t npixels_roi = gui.roi.selection.w * gui.roi.selection.h;
+	size_t npixels_roi = lsel.w * lsel.h;
 	size_t npixels_gfit = gfit->rx * gfit->ry;
 	size_t nchans = gfit->naxes[2];
 	g_assert(nchans == 1 || nchans == 3);
@@ -318,8 +330,8 @@ int populate_roi() {
 	clearfits(&gui.roi.fit);
 	copyfits(gfit, &gui.roi.fit, CP_FORMAT, -1);
 
-	gui.roi.fit.rx = gui.roi.fit.naxes[0] = gui.roi.selection.w;
-	gui.roi.fit.ry = gui.roi.fit.naxes[1] = gui.roi.selection.h;
+	gui.roi.fit.rx = gui.roi.fit.naxes[0] = lsel.w;
+	gui.roi.fit.ry = gui.roi.fit.naxes[1] = lsel.h;
 	gui.roi.fit.naxes[2] = nchans;
 	gui.roi.fit.naxis = (nchans == 1 ? 2 : 3);
 
@@ -334,19 +346,19 @@ int populate_roi() {
 		gui.roi.fit.fpdata[2] = rgb ? gui.roi.fit.fdata + 2 * npixels_roi : gui.roi.fit.fdata;
 
 		for (uint32_t c = 0; c < nchans; c++) {
-			for (uint32_t y = 0; y < gui.roi.selection.h; y++) {
+			for (uint32_t y = 0; y < lsel.h; y++) {
 				float *srcindex =
 					gfit->fdata +
 					(npixels_gfit * c) +
-					((gfit->ry - y - (gui.roi.selection.y + 1)) * gfit->rx) +
-					gui.roi.selection.x;
+					((gfit->ry - y - (lsel.y + 1)) * gfit->rx) +
+					lsel.x;
 
 				float *destindex =
 					gui.roi.fit.fdata +
 					(npixels_roi * c) +
 					(gui.roi.fit.rx * y);
 
-				memcpy(destindex, srcindex, gui.roi.selection.w * sizeof(float));
+				memcpy(destindex, srcindex, lsel.w * sizeof(float));
 			}
 		}
 	} else {
@@ -359,19 +371,19 @@ int populate_roi() {
 		gui.roi.fit.pdata[2] = rgb ? gui.roi.fit.data + 2 * npixels_roi : gui.roi.fit.data;
 
 		for (uint32_t c = 0; c < nchans; c++) {
-			for (uint32_t y = 0; y < gui.roi.selection.h; y++) {
+			for (uint32_t y = 0; y < lsel.h; y++) {
 				WORD *srcindex =
 					gfit->data +
 					(npixels_gfit * c) +
-					((gfit->ry - y - (gui.roi.selection.y + 1)) * gfit->rx) +
-					gui.roi.selection.x;
+					((gfit->ry - y - (lsel.y + 1)) * gfit->rx) +
+					lsel.x;
 
 				WORD *destindex =
 					gui.roi.fit.data +
 					(npixels_roi * c) +
 					(y * gui.roi.fit.rx);
 
-				memcpy(destindex, srcindex, gui.roi.selection.w * sizeof(WORD));
+				memcpy(destindex, srcindex, lsel.w * sizeof(WORD));
 			}
 		}
 	}
@@ -381,7 +393,7 @@ int populate_roi() {
 	gui.roi.fit.mask = NULL;
 
 	if (gfit->mask && gfit->mask->data) {
-		size_t n = gui.roi.selection.w * gui.roi.selection.h;
+		size_t n = lsel.w * lsel.h;
 		size_t src_w = gfit->rx;
 		size_t src_h = gfit->ry;
 
@@ -413,17 +425,17 @@ int populate_roi() {
 		}
 
 		/* Copy mask ROI with same flip logic as image */
-		for (uint32_t y = 0; y < gui.roi.selection.h; y++) {
-			size_t src_y = src_h - y - (gui.roi.selection.y + 1);
-			size_t src_x = gui.roi.selection.x;
+		for (uint32_t y = 0; y < lsel.h; y++) {
+			size_t src_y = src_h - y - (lsel.y + 1);
+			size_t src_x = lsel.x;
 
 			void *src = (uint8_t*)gfit->mask->data +
 						(src_y * src_w + src_x) * elem_size;
 
 			void *dst = (uint8_t*)gui.roi.fit.mask->data +
-						(y * gui.roi.selection.w) * elem_size;
+						(y * lsel.w) * elem_size;
 
-			memcpy(dst, src, gui.roi.selection.w * elem_size);
+			memcpy(dst, src, lsel.w * elem_size);
 		}
 
 		gui.roi.fit.mask_active = gfit->mask_active;
@@ -687,7 +699,7 @@ void on_display_item_toggled(GtkCheckButton *checkmenuitem, gpointer user_data) 
 	GtkApplicationWindow *app_win = GTK_APPLICATION_WINDOW(lookup_widget("control_window"));
 	siril_window_autostretch_actions(app_win, gui.rendering_mode == STF_DISPLAY, gfit->naxes[2] == 3);
 
-	com.gui_icc.same_primaries = same_primaries(gfit->icc_profile, com.gui_icc.monitor, com.gui_icc.soft_proof ? com.gui_icc.soft_proof : NULL);
+	com.gui_icc.same_primaries = same_primaries(current_icc_profile(), com.gui_icc.monitor, com.gui_icc.soft_proof ? com.gui_icc.soft_proof : NULL);
 
 	if (single_image_is_loaded() || sequence_is_loaded()) {
 		if (processing_is_job_active()) {
@@ -1482,7 +1494,7 @@ void display_filename() {
 	if (single_image_is_loaded() && com.uniq->filename && com.uniq->filename[0] != '\0') {	// unique image
 		filename = com.uniq->filename;
 		orig_filename = g_file_read_link(filename, &error);
-		nb_layers = com.uniq->nb_layers;
+		nb_layers = com.uniq->chans;
 	} else if (sequence_is_loaded()) {	// sequence
 		filename = malloc(256);
 		strcpy(filename, " ");
@@ -1799,6 +1811,14 @@ gboolean show_or_hide_mask_tab_idle(gpointer p) {
 		return FALSE;
 	gboolean has_mask = (gfit->mask != NULL);
 	g_rw_lock_reader_unlock(&gfit->rwlock);
+	/* FLIS: the tab can also display the active layer's layer mask (the
+	 * mask-view radios switch between the two sources), so it must show
+	 * when either exists — checking only gfit->mask kept the tab hidden
+	 * after routing a freshly created mask to a layer's lmask. */
+	if (!has_mask && is_current_image_flis()) {
+		flis_layer_t *act = flis_active_layer();
+		has_mask = (act && act->lmask && act->lmask->data);
+	}
 	GtkNotebook* Color_Layers = GTK_NOTEBOOK(lookup_widget("notebook1"));
 	GtkWidget *page = gtk_notebook_get_nth_page(Color_Layers, MASK_VPORT);
 	if (has_mask) {
@@ -1818,17 +1838,26 @@ gboolean close_tab(gpointer user_data) {
 	GtkNotebook* Color_Layers = GTK_NOTEBOOK(lookup_widget("notebook1"));
 	GtkWidget* page;
 
-	/* When a single image is loaded (incl. the stacking result), the
-	 * displayed image is gfit, which may have a different channel count
+	/* FLIS: a mono base layer (gfit->naxes[2] == 1) does NOT mean the
+	 * displayed image is mono — the composite is chromatic if any layer
+	 * is RGB or any mono layer carries a non-greyscale LAYER_COLOR tint
+	 * (e.g. a 1-mono-base + 3-tinted-mono SHO stack).  Consult the layer
+	 * stack instead of the active layer for FLIS images.
+	 *
+	 * Plain FITS: when a single image is loaded (incl. the stacking result),
+	 * the displayed image is gfit, which may have a different channel count
 	 * than com.seq — Bayer-drizzle/multipoint in particular produces a
 	 * 3-channel result from a mono Bayer SER sequence. Otherwise (sequence
 	 * load before gfit is updated to a frame), com.seq.nb_layers is the
 	 * authoritative count. Keying off com.seq.nb_layers here would force the
 	 * mono viewport for an RGB result whose source sequence is mono. */
-	const int displayed_layers = single_image_is_loaded()
-		? (int) gfit->naxes[2]
-		: com.seq.nb_layers;
-	if (displayed_layers == 1) {
+	gboolean is_mono = is_current_image_flis()
+	    ? !flis_composite_is_chromatic()
+	    : (single_image_is_loaded()
+	        ? (int) gfit->naxes[2] == 1
+	        : com.seq.nb_layers == 1);
+
+	if (is_mono) {
 		/* Leave the colour pages BEFORE hiding them: hiding the current page
 		 * makes GtkNotebook pick an adjacent visible page itself, which can
 		 * transiently land on another colour viewport — its switch-page
@@ -1867,7 +1896,15 @@ void activate_tab(int vport) {
 }
 
 gboolean init_right_tab(gpointer user_data) {
-	activate_tab(isrgb(gfit) ? RGB_VPORT : RED_VPORT);
+	/* FLIS: gfit is the active layer, which may be mono even when the
+	 * composite is chromatic (e.g. a mono-base FLIS with a tinted mono
+	 * narrowband layer on top).  Read the composite's chromaticity from
+	 * the layer stack so the user gets RGB viewports for anything that
+	 * displays in colour. */
+	gboolean rgb = is_current_image_flis()
+	    ? flis_composite_is_chromatic()
+	    : isrgb(gfit);
+	activate_tab(rgb ? RGB_VPORT : RED_VPORT);
 	return FALSE;
 }
 
@@ -2083,6 +2120,7 @@ static void load_accels() {
 		"win.mirrory-processing",     "<Primary>Down", NULL,
 
 		"win.regframe",               "<Primary>r", NULL,
+		"win.show-layers",            "<Primary>l", NULL,
 
 		NULL /* Terminating NULL */
 	};
@@ -2168,17 +2206,52 @@ gboolean set_GUI_CWD(gpointer user_data) {
 		return FALSE;
 	/* GTK4: gtk_header_bar_set_title / set_subtitle were removed.  The
 	 * replacement is set_title_widget with a custom GtkLabel containing
-	 * markup for the two lines (title + dimmed subtitle). */
+	 * markup for the two lines (title + dimmed subtitle).
+	 *
+	 * For a FLIS image the subtitle becomes "name.flis — layer 'X' [n/N]"
+	 * so the active layer and stack position are visible at a glance.
+	 * For sequence / plain-FITS / no-image we keep the working directory. */
 	GtkHeaderBar *bar = GTK_HEADER_BAR(lookup_widget("headerbar"));
-	gchar *truncated_wd = siril_truncate_str(com.wd, 50);
+	gchar *subtitle = NULL;
+	if (single_image_is_loaded() && is_current_image_flis() && com.uniq) {
+		guint n_layers = g_slist_length(com.uniq->layers);
+		flis_layer_t *active = flis_active_layer();
+		const gchar *basename = NULL;
+		gchar *bn = NULL;
+		if (com.uniq->filename && *com.uniq->filename) {
+			bn = g_path_get_basename(com.uniq->filename);
+			basename = bn;
+		} else {
+			basename = _("(untitled FLIS)");
+		}
+		if (active && n_layers > 0) {
+			/* §7: canvas is a first-class document property; surface its
+			 * dimensions alongside the active-layer indicator so users
+			 * can tell at a glance whether the canvas matches a given
+			 * layer's pixel dims. */
+			subtitle = g_strdup_printf(
+				/* Translators: header-bar subtitle for a layered image:
+				 * filename — canvas WxH — layer 'name' [index/count] */
+				_("%s — canvas %ux%u — layer '%s' [%d/%u]"),
+				basename,
+				flis_canvas_rx(), flis_canvas_ry(),
+				active->layer_name ? active->layer_name : "?",
+				com.uniq->active_layer + 1, n_layers);
+		} else {
+			subtitle = g_strdup_printf("%s — FLIS", basename);
+		}
+		g_free(bn);
+	}
+	if (!subtitle)
+		subtitle = siril_truncate_str(com.wd, 50);
 	gchar *markup = g_markup_printf_escaped(
-		"<b>Siril-%s</b>\n<small>%s</small>", VERSION, truncated_wd);
+		"<b>Siril-%s</b>\n<small>%s</small>", VERSION, subtitle);
 	GtkWidget *title = gtk_label_new(NULL);
 	gtk_label_set_markup(GTK_LABEL(title), markup);
 	gtk_label_set_justify(GTK_LABEL(title), GTK_JUSTIFY_CENTER);
 	gtk_header_bar_set_title_widget(bar, title);
 	g_free(markup);
-	g_free(truncated_wd);
+	g_free(subtitle);
 	return FALSE;
 }
 
@@ -3074,7 +3147,7 @@ void on_checkcut_toggled(GtkCheckButton *togglebutton, gpointer user_data) {
 }
 /* gamut check was toggled. */
 void on_gamutcheck_toggled(GtkCheckButton *togglebutton, gpointer user_data) {
-	if (gfit->color_managed) {
+	if (current_image_color_managed()) {
 		lock_display_transform();
 		if (com.gui_icc.proofing_transform)
 			cmsDeleteTransform(com.gui_icc.proofing_transform);

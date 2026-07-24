@@ -36,6 +36,7 @@
 #include "io/conversion.h"
 #include "io/sequence.h"
 #include "io/image_format_fits.h"
+#include "io/image_format_flis.h"
 #include "io/single_image.h"
 #include "core/undo.h"
 #include "core/processing.h"
@@ -78,10 +79,6 @@ void close_single_image() {
 /* frees resources when changing sequence or closing a single image */
 void free_image_data() {
 	siril_log_debug("free_image_data() called, clearing loaded image\n");
-	/* WARNING: single_image.fit references the actual fits image,
-	 * shouldn't it be used here instead of gfit? */
-	cmsCloseProfile(gfit->icc_profile);
-	gfit->icc_profile = NULL;
 	reset_icc_transforms();
 	if (!single_image_is_loaded() && sequence_is_loaded())
 		save_stats_from_fit(gfit, &com.seq, com.seq.current);
@@ -89,6 +86,45 @@ void free_image_data() {
 	gui_iface.invalidate_histogram();
 
 	if (com.uniq) {
+		/* Release the authoritative ICC profile. */
+		if (com.uniq->icc_profile) {
+			cmsCloseProfile(com.uniq->icc_profile);
+			com.uniq->icc_profile = NULL;
+		}
+		com.uniq->color_managed = FALSE;
+		/* FLIS cleanup (stage 3.1): release the display-side composite
+		 * cache and the in-memory layer stack before freeing the single
+		 * struct.  Order matters — see below for the gfit detach dance. */
+		gui_iface.flis_composite_free();
+		if (com.uniq->layers) {
+			/* gfit points at the active layer's fits (set by
+			 * uniq_set_active_layer at load time).  flis_free_layers
+			 * would free that fits along with all the others, leaving
+			 * gfit dangling — the subsequent clearfits(gfit) at the
+			 * bottom of this function then crashes inside wcsfree on
+			 * the freed memory.
+			 *
+			 * The safe sequence:
+			 *   1. Capture the active layer's fits pointer.
+			 *   2. NULL out layer->fit so flis_layer_free skips it.
+			 *   3. flis_free_layers cleans up every other layer.
+			 *   4. Free the captured active-layer fits ourselves
+			 *      (clearfits + free, same as flis_layer_free does).
+			 *   5. Allocate a fresh empty fits for gfit so the
+			 *      trailing clearfits(gfit) and the next
+			 *      read_single_image both have a valid struct. */
+			flis_layer_t *active = flis_active_layer();
+			fits *active_fit = (active && active->fit == gfit) ? active->fit : NULL;
+			if (active_fit) active->fit = NULL;
+			flis_free_layers(com.uniq);
+			if (com.uniq->groups) flis_free_groups(com.uniq);
+			if (active_fit) {
+				clearfits(active_fit);
+				free(active_fit);
+			}
+			gfit = calloc(1, sizeof(fits));
+			if (!gfit) PRINT_ALLOC_ERR;
+		}
 		free(com.uniq->filename);
 		com.uniq->fileexist = FALSE;
 		free(com.uniq->comment);
@@ -99,8 +135,12 @@ void free_image_data() {
 	 * need to be handled in the GTK+ main thread, so we use an idle function
 	 * to deal with them */
 
-	if (!com.headless)
+	if (!com.headless) {
 		gui_iface.on_image_closed();
+		/* Refresh the layers panel and the header bar title (set_GUI_CWD via
+		 * the flis_gui idle), so closing a FLIS clears both. */
+		gui_iface.flis_gui_update();
+	}
 	clearfits(gfit);
 	siril_log_debug("free_image_data() complete\n");
 }
@@ -187,6 +227,19 @@ gboolean end_open_single_image(gpointer arg) {
 
 /* filename will be freed when the unique file is closed */
 int create_uniq_from_gfit(char *filename, gboolean exists) {
+	/* If com.uniq is already populated as a FLIS (load_flis ran during
+	 * read_single_image via the readfits FLIS dispatch), preserve the
+	 * layer/group state and only fill in filename + fileexist.  Without
+	 * this guard the calloc-fresh-single below would silently drop the
+	 * just-loaded layer stack and is_current_image_flis() would return
+	 * FALSE on a freshly-opened FLIS file. */
+	if (com.uniq && com.uniq->layers) {
+		g_free(com.uniq->filename);
+		com.uniq->filename = filename;
+		com.uniq->fileexist = exists;
+		/* chans / fit / icc state already set by load_flis */
+		return 0;
+	}
 	com.uniq = calloc(1, sizeof(single));
 	if (!com.uniq) {
 		PRINT_ALLOC_ERR;
@@ -194,8 +247,13 @@ int create_uniq_from_gfit(char *filename, gboolean exists) {
 	}
 	com.uniq->filename = filename;
 	com.uniq->fileexist = exists;
-	com.uniq->nb_layers = gfit->naxes[2];
+	com.uniq->chans = gfit->naxes[2];
 	com.uniq->fit = gfit;
+	/* Promote any ICC profile that the loader read from the file.  The
+	 * loader stages profiles via current_image_set_icc_profile, which
+	 * routes to the staging area when com.uniq is NULL (i.e. during
+	 * load, before this function runs). */
+	install_staged_icc_profile();
 	return 0;
 }
 
@@ -212,6 +270,11 @@ int open_single_image_internal(const char* filename) {
 	/* first, close everything */
 	close_sequence(FALSE);	// closing a sequence if loaded
 	close_single_image();	// close the previous image and free resources
+
+	/* Drop any profile a previous load (e.g. a sequence-frame display)
+	 * left in the ICC staging area, so it cannot be installed onto this
+	 * image if the file about to be read carries no profile. */
+	stage_icc_profile_for_pending_image(NULL, FALSE);
 
 	/* open the new file */
 	retval = read_single_image(filename, gfit, &realname, TRUE, &is_single_sequence, TRUE, FALSE, FALSE);
@@ -290,6 +353,21 @@ gboolean single_image_path_is_sequence(const char *filename) {
 	return is_seq;
 }
 
+/* TRUE if `filename` is a FLIS file.  Like sequences, FLIS files must be routed
+ * through the synchronous (main-thread) open path: the FLIS layer stack is
+ * loaded into gfit/com.uniq by load_flis (dispatched from readfits only when
+ * the destination fits IS gfit), which the threaded worker's decode into a
+ * private fits bypasses — producing a flat thumbnail with no layers. */
+gboolean single_image_path_is_flis(const char *filename) {
+	image_type imagetype;
+	char *realname = NULL;
+	if (stat_file(filename, &imagetype, &realname))
+		return FALSE;	/* not found / unsupported: let the real open report it */
+	gboolean is_flis = (imagetype == TYPEFITS && is_flis_file(realname));
+	free(realname);
+	return is_flis;
+}
+
 /* Worker half: decode `filename` into a freshly allocated fits WITHOUT touching
  * gfit, so the displayed image stays valid and readable by the GUI and the
  * lazy-tile pool for the whole decode.  Returns the new fits (installed by
@@ -304,11 +382,20 @@ fits *read_new_single_image(const char *filename, char **realname_out, int *retv
 		return NULL;
 	}
 	gboolean is_seq = FALSE;
+	/* Register newfit as the ICC destination for this load (also drops any
+	 * stale staged profile): loaders route its embedded profile into the
+	 * staging area, from where install_new_single_image() →
+	 * create_uniq_from_gfit() installs it onto the new com.uniq.  The old
+	 * image's com.uniq is still live here and must not be touched. */
+	icc_profile_set_pending_fit(newfit);
 	int rv = read_single_image(filename, newfit, realname_out, FALSE, &is_seq,
 			TRUE, FALSE, FALSE);
+	icc_profile_set_pending_fit(NULL);
 	if (retval)
 		*retval = rv;
 	if (rv) {
+		/* Failed load: nothing will consume the staging — drop it. */
+		stage_icc_profile_for_pending_image(NULL, FALSE);
 		clearfits(newfit);
 		free(newfit);
 		return NULL;
@@ -401,6 +488,17 @@ gboolean open_single_image_from_gfit(gpointer user_data) {
 	gui_iface.remap_all_vports();
 	gui_iface.update_histogram();
 	gui_iface.redraw_image(REDRAW_ALL);
+	/* Tell the layers panel to refresh.  Unconditional so opening a
+	 * non-FLIS file also clears the previously-shown layers (panel
+	 * survives across image switches per §4.1).  flis_gui_update
+	 * schedules an idle that's a no-op if the panel isn't visible,
+	 * so this is cheap when the user hasn't opened the panel. */
+	gui_iface.flis_gui_update();
+	/* If the loaded file is a FLIS, present the panel automatically so
+	 * the user sees their layer stack without having to fish for the
+	 * Tools menu / Ctrl+L shortcut.  No-op for plain FITS / sequences
+	 * (the helper checks is_current_image_flis itself). */
+	gui_iface.flis_gui_present_if_flis();
 	return FALSE;
 }
 
@@ -481,7 +579,7 @@ void init_layers_hi_and_lo_values(sliders_mode force_minmax) {
 }
 
 int single_image_is_loaded() {
-	return (com.uniq != NULL && com.uniq->nb_layers > 0);
+	return (com.uniq != NULL && com.uniq->chans > 0);
 }
 
 /**************** updating the single image *******************/
@@ -550,6 +648,18 @@ void notify_gfit_data_modified() {
 	if (com.quitting)
 		return;
 	invalidate_stats_from_fit(gfit);
+	/* FLIS: the modification just happened on gfit (= the active layer's
+	 * pixels).  Both the §3.1 CPU composite cache and the §3.2 per-layer
+	 * GPU texture cache hold the previous version of that layer — drop
+	 * them so the next redraw sees the new pixels.  Coarse: this also
+	 * invalidates the other layers' GPU textures, which haven't changed,
+	 * but the rebuild cost is bounded and avoids needing per-layer
+	 * pixel-version tracking.  (Per-layer-only invalidation is §3.4
+	 * territory once the granular flis_display_invalidate API arrives.) */
+	if (is_current_image_flis()) {
+		gui_iface.flis_invalidate_composite();
+		gui_iface.flis_gui_update();   /* layers panel sees new stack */
+	}
 	// The following are only required in GUI mode
 	if (!com.headless) {
 		/* Hold histogram_mutex across the invalidate+recompute pair so the
@@ -585,14 +695,69 @@ void notify_gfit_data_modified() {
 				((gfit->type == DATA_FLOAT && roi_fit->fdata) ||
 				 (gfit->type == DATA_USHORT && roi_fit->data)))
 			gui_iface.copy_roi_into_gfit();
+
+		/* For FLIS the histogram dialog should show the composite's
+		 * distribution, not the active layer in isolation — swap
+		 * gfit to the composite for compute_histo_for_fit only. */
+		fits *flis_saved = gui_iface.flis_swap_in_composite();
 		gui_iface.compute_histo_for_fit(gfit); // reads gfit pixel data; GTK toggle update deferred to idle
 		g_mutex_unlock(&com.histogram_mutex);
-		/* Update hi/lo display range BEFORE remapping so the first rendered frame
-		 * of a new image uses the correct stretch (not stale values from the
-		 * previously displayed image).  In USER slider mode this is a no-op, so
-		 * manually-set slider values are preserved. */
+
+		/* Update hi/lo display range BEFORE remapping so the first
+		 * rendered frame of a new image uses the correct stretch (not
+		 * stale values from the previously displayed image).  Mode-
+		 * dependent: gfit must point at the right fits so init reads
+		 * the values that actually represent what's on screen.
+		 *
+		 *   USER     → no-op (init returns early); manual values kept.
+		 *   MIPSLOHI → swap-out first.  init reads gfit->keywords.hi/lo,
+		 *              which only the active-layer fits carries — the
+		 *              composite is a transient build with no keywords.
+		 *              Skip the call entirely when keywords.hi == 0
+		 *              (common for FLIS layers added from stacker
+		 *              output without MIPS-HI), otherwise init's
+		 *              fallback would silently flip gui.sliders to
+		 *              MINMAX and leave the display "too dark".
+		 *   MINMAX   → keep the composite in.  init runs
+		 *              image_find_minmax(gfit), and what's actually
+		 *              displayed is the COMPOSITE — so the LUT range
+		 *              must match the composite's min/max, not the
+		 *              active layer's.  Running init against the
+		 *              active layer (the pre-fix behaviour) made the
+		 *              LUT track a different image than the one on
+		 *              screen, producing "too dark" / "too bright"
+		 *              wherever the composite range differed from the
+		 *              active layer's.
+		 *
+		 * After init returns we always swap out (so subsequent code
+		 * sees gfit = active layer, the rest of the function and its
+		 * callers' invariant). */
 		g_mutex_lock(&com.mutex);
-		init_layers_hi_and_lo_values((sliders_mode)gui_iface.get_sliders_mode());
+		sliders_mode sm = (sliders_mode)gui_iface.get_sliders_mode();
+		if (sm == USER) {
+			/* USER mode: nothing to do.  Keep gfit on the composite
+			 * shortly until swap-out below; remap_all_vports below
+			 * will run against the active layer either way (the
+			 * remap path sources its own swap). */
+		} else if (sm == MIPSLOHI) {
+			gui_iface.flis_swap_out_composite(flis_saved);
+			flis_saved = NULL;
+			/* The hi == 0 skip is FLIS-only (see the comment above);
+			 * ordinary images keep the historical behaviour where init
+			 * falls back to MINMAX for files without MIPS-HI — skipping
+			 * for them left the display range stale after operations on
+			 * e.g. TIFF/PNG-sourced images. */
+			if (!is_current_image_flis() || gfit->keywords.hi != 0)
+				init_layers_hi_and_lo_values(sm);
+		} else /* MINMAX */ {
+			/* gfit is still the composite here — exactly what we want
+			 * for image_find_minmax to compute the LUT against. */
+			init_layers_hi_and_lo_values(sm);
+		}
+		if (flis_saved) {
+			gui_iface.flis_swap_out_composite(flis_saved);
+			flis_saved = NULL;
+		}
 		g_mutex_unlock(&com.mutex);
 		gui_iface.remap_all_vports(); // Updates the Cairo image buffers based on applying the remap LUT to gfit
 	}

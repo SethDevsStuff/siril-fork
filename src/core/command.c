@@ -62,6 +62,7 @@
 #include "io/Astro-TIFF.h"
 #include "io/conversion.h"
 #include "io/image_format_fits.h"
+#include "io/image_format_flis.h"
 #include "io/path_parse.h"
 #include "io/sequence.h"
 #include "io/single_image.h"
@@ -116,6 +117,7 @@
 #include "stacking/stacking.h"
 #include "stacking/sum.h"
 #include "registration/registration.h"
+#include "registration/flis_register.h"
 #include "registration/mpp.h"
 #include "registration/mpp/mpp_ap.h"
 #include "registration/mpp/mpp_config.h"
@@ -412,22 +414,46 @@ int process_save(int nb){
 		retval = CMD_GENERIC_ERROR;
 	} else {
 		gui_iface.set_busy(TRUE);
-		retval = savefits(savename, gfit) ? CMD_GENERIC_ERROR : CMD_OK;
+		/* Data-driven save dispatch (matches the GUI save / save-as paths):
+		 * format follows the loaded image's state, not the filename
+		 * extension.  Headless / scripted runs cannot show the multi-layer
+		 * flatten-vs-preserve dialog, so the safe default is always to
+		 * preserve layers — a script that wants to flatten should invoke
+		 * `flis_flatten` first. */
+		if (is_current_image_flis()) {
+			/* Append the .flis extension when none was given, mirroring
+			 * the plain-FITS branch below — `save result` should
+			 * produce result.flis, not an extensionless file. */
+			gchar *flis_name = g_str_has_suffix(savename, ".flis")
+				? g_strdup(savename)
+				: g_strdup_printf("%s.flis", savename);
+			retval = save_flis(flis_name) ? CMD_GENERIC_ERROR : CMD_OK;
+			if (retval == CMD_OK && com.uniq) {
+				free(com.uniq->filename);
+				com.uniq->filename = strdup(flis_name);
+				com.uniq->fileexist = TRUE;
+			}
+			g_free(flis_name);
+		} else {
+			retval = savefits(savename, gfit) ? CMD_GENERIC_ERROR : CMD_OK;
+			if (com.uniq && retval == CMD_OK) {
+				if (!g_str_has_suffix(savename, com.pref.ext)) {
+					gchar* tempfilename = g_strdup_printf("%s%s", savename, com.pref.ext);
+					free(com.uniq->filename);
+					com.uniq->filename = strdup(tempfilename);
+					g_free(tempfilename);
+				} else {
+					free(com.uniq->filename);
+					com.uniq->filename = strdup(savename);
+				}
+				com.uniq->fileexist = TRUE;
+			}
+		}
 		gui_iface.set_busy(FALSE);
 	}
-	if (com.uniq) {
-		if (!g_str_has_suffix(savename, com.pref.ext)) {
-			gchar* tempfilename = g_strdup_printf("%s%s", savename, com.pref.ext);
-			com.uniq->filename = strdup(tempfilename);
-			g_free(tempfilename);
-		} else {
-			com.uniq->filename = strdup(savename);
-		}
-		com.uniq->fileexist = TRUE;
-		if (!com.headless) {
-			gui_iface.display_filename();
-			gui_iface.adjust_sellabel();
-		}
+	if (com.uniq && !com.headless) {
+		gui_iface.display_filename();
+		gui_iface.adjust_sellabel();
 	}
 	gui_iface.on_precision_changed();
 
@@ -4799,6 +4825,7 @@ int process_mirrorx(int nb){
 	args->max_threads = com.max_thread;
 	args->command_updates_gfit = TRUE;
 	args->command = TRUE;
+	args->geometry_changing = TRUE;
 
 	if (!start_in_new_thread(generic_image_worker, args)) {
 		free_generic_img_args(args);
@@ -4834,6 +4861,7 @@ int process_mirrory(int nb){
 	args->max_threads = com.max_thread;
 	args->command_updates_gfit = TRUE;
 	args->command = TRUE;
+	args->geometry_changing = TRUE;
 
 	if (!start_in_new_thread(generic_image_worker, args)) {
 		free_generic_img_args(args);
@@ -4883,6 +4911,7 @@ int process_binxy(int nb) {
 	args->max_threads = com.max_thread;
 	args->command_updates_gfit = TRUE;
 	args->command = TRUE;
+	args->geometry_changing = TRUE;
 
 	if (!start_in_new_thread(generic_image_worker, args)) {
 		free_generic_img_args(args);
@@ -5016,6 +5045,7 @@ int process_resample(int nb) {
 	args->max_threads = com.max_thread;
 	args->command_updates_gfit = TRUE;
 	args->command = TRUE;
+	args->geometry_changing = TRUE;
 
 	if (!start_in_new_thread(generic_image_worker, args)) {
 		free_generic_img_args(args);
@@ -5086,6 +5116,7 @@ int process_crop(int nb) {
 	args->max_threads = 1;
 	args->command = TRUE;
 	args->command_updates_gfit = TRUE;
+	args->geometry_changing = TRUE;
 
 	if (!start_in_new_thread(generic_image_worker, args)) {
 		free_generic_img_args(args);
@@ -5197,6 +5228,7 @@ int process_rotate(int nb) {
 	args->max_threads = com.max_thread;
 	args->command_updates_gfit = TRUE;
 	args->command = TRUE;
+	args->geometry_changing = TRUE;
 
 	if (!start_in_new_thread(generic_image_worker, args)) {
 		free_generic_img_args(args);
@@ -5238,6 +5270,7 @@ int process_rotatepi(int nb){
 	args->max_threads = 1;
 	args->command_updates_gfit = TRUE;
 	args->command = TRUE;
+	args->geometry_changing = TRUE;
 
 	if (!start_in_new_thread(generic_image_worker, args)) {
 		free_generic_img_args(args);
@@ -7692,6 +7725,15 @@ int process_findstar(int nb) {
 	}
 
 	struct starfinder_data *args = calloc(1, sizeof(struct starfinder_data));
+	/* Clamp out-of-range vports to a real channel: for FLIS the active
+	 * layer can be mono even though the GUI displays the RGB composite,
+	 * and for plain RGB images the RGB vport (3) has no channel of its
+	 * own — master passed it straight into statistics(), an
+	 * out-of-bounds pdata access.  Pick the same channel the scripted
+	 * path uses (green for multi-channel, red for mono) so GUI and
+	 * script results agree. */
+	if (layer >= (int)gfit->naxes[2])
+		layer = (gfit->naxes[2] > 1) ? GLAYER : RLAYER;
 	args->layer = layer;
 	args->im.fit = gfit;
 	if (sequence_is_loaded() && com.seq.current >= 0) {
@@ -14311,19 +14353,23 @@ int process_seq_profile(int nb) {
 int process_icc_assign(int nb) {
 	gui_iface.clear_roi();
 	char *arg = word[1];
+	/* The profile describes the current image: for a FLIS that is the
+	 * always-RGB composite, not the (possibly mono) active layer. */
+	gboolean mono = (is_current_image_flis()
+	                 ? flis_composite_naxes2() : (guint)gfit->naxes[2]) == 1;
 	cmsHPROFILE profile = NULL;
 	if (!g_ascii_strncasecmp(arg, "srgblinear", 10)) {
-		profile = gfit->naxes[2] == 1 ? gray_linear() : srgb_linear();
+		profile = mono ? gray_linear() : srgb_linear();
 	} else if (!g_ascii_strncasecmp(arg, "srgb", 4)) {
-		profile = gfit->naxes[2] == 1 ? gray_srgbtrc() : srgb_trc();
+		profile = mono ? gray_srgbtrc() : srgb_trc();
 	} else if (!g_ascii_strncasecmp(arg, "rec2020linear", 13)) {
-		profile = gfit->naxes[2] == 1 ? gray_linear() : rec2020_linear();
+		profile = mono ? gray_linear() : rec2020_linear();
 	} else if (!g_ascii_strncasecmp(arg, "rec2020", 7)) {
-		profile = gfit->naxes[2] == 1 ? gray_rec709trc() : rec2020_trc();
+		profile = mono ? gray_rec709trc() : rec2020_trc();
 	} else if (!g_ascii_strncasecmp(arg, "linear", 6)) {
-		profile = gfit->naxes[2] == 1 ? gray_linear() : siril_color_profile_linear_from_color_profile(com.icc.working_standard);
+		profile = mono ? gray_linear() : siril_color_profile_linear_from_color_profile(com.icc.working_standard);
 	} else if (!g_ascii_strncasecmp(arg, "working", 7)) {
-		profile = copyICCProfile(gfit->naxes[2] == 1 ? com.icc.mono_standard : com.icc.working_standard);
+		profile = copyICCProfile(mono ? com.icc.mono_standard : com.icc.working_standard);
 	} else if (g_file_test(arg, G_FILE_TEST_EXISTS) && g_file_test(arg, G_FILE_TEST_IS_REGULAR)) {
 		profile = cmsOpenProfileFromFile(arg, "r");
 	}
@@ -14332,20 +14378,14 @@ int process_icc_assign(int nb) {
 		return CMD_GENERIC_ERROR;
 	}
 
-	struct icc_data *icc_args = calloc(1, sizeof(struct icc_data));
-	icc_args->destroy_fn = free_icc_data;
-	icc_args->profile = profile;  /* hook owns it via icc_args */
-
-	struct generic_img_args *args = calloc(1, sizeof(struct generic_img_args));
-	args->fit = gfit;
-	args->op = &op_desc_icc_assign;
-	args->verbose = TRUE;
+	/* Assign is a pure com.uniq state change: no pixel work, so no
+	 * generic_image_worker (see icc_state_worker). */
+	struct icc_state_args *args = calloc(1, sizeof(struct icc_state_args));
+	args->destroy_fn = free_icc_state_args;
+	args->profile = profile;  /* worker owns it */
 	args->command = TRUE;
-	args->command_updates_gfit = TRUE;
-	args->skip_generic_undo = TRUE;  /* siril_colorspace_transform already writes FITS history */
-	args->user = icc_args;
-	if (!start_in_new_thread(generic_image_worker, args)) {
-		free_generic_img_args(args);
+	if (!start_in_new_thread(icc_state_worker, args)) {
+		free_icc_state_args(args);
 		return CMD_GENERIC_ERROR;
 	}
 	return CMD_OK;
@@ -14354,7 +14394,7 @@ int process_icc_assign(int nb) {
 int process_icc_convert_to(int nb) {
 	gui_iface.clear_roi();
 	char *arg = word[1];
-	if (!gfit->icc_profile) {
+	if (!current_icc_profile()) {
 		siril_log_error(_("Image has no color profile assigned to convert from. Assign a profile first.\n"));
 		return CMD_GENERIC_ERROR;
 	}
@@ -14389,7 +14429,10 @@ int process_icc_convert_to(int nb) {
 	} else if (!g_ascii_strncasecmp(arg, "graylinear", 10)) {
 		profile = gray_linear();
 	} else if (!g_ascii_strncasecmp(arg, "working", 7)) {
-		profile = copyICCProfile(gfit->naxes[2] == 1 ? com.icc.mono_standard : com.icc.working_standard);
+		/* Composite-aware: a FLIS document is always RGB. */
+		gboolean mono = (is_current_image_flis()
+		                 ? flis_composite_naxes2() : (guint)gfit->naxes[2]) == 1;
+		profile = copyICCProfile(mono ? com.icc.mono_standard : com.icc.working_standard);
 	} else if (g_file_test(arg, G_FILE_TEST_EXISTS) && g_file_test(arg, G_FILE_TEST_IS_REGULAR)) {
 		profile = cmsOpenProfileFromFile(arg, "r");
 	}
@@ -14403,13 +14446,30 @@ int process_icc_convert_to(int nb) {
 	icc_args->profile = profile;
 	icc_args->intent = intent;
 
+	if (is_current_image_flis()) {
+		/* Converting a FLIS rewrites every layer's pixels — a layer-stack
+		 * mutation, so it goes through generic_layer_worker (stack writer
+		 * lock + multi-layer undo). */
+		struct generic_layer_args *largs = calloc(1, sizeof(struct generic_layer_args));
+		largs->layer_hook = icc_convert_flis_layer_hook;
+		largs->user = icc_args;
+		largs->description = _("ICC color space conversion");
+		largs->verbose = TRUE;
+		largs->command = TRUE;
+		if (!start_in_new_thread(generic_layer_worker, largs)) {
+			free_generic_layer_args(largs);
+			return CMD_GENERIC_ERROR;
+		}
+		return CMD_OK;
+	}
+
 	struct generic_img_args *args = calloc(1, sizeof(struct generic_img_args));
 	args->fit = gfit;
 	args->op = &op_desc_icc_convert;
 	args->verbose = TRUE;
 	args->command = TRUE;
 	args->command_updates_gfit = TRUE;
-	args->skip_generic_undo = TRUE;  /* siril_colorspace_transform already writes FITS history */
+	args->skip_generic_undo = TRUE;  /* the hook saves a combined pixels+ICC entry */
 	args->user = icc_args;
 	if (!start_in_new_thread(generic_image_worker, args)) {
 		free_generic_img_args(args);
@@ -14420,19 +14480,18 @@ int process_icc_convert_to(int nb) {
 
 int process_icc_remove(int nb) {
 	gui_iface.clear_roi();
-	struct generic_img_args *args = calloc(1, sizeof(struct generic_img_args));
+	/* Remove is a pure com.uniq state change: no pixel work, so no
+	 * generic_image_worker (see icc_state_worker). */
+	struct icc_state_args *args = calloc(1, sizeof(struct icc_state_args));
 	if (!args) {
 		PRINT_ALLOC_ERR;
 		return CMD_ALLOC_ERROR;
 	}
-	args->fit = gfit;
-	args->op = &op_desc_icc_remove;
-	args->verbose = TRUE;
+	args->destroy_fn = free_icc_state_args;
+	args->profile = NULL;   /* NULL = remove */
 	args->command = TRUE;
-	args->command_updates_gfit = TRUE;
-	args->skip_generic_undo = TRUE;  /* siril_colorspace_transform already writes FITS history */
-	if (!start_in_new_thread(generic_image_worker, args)) {
-		free_generic_img_args(args);
+	if (!start_in_new_thread(icc_state_worker, args)) {
+		free_icc_state_args(args);
 		return CMD_GENERIC_ERROR;
 	}
 	return CMD_OK;
@@ -15564,16 +15623,41 @@ int process_catmag_mono(int nb) {
 }
 
 // Process functions refactored
+
+/* Forward decl of the §C.1 layer-arg parser (defined further down in the
+ * flis_* command block).  Lets the mask_from_* commands share the same
+ * <id|"name"> resolution as the rest of the FLIS surface. */
+static flis_layer_t *resolve_layer_arg(const char *arg);
+
+/* Parse the value of a -layermask=<id|"name"> option.  Returns the
+ * resolved layer's stable item_id, or 0 on failure (logging the cause).
+ * Used by every mask_from_* command to honour the §5.2 routing contract:
+ * when present, the mask is stored on the named layer's lmask instead
+ * of gfit's processing mask. */
+static gint parse_layermask_value(const char *arg) {
+	if (!is_current_image_flis()) {
+		siril_log_error(_("-layermask= requires a FLIS image to be loaded\n"));
+		return 0;
+	}
+	flis_layer_t *lay = resolve_layer_arg(arg);
+	return lay ? lay->item_id : 0;
+}
+
 int process_mask_from_stars(int nb) {
 	int argidx = 1;
 	float r = 0.f, feather = 0.f;
 	gboolean invert = FALSE;
 	int bitdepth = com.pref.default_mask_bitpix;
+	gint target_layer_id = 0;
 	char *end;
 
 	while (argidx < nb) {
 		if (g_str_has_prefix(word[argidx], "-invert")) {
 			invert = TRUE;
+		}
+		else if (g_str_has_prefix(word[argidx], "-layermask=")) {
+			target_layer_id = parse_layermask_value(word[argidx] + 11);
+			if (!target_layer_id) return CMD_ARG_ERROR;
 		}
 		else if (g_str_has_prefix(word[argidx], "-r=")) {
 			char *arg = word[argidx] + 3;
@@ -15618,6 +15702,7 @@ int process_mask_from_stars(int nb) {
 	args->mask_creation = TRUE;
 	args->user = data;
 	args->max_threads = com.max_thread;
+	args->target_layer_id = target_layer_id;
 
 	start_in_new_thread(generic_mask_worker, args);
 	return CMD_OK;
@@ -15630,6 +15715,7 @@ int process_mask_from_channel(int nb) {
 	gboolean invert = FALSE;
 	int bitdepth = com.pref.default_mask_bitpix;
 	gchar *filename = NULL;
+	gint target_layer_id = 0;
 	char *end;
 
 	while (argidx < nb) {
@@ -15638,6 +15724,10 @@ int process_mask_from_channel(int nb) {
 		}
 		else if (g_str_has_prefix(word[argidx], "-invert")) {
 			invert = TRUE;
+		}
+		else if (g_str_has_prefix(word[argidx], "-layermask=")) {
+			target_layer_id = parse_layermask_value(word[argidx] + 11);
+			if (!target_layer_id) return CMD_ARG_ERROR;
 		}
 		else if (g_str_has_prefix(word[argidx], "-channel=")) {
 			char *arg = word[argidx] + 9;
@@ -15683,6 +15773,7 @@ int process_mask_from_channel(int nb) {
 	args->mask_creation = TRUE;
 	args->user = data;
 	args->max_threads = com.max_thread;
+	args->target_layer_id = target_layer_id;
 
 	start_in_new_thread(generic_mask_worker, args);
 	return CMD_OK;
@@ -15697,6 +15788,7 @@ int process_mask_from_lum(int nb) {
 	gboolean use_even = FALSE;
 	int bitdepth = com.pref.default_mask_bitpix;
 	gchar *filename = NULL;
+	gint target_layer_id = 0;
 	char *end;
 
 	while (argidx < nb) {
@@ -15705,6 +15797,10 @@ int process_mask_from_lum(int nb) {
 		}
 		else if (g_str_has_prefix(word[argidx], "-invert")) {
 			invert = TRUE;
+		}
+		else if (g_str_has_prefix(word[argidx], "-layermask=")) {
+			target_layer_id = parse_layermask_value(word[argidx] + 11);
+			if (!target_layer_id) return CMD_ARG_ERROR;
 		}
 		else if (g_str_has_prefix(word[argidx], "-human")) {
 			use_human = TRUE;
@@ -15803,6 +15899,7 @@ int process_mask_from_lum(int nb) {
 	args->mask_creation = TRUE;
 	args->user = data;
 	args->max_threads = com.max_thread;
+	args->target_layer_id = target_layer_id;
 
 	start_in_new_thread(generic_mask_worker, args);
 	return CMD_OK;
@@ -16134,11 +16231,16 @@ int process_mask_from_color(int nb) {
 	int feather_radius = 0;
 	gboolean invert = FALSE;
 	int bitdepth = com.pref.default_mask_bitpix;
+	gint target_layer_id = 0;
 	char *end;
 
 	while (argidx < nb) {
 		if (g_str_has_prefix(word[argidx], "-invert")) {
 			invert = TRUE;
+		}
+		else if (g_str_has_prefix(word[argidx], "-layermask=")) {
+			target_layer_id = parse_layermask_value(word[argidx] + 11);
+			if (!target_layer_id) return CMD_ARG_ERROR;
 		}
 		else if (g_str_has_prefix(word[argidx], "-cr=")) {
 			char *arg = word[argidx] + 4;
@@ -16243,8 +16345,1199 @@ int process_mask_from_color(int nb) {
 	args->mask_creation = TRUE;
 	args->user = data;
 	args->max_threads = com.max_thread;
+	args->target_layer_id = target_layer_id;
 
 	start_in_new_thread(generic_mask_worker, args);
+	return CMD_OK;
+}
+
+/* ===========================================================================
+ * FLIS introspection commands (stage 1.6)
+ * ===========================================================================
+ *
+ * Five read-only commands that expose FLIS state to scripts and to the
+ * command console.  Together they form the headless test harness for
+ * stage 1: a .ssf script can open a FLIS, dump its structure to CSV, run
+ * an operation, and diff the post-state CSV against a golden file.  The
+ * commands run from the command thread, take no locks beyond reading
+ * com.uniq, and never mutate state.
+ *
+ *   flis_info               Canvas dimensions, layer/group count, ICC presence.
+ *   flis_layer_list         Tabular dump of every layer.  -format=text|csv.
+ *   flis_group_list         Tabular dump of every group.  -format=text|csv.
+ *   flis_layer_info <id|"name">   Verbose dump of one layer.
+ *   flis_group_info <gid|"name">  Verbose dump of one group.
+ *
+ * The REQ_CMD_FLIS_IMAGE prerequisite is set on all five; the parser
+ * refuses each with a uniform "command requires a FLIS layered image"
+ * message when no FLIS is loaded.
+ */
+
+/* Map a flis_blend_mode_t to its spec-compliant name (Section 5). */
+static const char *flis_blend_mode_name(flis_blend_mode_t m) {
+	switch (m) {
+		case FLIS_BLEND_NORMAL:       return "NORMAL";
+		case FLIS_BLEND_MULTIPLY:     return "MULTIPLY";
+		case FLIS_BLEND_SCREEN:       return "SCREEN";
+		case FLIS_BLEND_OVERLAY:      return "OVERLAY";
+		case FLIS_BLEND_SOFT_LIGHT:   return "SOFT_LIGHT";
+		case FLIS_BLEND_HARD_LIGHT:   return "HARD_LIGHT";
+		case FLIS_BLEND_COLOR_DODGE:  return "COLOR_DODGE";
+		case FLIS_BLEND_COLOR_BURN:   return "COLOR_BURN";
+		case FLIS_BLEND_DARKEN:       return "DARKEN";
+		case FLIS_BLEND_LIGHTEN:      return "LIGHTEN";
+		case FLIS_BLEND_DIFFERENCE:   return "DIFFERENCE";
+		case FLIS_BLEND_EXCLUSION:    return "EXCLUSION";
+		case FLIS_BLEND_HUE:          return "HUE";
+		case FLIS_BLEND_SATURATION:   return "SATURATION";
+		case FLIS_BLEND_COLOR:        return "COLOR";
+		case FLIS_BLEND_LUMINOSITY:   return "LUMINOSITY";
+		case FLIS_BLEND_CHROMA:       return "LRGB_COLOR";
+		case FLIS_BLEND_PASS_THROUGH: return "PASS_THROUGH";
+	}
+	return "?";
+}
+
+/* Reverse of flis_blend_mode_name — case-insensitive lookup.  Returns
+ * the matched mode or 0 (= invalid) on miss; caller checks. */
+static flis_blend_mode_t flis_blend_mode_from_name(const char *s) {
+	if (!s) return 0;
+	if (!g_ascii_strcasecmp(s, "NORMAL"))       return FLIS_BLEND_NORMAL;
+	if (!g_ascii_strcasecmp(s, "MULTIPLY"))     return FLIS_BLEND_MULTIPLY;
+	if (!g_ascii_strcasecmp(s, "SCREEN"))       return FLIS_BLEND_SCREEN;
+	if (!g_ascii_strcasecmp(s, "OVERLAY"))      return FLIS_BLEND_OVERLAY;
+	if (!g_ascii_strcasecmp(s, "SOFT_LIGHT"))   return FLIS_BLEND_SOFT_LIGHT;
+	if (!g_ascii_strcasecmp(s, "HARD_LIGHT"))   return FLIS_BLEND_HARD_LIGHT;
+	if (!g_ascii_strcasecmp(s, "COLOR_DODGE"))  return FLIS_BLEND_COLOR_DODGE;
+	if (!g_ascii_strcasecmp(s, "COLOR_BURN"))   return FLIS_BLEND_COLOR_BURN;
+	if (!g_ascii_strcasecmp(s, "DARKEN"))       return FLIS_BLEND_DARKEN;
+	if (!g_ascii_strcasecmp(s, "LIGHTEN"))      return FLIS_BLEND_LIGHTEN;
+	if (!g_ascii_strcasecmp(s, "DIFFERENCE"))   return FLIS_BLEND_DIFFERENCE;
+	if (!g_ascii_strcasecmp(s, "EXCLUSION"))    return FLIS_BLEND_EXCLUSION;
+	if (!g_ascii_strcasecmp(s, "HUE"))          return FLIS_BLEND_HUE;
+	if (!g_ascii_strcasecmp(s, "SATURATION"))   return FLIS_BLEND_SATURATION;
+	if (!g_ascii_strcasecmp(s, "COLOR"))        return FLIS_BLEND_COLOR;
+	if (!g_ascii_strcasecmp(s, "LUMINOSITY"))   return FLIS_BLEND_LUMINOSITY;
+	if (!g_ascii_strcasecmp(s, "LRGB_COLOR"))   return FLIS_BLEND_CHROMA;
+	if (!g_ascii_strcasecmp(s, "CHROMA"))       return FLIS_BLEND_CHROMA;
+	if (!g_ascii_strcasecmp(s, "PASS_THROUGH")) return FLIS_BLEND_PASS_THROUGH;
+	return 0;
+}
+
+/* Parse on / off / true / false / 1 / 0 → gboolean; returns -1 on
+ * invalid input. */
+static int parse_bool_arg(const char *s) {
+	if (!s) return -1;
+	if (!g_ascii_strcasecmp(s, "on")  || !g_ascii_strcasecmp(s, "true")  || !strcmp(s, "1")) return 1;
+	if (!g_ascii_strcasecmp(s, "off") || !g_ascii_strcasecmp(s, "false") || !strcmp(s, "0")) return 0;
+	return -1;
+}
+
+/* Resolve an argument that is either a positive integer (item_id) or a
+ * layer name in double quotes, e.g. `flis_layer_info 3` or
+ * `flis_layer_info "Ha Narrowband"`.  Returns the layer or NULL with an
+ * error logged. */
+static flis_layer_t *resolve_layer_arg(const char *arg) {
+	if (!arg || !*arg) {
+		siril_log_error(_("flis: layer identifier required\n"));
+		return NULL;
+	}
+	/* Integer form: digits only */
+	gboolean all_digits = TRUE;
+	for (const char *p = arg; *p; p++) if (!g_ascii_isdigit(*p)) { all_digits = FALSE; break; }
+	if (all_digits) {
+		gint64 id64 = g_ascii_strtoll(arg, NULL, 10);
+		if (id64 <= 0 || id64 > G_MAXINT) {
+			siril_log_error(_("flis: layer id '%s' out of range\n"), arg);
+			return NULL;
+		}
+		gint id = (gint)id64;
+		flis_layer_t *l = flis_layer_get_by_id(id);
+		if (!l) siril_log_error(_("flis: no layer with id %d\n"), id);
+		return l;
+	}
+	/* Name form: strip surrounding quotes if present (the command parser
+	 * may or may not have done this for us depending on path). */
+	gchar *trimmed = g_strdup(arg);
+	size_t len = strlen(trimmed);
+	if (len >= 2 && trimmed[0] == '"' && trimmed[len-1] == '"') {
+		trimmed[len-1] = '\0';
+		memmove(trimmed, trimmed + 1, len - 1);
+	}
+	flis_layer_t *l = flis_layer_get_by_name(trimmed);
+	if (!l) siril_log_error(_("flis: no layer named \"%s\"\n"), trimmed);
+	g_free(trimmed);
+	return l;
+}
+
+static flis_group_t *resolve_group_arg(const char *arg) {
+	if (!arg || !*arg) {
+		siril_log_error(_("flis: group identifier required\n"));
+		return NULL;
+	}
+	gboolean all_digits = TRUE;
+	for (const char *p = arg; *p; p++) if (!g_ascii_isdigit(*p)) { all_digits = FALSE; break; }
+	if (all_digits) {
+		gint id = atoi(arg);
+		flis_group_t *g = flis_group_get_by_id(id);
+		if (!g) siril_log_error(_("flis: no group with id %d\n"), id);
+		return g;
+	}
+	gchar *trimmed = g_strdup(arg);
+	size_t len = strlen(trimmed);
+	if (len >= 2 && trimmed[0] == '"' && trimmed[len-1] == '"') {
+		trimmed[len-1] = '\0';
+		memmove(trimmed, trimmed + 1, len - 1);
+	}
+	flis_group_t *g = NULL;
+	for (GSList *l = com.uniq->groups; l; l = l->next) {
+		flis_group_t *cand = (flis_group_t *)l->data;
+		if (cand && cand->name && !strcmp(cand->name, trimmed)) { g = cand; break; }
+	}
+	if (!g) siril_log_error(_("flis: no group named \"%s\"\n"), trimmed);
+	g_free(trimmed);
+	return g;
+}
+
+/* Parse -format=text|csv option from word[1..nb-1]; default text. */
+static int parse_format_arg(int nb) {
+	for (int i = 1; i < nb; i++) {
+		if (!word[i]) continue;
+		if (!g_str_has_prefix(word[i], "-format=")) continue;
+		const char *v = word[i] + 8;
+		if (!g_ascii_strcasecmp(v, "csv"))  return 1;
+		if (!g_ascii_strcasecmp(v, "text")) return 0;
+		/* word[0] is the invoking command (flis_layer_list or
+		 * flis_group_list) — don't hard-code one of them. */
+		siril_log_error(_("%s: -format= must be text or csv\n"), word[0]);
+		return -1;
+	}
+	return 0;
+}
+
+int process_flis_info(int nb) {
+	(void)nb;
+	guint nl = flis_layer_count();
+	guint ng = flis_group_count();
+	guint cw = flis_canvas_rx();
+	guint ch = flis_canvas_ry();
+	flis_layer_t *base = NULL;
+	gboolean icc = FALSE;
+	if (com.uniq->layers) {
+		base = (flis_layer_t *)com.uniq->layers->data;
+		if (base && base->fit && fit_get_icc_profile(base->fit)) icc = TRUE;
+	}
+	siril_log_info(_("FLIS image: canvas %ux%u, layers=%u, groups=%u, ICC=%s\n"),
+	               cw, ch, nl, ng, icc ? "yes" : "no");
+	if (com.uniq->filename)
+		siril_log_info(_("  source: %s\n"), com.uniq->filename);
+	return CMD_OK;
+}
+
+int process_flis_layer_list(int nb) {
+	int fmt = parse_format_arg(nb);
+	if (fmt < 0) return CMD_ARG_ERROR;
+	gboolean csv = (fmt == 1);
+
+	if (csv) {
+		siril_log_message("id,order,name,model,blend,opacity,visible,locked,has_tint,tint_r,tint_g,tint_b,has_lmask,lmask_active,group_id,pos_x,pos_y\n");
+	} else {
+		siril_log_info(_("%4s %5s %-24s %4s %-12s %5s %3s %3s %4s %4s %3s\n"),
+		               "id", "order", "name", "mdl", "blend", "opac", "vis", "lck",
+		               "tint", "lmsk", "grp");
+	}
+	for (GSList *l = com.uniq->layers; l; l = l->next) {
+		flis_layer_t *lay = (flis_layer_t *)l->data;
+		if (!lay) continue;
+		const char *mdl = (lay->fit && lay->fit->naxes[2] == 3) ? "RGB" : "MONO";
+		const char *blend = flis_blend_mode_name(lay->blend_mode);
+		if (csv) {
+			siril_log_message("%d,%d,\"%s\",%s,%s,%.4f,%d,%d,%d,%.4f,%.4f,%.4f,%d,%d,%d,%d,%d\n",
+			                  lay->item_id, lay->layer_order,
+			                  lay->layer_name ? lay->layer_name : "",
+			                  mdl, blend, (double)lay->opacity,
+			                  lay->visible ? 1 : 0, lay->locked ? 1 : 0,
+			                  lay->has_tint ? 1 : 0,
+			                  lay->layer_tint.r, lay->layer_tint.g, lay->layer_tint.b,
+			                  lay->lmask ? 1 : 0, lay->lmask_active ? 1 : 0,
+			                  lay->group_id, lay->position_x, lay->position_y);
+		} else {
+			siril_log_info(_("%4d %5d %-24.24s %4s %-12s %5.2f %3s %3s %4s %4s %3d\n"),
+			               lay->item_id, lay->layer_order,
+			               lay->layer_name ? lay->layer_name : "",
+			               mdl, blend, (double)lay->opacity,
+			               lay->visible ? "yes" : "no",
+			               lay->locked ? "yes" : "no",
+			               lay->has_tint ? "yes" : "no",
+			               lay->lmask ? (lay->lmask_active ? "on" : "off") : "no",
+			               lay->group_id);
+		}
+	}
+	return CMD_OK;
+}
+
+int process_flis_group_list(int nb) {
+	int fmt = parse_format_arg(nb);
+	if (fmt < 0) return CMD_ARG_ERROR;
+	gboolean csv = (fmt == 1);
+
+	if (csv) {
+		siril_log_message("id,name,visible,opacity,blend,members,collapsed\n");
+	} else {
+		siril_log_info(_("%4s %-24s %3s %5s %-12s %7s %3s\n"),
+		               "id", "name", "vis", "opac", "blend", "members", "col");
+	}
+	for (GSList *l = com.uniq->groups; l; l = l->next) {
+		flis_group_t *grp = (flis_group_t *)l->data;
+		if (!grp) continue;
+		guint members = 0;
+		for (GSList *m = com.uniq->layers; m; m = m->next) {
+			flis_layer_t *lay = (flis_layer_t *)m->data;
+			if (lay && lay->group_id == grp->item_id) members++;
+		}
+		const char *blend = flis_blend_mode_name(grp->blend_mode);
+		if (csv) {
+			siril_log_message("%d,\"%s\",%d,%.4f,%s,%u,%d\n",
+			                  grp->item_id, grp->name ? grp->name : "",
+			                  grp->visible ? 1 : 0, (double)grp->opacity, blend,
+			                  members, grp->collapsed ? 1 : 0);
+		} else {
+			siril_log_info(_("%4d %-24.24s %3s %5.2f %-12s %7u %3s\n"),
+			               grp->item_id, grp->name ? grp->name : "",
+			               grp->visible ? "yes" : "no", (double)grp->opacity, blend,
+			               members, grp->collapsed ? "yes" : "no");
+		}
+	}
+	return CMD_OK;
+}
+
+int process_flis_layer_info(int nb) {
+	if (nb < 2) {
+		siril_log_error(_("Usage: flis_layer_info <id|\"name\">\n"));
+		return CMD_WRONG_N_ARG;
+	}
+	flis_layer_t *lay = resolve_layer_arg(word[1]);
+	if (!lay) return CMD_ARG_ERROR;
+
+	siril_log_info(_("Layer id %d: \"%s\"\n"),
+	               lay->item_id, lay->layer_name ? lay->layer_name : "");
+	siril_log_info(_("  order       : %d\n"), lay->layer_order);
+	siril_log_info(_("  model       : %s\n"),
+	               (lay->fit && lay->fit->naxes[2] == 3) ? "RGB" : "MONO");
+	if (lay->fit)
+		siril_log_info(_("  size        : %lu x %lu\n"),
+		               (unsigned long)lay->fit->rx, (unsigned long)lay->fit->ry);
+	siril_log_info(_("  position    : (%d, %d)\n"), lay->position_x, lay->position_y);
+	siril_log_info(_("  blend mode  : %s\n"), flis_blend_mode_name(lay->blend_mode));
+	siril_log_info(_("  opacity     : %.4f\n"), (double)lay->opacity);
+	siril_log_info(_("  visible     : %s\n"), lay->visible ? "yes" : "no");
+	siril_log_info(_("  locked      : %s\n"), lay->locked  ? "yes" : "no");
+	if (lay->has_tint)
+		siril_log_info(_("  tint        : (%.3f, %.3f, %.3f)\n"),
+		               lay->layer_tint.r, lay->layer_tint.g, lay->layer_tint.b);
+	else
+		siril_log_info(_("  tint        : neutral\n"));
+	siril_log_info(_("  layer mask  : %s\n"),
+	               lay->lmask ? (lay->lmask_active ? "active" : "inactive") : "none");
+	siril_log_info(_("  proc mask   : %s\n"),
+	               (lay->fit && lay->fit->mask && lay->fit->mask->data) ? "present" : "none");
+	siril_log_info(_("  group_id    : %d\n"), lay->group_id);
+	return CMD_OK;
+}
+
+/* Strip one leading and one trailing quote (single or double) from an
+ * -opt= value, in place (word[] points into the mutable command line).
+ * The tokenizer keeps the opening quote of a -opt="..." value embedded
+ * in the word and eats the closing one at end-of-word; values typed
+ * without spaces may still carry both. */
+static char *strip_optval_quotes(char *v) {
+	if (!v) return v;
+	if (*v == '"' || *v == '\'')
+		v++;
+	size_t vl = strlen(v);
+	if (vl > 0 && (v[vl - 1] == '"' || v[vl - 1] == '\''))
+		v[vl - 1] = '\0';
+	return v;
+}
+
+int process_flis_promote(int nb) {
+	const char *name = NULL;
+	for (int i = 1; i < nb; i++) {
+		if (!word[i]) continue;
+		if (g_str_has_prefix(word[i], "-name=")) {
+			name = strip_optval_quotes(word[i] + 6);
+		} else {
+			siril_log_error(_("flis_promote: unknown argument '%s'\n"), word[i]);
+			return CMD_ARG_ERROR;
+		}
+	}
+	if (is_current_image_flis()) {
+		siril_log_warning(_("flis_promote: image is already a FLIS — nothing to do\n"));
+		return CMD_OK;
+	}
+	if (flis_promote_from_gfit(name)) {
+		siril_log_error(_("flis_promote: failed to promote image to single-layer FLIS\n"));
+		return CMD_GENERIC_ERROR;
+	}
+	siril_log_message(_("flis_promote: image is now a single-layer FLIS (base: \"%s\")\n"),
+	                  name ? name : "Background");
+	return CMD_OK;
+}
+
+int process_flis_active_layer(int nb) {
+	/* No argument: report the currently active layer's id and name.
+	 * One argument: set the active layer to that id or name. */
+	if (nb < 2) {
+		flis_layer_t *active = flis_active_layer();
+		if (!active) {
+			siril_log_error(_("flis_active_layer: no FLIS loaded\n"));
+			return CMD_GENERIC_ERROR;
+		}
+		siril_log_message(_("Active layer: id=%d  name=\"%s\"\n"),
+		                  active->item_id,
+		                  active->layer_name ? active->layer_name : "");
+		return CMD_OK;
+	}
+
+	/* Resolve <id|"name"> using the same dispatch the introspection
+	 * commands use (positive integer → item_id, anything else → name). */
+	const char *arg = word[1];
+	flis_layer_t *target = NULL;
+	gboolean all_digits = (arg && *arg);
+	for (const char *p = arg; *p; p++) if (!g_ascii_isdigit(*p)) { all_digits = FALSE; break; }
+	if (all_digits) {
+		target = flis_layer_get_by_id(atoi(arg));
+		if (!target) {
+			siril_log_error(_("flis_active_layer: no layer with id %s\n"), arg);
+			return CMD_ARG_ERROR;
+		}
+	} else {
+		gchar *trimmed = g_strdup(arg);
+		size_t len = strlen(trimmed);
+		if (len >= 2 && trimmed[0] == '"' && trimmed[len-1] == '"') {
+			trimmed[len-1] = '\0';
+			memmove(trimmed, trimmed + 1, len - 1);
+		}
+		target = flis_layer_get_by_name(trimmed);
+		if (!target) {
+			siril_log_error(_("flis_active_layer: no layer named \"%s\"\n"), trimmed);
+			g_free(trimmed);
+			return CMD_ARG_ERROR;
+		}
+		g_free(trimmed);
+	}
+
+	gint idx = flis_layer_get_index(target);
+	if (idx < 0) {
+		siril_log_error(_("flis_active_layer: target layer not in stack\n"));
+		return CMD_GENERIC_ERROR;
+	}
+	flis_switch_active_layer_gui(idx);
+	siril_log_message(_("Active layer: id=%d  name=\"%s\"\n"),
+	                  target->item_id,
+	                  target->layer_name ? target->layer_name : "");
+	/* Switching the active layer changes which fits gfit points at, so
+	 * any downstream display refresh needs to be triggered.  The mask
+	 * tab visibility and right-tab activation are GUI-side concerns
+	 * but the script command is normally invoked from headless paths
+	 * where neither matters; no extra plumbing needed here. */
+	return CMD_OK;
+}
+
+/* flis_addlayer <file> [-name="X"] — load a FITS from disk and add it
+ * as a new layer on top of the current FLIS stack.  Mirrors the panel's
+ * Add Layer toolbar button: both build a flis_addlayer_args payload and
+ * submit through generic_layer_worker so undo, logging, HISTORY and
+ * invalidation are identical between paths (§4.3 parity). */
+int process_flis_addlayer(int nb) {
+	if (nb < 2) {
+		siril_log_error(_("Usage: flis_addlayer <file> [-name=\"X\"]\n"));
+		return CMD_WRONG_N_ARG;
+	}
+	const char *path = word[1];
+	const char *name = NULL;
+	for (int i = 2; i < nb; i++) {
+		if (!word[i]) continue;
+		if (g_str_has_prefix(word[i], "-name=")) {
+			name = strip_optval_quotes(word[i] + 6);
+		} else {
+			siril_log_error(_("flis_addlayer: unknown argument '%s'\n"), word[i]);
+			return CMD_ARG_ERROR;
+		}
+	}
+
+	struct flis_addlayer_args *payload = calloc(1, sizeof(*payload));
+	if (!payload) return CMD_ALLOC_ERROR;
+	payload->destroy_fn = flis_addlayer_args_free;
+	payload->filename   = g_strdup(path);
+	payload->name       = name ? g_strdup(name) : NULL;
+
+	struct generic_layer_args *args = calloc(1, sizeof(*args));
+	if (!args) { flis_addlayer_args_free(payload); return CMD_ALLOC_ERROR; }
+	args->layer_hook         = flis_addlayer_hook;
+	args->user               = payload;
+	args->description        = g_strdup("flis_addlayer");
+	args->command            = TRUE;     /* script blocks until done */
+	args->invalidate_flags   = FLIS_INV_ALL;
+	args->invalidate_item_id = 0;        /* hook fills in the new layer's id */
+
+	if (!start_in_new_thread(generic_layer_worker, args)) {
+		free_generic_layer_args(args);
+		return CMD_GENERIC_ERROR;
+	}
+	/* CMD_NOTIFY_GFIT_MODIFIED makes the script processor wait for the
+	 * worker to finish before running the next command. */
+	return CMD_OK | CMD_NOTIFY_GFIT_MODIFIED;
+}
+
+/* flis_setmask <id|"name"> <file> [-bitpix=8|32] — load a mono FITS and
+ * attach it as the named layer's mask.  Mirrors the panel's mask Add…
+ * button via shared flis_setmask_hook. */
+int process_flis_setmask(int nb) {
+	if (nb < 3) {
+		siril_log_error(_("Usage: flis_setmask <id|\"name\"> <file> [-bitpix=8|32]\n"));
+		return CMD_WRONG_N_ARG;
+	}
+	flis_layer_t *target = resolve_layer_arg(word[1]);
+	if (!target) return CMD_ARG_ERROR;
+	const char *path = word[2];
+	int bitpix = 0;
+	for (int i = 3; i < nb; i++) {
+		if (!word[i]) continue;
+		if (g_str_has_prefix(word[i], "-bitpix=")) {
+			bitpix = atoi(word[i] + 8);
+			if (bitpix != 8 && bitpix != 32) {
+				siril_log_error(_("flis_setmask: -bitpix must be 8 or 32\n"));
+				return CMD_ARG_ERROR;
+			}
+		} else {
+			siril_log_error(_("flis_setmask: unknown argument '%s'\n"), word[i]);
+			return CMD_ARG_ERROR;
+		}
+	}
+
+	struct flis_setmask_args *payload = calloc(1, sizeof(*payload));
+	if (!payload) return CMD_ALLOC_ERROR;
+	payload->destroy_fn = flis_setmask_args_free;
+	payload->filename   = g_strdup(path);
+	payload->bitpix     = bitpix;
+
+	struct generic_layer_args *args = calloc(1, sizeof(*args));
+	if (!args) { flis_setmask_args_free(payload); return CMD_ALLOC_ERROR; }
+	args->layer_hook         = flis_setmask_hook;
+	args->user               = payload;
+	args->description        = g_strdup("flis_setmask");
+	args->command            = TRUE;
+	args->updates_lmask      = TRUE;
+	args->invalidate_flags   = FLIS_INV_LAYER_PIXELS;  /* lmask is per-layer */
+	args->invalidate_item_id = target->item_id;
+
+	if (!start_in_new_thread(generic_layer_worker, args)) {
+		free_generic_layer_args(args);
+		return CMD_GENERIC_ERROR;
+	}
+	return CMD_OK | CMD_NOTIFY_GFIT_MODIFIED;
+}
+
+/* flis_clearmask <id|"name"> — strip the layer's mask.  Mirrors the
+ * panel's mask Remove… button. */
+int process_flis_clearmask(int nb) {
+	if (nb < 2) {
+		siril_log_error(_("Usage: flis_clearmask <id|\"name\">\n"));
+		return CMD_WRONG_N_ARG;
+	}
+	flis_layer_t *target = resolve_layer_arg(word[1]);
+	if (!target) return CMD_ARG_ERROR;
+
+	struct generic_layer_args *args = calloc(1, sizeof(*args));
+	if (!args) return CMD_ALLOC_ERROR;
+	args->layer_hook         = flis_clearmask_hook;
+	args->description        = g_strdup("flis_clearmask");
+	args->command            = TRUE;
+	args->updates_lmask      = TRUE;
+	args->invalidate_flags   = FLIS_INV_LAYER_PIXELS;
+	args->invalidate_item_id = target->item_id;
+
+	if (!start_in_new_thread(generic_layer_worker, args)) {
+		free_generic_layer_args(args);
+		return CMD_GENERIC_ERROR;
+	}
+	return CMD_OK | CMD_NOTIFY_GFIT_MODIFIED;
+}
+
+/* flis_flatten — composite all visible layers into a single base layer.
+ * Mirrors the panel's Flatten Image context item via the shared
+ * flis_flatten_hook.  This is the scripted counterpart the stacking /
+ * livestacking refusal messages direct users to. */
+int process_flis_flatten(int nb) {
+	(void)nb;
+	struct generic_layer_args *args = calloc(1, sizeof(*args));
+	if (!args) return CMD_ALLOC_ERROR;
+	args->layer_hook       = flis_flatten_hook;
+	args->description      = g_strdup("flis_flatten");
+	args->command          = TRUE;
+	args->invalidate_flags = FLIS_INV_ALL;
+
+	if (!start_in_new_thread(generic_layer_worker, args)) {
+		free_generic_layer_args(args);
+		return CMD_GENERIC_ERROR;
+	}
+	return CMD_OK | CMD_NOTIFY_GFIT_MODIFIED;
+}
+
+/* flis_addgroup [-name="X"] — create a new layer group. */
+int process_flis_addgroup(int nb) {
+	const char *name = NULL;
+	for (int i = 1; i < nb; i++) {
+		if (!word[i]) continue;
+		if (g_str_has_prefix(word[i], "-name=")) {
+			name = strip_optval_quotes(word[i] + 6);
+		} else {
+			siril_log_error(_("flis_addgroup: unknown argument '%s'\n"), word[i]);
+			return CMD_ARG_ERROR;
+		}
+	}
+	struct flis_addgroup_args *payload = calloc(1, sizeof(*payload));
+	if (!payload) return CMD_ALLOC_ERROR;
+	payload->destroy_fn = flis_addgroup_args_free;
+	payload->name       = (name && *name) ? g_strdup(name) : NULL;
+
+	struct generic_layer_args *args = calloc(1, sizeof(*args));
+	if (!args) { flis_addgroup_args_free(payload); return CMD_ALLOC_ERROR; }
+	args->layer_hook         = flis_addgroup_hook;
+	args->user               = payload;
+	args->description        = g_strdup("flis_addgroup");
+	args->command            = TRUE;
+	args->invalidate_flags   = FLIS_INV_STACK;  /* groups affect z-order display */
+	args->invalidate_item_id = 0;
+
+	if (!start_in_new_thread(generic_layer_worker, args)) {
+		free_generic_layer_args(args);
+		return CMD_GENERIC_ERROR;
+	}
+	return CMD_OK | CMD_NOTIFY_GFIT_MODIFIED;
+}
+
+/* flis_setgroup <layer-id|"name"> { <group-id|"name"> | -clear } */
+int process_flis_setgroup(int nb) {
+	if (nb < 3) {
+		siril_log_error(_("Usage: flis_setgroup <layer-id|\"name\"> "
+		                  "{ <group-id|\"name\"> | -clear }\n"));
+		return CMD_WRONG_N_ARG;
+	}
+	flis_layer_t *target = resolve_layer_arg(word[1]);
+	if (!target) return CMD_ARG_ERROR;
+
+	gint target_group = 0;
+	if (!g_strcmp0(word[2], "-clear")) {
+		target_group = 0;
+	} else {
+		flis_group_t *grp = resolve_group_arg(word[2]);
+		if (!grp) return CMD_ARG_ERROR;
+		target_group = grp->item_id;
+	}
+
+	struct flis_setgroup_args *payload = calloc(1, sizeof(*payload));
+	if (!payload) return CMD_ALLOC_ERROR;
+	payload->destroy_fn = flis_setgroup_args_free;
+	payload->group_id   = target_group;
+
+	struct generic_layer_args *args = calloc(1, sizeof(*args));
+	if (!args) { flis_setgroup_args_free(payload); return CMD_ALLOC_ERROR; }
+	args->layer_hook         = flis_setgroup_hook;
+	args->user               = payload;
+	args->description        = g_strdup("flis_setgroup");
+	args->command            = TRUE;
+	args->invalidate_flags   = FLIS_INV_STACK;
+	args->invalidate_item_id = target->item_id;
+
+	if (!start_in_new_thread(generic_layer_worker, args)) {
+		free_generic_layer_args(args);
+		return CMD_GENERIC_ERROR;
+	}
+	return CMD_OK | CMD_NOTIFY_GFIT_MODIFIED;
+}
+
+/* flis_setposition <id|"name"> <x> <y> — move a layer to canvas (x,y). */
+int process_flis_setposition(int nb) {
+	if (nb < 4) {
+		siril_log_error(_("Usage: flis_setposition <id|\"name\"> <x> <y>\n"));
+		return CMD_WRONG_N_ARG;
+	}
+	flis_layer_t *target = resolve_layer_arg(word[1]);
+	if (!target) return CMD_ARG_ERROR;
+	char *endx, *endy;
+	gint x = (gint)strtol(word[2], &endx, 10);
+	gint y = (gint)strtol(word[3], &endy, 10);
+	if (*endx || *endy) {
+		siril_log_error(_("flis_setposition: x and y must be integers\n"));
+		return CMD_ARG_ERROR;
+	}
+
+	struct flis_setposition_args *payload = calloc(1, sizeof(*payload));
+	if (!payload) return CMD_ALLOC_ERROR;
+	payload->destroy_fn = flis_setposition_args_free;
+	payload->x = x;
+	payload->y = y;
+
+	struct generic_layer_args *args = calloc(1, sizeof(*args));
+	if (!args) { flis_setposition_args_free(payload); return CMD_ALLOC_ERROR; }
+	args->layer_hook         = flis_setposition_hook;
+	args->user               = payload;
+	args->description        = g_strdup("flis_setposition");
+	args->command            = TRUE;
+	args->invalidate_flags   = FLIS_INV_STACK;
+	args->invalidate_item_id = target->item_id;
+
+	if (!start_in_new_thread(generic_layer_worker, args)) {
+		free_generic_layer_args(args);
+		return CMD_GENERIC_ERROR;
+	}
+	return CMD_OK | CMD_NOTIFY_GFIT_MODIFIED;
+}
+
+/* flis_exportlayer <id|"name"> <file> — write the named layer to file. */
+int process_flis_exportlayer(int nb) {
+	if (nb < 3) {
+		siril_log_error(_("Usage: flis_exportlayer <id|\"name\"> <file>\n"));
+		return CMD_WRONG_N_ARG;
+	}
+	flis_layer_t *target = resolve_layer_arg(word[1]);
+	if (!target) return CMD_ARG_ERROR;
+
+	struct flis_exportlayer_args *payload = calloc(1, sizeof(*payload));
+	if (!payload) return CMD_ALLOC_ERROR;
+	payload->destroy_fn = flis_exportlayer_args_free;
+	payload->filename   = g_strdup(word[2]);
+
+	struct generic_layer_args *args = calloc(1, sizeof(*args));
+	if (!args) { flis_exportlayer_args_free(payload); return CMD_ALLOC_ERROR; }
+	args->layer_hook         = flis_exportlayer_hook;
+	args->user               = payload;
+	args->description        = g_strdup("flis_exportlayer");
+	args->command            = TRUE;
+	args->read_only          = TRUE;
+	args->invalidate_item_id = target->item_id;
+
+	if (!start_in_new_thread(generic_layer_worker, args)) {
+		free_generic_layer_args(args);
+		return CMD_GENERIC_ERROR;
+	}
+	return CMD_OK | CMD_NOTIFY_GFIT_MODIFIED;
+}
+
+/* -----------------------------------------------------------------
+ * Layer property commands (§4.3 slice 8) — set name / blend mode /
+ * opacity / visibility / locked / tint.  Thin wrappers around the
+ * existing flis_layer_set_* primitives.  Following the pattern of
+ * flis_active_layer, they call the primitive directly (no worker)
+ * — these are fast property mutations and don't need the worker's
+ * thread management.  Display refresh is the caller's
+ * responsibility (the script processor flushes at end; interactive
+ * GUI users see the panel's own widget feedback).
+ * ----------------------------------------------------------------- */
+
+/* Shared tail for the flis_set* property commands: push a props-only undo
+ * entry (captured before the mutation; no-op when scripted) and refresh
+ * the composite / layers panel / display, so a property change is undoable
+ * and visible immediately — matching the panel's dispatch path. */
+static int flis_prop_cmd_finish(const flis_layer_t *target, int rc,
+                                const flis_layer_props_t *pre,
+                                const char *cmdname) {
+	if (rc)
+		return CMD_GENERIC_ERROR;
+	undo_save_flis_layer_props_snapshot(target->item_id, pre, cmdname);
+	notify_gfit_data_modified();
+	return CMD_OK;
+}
+
+int process_flis_setname(int nb) {
+	if (nb < 3) {
+		siril_log_error(_("Usage: flis_setname <id|\"name\"> \"<new name>\"\n"));
+		return CMD_WRONG_N_ARG;
+	}
+	flis_layer_t *target = resolve_layer_arg(word[1]);
+	if (!target) return CMD_ARG_ERROR;
+	/* Strip surrounding quotes on the new name if present. */
+	gchar *name = g_strdup(word[2]);
+	size_t len = strlen(name);
+	if (len >= 2 && name[0] == '"' && name[len-1] == '"') {
+		name[len-1] = '\0';
+		memmove(name, name + 1, len - 1);
+	}
+	flis_layer_props_t pre;
+	flis_layer_capture_props(target, &pre);
+	int rv = flis_layer_set_name(target, name);
+	g_free(name);
+	return flis_prop_cmd_finish(target, rv, &pre, "flis_setname");
+}
+
+int process_flis_setblend(int nb) {
+	if (nb < 3) {
+		siril_log_error(_("Usage: flis_setblend <id|\"name\"> <mode>\n"));
+		return CMD_WRONG_N_ARG;
+	}
+	flis_layer_t *target = resolve_layer_arg(word[1]);
+	if (!target) return CMD_ARG_ERROR;
+	flis_blend_mode_t mode = flis_blend_mode_from_name(word[2]);
+	if (!mode) {
+		siril_log_error(_("flis_setblend: unknown blend mode '%s'\n"), word[2]);
+		return CMD_ARG_ERROR;
+	}
+	flis_layer_props_t pre;
+	flis_layer_capture_props(target, &pre);
+	return flis_prop_cmd_finish(target,
+			flis_layer_set_blend_mode(target, mode), &pre, "flis_setblend");
+}
+
+int process_flis_setopacity(int nb) {
+	if (nb < 3) {
+		siril_log_error(_("Usage: flis_setopacity <id|\"name\"> <0.0-1.0>\n"));
+		return CMD_WRONG_N_ARG;
+	}
+	flis_layer_t *target = resolve_layer_arg(word[1]);
+	if (!target) return CMD_ARG_ERROR;
+	char *end;
+	double v = g_ascii_strtod(word[2], &end);
+	if (*end || v < 0.0 || v > 1.0) {
+		siril_log_error(_("flis_setopacity: opacity must be a float in [0.0, 1.0]\n"));
+		return CMD_ARG_ERROR;
+	}
+	flis_layer_props_t pre;
+	flis_layer_capture_props(target, &pre);
+	return flis_prop_cmd_finish(target,
+			flis_layer_set_opacity(target, (gfloat)v), &pre, "flis_setopacity");
+}
+
+int process_flis_setvisible(int nb) {
+	if (nb < 3) {
+		siril_log_error(_("Usage: flis_setvisible <id|\"name\"> <on|off>\n"));
+		return CMD_WRONG_N_ARG;
+	}
+	flis_layer_t *target = resolve_layer_arg(word[1]);
+	if (!target) return CMD_ARG_ERROR;
+	int b = parse_bool_arg(word[2]);
+	if (b < 0) {
+		siril_log_error(_("flis_setvisible: expected on/off/true/false/1/0\n"));
+		return CMD_ARG_ERROR;
+	}
+	flis_layer_props_t pre;
+	flis_layer_capture_props(target, &pre);
+	return flis_prop_cmd_finish(target,
+			flis_layer_set_visible(target, b), &pre, "flis_setvisible");
+}
+
+int process_flis_setlocked(int nb) {
+	if (nb < 3) {
+		siril_log_error(_("Usage: flis_setlocked <id|\"name\"> <on|off>\n"));
+		return CMD_WRONG_N_ARG;
+	}
+	flis_layer_t *target = resolve_layer_arg(word[1]);
+	if (!target) return CMD_ARG_ERROR;
+	int b = parse_bool_arg(word[2]);
+	if (b < 0) {
+		siril_log_error(_("flis_setlocked: expected on/off/true/false/1/0\n"));
+		return CMD_ARG_ERROR;
+	}
+	flis_layer_props_t pre;
+	flis_layer_capture_props(target, &pre);
+	return flis_prop_cmd_finish(target,
+			flis_layer_set_locked(target, b), &pre, "flis_setlocked");
+}
+
+int process_flis_settint(int nb) {
+	if (nb < 3) {
+		siril_log_error(_("Usage: flis_settint <id|\"name\"> { -clear | <r> <g> <b> }\n"));
+		return CMD_WRONG_N_ARG;
+	}
+	flis_layer_t *target = resolve_layer_arg(word[1]);
+	if (!target) return CMD_ARG_ERROR;
+	if (!g_strcmp0(word[2], "-clear")) {
+		/* Use the primitive so the locked-layer check, tint reset and
+		 * modified stamp all apply — mirrors flis_layer_set_tint below. */
+		flis_layer_props_t pre_clear;
+		flis_layer_capture_props(target, &pre_clear);
+		return flis_prop_cmd_finish(target,
+				flis_layer_clear_tint(target), &pre_clear, "flis_settint");
+	}
+	if (nb < 5) {
+		siril_log_error(_("flis_settint: need three colour components (r g b) or -clear\n"));
+		return CMD_WRONG_N_ARG;
+	}
+	char *er, *eg, *eb;
+	double r = g_ascii_strtod(word[2], &er);
+	double g = g_ascii_strtod(word[3], &eg);
+	double b = g_ascii_strtod(word[4], &eb);
+	if (*er || *eg || *eb ||
+	    r < 0.0 || r > 1.0 || g < 0.0 || g > 1.0 || b < 0.0 || b > 1.0) {
+		siril_log_error(_("flis_settint: r g b must each be floats in [0.0, 1.0]\n"));
+		return CMD_ARG_ERROR;
+	}
+	flis_layer_props_t pre;
+	flis_layer_capture_props(target, &pre);
+	return flis_prop_cmd_finish(target,
+			flis_layer_set_tint(target, r, g, b), &pre, "flis_settint");
+}
+
+int process_flis_group_info(int nb) {
+	if (nb < 2) {
+		siril_log_error(_("Usage: flis_group_info <gid|\"name\">\n"));
+		return CMD_WRONG_N_ARG;
+	}
+	flis_group_t *grp = resolve_group_arg(word[1]);
+	if (!grp) return CMD_ARG_ERROR;
+
+	siril_log_info(_("Group id %d: \"%s\"\n"),
+	               grp->item_id, grp->name ? grp->name : "");
+	siril_log_info(_("  visible    : %s\n"), grp->visible ? "yes" : "no");
+	siril_log_info(_("  opacity    : %.4f\n"), (double)grp->opacity);
+	siril_log_info(_("  blend mode : %s\n"), flis_blend_mode_name(grp->blend_mode));
+	siril_log_info(_("  collapsed  : %s\n"), grp->collapsed ? "yes" : "no");
+
+	siril_log_info(_("  members    :\n"));
+	for (GSList *l = com.uniq->layers; l; l = l->next) {
+		flis_layer_t *lay = (flis_layer_t *)l->data;
+		if (lay && lay->group_id == grp->item_id)
+			siril_log_info(_("    [%d] \"%s\"\n"),
+			               lay->item_id, lay->layer_name ? lay->layer_name : "");
+	}
+	return CMD_OK;
+}
+
+/* Parse a comma-separated `<id|"name">` list into a freshly-allocated
+ * GSList of flis_layer_t* (no ownership transfer of the layers).  On any
+ * resolution failure logs and returns NULL.  Caller frees the GSList
+ * shell via g_slist_free (layer pointers are borrowed). */
+static GSList *parse_layer_subset(const char *csv) {
+	if (!csv || !*csv) {
+		siril_log_error(_("-subset= requires a comma-separated list of "
+				"layer ids or names\n"));
+		return NULL;
+	}
+	/* Known limitation: the split is a plain comma split, so quoted
+	 * layer names containing commas cannot be addressed here — use the
+	 * numeric id for such layers. */
+	GSList *out = NULL;
+	gchar **toks = g_strsplit(csv, ",", -1);
+	gboolean ok = TRUE;
+	for (gchar **t = toks; *t && ok; t++) {
+		gchar *trimmed = g_strstrip(*t);
+		if (!*trimmed) continue;
+		flis_layer_t *lay = resolve_layer_arg(trimmed);
+		if (!lay) { ok = FALSE; break; }
+		out = g_slist_append(out, lay);
+	}
+	g_strfreev(toks);
+	if (!ok) { g_slist_free(out); return NULL; }
+	return out;
+}
+
+int process_flis_layers_match(int nb) {
+	if (!is_current_image_flis()) {
+		siril_log_error(_("flis_layers_match: requires a FLIS image\n"));
+		return CMD_GENERIC_ERROR;
+	}
+
+	GSList *subset = NULL;
+	gboolean owned_subset = FALSE;
+	for (int i = 1; i < nb; i++) {
+		if (g_str_has_prefix(word[i], "-subset=")) {
+			if (owned_subset) g_slist_free(subset);  /* repeated option */
+			subset = parse_layer_subset(word[i] + 8);
+			if (!subset) return CMD_ARG_ERROR;
+			owned_subset = TRUE;
+		} else {
+			siril_log_error(_("flis_layers_match: unknown option '%s'\n"), word[i]);
+			if (owned_subset) g_slist_free(subset);
+			return CMD_ARG_ERROR;
+		}
+	}
+
+	/* M-F12: this command mutates layer pixels on the calling thread
+	 * (script / console), not through the layer worker — take the stack
+	 * writer lock over the undo snapshot (which reads layer pixels) and
+	 * the mutation together. */
+	flis_stack_writer_lock();
+	/* Snapshot every affected layer for one-step undo. */
+	GSList *snap_target = subset ? subset : com.uniq->layers;
+	if (undo_save_flis_multi_layer(snap_target, _("Layers match"))) {
+		siril_log_warning(_("flis_layers_match: could not save undo state\n"));
+	}
+
+	int ret = flis_background_neutralise_layers(subset);
+	flis_stack_writer_unlock();
+	if (owned_subset) g_slist_free(subset);
+
+	if (ret) {
+		siril_log_error(_("flis_layers_match failed\n"));
+		return CMD_GENERIC_ERROR;
+	}
+
+	gui_iface.flis_invalidate_composite();
+	gui_iface.flis_gui_update();
+	return CMD_OK;
+}
+
+/* Parse a -interp= argument string into an OpenCV interpolation constant.
+ * Returns -1 on unknown value (caller logs and aborts). */
+static int parse_interp_name(const char *s) {
+	if (!s) return -1;
+	if (!g_ascii_strcasecmp(s, "nearest")) return OPENCV_NEAREST;
+	if (!g_ascii_strcasecmp(s, "linear"))  return OPENCV_LINEAR;
+	if (!g_ascii_strcasecmp(s, "cubic"))   return OPENCV_CUBIC;
+	if (!g_ascii_strcasecmp(s, "area"))    return OPENCV_AREA;
+	if (!g_ascii_strcasecmp(s, "lanczos")) return OPENCV_LANCZOS4;
+	if (!g_ascii_strcasecmp(s, "lanczos4")) return OPENCV_LANCZOS4;
+	return -1;
+}
+
+static flis_reg_method_id parse_reg_method_name(const char *s) {
+	if (!s) return (flis_reg_method_id)-1;
+	if (!g_ascii_strcasecmp(s, "global")) return FLIS_REG_GLOBAL;
+	if (!g_ascii_strcasecmp(s, "2pass"))  return FLIS_REG_2PASS;
+	if (!g_ascii_strcasecmp(s, "dft"))    return FLIS_REG_DFT;
+	if (!g_ascii_strcasecmp(s, "kombat")) return FLIS_REG_KOMBAT;
+	return (flis_reg_method_id)-1;
+}
+
+int process_flis_register_layers(int nb) {
+	if (!is_current_image_flis()) {
+		siril_log_error(_("flis_register_layers: requires a FLIS image\n"));
+		return CMD_GENERIC_ERROR;
+	}
+
+	flis_layer_t *ref = NULL;
+	opencv_interpolation interp = OPENCV_LANCZOS4;
+	gboolean clamp = TRUE;
+	flis_reg_method_id method_id = FLIS_REG_GLOBAL;
+
+	for (int i = 1; i < nb; i++) {
+		if (g_str_has_prefix(word[i], "-ref=")) {
+			ref = resolve_layer_arg(word[i] + 5);
+			if (!ref) return CMD_ARG_ERROR;
+		} else if (g_str_has_prefix(word[i], "-method=")) {
+			flis_reg_method_id m = parse_reg_method_name(word[i] + 8);
+			if ((int)m < 0) {
+				siril_log_error(_("flis_register_layers: unknown -method= "
+				                  "value '%s' (expected one of: global, "
+				                  "2pass, dft, kombat)\n"), word[i] + 8);
+				return CMD_ARG_ERROR;
+			}
+			method_id = m;
+		} else if (g_str_has_prefix(word[i], "-interp=")) {
+			int v = parse_interp_name(word[i] + 8);
+			if (v < 0) {
+				siril_log_error(_("flis_register_layers: unknown -interp= value '%s'\n"),
+				                word[i] + 8);
+				return CMD_ARG_ERROR;
+			}
+			interp = (opencv_interpolation)v;
+		} else if (!strcmp(word[i], "-noclamp")) {
+			clamp = FALSE;
+		} else {
+			siril_log_error(_("flis_register_layers: unknown option '%s'\n"), word[i]);
+			return CMD_ARG_ERROR;
+		}
+	}
+
+	if (g_slist_length(com.uniq->layers) < 2) {
+		siril_log_error(_("flis_register_layers: need at least two layers\n"));
+		return CMD_GENERIC_ERROR;
+	}
+
+	/* Default reference: the currently active layer. */
+	if (!ref) ref = flis_active_layer();
+
+	selection_type sel_req;
+	transformation_type tx;
+	registration_function method = flis_register_resolve_method(method_id, &sel_req, &tx);
+	if (!method) {
+		siril_log_error(_("flis_register_layers: internal — unresolved method\n"));
+		return CMD_GENERIC_ERROR;
+	}
+
+	/* Snapshot every layer for one-step undo (pixels change). */
+	if (undo_save_flis_multi_layer(com.uniq->layers, _("Register layers"))) {
+		siril_log_warning(_("flis_register_layers: could not save undo state\n"));
+	}
+
+	/* M-F12: direct mutation on the calling thread — same exclusive
+	 * discipline as the panel path (whose hook runs under the layer
+	 * worker's stack writer lock). */
+	flis_stack_writer_lock();
+	int ret = flis_register_layers(ref, NULL, method, sel_req, tx, interp, clamp);
+	flis_stack_writer_unlock();
+	if (ret) {
+		siril_log_error(_("flis_register_layers failed\n"));
+		return CMD_GENERIC_ERROR;
+	}
+
+	gui_iface.flis_invalidate_composite();
+	gui_iface.flis_gui_update();
+	return CMD_OK;
+}
+
+/* =====================================================================
+ * §7 canvas-scoped commands: act on the FLIS document's canvas
+ * (com.uniq->canvas_w/h) and shift every layer's position to track
+ * the change.  Layer pixel data is never touched.
+ *
+ * Each command snapshots every layer's props for one-step undo via
+ * undo_save_flis_multi_layer_props (positions change, pixels don't,
+ * so the props-only variant is sufficient).  The compound entry also
+ * captures com.uniq->canvas_w/h, so undo restores the canvas
+ * dimensions together with the layer positions.
+ * ===================================================================== */
+
+int process_flis_canvas_resize(int nb) {
+	if (!is_current_image_flis()) {
+		siril_log_error(_("flis_canvas_resize: requires a FLIS image\n"));
+		return CMD_GENERIC_ERROR;
+	}
+	gint w = 0, h = 0, dx = 0, dy = 0;
+	for (int i = 1; i < nb; i++) {
+		char *end;
+		if (g_str_has_prefix(word[i], "-w=")) {
+			w = (gint)g_ascii_strtoll(word[i] + 3, &end, 10);
+			if (end == word[i] + 3 || w <= 0 || w > (1 << 20)) {
+				siril_log_error(_("flis_canvas_resize: -w= must be a positive integer up to %d\n"), 1 << 20);
+				return CMD_ARG_ERROR;
+			}
+		} else if (g_str_has_prefix(word[i], "-h=")) {
+			h = (gint)g_ascii_strtoll(word[i] + 3, &end, 10);
+			if (end == word[i] + 3 || h <= 0 || h > (1 << 20)) {
+				siril_log_error(_("flis_canvas_resize: -h= must be a positive integer up to %d\n"), 1 << 20);
+				return CMD_ARG_ERROR;
+			}
+		} else if (g_str_has_prefix(word[i], "-dx=")) {
+			dx = (gint)g_ascii_strtoll(word[i] + 4, &end, 10);
+			if (end == word[i] + 4) {
+				siril_log_error(_("flis_canvas_resize: -dx= must be an integer\n"));
+				return CMD_ARG_ERROR;
+			}
+		} else if (g_str_has_prefix(word[i], "-dy=")) {
+			dy = (gint)g_ascii_strtoll(word[i] + 4, &end, 10);
+			if (end == word[i] + 4) {
+				siril_log_error(_("flis_canvas_resize: -dy= must be an integer\n"));
+				return CMD_ARG_ERROR;
+			}
+		} else {
+			siril_log_error(_("flis_canvas_resize: unknown option '%s'\n"), word[i]);
+			return CMD_ARG_ERROR;
+		}
+	}
+	if (w == 0 || h == 0) {
+		siril_log_error(_("flis_canvas_resize: -w= and -h= are required\n"));
+		return CMD_ARG_ERROR;
+	}
+	/* M-F12: direct mutation on the calling thread — writer lock over
+	 * the undo snapshot and the canvas op together. */
+	flis_stack_writer_lock();
+	if (undo_save_flis_multi_layer_props(com.uniq->layers, _("Resize canvas"))) {
+		siril_log_warning(_("flis_canvas_resize: could not save undo state\n"));
+	}
+	int canvas_ret = flis_canvas_resize((guint)w, (guint)h, dx, dy);
+	flis_stack_writer_unlock();
+	if (canvas_ret) return CMD_GENERIC_ERROR;
+	gui_iface.flis_invalidate_composite();
+	gui_iface.flis_gui_update();
+	return CMD_OK;
+}
+
+int process_flis_canvas_fit(int nb) {
+	if (!is_current_image_flis()) {
+		siril_log_error(_("flis_canvas_fit: requires a FLIS image\n"));
+		return CMD_GENERIC_ERROR;
+	}
+	gboolean include_invisible = FALSE;
+	for (int i = 1; i < nb; i++) {
+		if (!strcmp(word[i], "-all")) {
+			include_invisible = TRUE;
+		} else {
+			siril_log_error(_("flis_canvas_fit: unknown option '%s'\n"), word[i]);
+			return CMD_ARG_ERROR;
+		}
+	}
+	/* M-F12: direct mutation on the calling thread — writer lock over
+	 * the undo snapshot and the canvas op together. */
+	flis_stack_writer_lock();
+	if (undo_save_flis_multi_layer_props(com.uniq->layers, _("Fit canvas to layers"))) {
+		siril_log_warning(_("flis_canvas_fit: could not save undo state\n"));
+	}
+	int canvas_ret = flis_canvas_fit_to_layers(include_invisible);
+	flis_stack_writer_unlock();
+	if (canvas_ret) return CMD_GENERIC_ERROR;
+	gui_iface.flis_invalidate_composite();
+	gui_iface.flis_gui_update();
+	return CMD_OK;
+}
+
+int process_flis_canvas_rotate(int nb) {
+	if (!is_current_image_flis()) {
+		siril_log_error(_("flis_canvas_rotate: requires a FLIS image\n"));
+		return CMD_GENERIC_ERROR;
+	}
+	if (nb < 2) {
+		siril_log_error(_("Usage: flis_canvas_rotate <angle-degrees>\n"));
+		return CMD_WRONG_N_ARG;
+	}
+	char *end;
+	double angle = g_ascii_strtod(word[1], &end);
+	if (end == word[1]) {
+		siril_log_error(_("flis_canvas_rotate: angle must be a number\n"));
+		return CMD_ARG_ERROR;
+	}
+	/* M-F12: direct mutation on the calling thread — writer lock over
+	 * the undo snapshot and the canvas op together. */
+	flis_stack_writer_lock();
+	if (undo_save_flis_multi_layer_props(com.uniq->layers, _("Rotate canvas"))) {
+		siril_log_warning(_("flis_canvas_rotate: could not save undo state\n"));
+	}
+	int canvas_ret = flis_canvas_rotate(angle);
+	flis_stack_writer_unlock();
+	if (canvas_ret) return CMD_GENERIC_ERROR;
+	gui_iface.flis_invalidate_composite();
+	gui_iface.flis_gui_update();
+	return CMD_OK;
+}
+
+int process_flis_canvas_mirrorx(int nb) {
+	(void)nb;
+	if (!is_current_image_flis()) {
+		siril_log_error(_("flis_canvas_mirrorx: requires a FLIS image\n"));
+		return CMD_GENERIC_ERROR;
+	}
+	/* M-F12: direct mutation on the calling thread — writer lock over
+	 * the undo snapshot and the canvas op together. */
+	flis_stack_writer_lock();
+	if (undo_save_flis_multi_layer_props(com.uniq->layers, _("Mirror canvas X"))) {
+		siril_log_warning(_("flis_canvas_mirrorx: could not save undo state\n"));
+	}
+	int canvas_ret = flis_canvas_mirrorx();
+	flis_stack_writer_unlock();
+	if (canvas_ret) return CMD_GENERIC_ERROR;
+	gui_iface.flis_invalidate_composite();
+	gui_iface.flis_gui_update();
+	return CMD_OK;
+}
+
+int process_flis_canvas_mirrory(int nb) {
+	(void)nb;
+	if (!is_current_image_flis()) {
+		siril_log_error(_("flis_canvas_mirrory: requires a FLIS image\n"));
+		return CMD_GENERIC_ERROR;
+	}
+	/* M-F12: direct mutation on the calling thread — writer lock over
+	 * the undo snapshot and the canvas op together. */
+	flis_stack_writer_lock();
+	if (undo_save_flis_multi_layer_props(com.uniq->layers, _("Mirror canvas Y"))) {
+		siril_log_warning(_("flis_canvas_mirrory: could not save undo state\n"));
+	}
+	int canvas_ret = flis_canvas_mirrory();
+	flis_stack_writer_unlock();
+	if (canvas_ret) return CMD_GENERIC_ERROR;
+	gui_iface.flis_invalidate_composite();
+	gui_iface.flis_gui_update();
 	return CMD_OK;
 }
 

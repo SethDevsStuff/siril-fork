@@ -309,10 +309,9 @@ static void curves_close(gboolean update_image_if_needed, gboolean revert_icc_pr
 	}
 
 	if (revert_icc_profile && !single_image_stretch_applied) {
-		if (gfit->icc_profile)
-			cmsCloseProfile(gfit->icc_profile);
-		gfit->icc_profile = copyICCProfile(original_icc);
-		color_manage(gfit, gfit->icc_profile != NULL);
+		current_image_set_icc_profile(original_icc
+			? copyICCProfile(original_icc) : NULL);
+		current_image_color_manage(original_icc != NULL);
 	}
 
 	clear_backup();
@@ -716,11 +715,10 @@ void on_curves_apply_button_clicked(GtkButton *button, gpointer user_data) {
 				.do_channel = { do_channel[0], do_channel[1], do_channel[2] }
 			};
 			gchar *summary = curves_log_hook(&undo_params, SUMMARY);
-			fits undo_fit = { 0 };
-			memcpy(&undo_fit, get_preview_gfit_backup(), sizeof(fits));
-			undo_fit.icc_profile = original_icc;
-			undo_fit.color_managed = original_icc != NULL;
-			undo_save_state(&undo_fit, "%s", summary);
+			/* One entry captures pre-curve pixels + pre-curve ICC
+			 * profile so a single Ctrl-Z reverts the operation. */
+			undo_save_state_with_icc(get_preview_gfit_backup(),
+					original_icc, "%s", summary);
 			g_free(summary);
 
 			populate_roi();
@@ -830,7 +828,7 @@ void toggle_curves_window_visibility() {
 		if (single_image_is_loaded()) {
 			if (original_icc) {
 				cmsCloseProfile(original_icc);
-				original_icc = copyICCProfile(gfit->icc_profile);
+				original_icc = copyICCProfile(current_icc_profile());
 			}
 			icc_auto_assign_or_convert(gfit, ICC_ASSIGN_ON_STRETCH);
 		} else {

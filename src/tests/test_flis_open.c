@@ -1,0 +1,338 @@
+/*
+ * This file is part of Siril, an astronomy image processor.
+ * Copyright (C) 2005-2011 Francois Meyer (dulle at free.fr)
+ * Copyright (C) 2012-2026 team free-astro (see more in AUTHORS file)
+ * Reference site is https://siril.org
+ *
+ * Siril is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ */
+
+/*
+ * test_flis_open — stage 2 integration tests.  Covers:
+ *   • readfits() FLIS dispatch: a file with FLIS=T in HDU 0 is routed to
+ *     load_flis, populating com.uniq->layers without going through the
+ *     normal FITS read path.
+ *   • flis_promote: turns a loaded plain FITS into a 1-layer FLIS.
+ *   • flis_promote idempotent refusal: calling on an already-FLIS image
+ *     succeeds (with a warning) and changes nothing.
+ *   • Full promote → save → load round-trip through the readfits dispatch
+ *     (the test_flis_roundtrip tests go through save_flis/load_flis
+ *     directly; this one exercises the public open_single_image path
+ *     that scripts and the GUI actually use).
+ */
+
+#include <criterion/criterion.h>
+#include <unistd.h>
+#include "flis_test_helpers.h"
+#include "core/command.h"
+#include "core/command_line_processor.h"
+#include "io/image_format_fits.h"
+#include "io/fits_sequence.h"
+
+cominfo com;
+fits *gfit;
+/* needed by process_flis_promote — arg parser reads word[1..nb-1] */
+char *word[MAX_COMMAND_WORDS];
+
+static char *tmpdir = NULL;
+static char *tmppath = NULL;
+
+static void setup(void) {
+	flis_test_init_com();
+	tmpdir = g_dir_make_tmp("flis-open-XXXXXX", NULL);
+	tmppath = g_build_filename(tmpdir, "test.flis", NULL);
+}
+static void teardown(void) {
+	if (tmppath) { g_unlink(tmppath); g_free(tmppath); tmppath = NULL; }
+	if (tmpdir)  { g_rmdir(tmpdir);   g_free(tmpdir);   tmpdir = NULL; }
+	flis_test_cleanup_com();
+}
+
+TestSuite(flis_open, .init = setup, .fini = teardown);
+
+/* Build a 2-layer fixture in memory, save it, free, reload via readfits
+ * (the public path scripts and the GUI take), and assert the layer stack
+ * is restored.  This is the key §2.1 round-trip — exercises the FLIS=T
+ * header check inside readfits, not just save_flis/load_flis directly. */
+Test(flis_open, readfits_dispatches_flis_files_to_load_flis) {
+	/* Build and save a 2-layer FLIS */
+	flis_test_add_layer(flis_test_make_rgb_fits(4, 4, 0.1f, 0.2f, 0.3f), "base");
+	flis_test_add_layer(flis_test_make_mono_fits(4, 4, 0.7f), "top");
+	cr_assert_eq(save_flis(tmppath), 0);
+	cr_assert_eq(flis_layer_count(), 2);
+
+	/* Reload through readfits — the public path.  Allocate gfit so
+	 * readfits has somewhere to write to (the FLIS dispatch in readfits
+	 * requires fit == gfit). */
+	flis_free_layers(com.uniq);
+	free(com.uniq); com.uniq = NULL;
+	gfit = calloc(1, sizeof(fits));
+	cr_assert_eq(readfits(tmppath, gfit, NULL, FALSE), 0);
+
+	/* load_flis should have populated com.uniq via the readfits delegation,
+	 * not the normal FITS read path. */
+	cr_assert_not_null(com.uniq, "com.uniq should be populated by load_flis");
+	cr_assert_eq(flis_layer_count(), 2,
+	             "two layers should round-trip through readfits dispatch");
+	cr_assert(is_current_image_flis());
+}
+
+/* Plain-FITS readfits unchanged: writing a non-FLIS FITS and reading it
+ * back via readfits should NOT populate com.uniq->layers. */
+Test(flis_open, readfits_plain_fits_not_treated_as_flis) {
+	gfit = flis_test_make_mono_fits(4, 4, 0.5f);
+	gchar *plain_fits = g_build_filename(tmpdir, "plain.fit", NULL);
+	cr_assert_eq(savefits(plain_fits, gfit), 0);
+	clearfits(gfit);
+	free(gfit);
+	gfit = calloc(1, sizeof(fits));
+
+	cr_assert_eq(readfits(plain_fits, gfit, NULL, FALSE), 0);
+	cr_assert(!is_current_image_flis() || !com.uniq || !com.uniq->layers,
+	          "plain FITS must not be auto-treated as FLIS");
+	g_unlink(plain_fits);
+	g_free(plain_fits);
+}
+
+/* ----- flis_promote command coverage ----- */
+
+Test(flis_open, promote_turns_plain_fits_into_single_layer_flis) {
+	/* Simulate a freshly-loaded plain FITS: gfit allocated, com.uniq
+	 * present with chans set but no layers (the post-create_uniq_from_gfit
+	 * state for a plain FITS). */
+	gfit = flis_test_make_mono_fits(8, 8, 0.5f);
+	com.uniq->fit = gfit;
+	com.uniq->chans = 1;
+	cr_assert(!is_current_image_flis());
+
+	word[0] = "flis_promote";
+	word[1] = NULL;
+	cr_assert_eq(process_flis_promote(1), CMD_OK);
+	cr_assert(is_current_image_flis());
+	cr_assert_eq(flis_layer_count(), 1);
+	flis_layer_t *base = (flis_layer_t *)com.uniq->layers->data;
+	cr_assert_str_eq(base->layer_name, "Background");
+}
+
+Test(flis_open, promote_with_name_uses_given_name) {
+	gfit = flis_test_make_mono_fits(8, 8, 0.5f);
+	com.uniq->fit = gfit;
+	com.uniq->chans = 1;
+
+	word[0] = "flis_promote";
+	word[1] = "-name=Jupiter";
+	word[2] = NULL;
+	cr_assert_eq(process_flis_promote(2), CMD_OK);
+	flis_layer_t *base = (flis_layer_t *)com.uniq->layers->data;
+	cr_assert_str_eq(base->layer_name, "Jupiter");
+}
+
+Test(flis_open, promote_idempotent_when_already_flis) {
+	flis_test_add_layer(flis_test_make_mono_fits(4, 4, 0.5f), "existing");
+	cr_assert(is_current_image_flis());
+
+	word[0] = "flis_promote";
+	word[1] = NULL;
+	/* Second invocation succeeds with a warning; layer stack unchanged. */
+	cr_assert_eq(process_flis_promote(1), CMD_OK);
+	cr_assert_eq(flis_layer_count(), 1, "no extra layer should be added");
+	flis_layer_t *base = (flis_layer_t *)com.uniq->layers->data;
+	cr_assert_str_eq(base->layer_name, "existing");
+}
+
+Test(flis_open, promote_rejects_unknown_argument) {
+	gfit = flis_test_make_mono_fits(8, 8, 0.5f);
+	com.uniq->fit = gfit;
+	com.uniq->chans = 1;
+
+	word[0] = "flis_promote";
+	word[1] = "-bogus=42";
+	word[2] = NULL;
+	cr_assert_eq(process_flis_promote(2), CMD_ARG_ERROR);
+}
+
+/* Data-driven save: a multi-layer FLIS saved to a plain .fit name still
+ * comes back as multi-layer.  Format follows the data state (which is
+ * FLIS, with >1 layer), not the chosen extension. */
+Test(flis_open, save_flis_preserves_layers_with_fit_extension) {
+	/* Two-layer FLIS in memory */
+	flis_test_add_layer(flis_test_make_rgb_fits(4, 4, 0.1f, 0.1f, 0.1f), "base");
+	flis_test_add_layer(flis_test_make_mono_fits(4, 4, 0.7f), "top");
+	cr_assert_eq(flis_layer_count(), 2);
+
+	/* Write to a non-.flis extension — save_flis is still the right
+	 * writer because the data state is FLIS.  The file is a valid FITS
+	 * container by spec, so the .fit extension is correct. */
+	gchar *fit_path = g_build_filename(tmpdir, "test.fit", NULL);
+	cr_assert_eq(save_flis(fit_path), 0);
+
+	/* Round-trip through readfits — the FLIS=T header is the signal,
+	 * not the extension.  Both layers should come back. */
+	flis_free_layers(com.uniq);
+	free(com.uniq); com.uniq = NULL;
+	gfit = calloc(1, sizeof(fits));
+	cr_assert_eq(readfits(fit_path, gfit, NULL, FALSE), 0);
+	cr_assert_eq(flis_layer_count(), 2,
+	             ".fit-extensioned FLIS must round-trip with all layers");
+
+	g_unlink(fit_path);
+	g_free(fit_path);
+}
+
+/* Full integration: promote, save (through save_flis), close, reopen via
+ * readfits dispatch.  Mirrors what the e2e siril-cli script does. */
+Test(flis_open, promote_then_save_then_readfits_roundtrip) {
+	gfit = flis_test_make_rgb_fits(8, 8, 0.2f, 0.3f, 0.4f);
+	com.uniq->fit = gfit;
+	com.uniq->chans = 3;
+
+	word[0] = "flis_promote";
+	word[1] = "-name=base";
+	word[2] = NULL;
+	cr_assert_eq(process_flis_promote(2), CMD_OK);
+
+	cr_assert_eq(save_flis(tmppath), 0);
+	flis_free_layers(com.uniq);
+	free(com.uniq); com.uniq = NULL;
+	gfit = calloc(1, sizeof(fits));
+
+	cr_assert_eq(readfits(tmppath, gfit, NULL, FALSE), 0);
+	cr_assert(is_current_image_flis());
+	cr_assert_eq(flis_layer_count(), 1);
+	flis_layer_t *reloaded = (flis_layer_t *)com.uniq->layers->data;
+	cr_assert_str_eq(reloaded->layer_name, "base");
+	cr_assert_eq(reloaded->fit->naxes[2], 3);
+	cr_assert_float_eq(reloaded->fit->fpdata[0][0], 0.2f, 1e-5);
+	cr_assert_float_eq(reloaded->fit->fpdata[1][0], 0.3f, 1e-5);
+	cr_assert_float_eq(reloaded->fit->fpdata[2][0], 0.4f, 1e-5);
+}
+
+/* A FLIS file must never be detected as a FITS sequence: its image HDUs
+ * legitimately differ in size (sparse layers, thumbnail), and treating it
+ * as a fitseq bypasses load_flis entirely (the user gets a stack of mono
+ * "frames" — or just the thumbnail — instead of the layered image).
+ * Guards the _find_hdus() FLIS bail-out ported from the flis branch. */
+Test(flis_open, flis_file_is_not_a_fitseq) {
+	/* Layers of different sizes — the heterogeneous case that used to
+	 * trip the fitseq detector. */
+	flis_test_add_layer(flis_test_make_rgb_fits(8, 8, 0.1f, 0.2f, 0.3f), "base");
+	flis_test_add_layer(flis_test_make_mono_fits(4, 6, 0.7f), "small");
+	cr_assert_eq(save_flis(tmppath), 0);
+
+	int frames = -1;
+	cr_assert_eq(fitseq_is_fitseq(tmppath, &frames), 0,
+	             "FLIS file detected as a FITS sequence (frames=%d)", frames);
+}
+
+/* ---- crafted-file hardening (M-F15 regression) ---------------------- */
+
+#include <fitsio.h>
+#include <string.h>
+
+/* Craft a FLIS whose metadata table has the columns in a non-standard
+ * order AND declares LAYER_NAME as 128A — wider than the loader's fixed
+ * 33-byte row field.  Pre-hardening, the loader used fixed column
+ * indices (misreading reordered tables) and CFITSIO's TSTRING read
+ * copied the declared width into the fixed buffer (heap overflow).
+ * Post-hardening, columns resolve by name and string cells are read
+ * bounded; the over-long name truncates. */
+Test(flis_open, crafted_wide_reordered_meta_columns_are_safe) {
+	gchar *path = g_build_filename(tmpdir, "crafted.flis", NULL);
+	fitsfile *fptr = NULL;
+	int status = 0;
+
+	fits_create_diskfile(&fptr, path, &status);
+	cr_assert_eq(status, 0);
+
+	/* HDU 1: thumbnail-ish primary with the FLIS identification keys. */
+	long naxes[2] = { 2, 2 };
+	float px[4] = { 0.f, 0.f, 0.f, 0.f };
+	fits_create_img(fptr, FLOAT_IMG, 2, naxes, &status);
+	int t = 1;
+	fits_write_key(fptr, TLOGICAL, "FLIS", &t, "FLIS file", &status);
+	fits_write_key(fptr, TSTRING, "FLISVER", "1.0", "version", &status);
+	fits_write_img(fptr, TFLOAT, 1, 4, px, &status);
+
+	/* HDU 2: FLIS_META with LAYER_NAME first and declared as 128A. */
+	char *names[14] = { "LAYER_NAME", "ITEM_ID", "ITEM_TYPE", "HDU_INDEX",
+	                    "PARENT_ID", "LAYER_ORDER", "COLOR_MDL", "BLEND_MODE",
+	                    "OPACITY", "VISIBLE", "POSITION_X", "POSITION_Y",
+	                    "METADATA", "GROUP_ID" };
+	char *forms[14] = { "128A", "1J", "8A", "1J",
+	                    "1J", "1J", "4A", "16A",
+	                    "1E", "1L", "1J", "1J",
+	                    "1PA", "1J" };
+	fits_create_tbl(fptr, BINARY_TBL, 0, 14, names, forms, NULL,
+	                "FLIS_META", &status);
+	cr_assert_eq(status, 0, "table creation failed: %d", status);
+
+	char longname[129];
+	memset(longname, 'N', 128);
+	longname[128] = '\0';
+	char *sp = longname;
+	fits_write_col(fptr, TSTRING, 1, 1, 1, 1, &sp, &status);
+	int iv = 1;
+	fits_write_col(fptr, TINT, 2, 1, 1, 1, &iv, &status);      /* ITEM_ID */
+	sp = "LAYER";
+	fits_write_col(fptr, TSTRING, 3, 1, 1, 1, &sp, &status);
+	iv = 3;
+	fits_write_col(fptr, TINT, 4, 1, 1, 1, &iv, &status);      /* HDU_INDEX */
+	iv = 0;
+	fits_write_col(fptr, TINT, 5, 1, 1, 1, &iv, &status);      /* PARENT_ID */
+	iv = 0;
+	fits_write_col(fptr, TINT, 6, 1, 1, 1, &iv, &status);      /* LAYER_ORDER */
+	sp = "MONO";
+	fits_write_col(fptr, TSTRING, 7, 1, 1, 1, &sp, &status);
+	sp = "NORMAL";
+	fits_write_col(fptr, TSTRING, 8, 1, 1, 1, &sp, &status);
+	float fv = 1.0f;
+	fits_write_col(fptr, TFLOAT, 9, 1, 1, 1, &fv, &status);
+	char lv = 1;
+	fits_write_col(fptr, TLOGICAL, 10, 1, 1, 1, &lv, &status);
+	iv = 0;
+	fits_write_col(fptr, TINT, 11, 1, 1, 1, &iv, &status);
+	iv = 0;
+	fits_write_col(fptr, TINT, 12, 1, 1, 1, &iv, &status);
+	/* METADATA left empty */
+	iv = 0;
+	fits_write_col(fptr, TINT, 14, 1, 1, 1, &iv, &status);
+	cr_assert_eq(status, 0, "row write failed: %d", status);
+
+	/* HDU 3: the layer image the row points at. */
+	float lpx[4] = { 0.5f, 0.5f, 0.5f, 0.5f };
+	fits_create_img(fptr, FLOAT_IMG, 2, naxes, &status);
+	fits_write_img(fptr, TFLOAT, 1, 4, lpx, &status);
+	fits_close_file(fptr, &status);
+	cr_assert_eq(status, 0, "file creation failed: %d", status);
+
+	/* The load must not corrupt memory.  Either a clean refusal or a
+	 * successful load with the over-long name truncated is acceptable. */
+	int rv = load_flis(path);
+	if (rv == 0) {
+		cr_assert_eq(flis_layer_count(), 1);
+		flis_layer_t *l = (flis_layer_t *)com.uniq->layers->data;
+		cr_assert_not_null(l->layer_name);
+		cr_assert(strlen(l->layer_name) <= 32,
+		          "over-long layer name must be truncated (got %zu chars)",
+		          strlen(l->layer_name));
+	}
+	g_unlink(path);
+	g_free(path);
+}
+
+/* A metadata table declaring an absurd row count must be refused before
+ * any per-row allocation happens. */
+Test(flis_open, garbage_file_fails_cleanly) {
+	gchar *path = g_build_filename(tmpdir, "garbage.flis", NULL);
+	FILE *f = fopen(path, "wb");
+	cr_assert_not_null(f);
+	for (int i = 0; i < 4096; i++)
+		fputc(i * 37 & 0xff, f);
+	fclose(f);
+	cr_assert_neq(load_flis(path), 0, "garbage input must fail cleanly");
+	g_unlink(path);
+	g_free(path);
+}

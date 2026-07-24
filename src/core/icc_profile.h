@@ -87,7 +87,8 @@ char* siril_color_profile_get_manufacturer (cmsHPROFILE profile);
 char* siril_color_profile_get_model (cmsHPROFILE profile);
 gboolean siril_color_profile_is_rgb(cmsHPROFILE profile);
 unsigned char* get_icc_profile_data(cmsHPROFILE profile, guint32 *len);
-cmsBool fit_icc_is_linear(fits *fit);
+cmsBool fit_icc_is_linear(fits *fit);  /* deprecated; use icc_profile_is_linear */
+cmsBool icc_profile_is_linear(cmsHPROFILE profile);
 cmsHPROFILE siril_color_profile_linear_from_color_profile (cmsHPROFILE profile);
 void check_profile_correct(fits* fit);
 void enable_profile_check_verbose();
@@ -110,6 +111,66 @@ void icc_unlock_monitor_profile(void);
 void icc_lock_soft_proof_profile(void);
 void icc_unlock_soft_proof_profile(void);
 
+/* --------------------------------------------------------------------
+ * Current-image ICC accessors.
+ *
+ * The authoritative store for the current image's colour profile lives
+ * on com.uniq (single struct), not on any fits.  Use these helpers
+ * everywhere you would previously have read or written gfit->icc_profile
+ * / gfit->color_managed.  They cope with the no-image-loaded case
+ * (com.uniq == NULL) by returning NULL / FALSE / no-op.
+ *
+ * Sequence frames and intermediate processing buffers do NOT have a
+ * profile attached and must not call these — they either operate
+ * profile-free (sequences) or pass profile explicitly via function
+ * parameters (intermediate transforms).
+ * -------------------------------------------------------------------- */
+cmsHPROFILE current_icc_profile(void);
+gboolean    current_image_color_managed(void);
+/* Takes ownership of @p (caller must not close it after handing it
+ * over); a previous current_icc_profile is cmsCloseProfile'd. */
+void        current_image_set_icc_profile(cmsHPROFILE p);
+/* Close & clear current profile and set color_managed = FALSE. */
+void        current_image_clear_icc_profile(void);
+/* Set color_managed flag without touching the profile.  Updates the
+ * GUI toolbar icon as a side effect (was the responsibility of the
+ * old color_manage() function). */
+void        current_image_color_manage(gboolean active);
+
+/* During the (brief) window between close_single_image() and
+ * create_uniq_from_gfit() in the open-file path, com.uniq is NULL.
+ * Load helpers that try to install a profile via the accessors
+ * during this window would otherwise just close-and-discard.  The
+ * staging area below lets the loader hand off a profile that the
+ * subsequent install_staged_icc_profile() call (from
+ * create_uniq_from_gfit) will promote to com.uniq once it exists. */
+void        stage_icc_profile_for_pending_image(cmsHPROFILE p, gboolean managed);
+void        install_staged_icc_profile(void);
+
+/* The threaded open decodes into a private fits while the previous image's
+ * com.uniq is still live.  Register that fits here (clears any stale staged
+ * profile); loaders then route its embedded profile into the staging area
+ * via icc_profile_attach_from_load().  Unregister with NULL when the decode
+ * finishes — that keeps the staged profile for install_staged_icc_profile().
+ *
+ * icc_profile_attach_from_load() takes ownership of @p and sends it to the
+ * right place for a load-time profile: staging (pending fit, or gfit with
+ * no com.uniq yet), the live image state (gfit with com.uniq), or closed
+ * and discarded (sequence frames / intermediate buffers — returns FALSE). */
+void        icc_profile_set_pending_fit(const fits *fit);
+gboolean    icc_fit_is_load_target(const fits *fit);
+gboolean    icc_profile_attach_from_load(const fits *fit, cmsHPROFILE p);
+
+/* Per-fits accessor: returns the ICC profile that applies to @fit.
+ * For the current-image fits (gfit, or the FLIS profiled fit) this
+ * is com.uniq's profile; for any intermediate / sequence-frame fits
+ * it is NULL — those buffers carry no colour profile state.  Use
+ * this everywhere old code did `fit->icc_profile` (the field has been
+ * removed from the fits struct; these accessors are the only source of
+ * per-fits profile state). */
+cmsHPROFILE fit_get_icc_profile(const fits *fit);
+gboolean    fit_get_color_managed(const fits *fit);
+
 /* Image processing hooks for generic_image_worker */
 #include "core/processing.h"
 
@@ -120,11 +181,33 @@ struct icc_data {
 };
 
 void free_icc_data(void *p);
-int icc_remove_hook(struct generic_img_args *args, fits *fit, int threads);
-gchar *icc_remove_log_hook(gpointer p, log_hook_detail detail);
-int icc_assign_hook(struct generic_img_args *args, fits *fit, int threads);
-gchar *icc_assign_log_hook(gpointer p, log_hook_detail detail);
 int icc_convert_to_hook(struct generic_img_args *args, fits *fit, int threads);
 gchar *icc_convert_to_log_hook(gpointer p, log_hook_detail detail);
+
+/* Layer hook for ICC conversion of a FLIS document: transforms every
+ * layer's pixels (and tint vectors) via flis_convert_layers_icc under the
+ * stack writer lock, saves a multi-layer undo entry and lands the new
+ * profile on com.uniq.  Submit via generic_layer_worker; args->user is a
+ * struct icc_data. */
+int icc_convert_flis_layer_hook(struct generic_layer_args *args);
+
+/* --------------------------------------------------------------------
+ * Assign / Remove are pure document-state operations: they touch no
+ * pixels, so they do not ride generic_image_worker (which would deep-copy
+ * the whole image on the swap path just to change a profile pointer).
+ * They run as a lightweight processing-thread job that reads and writes
+ * com.uniq directly.
+ * -------------------------------------------------------------------- */
+struct icc_state_args {
+	destructor destroy_fn;      /* Must be first member */
+	cmsHPROFILE profile;        /* owned; NULL = remove the profile */
+	gboolean command;           /* TRUE when invoked from a command/script */
+	gboolean (*idle_function)(gpointer p); /* override the default end idle */
+	int retval;                 /* 0 = success, set by the worker */
+};
+
+void free_icc_state_args(void *p);
+/* Thread function for start_in_new_thread. */
+gpointer icc_state_worker(gpointer p);
 
 #endif /* SRC_CORE_ICC_PROFILE_H_ */

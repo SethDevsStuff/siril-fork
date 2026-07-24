@@ -186,6 +186,7 @@ static void rotate_gui(fits *fit) {
 	args->verbose = TRUE;
 	args->user = params;
 	args->max_threads = com.max_thread;
+	args->geometry_changing = TRUE;
 
 	if (!start_in_new_thread(generic_image_worker, args)) {
 		free_generic_img_args(args);
@@ -250,6 +251,7 @@ void siril_rotate90() {
 	args->verbose = TRUE;
 	args->user = params;
 	args->max_threads = 1;  // Fast rotation doesn't benefit from threading
+	args->geometry_changing = TRUE;
 
 	if (!start_in_new_thread(generic_image_worker, args)) {
 		free_generic_img_args(args);
@@ -292,6 +294,7 @@ void siril_rotate270() {
 	args->verbose = TRUE;
 	args->user = params;
 	args->max_threads = 1;
+	args->geometry_changing = TRUE;
 
 	if (!start_in_new_thread(generic_image_worker, args)) {
 		free_generic_img_args(args);
@@ -406,6 +409,7 @@ void mirrorx_gui(fits *fit) {
 	args->verbose = TRUE;
 	args->user = params;
 	args->max_threads = com.max_thread;
+	args->geometry_changing = TRUE;
 
 	if (!start_in_new_thread(generic_image_worker, args)) {
 		free_generic_img_args(args);
@@ -442,6 +446,7 @@ void mirrory_gui(fits *fit) {
 	args->verbose = TRUE;
 	args->user = params;
 	args->max_threads = com.max_thread;
+	args->geometry_changing = TRUE;
 
 	if (!start_in_new_thread(generic_image_worker, args)) {
 		free_generic_img_args(args);
@@ -507,6 +512,7 @@ void on_button_binning_ok_clicked(GtkButton *button, gpointer user_data) {
 	args->verbose = TRUE;
 	args->user = params;
 	args->max_threads = com.max_thread;
+	args->geometry_changing = TRUE;
 
 	if (!start_in_new_thread(generic_image_worker, args)) {
 		free_generic_img_args(args);
@@ -578,6 +584,7 @@ void on_button_resample_ok_clicked(GtkButton *button, gpointer user_data) {
 	args->verbose = TRUE;
 	args->user = params;
 	args->max_threads = com.max_thread;
+	args->geometry_changing = TRUE;
 
 	if (!start_in_new_thread(generic_image_worker, args)) {
 		free_generic_img_args(args);
@@ -778,6 +785,7 @@ void siril_crop() {
 	args->verbose = TRUE;
 	args->user = params;
 	args->max_threads = 1;  // Crop doesn't benefit from threading
+	args->geometry_changing = TRUE;
 
 	if (!start_in_new_thread(generic_image_worker, args)) {
 		free_generic_img_args(args);

@@ -872,6 +872,89 @@ static void impl_redraw_mask_idle(gboolean remap_tints) {
 		queue_redraw_mask(remap_tints);
 }
 
+/* FLIS composite invalidation — stage 1.2 no-op stub.  Replaced in
+ * stage 3.4 with a real implementation that drops per-layer GdkTexture
+ * tile caches and queues a snapshot redraw via flis_display_invalidate(). */
+/* Stage 3.1 — the FLIS display composite cache lives in image_display.c
+ * as static state.  These wrappers expose only the cache-management
+ * operations to gui_iface so non-GUI code (image_format_flis primitives,
+ * single_image close path) can invalidate / release without including
+ * image_display.h. */
+extern void flis_display_invalidate_composite(void);
+extern void flis_display_composite_free(void);
+extern void flis_display_invalidate(int flags, int item_id);
+extern fits *flis_display_swap_in_composite(void);
+extern void  flis_display_swap_out_composite(fits *saved);
+
+static void impl_flis_invalidate_composite(void) {
+	flis_display_invalidate_composite();
+}
+
+static void impl_flis_composite_free(void) {
+	flis_display_composite_free();
+}
+
+static void impl_flis_display_invalidate(int flags, int item_id) {
+	flis_display_invalidate(flags, item_id);
+}
+
+static void *impl_flis_swap_in_composite(void) {
+	return flis_display_swap_in_composite();
+}
+static void impl_flis_swap_out_composite(void *saved) {
+	flis_display_swap_out_composite((fits *)saved);
+}
+
+extern void flis_gui_update_from_idle(void);  /* flis_gui.h, stage 4 */
+
+/* ── Active-layer-change reconciler ──────────────────────────────────────
+ *
+ * Single chokepoint for everything keyed to WHICH layer gfit points at.
+ * uniq_set_active_layer() fires gui_iface.on_active_layer_changed() on
+ * every retarget; this queues one coalesced main-thread idle (async by
+ * contract — the caller may hold the FLIS stack writer lock, so nothing
+ * here may take locks or block).  The idle then:
+ *
+ *   - re-arms a live preview whose backup was taken from another layer
+ *     (identity-checked; restores and preview ticks are blocked by the
+ *     owner gate in siril_preview.c until this runs);
+ *   - repopulates the ROI pixel cache, which held the outgoing layer's
+ *     pixels (populate_roi clips to the new layer, or empties);
+ *   - retests mask-tab visibility (lmask presence differs per layer);
+ *   - refreshes the layers panel / header / canvas dialog.
+ */
+static gint active_layer_reconcile_pending = 0;
+
+static gboolean active_layer_reconcile_idle(gpointer p) {
+	(void)p;
+	g_atomic_int_set(&active_layer_reconcile_pending, 0);
+	if (is_preview_active() && get_preview_backup_owner() != gfit) {
+		clear_backup();
+		copy_gfit_to_backup();
+	}
+	if (gui.roi.active)
+		populate_roi();
+	show_or_hide_mask_tab();
+	flis_gui_update_from_idle();
+	redraw(REDRAW_OVERLAY);
+	return G_SOURCE_REMOVE;
+}
+
+static void impl_on_active_layer_changed(void) {
+	if (!g_atomic_int_compare_and_exchange(&active_layer_reconcile_pending, 0, 1))
+		return;
+	g_idle_add(active_layer_reconcile_idle, NULL);
+}
+extern gboolean flis_panel_group_is_selected(void);  /* flis_gui.h */
+extern void flis_gui_present_if_flis(void);
+
+static void impl_flis_gui_update(void) {
+	flis_gui_update_from_idle();
+}
+static void impl_flis_gui_present_if_flis(void) {
+	flis_gui_present_if_flis();
+}
+
 /* ── Group G additions: Channel / precision display state ────────────────── */
 
 static void impl_on_channel_count_changed(void) {
@@ -991,15 +1074,19 @@ struct cm_struct {
 
 static gboolean cm_worker(gpointer user_data) {
 	struct cm_struct *data = (struct cm_struct *) user_data;
-	fits *fit = data->fit;
+	(void)data->fit;
 	gboolean active = data->active;
 	gchar *buffer = NULL, *monitor = NULL, *proof = NULL;
 	gchar *name = g_build_filename("/org/siril/ui/", "pixmaps",
 		active ? "color_management.svg" : "color_management_off.svg", NULL);
 	gchar *tooltip = NULL;
 	if (active) {
-		if (fit->icc_profile) {
-			buffer = siril_color_profile_get_description(fit->icc_profile);
+		/* Read the current image's profile from com.uniq (the fit
+		 * pointer the caller passed is no longer used — the accessors
+		 * own the profile state). */
+		cmsHPROFILE current = current_icc_profile();
+		if (current) {
+			buffer = siril_color_profile_get_description(current);
 			monitor = siril_color_profile_get_description(com.gui_icc.monitor);
 		}
 		if (com.gui_icc.soft_proof)
@@ -1528,6 +1615,15 @@ void siril_register_gui_iface(void) {
 	gui_iface.invalidate_histogram        = impl_invalidate_histogram;
 	gui_iface.update_histogram            = impl_update_histogram;
 	gui_iface.redraw_mask_idle            = impl_redraw_mask_idle;
+	gui_iface.flis_invalidate_composite   = impl_flis_invalidate_composite;
+	gui_iface.flis_display_invalidate     = impl_flis_display_invalidate;
+	gui_iface.flis_swap_in_composite      = impl_flis_swap_in_composite;
+	gui_iface.flis_swap_out_composite     = impl_flis_swap_out_composite;
+	gui_iface.flis_composite_free         = impl_flis_composite_free;
+	gui_iface.flis_gui_update             = impl_flis_gui_update;
+	gui_iface.on_active_layer_changed     = impl_on_active_layer_changed;
+	gui_iface.flis_group_is_selected      = flis_panel_group_is_selected;
+	gui_iface.flis_gui_present_if_flis    = impl_flis_gui_present_if_flis;
 	gui_iface.on_channel_count_changed    = impl_on_channel_count_changed;
 	gui_iface.on_precision_changed        = impl_on_precision_changed;
 	gui_iface.roi_is_active               = impl_roi_is_active;
@@ -1673,13 +1769,14 @@ static void impl_apply_display_icc_compensation(gpointer p) {
 			memcpy(fit->pdata[2], fit->data, fit->rx * fit->ry * sizeof(WORD));
 		}
 	}
-	cmsHPROFILE temp = copyICCProfile(fit->icc_profile);
-	cmsCloseProfile(fit->icc_profile);
-	fit->icc_profile = copyICCProfile(com.gui_icc.monitor);
-	siril_colorspace_transform(fit, temp);
-	cmsCloseProfile(fit->icc_profile);
-	fit->icc_profile = copyICCProfile(temp);
-	cmsCloseProfile(temp);
+	/* Only the current image has profile state to compensate against
+	 * the monitor.  For non-current fits this operation is a no-op. */
+	if (fit == gfit) {
+		cmsHPROFILE temp = copyICCProfile(current_icc_profile());
+		current_image_set_icc_profile(copyICCProfile(com.gui_icc.monitor));
+		siril_colorspace_transform(fit, temp);
+		current_image_set_icc_profile(temp);  /* takes ownership */
+	}
 	if (depth == 1) {
 		size_t npixels = fit->rx * fit->ry;
 		if (fit->type == DATA_FLOAT) {

@@ -189,6 +189,8 @@ src_files = [
   'io/healpix/xp_continuous.cpp',
   'io/healpix/gaia_xp_design.c',
   'io/image_format_fits.c',
+  'io/image_format_flis.c',
+  'io/flis_compose.c',
   'io/image_formats_internal.c',
   'io/image_formats_libraries.c',
   'io/local_catalogues.c',
@@ -232,6 +234,7 @@ src_files = [
   'registration/registration.c',
   'registration/applyreg.c',
   'registration/shift_methods.c',
+  'registration/flis_register.c',
   'registration/mpp.cpp',
   'registration/mpp/mpp_run.c',
   'registration/mpp/mpp_config.c',
@@ -355,6 +358,8 @@ gui_filenames = [
   'utils.c',
   'wavelets.c',
   'file_browser.c',  # custom GtkDirectoryList-based file picker with preview
+  'flis_gpu_compose.c',  # per-layer GdkTexture cache + GSK push_blend (stage 3.2)
+  'flis_gui.c',          # FLIS layers panel (stage 4)
 ]
 
 src_files_gui = []

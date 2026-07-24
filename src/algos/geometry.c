@@ -35,6 +35,7 @@
 #include "opencv/opencv.h"
 #include "io/sequence.h"
 #include "io/image_format_fits.h"
+#include "io/image_format_flis.h"
 #include "io/gps_parser.h"
 #include "io/single_image.h"
 #include "core/gui_iface.h"
@@ -803,6 +804,28 @@ int fits_binning(fits *fit, int factor, gboolean mean) {
 		}
 	}
 
+	/* FLIS: keep the layer mask (lmask) in step with the pixel data —
+	 * a stale-size lmask corrupts compositing.  Wrapped as a mask_t so
+	 * the shared geometry helpers apply.  This hook runs under
+	 * generic_image_worker (no stack lock), so take the stack writer
+	 * lock around the lmask lifetime mutation — M-F12 rule 2 allows
+	 * fits→stack nesting; the free is deferred to the main thread. */
+	flis_stack_writer_lock();
+	flis_layer_t *_lay_bin = flis_layer_get_by_fit(fit);
+	if (_lay_bin && _lay_bin->lmask && _lay_bin->lmask->data) {
+		mask_t _tmp = { .bitpix = _lay_bin->lmask->bitpix, .data = _lay_bin->lmask->data };
+		if (bin_mask(&_tmp, old_rx, old_ry, factor, mean)) {
+			siril_log_error(_("Error binning layer mask\n"));
+			layermask_free_deferred(_lay_bin->lmask);
+			_lay_bin->lmask = NULL;
+		} else {
+			_lay_bin->lmask->data = _tmp.data;
+			_lay_bin->lmask->w = old_rx / factor;
+			_lay_bin->lmask->h = old_ry / factor;
+		}
+	}
+	flis_stack_writer_unlock();
+
 	if (has_wcs(fit)) {
 		Homography H = { 0 };
 		cvGetEye(&H);
@@ -874,6 +897,26 @@ int verbose_resize_gaussian(fits *image, int toX, int toY, opencv_interpolation 
 		}
 	}
 
+	if (retvalue == 0) {
+		/* Stack writer lock: see the matching comment in the binning
+		 * hook (M-F12 — lmask lifetime mutation from the image worker). */
+		flis_stack_writer_lock();
+		flis_layer_t *_lay_res = flis_layer_get_by_fit(image);
+		if (_lay_res && _lay_res->lmask && _lay_res->lmask->data) {
+			mask_t _tmp = { .bitpix = _lay_res->lmask->bitpix, .data = _lay_res->lmask->data };
+			if (resize_mask(&_tmp, old_rx, old_ry, toX, toY, interpolation)) {
+				siril_log_error(_("Error resizing layer mask\n"));
+				layermask_free_deferred(_lay_res->lmask);
+				_lay_res->lmask = NULL;
+			} else {
+				_lay_res->lmask->data = _tmp.data;
+				_lay_res->lmask->w = toX;
+				_lay_res->lmask->h = toY;
+			}
+		}
+		flis_stack_writer_unlock();
+	}
+
 	if (image->keywords.pixel_size_x > 0) image->keywords.pixel_size_x *= factor_X;
 	if (image->keywords.pixel_size_y > 0) image->keywords.pixel_size_y *= factor_Y;
 
@@ -915,6 +958,10 @@ static void GetMatrixReframe(fits *image, rectangle area, double angle, int crop
 // wraps cvRotateImage to update WCS data as well
 int verbose_rotate_fast(fits *image, int angle) {
 	if (angle % 90 != 0) return 1; // only for multiples of 90 \deg
+	/* 0° (and any multiple of 360°) is a no-op.  cvRotateImage() does not
+	 * handle angle==0 correctly (falls into the 270° branch), so bail out
+	 * before calling it. */
+	if (angle % 360 == 0) return 0;
 	gui_iface.on_geometry_changed(); // ROI is cleared on geometry-altering operations
 	gboolean tmp_mask_active = FALSE;
 	if (image->mask) {
@@ -943,6 +990,24 @@ int verbose_rotate_fast(fits *image, int angle) {
 			set_mask_active(image, tmp_mask_active);
 		}
 	}
+
+	/* Stack writer lock: see the matching comment in the binning hook
+	 * (M-F12 — lmask lifetime mutation from the image worker). */
+	flis_stack_writer_lock();
+	flis_layer_t *_lay_rf = flis_layer_get_by_fit(image);
+	if (_lay_rf && _lay_rf->lmask && _lay_rf->lmask->data) {
+		mask_t _tmp = { .bitpix = _lay_rf->lmask->bitpix, .data = _lay_rf->lmask->data };
+		if (transform_mask(&_tmp, orig_rx, orig_ry, target_rx, target_ry, H, OPENCV_NEAREST)) {
+			siril_log_error(_("Error rotating layer mask\n"));
+			layermask_free_deferred(_lay_rf->lmask);
+			_lay_rf->lmask = NULL;
+		} else {
+			_lay_rf->lmask->data = _tmp.data;
+			_lay_rf->lmask->w = target_rx;
+			_lay_rf->lmask->h = target_ry;
+		}
+	}
+	flis_stack_writer_unlock();
 
 	if (has_wcs(image)) {
 		cvApplyFlips(&H, orig_ry, target_ry);
@@ -1664,30 +1729,60 @@ gchar *rotation_log_hook(gpointer p, log_hook_detail detail) {
  *      G E O M E T R Y   I M A G E   H O O K S   F O R   W O R K E R
  ****************************************************************************/
 
+/* Returns TRUE when the current op should propagate dimension/centre changes
+ * to non-active FLIS layers — i.e. a FLIS is loaded AND the op is targeting
+ * the active layer (gfit), not an ROI or out-of-band fit. */
+static inline gboolean op_is_active_layer_in_flis(const struct generic_img_args *args) {
+	return is_current_image_flis() && args->fit == gfit;
+}
+
 int binning_image_hook(struct generic_img_args *args, fits *fit, int nb_threads) {
 	struct binning_args *params = (struct binning_args *)args->user;
 	if (!params)
 		return 1;
 
-	return fits_binning(fit, params->factor, params->mean);
+	int old_rx = (int)fit->rx, old_ry = (int)fit->ry;
+	int retval = fits_binning(fit, params->factor, params->mean);
+	if (!retval && op_is_active_layer_in_flis(args))
+		flis_update_layer_offset_after_resize(old_rx, old_ry,
+		                                      (int)fit->rx, (int)fit->ry);
+	return retval;
 }
 
 int crop_image_hook_single(struct generic_img_args *args, fits *fit, int nb_threads) {
 	struct crop_args *params = (struct crop_args *)args->user;
 	if (!params)
 		return 1;
+	gint canvas_sel_x = params->area.x;
+	gint canvas_sel_y = params->area.y;
+	if (op_is_active_layer_in_flis(args)) {
+		/* params->area is in active-layer fit coords; convert to canvas
+		 * coords for the offset helper.  Base layer sits at (0,0) so this
+		 * is a no-op for that case. */
+		flis_layer_t *active = flis_active_layer();
+		if (active) {
+			canvas_sel_x += active->position_x;
+			canvas_sel_y += active->position_y;
+		}
+	}
 	int retval = crop(fit, &params->area);
+	if (!retval && op_is_active_layer_in_flis(args))
+		flis_update_layer_offset_after_crop(canvas_sel_x, canvas_sel_y);
 	gui_iface.on_crop_complete();
 	return retval;
 }
 
 int mirrorx_image_hook(struct generic_img_args *args, fits *fit, int nb_threads) {
 	mirrorx(fit, FALSE);
+	if (op_is_active_layer_in_flis(args))
+		flis_update_layer_offset_after_mirrorx();
 	return 0;
 }
 
 int mirrory_image_hook(struct generic_img_args *args, fits *fit, int nb_threads) {
 	mirrory(fit, FALSE);
+	if (op_is_active_layer_in_flis(args))
+		flis_update_layer_offset_after_mirrory();
 	return 0;
 }
 
@@ -1696,8 +1791,12 @@ int resample_image_hook(struct generic_img_args *args, fits *fit, int nb_threads
 	if (!params)
 		return 1;
 
+	int old_rx = (int)fit->rx, old_ry = (int)fit->ry;
 	int retval = verbose_resize_gaussian(fit, params->toX, params->toY,
 	                                params->interpolation, params->clamp, params->update_wcs);
+	if (!retval && op_is_active_layer_in_flis(args))
+		flis_update_layer_offset_after_resize(old_rx, old_ry,
+		                                      (int)fit->rx, (int)fit->ry);
 	gui_iface.update_menu_state();
 	return retval;
 }
@@ -1707,6 +1806,7 @@ int rotation_image_hook(struct generic_img_args *args, fits *fit, int nb_threads
 	if (!params)
 		return 1;
 
+	int old_rx = (int)fit->rx, old_ry = (int)fit->ry;
 	// Check for fast rotation (90 degree increments)
 	int angle_int = (int)params->angle;
 	int retval;
@@ -1719,6 +1819,11 @@ int rotation_image_hook(struct generic_img_args *args, fits *fit, int nb_threads
 	                             params->interpolation, params->cropped,
 	                             params->clamp);
 	}
+
+	if (!retval && op_is_active_layer_in_flis(args))
+		flis_update_layer_offset_after_rotate(old_rx, old_ry,
+		                                      (int)fit->rx, (int)fit->ry,
+		                                      params->angle);
 
 	// If a selection is set, expand it to cover the entire (rotated) image.
 	// The GUI update (new_selection_zone) is deferred to the completion idle so

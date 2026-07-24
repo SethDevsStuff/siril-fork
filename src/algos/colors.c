@@ -829,15 +829,18 @@ static gpointer extract_channels_ushort(gpointer p) {
 	cmsUInt32Number bytesperline;
 	cmsUInt32Number bytesperplane;
 	gchar *desc = NULL;
-	if(args->fit->icc_profile) {
-		desc = siril_color_profile_get_description(args->fit->icc_profile);
-		cmsCloseProfile(args->fit->icc_profile);
+	/* args->fit is a working copy of the loaded image; under the com.uniq
+		* profile model the copy carries no profile state of its own, so the
+		* description comes from the current image's profile — which must be
+		* left untouched: the extraction must not strip colour management
+		* from the still-loaded image. */
+	if (current_icc_profile()) {
+		desc = siril_color_profile_get_description(current_icc_profile());
 	}
 	/* The extracted channels are considered raw data, and are not color
 		* managed. It is up to the user to ensure that future use of them is
 		* with similar data and an appropriate color profile is assigned.
 		* See also the HSV and CIELAB cases below.*/
-	args->fit->icc_profile = NULL;
 	color_manage(args->fit, FALSE);
 
 	switch (args->type) {
@@ -881,8 +884,8 @@ static gpointer extract_channels_ushort(gpointer p) {
 	case EXTRACT_CIELAB:
 		histstring = g_strdup_printf(_("%s: extract LAB channel"), extractionstring);
 		cielab_profile = cmsCreateLab4Profile(NULL);
-		if (args->fit->icc_profile) {
-			image_profile = copyICCProfile(args->fit->icc_profile);
+		if (fit_get_icc_profile(args->fit)) {
+			image_profile = copyICCProfile(fit_get_icc_profile(args->fit));
 		} else {
 			siril_log_message(_("Image is not color managed. Assuming sRGB.\n"));
 			image_profile = srgb_trc();
@@ -967,15 +970,18 @@ static gpointer extract_channels_float(gpointer p) {
 	cmsUInt32Number bytesperline;
 	cmsUInt32Number bytesperplane;
 	gchar *desc = NULL;
-	if(args->fit->icc_profile) {
-		desc = siril_color_profile_get_description(args->fit->icc_profile);
-		cmsCloseProfile(args->fit->icc_profile);
+	/* args->fit is a working copy of the loaded image; under the com.uniq
+		* profile model the copy carries no profile state of its own, so the
+		* description comes from the current image's profile — which must be
+		* left untouched: the extraction must not strip colour management
+		* from the still-loaded image. */
+	if (current_icc_profile()) {
+		desc = siril_color_profile_get_description(current_icc_profile());
 	}
 	/* The extracted channels are considered raw data, and are not color
 		* managed. It is up to the user to ensure that future use of them is
 		* with similar data and an appropriate color profile is assigned.
 		* See also the HSV and CIELAB cases below.*/
-	args->fit->icc_profile = NULL;
 	color_manage(args->fit, FALSE);
 
 	switch (args->type) {
@@ -1017,8 +1023,8 @@ static gpointer extract_channels_float(gpointer p) {
 		case EXTRACT_CIELAB:
 			histstring = g_strdup_printf(_("%s: extract LAB channel"), extractionstring);
 			cielab_profile = cmsCreateLab4Profile(NULL);
-			if (args->fit->icc_profile) {
-				image_profile = copyICCProfile(args->fit->icc_profile);
+			if (fit_get_icc_profile(args->fit)) {
+				image_profile = copyICCProfile(fit_get_icc_profile(args->fit));
 			} else {
 				siril_log_message(_("Image is not color managed. Assuming sRGB.\n"));
 				image_profile = srgb_trc();

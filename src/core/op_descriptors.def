@@ -53,9 +53,7 @@ OP_DESC(op_desc_mirrorx)                 /* geometry.mirrorx */
 OP_DESC(op_desc_mirrory)                 /* geometry.mirrory */
 OP_DESC(op_desc_resample)                /* geometry.resample */
 OP_DESC(op_desc_rotation)                /* geometry.rotation */
-OP_DESC(op_desc_icc_assign)              /* icc.assign */
 OP_DESC(op_desc_icc_convert)             /* icc.convert */
-OP_DESC(op_desc_icc_remove)              /* icc.remove */
 OP_DESC(op_desc_mask_autostretch)        /* mask.autostretch */
 OP_DESC(op_desc_mask_bitpix)             /* mask.bitpix */
 OP_DESC(op_desc_mask_blur)               /* mask.blur */

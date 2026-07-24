@@ -235,8 +235,59 @@ typedef struct {
 	void     (*invalidate_histogram)(void);
 	/* Recompute histogram if stale (call while holding at least a read lock). */
 	void     (*update_histogram)(void);
-	/* Run the mask redraw now.  remap_tints as in queue_redraw_mask. */
+	/* Queue an idle mask redraw (may also trigger a full image redraw).
+	 * remap_tints: TRUE when the mask data changed and cached tints are
+	 * stale and must be recomputed. */
 	void     (*redraw_mask_idle)(gboolean remap_tints);
+	/* FLIS composite invalidation hook (legacy "drop everything" form).
+	 * Equivalent to flis_display_invalidate(FLIS_INV_ALL, 0); kept as a
+	 * convenience for call sites that don't know which layer or aspect
+	 * changed.  Prefer flis_display_invalidate with the narrowest flag
+	 * where possible. */
+	void     (*flis_invalidate_composite)(void);
+	/* Stage 3.4 — narrow-flag display-cache invalidation chokepoint.
+	 * @flags: one or more FLIS_INV_* bits (image_format_flis.h).
+	 * @item_id: layer id (required for FLIS_INV_LAYER_PIXELS /
+	 *          FLIS_INV_LAYER_PROPS; ignored otherwise).
+	 * No-op in headless / GTK3 builds. */
+	void     (*flis_display_invalidate)(int flags, int item_id);
+	/* Swap gfit to the FLIS composite for the duration of caller's
+	 * read-from-gfit work (histogram, hi/lo computation, etc.).
+	 * Returns the saved gfit on success — caller MUST pass it back
+	 * to flis_swap_out_composite to restore.  Returns NULL when
+	 * no swap is needed / possible (non-FLIS, or composite build
+	 * failed); no unswap call then. */
+	void    *(*flis_swap_in_composite)(void);
+	void     (*flis_swap_out_composite)(void *saved);
+	/* Release the cached FLIS display composite.  Called when an image
+	 * is closed (free_image_data) so the per-image composite memory is
+	 * released promptly rather than waiting for the next FLIS open.
+	 * No-op when no composite is cached. */
+	void     (*flis_composite_free)(void);
+	/* Refresh the FLIS layers panel (rebuild the list, sync property
+	 * widgets to current state).  No-op when the panel hasn't been
+	 * created yet — the real implementation lands in stage 4. */
+	void     (*flis_gui_update)(void);
+	/* Fired by uniq_set_active_layer after EVERY active-layer retarget
+	 * (user switch, load, worker hooks).  The implementation must be
+	 * fully asynchronous (queue an idle, no locks) — the caller may hold
+	 * the FLIS stack writer lock.  The idle reconciles all GUI state
+	 * that is keyed to the active layer: preview backup ownership, the
+	 * ROI pixel cache, mask-tab visibility, panel highlight, overlays. */
+	void     (*on_active_layer_changed)(void);
+
+	/* TRUE when the FLIS layers panel's selection is a layer GROUP row.
+	 * Generic image/mask workers refuse to run in that state: the
+	 * operation would silently apply to the active layer only, which is
+	 * misleading when the user intends it to affect the whole group.
+	 * Headless stub returns FALSE (no panel). */
+	gboolean (*flis_group_is_selected)(void);
+	/* Idempotent show: present the FLIS layers panel iff a FLIS is
+	 * currently loaded.  No-op for plain FITS / sequences / no image,
+	 * no-op when the panel is already visible.  Called from
+	 * open_single_image_from_gfit so opening a FLIS automatically
+	 * reveals the panel without stealing focus during plain-FITS work. */
+	void     (*flis_gui_present_if_flis)(void);
 
 	/* F additions – Application lifecycle -------------------------------- */
 	/* Quit the application's main event loop. */

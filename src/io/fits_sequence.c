@@ -46,6 +46,24 @@ static int _find_hdus(fitsfile *fptr, int **hdus, int *nb_im) {
 	if (status || !nb_im)
 		return 1;
 
+	/* FLIS files are layered FITS, not FITS sequences: their image HDUs
+	 * legitimately have different sizes (sparse layers, thumbnail), so the
+	 * heterogeneity checks below would either reject them with misleading
+	 * log errors or — with allow_heterogeneous_fitseq enabled — open them
+	 * as a bogus multi-frame sequence instead of routing to load_flis.
+	 * Probe the FLIS marker on the primary HDU and bail out so
+	 * fitseq_is_fitseq() returns FALSE and readfits dispatches to the
+	 * FLIS loader.  (Ported from the flis branch, commit f424aa444.) */
+	{
+		int flis_status = 0, flis_flag = 0;
+		fits_movabs_hdu(fptr, 1, NULL, &flis_status);
+		fits_read_key(fptr, TLOGICAL, "FLIS", &flis_flag, NULL, &flis_status);
+		if (flis_status == 0 && flis_flag) {
+			*nb_im = 0;
+			return 1;
+		}
+	}
+
 	if (hdus) {
 		*hdus = malloc(nb_hdu * sizeof(int));
 		if (!*hdus) {
@@ -228,6 +246,25 @@ int fitseq_open(const char *filename, fitseq *fitseq, int iomode) {
 		free(candidate_filename);
 		return -1;
 	}
+	/* §5.8: a FLIS file is a multi-HDU FITS with a FLISCORE marker in the
+	 * primary HDU.  Without this check fitseq_open would happily try to
+	 * read the FLIS_META HDU as an image frame and produce garbage frame
+	 * data; the user must flatten the FLIS before treating it as a
+	 * sequence.  Detect early and emit a clean refusal. */
+	{
+		int flis_flag = 0, flis_status = 0;
+		fits_read_key(fitseq->fptr, TLOGICAL, "FLIS", &flis_flag, NULL, &flis_status);
+		if (flis_status == 0 && flis_flag) {
+			siril_log_error(_("%s is a FLIS layered image, not a FITS sequence. "
+			                  "Flatten the image first if you want to use it as "
+			                  "a sequence frame source.\n"), candidate_filename);
+			status = 0;
+			fits_close_file(fitseq->fptr, &status);
+			fitseq->fptr = NULL;
+			free(candidate_filename);
+			return -1;
+		}
+	}
 	if (_find_hdus(fitseq->fptr, &fitseq->hdu_index, &fitseq->frame_count) || fitseq->frame_count <= 1) {
 		siril_log_error(_("Cannot open FITS file %s: doesn't seem to be a FITS sequence\n"), candidate_filename);
 		free(candidate_filename);
@@ -317,7 +354,7 @@ static int fitseq_read_frame_internal(fitseq *fitseq, int index, fits *dest, gbo
 	if (read_fits_with_convert(dest, fitseq->filename, force_float)) {
 		return -1;
 	}
-	dest->icc_profile = NULL;
+	/* per-fits ICC removed */
 	color_manage(dest, FALSE);
 
 	return 0;
@@ -364,7 +401,7 @@ int fitseq_read_partial_fits(fitseq *fitseq, int layer, int index, fits *dest, c
 		dest->orig_ry = fitseq->naxes[1];
 		dest->x_offset = area->x;
 		dest->y_offset = dest->orig_ry - area->y - area->h;
-		dest->icc_profile = NULL;
+		/* per-fits ICC removed */
 		color_manage(dest, FALSE);
 	}
 	return status;

@@ -144,12 +144,10 @@ static void asinh_close(gboolean revert, gboolean revert_icc_profile) {
 		float stretch_value, black_value;
 		get_asinh_values(&stretch_value, &black_value, NULL, NULL);
 
-		fits undo_fit = {0};
-		memcpy(&undo_fit, get_preview_gfit_backup(), sizeof(fits));
-		undo_fit.icc_profile = original_icc;
-		undo_fit.color_managed = original_icc != NULL;
-
-		undo_save_state(&undo_fit,
+		/* One entry captures the pre-stretch pixels (from the preview
+		 * backup) and the pre-stretch ICC profile together, so a single
+		 * Ctrl-Z reverts the whole operation. */
+		undo_save_state_with_icc(get_preview_gfit_backup(), original_icc,
 				_("Asinh Transformation: (stretch=%6.1lf, bp=%7.5lf)"),
 				stretch_value, black_value);
 	}
@@ -157,10 +155,9 @@ static void asinh_close(gboolean revert, gboolean revert_icc_profile) {
 	roi_supported(FALSE);
 	remove_roi_callback(asinh_change_between_roi_and_image);
 	if (revert_icc_profile && !single_image_stretch_applied) {
-		if (gfit->icc_profile)
-			cmsCloseProfile(gfit->icc_profile);
-		gfit->icc_profile = copyICCProfile(original_icc);
-		color_manage(gfit, gfit->icc_profile != NULL);
+		current_image_set_icc_profile(original_icc
+			? copyICCProfile(original_icc) : NULL);
+		current_image_color_manage(original_icc != NULL);
 	}
 	clear_backup();
 	set_cursor_waiting(FALSE);
@@ -199,14 +196,14 @@ void on_asinh_dialog_show(GtkWidget *widget, gpointer user_data) {
 
 	if (original_icc)
 		cmsCloseProfile(original_icc);
-	original_icc = copyICCProfile(gfit->icc_profile);
+	original_icc = copyICCProfile(current_icc_profile());
 	icc_auto_assign_or_convert(gfit, ICC_ASSIGN_ON_STRETCH);
 	single_image_stretch_applied = FALSE;
 
 	if (single_image_is_loaded()) {
 		if (original_icc) {
 			cmsCloseProfile(original_icc);
-			original_icc = copyICCProfile(gfit->icc_profile);
+			original_icc = copyICCProfile(current_icc_profile());
 		}
 		icc_auto_assign_or_convert(gfit, ICC_ASSIGN_ON_STRETCH);
 	} else {

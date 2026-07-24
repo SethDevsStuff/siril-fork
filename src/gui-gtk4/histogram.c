@@ -260,10 +260,9 @@ static void histo_close(gboolean revert, gboolean update_image_if_needed, gboole
 		clear_hsl();
 	}
 	if (revert_icc_profile && !single_image_stretch_applied) {
-		if (gfit->icc_profile)
-			cmsCloseProfile(gfit->icc_profile);
-		gfit->icc_profile = copyICCProfile(original_icc);
-		color_manage(gfit, gfit->icc_profile != NULL);
+		current_image_set_icc_profile(original_icc
+			? copyICCProfile(original_icc) : NULL);
+		current_image_color_manage(original_icc != NULL);
 	}
 	clear_backup();
 	clear_hist_backup();
@@ -1337,13 +1336,8 @@ void on_button_histo_apply_clicked(GtkButton *button, gpointer user_data) {
 
 			populate_roi();
 
-			// Prepare undo state with ICC profile handling
-			// Use the backup which contains the original unstretched image
+			// Prepare undo state with separate ICC snapshot
 			fits *backup = get_preview_gfit_backup();
-			fits undo_fit = {0};
-			memcpy(&undo_fit, backup, sizeof(fits));
-			undo_fit.icc_profile = original_icc;
-			undo_fit.color_managed = original_icc != NULL;
 
 			gchar *log_string = NULL;
 
@@ -1387,7 +1381,10 @@ void on_button_histo_apply_clicked(GtkButton *button, gpointer user_data) {
 			}
 
 			if (log_string) {
-				undo_save_state(&undo_fit, log_string);
+				/* One entry: pre-stretch pixels + pre-stretch ICC
+				 * profile — a single Ctrl-Z reverts both. */
+				undo_save_state_with_icc(backup, original_icc,
+						"%s", log_string);
 				siril_log_info("%s\n", log_string);
 				g_free(log_string);
 			}
@@ -1416,12 +1413,8 @@ void on_button_histo_apply_clicked(GtkButton *button, gpointer user_data) {
 
 		populate_roi();
 
-		// Prepare undo state with ICC profile handling BEFORE applying stretch
+		// Prepare undo state with separate ICC snapshot BEFORE applying stretch
 		fits *backup = get_preview_gfit_backup();
-		fits undo_fit = {0};
-		memcpy(&undo_fit, backup, sizeof(fits));
-		undo_fit.icc_profile = original_icc;
-		undo_fit.color_managed = original_icc != NULL;
 
 		gchar *log_string = NULL;
 
@@ -1465,7 +1458,10 @@ void on_button_histo_apply_clicked(GtkButton *button, gpointer user_data) {
 		}
 
 		if (log_string) {
-			undo_save_state(&undo_fit, log_string);
+			/* One entry: pre-stretch pixels + pre-stretch ICC profile —
+			 * a single Ctrl-Z reverts both. */
+			undo_save_state_with_icc(backup, original_icc,
+					"%s", log_string);
 			siril_log_info("%s\n", log_string);
 			g_free(log_string);
 		}
@@ -1602,7 +1598,7 @@ void on_histoToolAutoStretch_clicked(GtkButton *button, gpointer user_data) {
 		update_histo_mtf();
 
 		// Set auto display compensation flag and trigger recompute
-		if (fit->color_managed && !profiles_identical(fit->icc_profile, com.gui_icc.monitor))
+		if (fit_get_color_managed(fit) && !profiles_identical(fit_get_icc_profile(fit), com.gui_icc.monitor))
 			auto_display_compensation = TRUE;
 
 		update_image *param = malloc(sizeof(update_image));
@@ -1724,7 +1720,7 @@ void toggle_histogram_window_visibility(int _invocation) {
 		fit = gfit;
 		if (original_icc)
 			cmsCloseProfile(original_icc);
-		original_icc = copyICCProfile(gfit->icc_profile);
+		original_icc = copyICCProfile(current_icc_profile());
 		icc_auto_assign_or_convert(gfit, ICC_ASSIGN_ON_STRETCH);
 		single_image_stretch_applied = FALSE;
 		// When opening the dialog with a single image loaded, we cache the original ICC
@@ -1733,7 +1729,7 @@ void toggle_histogram_window_visibility(int _invocation) {
 		if (single_image_is_loaded()) {
 			if (original_icc) {
 				cmsCloseProfile(original_icc);
-				original_icc = copyICCProfile(gfit->icc_profile);
+				original_icc = copyICCProfile(current_icc_profile());
 			}
 			icc_auto_assign_or_convert(gfit, ICC_ASSIGN_ON_STRETCH);
 		} else {

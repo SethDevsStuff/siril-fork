@@ -1821,7 +1821,7 @@ static void paint_mpp_ref_frame_into_gfit(const int32_t *src, int rows, int cols
 		com.uniq->filename  = strdup(_("REFERENCE IMAGE"));
 		com.uniq->comment   = strdup(_("Multipoint analysis reference frame (mono luminance)"));
 		com.uniq->fileexist = FALSE;
-		com.uniq->nb_layers = 1;
+		com.uniq->chans     = 1;
 		com.uniq->fit       = gfit;
 	}
 	siril_log_info(_("Displaying reference image (mono luminance from analysis frames). "

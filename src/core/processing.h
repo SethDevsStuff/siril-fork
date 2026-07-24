@@ -208,6 +208,13 @@ struct generic_img_args {
 	 * need to set this.  Retained on the struct purely so existing call sites
 	 * continue to compile; the value is ignored. */
 	gboolean populate_roi_on_complete;
+	/* When TRUE, this op resizes / rotates / mirrors the layer fit, so when
+	 * a FLIS is loaded the worker routes the undo entry through
+	 * undo_save_flis_layer_full (which captures pixels + pmask + lmask + props
+	 * for the active layer together) instead of the plain undo_save_state.
+	 * Each geometry image_hook is responsible for calling the corresponding
+	 * flis_update_layer_offset_after_* helper itself. */
+	gboolean geometry_changing;
 };
 
 struct generic_mask_args {
@@ -233,11 +240,81 @@ struct generic_mask_args {
 	gpointer user;
 	gboolean mask_creation; // states if this is a mask creation operation (mask is active on completion if TRUE)
 	int max_threads; // number of threads to use for the operation
+	/* FLIS lmask routing: when non-zero the mask produced by mask_hook is
+	 * moved from args->fit->mask onto the layer with this stable item_id
+	 * (set via flis_layer_set_lmask) instead of being left as gfit's
+	 * processing mask.  Validated against the target layer's pixel
+	 * dimensions in generic_mask_worker.  0 = no routing (default). */
+	gint target_layer_id;
 };
 
 void free_generic_img_args(struct generic_img_args *args);
 gpointer generic_sequence_worker(gpointer p);
 gboolean end_generic_sequence(gpointer p);
+
+/* generic_layer_worker — the standardised wrapper for mutating FLIS layer
+ * operations.  Mirrors generic_image_worker but for layer-scoped work:
+ * the hook receives a flis_layer_t* and runs on the processing thread,
+ * with progress, logging, error reporting, and the end-of-op idle posted
+ * by the worker so the GUI refreshes automatically.
+ *
+ * Headless undo gate: the worker itself does NOT save undo — that
+ * remains the hook's responsibility.  But the public undo_save_flis_*
+ * family already short-circuits when com.script is set (per §C.1a),
+ * so hooks that call them get the right behaviour in both modes
+ * without any extra plumbing here.
+ *
+ * Calling convention:
+ *
+ *   struct generic_layer_args *args = calloc(1, sizeof(*args));
+ *   args->layer        = target_layer;
+ *   args->layer_hook   = my_op_hook;       // called on worker thread
+ *   args->log_hook     = my_op_log;        // DETAILED + SUMMARY strings
+ *   args->user         = op_specific_data; // optional; first field MUST
+ *                                          // be a destructor pointer.
+ *   args->description  = g_strdup("My op");
+ *   args->updates_lmask = FALSE;           // TRUE if hook writes lmask
+ *   start_in_new_thread(generic_layer_worker, args);
+ */
+struct generic_layer_args {
+	destructor    destroy_fn;       /* first field: NULL or destructor for this struct
+	                                 * if it is itself passed as args->user elsewhere */
+	flis_layer_t *layer;            /* primary target layer (may be NULL
+	                                 * for multi-layer operations where
+	                                 * args->user carries the list) */
+	int         (*layer_hook)(struct generic_layer_args *args);
+	gchar      *(*log_hook)(gpointer user, int type); /* log_hook_detail */
+	gpointer      user;             /* op-specific data; freed via
+	                                 * destroy_any_args(user) by
+	                                 * free_generic_layer_args */
+	gchar        *description;      /* human-readable label */
+	gboolean      verbose;
+	gboolean      command;          /* TRUE: called from script — use the
+	                                 * synchronous idle execution path so
+	                                 * the script blocks until done */
+	gboolean      updates_lmask;    /* TRUE: lmask changed → refresh mask
+	                                 * tab and tint overlay */
+	gboolean    (*idle_function)(gpointer p);  /* override end idle; NULL
+	                                            * uses the default
+	                                            * end_generic_layer */
+	float         mem_ratio;        /* reserved; set 0 to skip memory check */
+	int           max_threads;      /* reserved */
+	int           retval;           /* set by the hook; 0 = success */
+	/* Stage 3.4 — display-cache invalidation declaration.  Leave 0 to
+	 * default to FLIS_INV_ALL (the safe legacy behaviour); otherwise
+	 * set to the narrowest applicable FLIS_INV_* flag(s) and, when
+	 * using LAYER_PIXELS / LAYER_PROPS, set invalidate_item_id. */
+	int           invalidate_flags;
+	int           invalidate_item_id;
+	/* TRUE → hook is read-only (no FLIS state mutation, no pixel change).
+	 * end_generic_layer skips the display-invalidation / notify-gfit
+	 * cascade for these.  Used by ops that only inspect or export. */
+	gboolean      read_only;
+};
+
+gpointer generic_layer_worker(gpointer p);
+void     free_generic_layer_args(struct generic_layer_args *args);
+
 /* default functions for some hooks */
 int seq_compute_mem_limits(struct generic_seq_args *args, gboolean for_writer);
 int seq_prepare_hook(struct generic_seq_args *args);

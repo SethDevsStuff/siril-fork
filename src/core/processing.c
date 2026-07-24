@@ -41,6 +41,7 @@
 #include "core/undo.h"
 #include "core/gui_iface.h"
 #include "io/single_image.h"
+#include "io/image_format_flis.h"
 #include "io/sequence.h"
 #include "io/ser.h"
 #include "io/seqwriter.h"
@@ -1561,6 +1562,18 @@ gpointer generic_image_worker(gpointer p) {
 	gboolean verbose = args->verbose || !args->for_preview;
 	gchar* desc = g_strdup(args->description);
 
+	/* FLIS geometry-op undo capture: when geometry_changing is set AND a FLIS
+	 * is loaded, route the undo entry through undo_save_flis_layer_full so the
+	 * active layer's pixels, pmask, lmask and props are reverted together.
+	 * The pre-op lmask and props are captured below (before the hook mutates
+	 * them) and consumed in the post-hook undo block. */
+	gboolean geom_flis = args->geometry_changing && args->fit == gfit
+	                     && is_current_image_flis()
+	                     && !args->skip_generic_undo && !args->for_preview && !com.script;
+	flis_layer_t      *geom_active     = NULL;
+	flis_layer_props_t geom_pre_props  = { 0 };
+	layermask_t       *geom_pre_lmask  = NULL;
+
 	/* Two processing strategies live in this one function:
 	 *
 	 *   Swap path (argfit == gfit) — the long-running image_hook works
@@ -1604,6 +1617,32 @@ gpointer generic_image_worker(gpointer p) {
 	gui_iface.set_progress(PROGRESS_RESET, NULL);
 	gettimeofday(&t_start, NULL);
 	args->retval = 0;
+
+	/* Refuse to run a GUI-initiated op while a layer GROUP row is selected
+	 * in the FLIS panel: the op would silently apply to the active layer
+	 * only, which is misleading when the user intends the whole group.
+	 * Command/script invocations (args->command) are exempt — they target
+	 * gfit explicitly and have no panel selection semantics.  No locks are
+	 * held yet, so finish through the same idle the normal path uses (it
+	 * owns and frees args). */
+	if (!args->command && is_current_image_flis()
+	    && gui_iface.flis_group_is_selected()) {
+		siril_log_error(_("%s: cannot apply to a layer group — select an individual layer.\n"),
+		                desc ? desc : "Operation");
+		gui_iface.message_dialog(SIRIL_MSG_ERROR, _("Layer Group Selected"),
+		    _("This operation cannot be applied to a layer group.\n"
+		      "Please select an individual layer."));
+		args->retval = 1;
+		if (!com.script && !com.python_command && use_swap)
+			gui_iface.set_suppress_redraws(FALSE);
+		gui_iface.set_progress(PROGRESS_RESET, NULL);
+		if (args->idle_function)
+			siril_add_idle(args->idle_function, args);
+		else
+			siril_add_idle(end_generic_image_update_gfit, args);
+		g_free(desc);
+		return GINT_TO_POINTER(1);
+	}
 
 	g_rw_lock_reader_lock(&com.pref_rwlock);
 
@@ -1654,6 +1693,21 @@ gpointer generic_image_worker(gpointer p) {
 	}
 
 	gboolean using_mask = args->mask_aware && hook_fit->mask && hook_fit->mask_active;
+
+	/* Capture pre-op layer state for the FLIS geometry undo path.  The hook
+	 * has not run yet, so the active layer's lmask and props still hold their
+	 * pre-op values; orig holds the pre-op pixel snapshot (swap path). */
+	if (geom_flis && orig) {
+		geom_active = flis_active_layer();
+		if (geom_active) {
+			flis_layer_capture_props(geom_active, &geom_pre_props);
+			geom_pre_lmask = layermask_clone(geom_active->lmask);
+		} else {
+			/* Active layer pointer unexpectedly missing — fall back to the
+			 * plain undo path rather than silently dropping the undo entry. */
+			geom_flis = FALSE;
+		}
+	}
 
 	// Set default max_threads if not specified
 	if (args->max_threads < 1)
@@ -1816,7 +1870,22 @@ the_end:;
 		/* On the swap path, `orig` now holds the pre-op image — the
 		 * swap above moved the original gfit content into it.  That's
 		 * exactly what undo_save_state wants to snapshot. */
-		undo_save_state(orig, summary);
+		if (geom_flis && geom_active) {
+			/* Active-layer geometry undo: bundles pixels + pmask + lmask
+			 * + props.  On failure fall back to the legacy path so we
+			 * still record SOMETHING in the undo stack. */
+			if (undo_save_flis_layer_full(orig, geom_active,
+			                              geom_pre_lmask, &geom_pre_props,
+			                              summary)) {
+				undo_save_state(orig, summary);
+			}
+		} else {
+			undo_save_state(orig, summary);
+		}
+	}
+	if (geom_pre_lmask) {
+		layermask_free(geom_pre_lmask);
+		geom_pre_lmask = NULL;
 	}
 	if (verbose) {
 		siril_log_info(_("%s %s.\n"), desc, retval ? _("failed") : _("succeeded"));
@@ -1862,6 +1931,49 @@ gpointer generic_mask_worker(gpointer p) {
 	args->retval = 0;
 	g_rw_lock_reader_lock(&com.pref_rwlock);
 
+	/* See the matching guard in generic_image_worker: mask ops are also
+	 * per-layer and must not run while a group row is selected. */
+	if (!args->command && is_current_image_flis()
+	    && gui_iface.flis_group_is_selected()) {
+		siril_log_error(_("%s: cannot apply to a layer group — select an individual layer.\n"),
+		                args->description ? args->description : "Mask operation");
+		gui_iface.message_dialog(SIRIL_MSG_ERROR, _("Layer Group Selected"),
+		    _("This operation cannot be applied to a layer group.\n"
+		      "Please select an individual layer."));
+		args->retval = 1;
+		goto the_end;
+	}
+
+	/* §5.2 routing pre-check: when the mask is destined for a layer's
+	 * lmask, validate the target BEFORE generating anything.  The
+	 * post-hoc check in the routing block below (kept as a backstop)
+	 * used to leave the freshly-built mask on the processing slot on a
+	 * dimension mismatch — an error message plus a stray processing
+	 * mask the user never asked for. */
+	if (args->target_layer_id != 0) {
+		flis_layer_t *pre_target = is_current_image_flis()
+			? flis_layer_get_by_id(args->target_layer_id) : NULL;
+		if (!pre_target || !pre_target->fit) {
+			siril_log_error(_("%s: target layer (id %d) not found — no mask created.\n"),
+			                args->description ? args->description : _("Mask operation"),
+			                args->target_layer_id);
+			args->retval = 1;
+			goto the_end;
+		}
+		if (pre_target->fit->rx != args->fit->rx
+		    || pre_target->fit->ry != args->fit->ry) {
+			siril_log_error(_("%s: cannot create a layer mask for '%s' — its "
+			                  "dimensions (%ux%u) do not match the mask source "
+			                  "(%ux%u).  No mask was created.\n"),
+			                args->description ? args->description : _("Mask operation"),
+			                pre_target->layer_name ? pre_target->layer_name : "?",
+			                pre_target->fit->rx, pre_target->fit->ry,
+			                args->fit->rx, args->fit->ry);
+			args->retval = 1;
+			goto the_end;
+		}
+	}
+
 	// Set default max_threads if not specified
 	if (args->max_threads < 1)
 		args->max_threads = com.max_thread;
@@ -1887,7 +1999,22 @@ gpointer generic_mask_worker(gpointer p) {
 	rwlocked = TRUE;
 	if (args->fit == gfit && !args->command) {
 		gchar *undo_msg = args->log_hook ? args->log_hook(args->user, SUMMARY) : g_strdup(args->description);
-		undo_save_state(gfit, undo_msg);
+		if (args->target_layer_id != 0 && is_current_image_flis()) {
+			/* §5.2 routed op (target validated by the pre-check above):
+			 * the meaningful pre-state is the target layer's lmask —
+			 * plus the processing mask the hook will clobber while
+			 * generating, if one exists.  A flavour-blind pixel
+			 * snapshot here left undo restoring identical pixels while
+			 * the freshly routed lmask survived untouched. */
+			if (gfit->mask && gfit->mask->data)
+				undo_save_processing_mask(gfit, "%s", undo_msg);
+			flis_layer_t *undo_target =
+				flis_layer_get_by_id(args->target_layer_id);
+			if (undo_target)
+				undo_save_flis_lmask(undo_target, undo_msg);
+		} else {
+			undo_save_state(gfit, undo_msg);
+		}
 		g_free(undo_msg);
 	}
 	// Call the mask processing hook
@@ -1916,6 +2043,62 @@ the_end:
 
 	int retval = args->retval;
 
+	/* FLIS layermask routing: move the freshly-built mask onto the target
+	 * layer's lmask slot and clear the processing-mask slot.  Only when the
+	 * hook succeeded and produced a mask.  Failure here (no FLIS / layer
+	 * gone / dimension mismatch) leaves the mask as the processing mask —
+	 * better than dropping it on the floor. */
+	if (!retval && args->target_layer_id != 0 && args->fit->mask
+	    && args->fit->mask->data && is_current_image_flis()) {
+		/* M-F12: the routing mutates a layer's lmask from the worker
+		 * thread.  Taking the stack lock while args->fit->rwlock is held
+		 * is the allowed direction (fits → stack); see the rules in
+		 * image_format_flis.c. */
+		flis_stack_writer_lock();
+		flis_layer_t *target = flis_layer_get_by_id(args->target_layer_id);
+		if (!target || !target->fit) {
+			siril_log_warning(_("Mask routing: target layer (id %d) not found; "
+			                    "mask left on processing slot\n"),
+			                  args->target_layer_id);
+		} else if ((size_t)target->fit->rx != args->fit->rx
+		           || (size_t)target->fit->ry != args->fit->ry) {
+			siril_log_warning(_("Mask routing: target layer '%s' (%ux%u) "
+			                    "does not match mask dimensions (%ux%u); "
+			                    "mask left on processing slot\n"),
+			                  target->layer_name ? target->layer_name : "?",
+			                  target->fit->rx, target->fit->ry,
+			                  args->fit->rx, args->fit->ry);
+		} else {
+			layermask_t *lm = calloc(1, sizeof(layermask_t));
+			if (lm) {
+				lm->w      = args->fit->rx;
+				lm->h      = args->fit->ry;
+				lm->bitpix = args->fit->mask->bitpix;
+				lm->data   = args->fit->mask->data;
+				args->fit->mask->data = NULL;
+				free_mask(args->fit->mask);
+				args->fit->mask = NULL;
+				set_mask_active(args->fit, FALSE);
+				if (flis_layer_set_lmask(target, lm)) {
+					layermask_free(lm);
+				} else {
+					/* Show the result: flip the mask-view radio to
+					 * LAYER so the (now visible) mask tab displays
+					 * the lmask that was just created, not the empty
+					 * processing slot. */
+					if (com.uniq)
+						com.uniq->flis_mask_view = 1;
+					gui_iface.flis_invalidate_composite();
+					gui_iface.flis_gui_update();
+				}
+				/* Suppress the generic mask_creation activate below — the
+				 * processing mask is now empty. */
+				args->mask_creation = FALSE;
+			}
+		}
+		flis_stack_writer_unlock();
+	}
+
 	if (args->mask_creation) {
 		set_mask_active(args->fit, TRUE);
 	}
@@ -1935,6 +2118,145 @@ the_end:
 		siril_add_idle(args->idle_function, args);
 	} else {
 		siril_add_idle(end_generic_mask, args);
+	}
+
+	return GINT_TO_POINTER(retval);
+}
+
+/* ===========================================================================
+ * generic_layer_worker (stage 1.5) — standardised wrapper for FLIS layer ops
+ * ===========================================================================
+ *
+ * Mirrors generic_image_worker / generic_mask_worker for layer-scoped work.
+ * The worker handles thread coordination, progress reporting, error logging,
+ * and the end-of-op idle that refreshes the GUI.  The undo gate per §C.1a
+ * lives inside the public undo_save_flis_* functions (each short-circuits
+ * when com.script is set); hooks call those directly and get the correct
+ * headless behaviour for free.
+ */
+
+void free_generic_layer_args(struct generic_layer_args *args) {
+	if (!args) return;
+	if (args->user)
+		destroy_any_args(args->user);
+	g_free(args->description);
+	free(args);
+}
+
+/* Default end-idle for layer operations: invalidates the FLIS composite,
+ * refreshes the layers panel, optionally refreshes the mask tab if the
+ * lmask changed, and requests a redraw. */
+static gboolean end_generic_layer(gpointer p) {
+	struct generic_layer_args *args = (struct generic_layer_args *)p;
+	stop_processing_thread();
+
+	if (!args->retval && is_current_image_flis() && !args->read_only) {
+		int inv = args->invalidate_flags ? args->invalidate_flags : FLIS_INV_ALL;
+		gui_iface.flis_display_invalidate(inv, args->invalidate_item_id);
+		if (args->updates_lmask)
+			gui_iface.show_or_hide_mask_tab();
+		gui_iface.flis_gui_update();
+
+		/* Any FLIS layer-state change — stack mutation OR property
+		 * change (opacity / blend / visibility / tint) — needs the
+		 * full pipeline: the CPU composite cache, the per-vport
+		 * Cairo tile buffers, the histogram, and the hi/lo display
+		 * range all feed off the composite.  The GPU compose path
+		 * does pick up live property values per frame, but only when
+		 * it's actually selected — the CPU fallback is used for
+		 * 1-layer FLIS, CHROMA blend, etc., and never sees property
+		 * changes that don't also poke the composite cache.
+		 *
+		 * notify_gfit_data_modified() is the single chokepoint that
+		 * runs the whole pipeline.  Treat every FLIS_INV_* path
+		 * (other than the mask-only one which has its own machinery)
+		 * the same way. */
+		if (args->updates_lmask) {
+			/* Layer mask changed: refresh mask viewport.  redraw_mask_idle
+			 * also drives a full image redraw when mask tints are enabled,
+			 * so guard the explicit REMAP_ALL on that pref to avoid a
+			 * double-redraw. */
+			gui_iface.redraw_mask_idle(TRUE); // mask data changed: tints are stale
+			/* Lmask data sits next to layer pixels for compositing
+			 * purposes — recompute the composite too. */
+			notify_gfit_data_modified();
+			/* notify_gfit_data_modified rebuilds the tile buffers but
+			 * doesn't queue a paint — the cvport widget needs an
+			 * explicit invalidation for GTK to repaint with the new
+			 * tiles.  Without this the image only refreshes on the
+			 * next mouseover (which incidentally invalidates the
+			 * widget). */
+			gui_iface.redraw_image(REDRAW_ALL);
+		} else {
+			notify_gfit_data_modified();
+			gui_iface.redraw_image(REDRAW_ALL);
+		}
+	}
+
+	free_generic_layer_args(args);
+	return FALSE;
+}
+
+gpointer generic_layer_worker(gpointer p) {
+	struct generic_layer_args *args = (struct generic_layer_args *)p;
+	assert(args && args->layer_hook);
+
+	struct timeval t_start, t_end;
+	gboolean verbose = args->verbose;
+	const gchar *desc = args->description ? args->description : "layer operation";
+
+	gui_iface.set_progress(PROGRESS_RESET, NULL);
+	gettimeofday(&t_start, NULL);
+	args->retval = 0;
+
+	if (verbose && args->description) {
+		siril_log_info(_("%s: processing layer...\n"), desc);
+	}
+
+	gui_iface.set_progress(0.1, _("Processing layer..."));
+
+	/* M-F12: hooks mutate com.uniq->layers and free/replace layer
+	 * payloads; the main thread walks the same list in the GPU compose
+	 * snapshot path, the prefetch idle, and the layers panel.  Exclusive
+	 * lock for the whole hook.  Hooks must obey the stack-lock rules in
+	 * image_format_flis.c: no fits rwlocks, no gui.cairo_mutex, no
+	 * blocking main-loop calls while it is held. */
+	flis_stack_writer_lock();
+	int hook_failed = args->layer_hook(args);
+	flis_stack_writer_unlock();
+	if (hook_failed) {
+		siril_log_error(_("%s layer processing failed.\n"), desc);
+		args->retval = 1;
+	} else if (verbose && args->description) {
+		siril_log_info(_("%s succeeded.\n"), desc);
+		gettimeofday(&t_end, NULL);
+		show_time(t_start, t_end);
+	}
+
+	int retval = args->retval;
+
+	if (retval) {
+		gui_iface.set_progress(PROGRESS_RESET, _("Layer processing failed. Check the log."));
+	} else {
+		gui_iface.set_progress(PROGRESS_DONE, _("Layer processing succeeded."));
+	}
+
+	/* Idle dispatch mirrors generic_image_worker:
+	 *   command + headless     → run completion inline, no idle
+	 *   command + interactive  → execute_idle_sync (script blocks until idle runs)
+	 *   non-command            → siril_add_idle (custom or default)
+	 */
+	if (args->command) {
+		if (com.headless) {
+			stop_processing_thread();
+			free_generic_layer_args(args);
+		} else {
+			gui_iface.execute_idle_sync(end_generic_layer, args);
+		}
+	} else if (args->idle_function) {
+		siril_add_idle(args->idle_function, args);
+	} else {
+		siril_add_idle(end_generic_layer, args);
 	}
 
 	return GINT_TO_POINTER(retval);

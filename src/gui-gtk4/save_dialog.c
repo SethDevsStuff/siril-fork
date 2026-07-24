@@ -42,6 +42,8 @@
 #include "io/sequence.h"
 #include "io/single_image.h"
 #include "io/image_format_fits.h"
+#include "io/image_format_flis.h"
+#include "io/flis_compose.h"
 
 #include "save_dialog.h"
 
@@ -85,12 +87,16 @@ static void save_dialog_init_statics(void) {
  * with the preferred extension (com.pref.ext for FITS; .pgm vs .ppm chosen by
  * the image's channel count for Netpbm).  Upper-case variants follow only so
  * the file list matches existing files.  `suggested` marks the matching filter
- * default so the dropdown agrees with the pre-filled name. */
+ * default so the dropdown agrees with the pre-filled name.
+ *
+ * FLIS is a FITS container variant per spec §10.5, so the same filter accepts
+ * .flis; the save dispatch picks the actual writer from the loaded image's
+ * data state, not the chosen extension. */
 static void set_filters_save_browser(SirilFileBrowser *fb, image_type suggested) {
 	gchar *fits_filter = g_strdup_printf(
 			"*%s;*.fit;*.FIT;*.fits;*.FITS;*.fts;*.FTS;"
-			"*.fit.fz;*.fits.fz;*.fts.fz", com.pref.ext);
-	siril_file_browser_add_filter_pattern(fb, _("FITS Files (*.fit, *.fits, *.fts)"),
+			"*.fit.fz;*.fits.fz;*.fts.fz;*.flis;*.FLIS", com.pref.ext);
+	siril_file_browser_add_filter_pattern(fb, _("FITS / FLIS Files (*.fit, *.fits, *.fts, *.flis)"),
 			fits_filter, suggested == TYPEFITS || suggested == TYPEUNDEF);
 	g_free(fits_filter);
 
@@ -229,7 +235,16 @@ static void prepare_savepopup() {
 		break;
 	default:
 	case TYPEFITS:
-		gtk_window_set_title(GTK_WINDOW(savepopup), _("Saving FITS"));
+		/* Same notebook page handles plain FITS and FLIS: bitpix and
+		 * checksum apply equally to FLIS layer HDUs.  The title varies
+		 * with the loaded data state so the user knows which writer
+		 * will run. */
+		if (is_current_image_flis() && flis_layer_count() > 1)
+			gtk_window_set_title(GTK_WINDOW(savepopup), _("Saving FLIS (multi-layer)"));
+		else if (is_current_image_flis())
+			gtk_window_set_title(GTK_WINDOW(savepopup), _("Saving FLIS"));
+		else
+			gtk_window_set_title(GTK_WINDOW(savepopup), _("Saving FITS"));
 		tab = PAGE_FITS;
 	}
 
@@ -542,11 +557,54 @@ static gpointer mini_save_dialog(gpointer p) {
 				gfit->keywords.lo = 0;
 			}
 			gfit->checksum = args->checksum;
-			args->retval = savefits(args->filename, gfit);
+			/* Format follows data state (plus, for multi-layer FLIS, the
+			 * user's pre-resolved choice from prompt_flis_save_choice_main):
+			 *   - Multi-layer FLIS: act on args->flis_save_choice, which
+			 *     was set on the main thread before this worker started.
+			 *   - Single-layer FLIS: always preserve via save_flis.
+			 *   - Plain FITS: savefits as today.
+			 * GTK calls must never happen here — this runs on a worker
+			 * thread.  Any user prompt has to be in the GUI-thread caller. */
+			gboolean wrote_flis = FALSE;
+			if (is_current_image_flis() && flis_layer_count() > 1) {
+				if (args->flis_save_choice == FLIS_SAVE_FLATTEN) {
+					/* Export a flattened COPY: render the composite and
+					 * save that.  The in-memory layer stack must survive
+					 * — flattening the live document here would destroy
+					 * the user's layers (and mutate the stack from the
+					 * save worker thread while the main thread may be
+					 * rendering it).  Reader lock: this walk runs on the
+					 * save worker thread (M-F12). */
+					flis_stack_reader_lock();
+					fits *flat = flis_render_layers(com.uniq->layers);
+					flis_stack_reader_unlock();
+					if (!flat) {
+						siril_log_error(_("Save: flatten failed.\n"));
+						args->retval = 1;
+						break;
+					}
+					copy_fits_metadata(gfit, flat);
+					args->retval = savefits(args->filename, flat);
+					clearfits(flat);
+					free(flat);
+				} else {
+					/* FLIS_SAVE_AS_FLIS or AUTOMATIC fallback for safety
+					 * (preserves data — never silently flatten). */
+					args->retval = save_flis(args->filename);
+					wrote_flis = TRUE;
+				}
+			} else if (is_current_image_flis()) {
+				/* 1-layer FLIS — preserve format silently. */
+				args->retval = save_flis(args->filename);
+				wrote_flis = TRUE;
+			} else {
+				/* Plain FITS path (unchanged). */
+				args->retval = savefits(args->filename, gfit);
+			}
 			if (!args->retval && single_image_is_loaded()) {
-				/* Use the same extension logic as savefits() so the tracked
-				 * filename always matches the file actually written on disk. */
-				gchar *actual = set_right_extension(args->filename);
+				gchar *actual = wrote_flis
+				    ? g_strdup(args->filename)
+				    : set_right_extension(args->filename);
 				free(com.uniq->filename);
 				com.uniq->filename = strdup(actual);
 				g_free(actual);
@@ -631,11 +689,69 @@ void on_quality_spinbutton_value_changed(GtkSpinButton *button, gpointer user_da
 	}
 }
 
+/* Shared flatten-vs-FLIS question for a multi-layer FLIS.  Returns the
+ * raw three-button choice: 0 = cancelled, 1 = flatten to plain FITS,
+ * 2 = preserve as FLIS.  Main thread only (runs a GtkAlertDialog). */
+static int ask_flis_flatten_or_preserve(void) {
+	gchar *msg = g_strdup_printf(
+		_("This image has %d layers.\n\n"
+		  "Saving as FLIS preserves every layer, mask, blend mode, and "
+		  "metadata key — recommended for in-work editing.\n\n"
+		  "Saving as plain FITS writes a flattened copy of the visible "
+		  "layers — useful for sharing with tools that don't read FLIS. "
+		  "The layered image stays open and unchanged in Siril.\n\n"
+		  "FLIS files remain valid FITS files: any FITS reader will see "
+		  "the composite thumbnail as a fallback."),
+		flis_layer_count());
+	int choice = siril_three_button_dialog(
+		_("Save with layers?"), msg,
+		_("Flatten and save as plain FITS"),
+		_("Save as FLIS (preserve layers)"));
+	g_free(msg);
+	return choice;
+}
+
+/* Ask the user — on the main thread — whether to flatten a multi-layer
+ * FLIS or preserve it.  Sets args->flis_save_choice and returns TRUE if
+ * the worker should proceed; FALSE if the user cancelled.  No-ops (and
+ * returns TRUE with FLIS_SAVE_AUTOMATIC) when the image isn't a
+ * multi-layer FLIS.  Must be called on the GTK main thread — never from
+ * the worker thread, since it creates and runs a GtkAlertDialog. */
+static gboolean prompt_flis_save_choice_main(struct savedial_data *args) {
+	args->flis_save_choice = FLIS_SAVE_AUTOMATIC;
+	if (!is_current_image_flis() || flis_layer_count() <= 1)
+		return TRUE;
+
+	/* An explicitly typed .flis filename already answers the question —
+	 * asking again (and possibly writing a flattened plain-FITS payload
+	 * into a .flis-named file) would be incoherent. */
+	if (args->filename && g_str_has_suffix(args->filename, ".flis")) {
+		args->flis_save_choice = FLIS_SAVE_AS_FLIS;
+		return TRUE;
+	}
+
+	int choice = ask_flis_flatten_or_preserve();
+
+	if (choice == 0) return FALSE;  /* cancelled */
+	args->flis_save_choice = (choice == 2) ? FLIS_SAVE_AS_FLIS : FLIS_SAVE_FLATTEN;
+	return TRUE;
+}
+
 void on_button_savepopup_clicked(GtkButton *button, gpointer user_data) {
 	struct savedial_data *args = calloc(1, sizeof(struct savedial_data));
 
 	set_cursor_waiting(TRUE);
 	initialize_data(args);
+	/* Ask the multi-layer flatten-vs-FLIS question on this (main) thread
+	 * before the worker fires — GTK cannot be called from the worker.
+	 * If the user cancels, free args and bail. */
+	if (!prompt_flis_save_choice_main(args)) {
+		set_cursor_waiting(FALSE);
+		g_free(args->copyright);
+		g_free(args->description);
+		free(args);
+		return;
+	}
 	if (test_for_viewer_mode()) {
 		if (!start_in_new_thread(mini_save_dialog, args)) {
 			g_free(args->copyright);
@@ -655,6 +771,13 @@ void on_savetxt_activate(GtkEntry *entry, gpointer user_data) {
 
 	set_cursor_waiting(TRUE);
 	initialize_data(args);
+	if (!prompt_flis_save_choice_main(args)) {
+		set_cursor_waiting(FALSE);
+		g_free(args->copyright);
+		g_free(args->description);
+		free(args);
+		return;
+	}
 	if (test_for_viewer_mode()) {
 		if (!start_in_new_thread(mini_save_dialog, args)) {
 			g_free(args->copyright);
@@ -676,6 +799,14 @@ void on_button_cancelpopup_clicked(GtkButton *button, gpointer user_data) {
 
 void on_header_save_as_button_clicked() {
 	if (single_image_is_loaded() || sequence_is_loaded()) {
+		/* Ensure the savepopup statics are populated before
+		 * save_dialog() touches sd_savetxt_entry on its first run.
+		 * prepare_savepopup() also calls save_dialog_init_statics(),
+		 * but it runs AFTER the use site below — so on the first Save
+		 * As of a session those widgets are NULL and GTK_CRITICAL
+		 * warnings fire.  Init here is idempotent (the helper guards
+		 * on sd_notebook_format). */
+		save_dialog_init_statics();
 		if (save_dialog() != GTK_RESPONSE_ACCEPT) {
 			/* Native file dialog dismissed without a selection.  Focus is
 			 * already handed back to the parent inside siril_fc_run(); just
@@ -981,7 +1112,37 @@ void on_header_snapshot_button_clicked(gboolean clipboard) {
 #undef NEW_SIZE
 
 void on_header_save_button_clicked() {
-	if (single_image_is_loaded() && com.uniq->fileexist) {
+	if (!single_image_is_loaded() || !com.uniq->fileexist)
+		return;
+
+	/* Data-driven dispatch matching the Save As path: format follows the
+	 * loaded image's state, not the filename extension.  Multi-layer FLIS
+	 * goes through the flatten-vs-preserve confirmation; single-layer FLIS
+	 * silently uses save_flis; plain FITS continues to use savefits. */
+	if (is_current_image_flis() && flis_layer_count() > 1) {
+		int choice = ask_flis_flatten_or_preserve();
+		if (choice == 0) return;
+		if (choice == 2) {
+			save_flis(com.uniq->filename);
+		} else {
+			/* Export a flattened COPY — the open document keeps its
+			 * layers (see the Save As worker path).  Reader lock: a
+			 * layer-worker job could be mutating the stack (M-F12). */
+			flis_stack_reader_lock();
+			fits *flat = flis_render_layers(com.uniq->layers);
+			flis_stack_reader_unlock();
+			if (!flat) {
+				siril_log_error(_("Save: flatten failed.\n"));
+				return;
+			}
+			copy_fits_metadata(gfit, flat);
+			savefits(com.uniq->filename, flat);
+			clearfits(flat);
+			free(flat);
+		}
+	} else if (is_current_image_flis()) {
+		save_flis(com.uniq->filename);
+	} else {
 		savefits(com.uniq->filename, gfit);
 	}
 }

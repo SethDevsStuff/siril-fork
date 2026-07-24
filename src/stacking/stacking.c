@@ -33,6 +33,7 @@
 #include "core/siril_log.h"
 #include "core/arithm.h"
 #include "io/image_format_fits.h"
+#include "io/image_format_flis.h"
 #include "io/path_parse.h"
 #include "io/sequence.h"
 #include "io/single_image.h"
@@ -111,6 +112,23 @@ void main_stack(struct stacking_args *args) {
 gpointer stack_function_handler(gpointer p) {
 	struct stacking_args *args = (struct stacking_args *)p;
 
+	/* §5.8: stacking writes its result into gfit, which is the active
+	 * layer's fit for a FLIS.  Letting a sequence stack overwrite an
+	 * active layer would silently corrupt the FLIS document.  Refuse
+	 * cleanly — the user should close or flatten the FLIS first. */
+	if (is_current_image_flis()) {
+		siril_log_error(_("Stacking cannot run while a FLIS layered image is "
+		                  "loaded.  Flatten the image or close it first; the "
+		                  "stack result would otherwise overwrite the active "
+		                  "layer.\n"));
+		args->retval = -1;
+		/* Route through the normal completion idle so the processing
+		 * thread is released, busy state cleared, and args freed —
+		 * an early return here would leak all of that. */
+		siril_add_idle(end_stacking, args);
+		return GINT_TO_POINTER(-1);
+	}
+
 	main_stack(args);
 
 	/* 4. Save result, write gfit, and notify display pipeline.
@@ -130,15 +148,19 @@ gpointer stack_function_handler(gpointer p) {
 		if (args->upscale_at_stacking)
 			com.seq.current = SCALED_IMAGE;
 		else com.seq.current = RESULT_IMAGE;
-		if (!com.script)
-			icc_auto_assign(gfit, ICC_ASSIGN_ON_STACK);
 		/* Warning: the previous com.uniq is not freed, but calling
 		 * close_single_image() will close everything before reopening it,
 		 * which is quite slow */
 		com.uniq = calloc(1, sizeof(single));
 		com.uniq->comment = strdup(_("Stacking result image"));
-		com.uniq->nb_layers = gfit->naxes[2];
+		com.uniq->chans = gfit->naxes[2];
 		com.uniq->fit = gfit;
+		/* Profile state lives on com.uniq, so the auto-assign must run
+		 * after the fresh single is installed — before it, the call would
+		 * early-return (no com.uniq) or write onto the stale one, and the
+		 * stacked result would be saved without an embedded profile. */
+		if (!com.script)
+			icc_auto_assign(gfit, ICC_ASSIGN_ON_STACK);
 		/* Giving summary if average rejection stacking */
 		_show_summary(args);
 
