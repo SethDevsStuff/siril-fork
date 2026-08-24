@@ -2,6 +2,7 @@
 #define SRC_ALGOS_BACKGROUND_EXTRACTION_H_
 
 #include "core/siril.h"
+#include "core/processing.h"
 
 /* ORDER OF POLYNOMES */
 typedef enum {
@@ -48,6 +49,9 @@ typedef struct sample {
 	gboolean valid;
 } background_sample;
 
+#ifdef __cplusplus
+extern "C" {
+#endif
 int get_background_sample_radius();
 void free_background_sample_list(GSList *list);
 GSList *generate_samples(fits *fit, int nb_per_line, double tolerance, int size, const char **error, threading_type threads);
@@ -58,6 +62,8 @@ int generate_background_samples(int nb_of_samples, double tolerance);
 gpointer remove_gradient_from_image(gpointer p);
 gpointer remove_gradient_from_cfa_image(gpointer p);
 void apply_background_extraction_to_sequence(struct background_data *background_args);
+int background_image_hook(struct generic_seq_args *args, int o, int i, fits *fit,
+		rectangle *_, int threads);
 
 gboolean background_sample_is_valid(background_sample *sample);
 gdouble background_sample_get_size(background_sample *sample);
@@ -65,6 +71,9 @@ point background_sample_get_position(background_sample *sample);
 void sample_mutex_lock();
 void sample_mutex_unlock();
 void apply_background_cancel();
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* SRC_ALGOS_BACKGROUND_EXTRACTION_H_ */
 
