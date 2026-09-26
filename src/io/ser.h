@@ -108,6 +108,7 @@ struct ser_struct {			// size and offset from header
 
 	/* timestamps (not in the header, timestamps are in trailer) */
 	guint64 *ts;			// total timestamps
+	guint64 delta_ts[10000];		// ts(i)-ts(i-1)
 	int ts_alloc;			// allocated number of elements in ts
 	guint64 ts_min, ts_max;		// min and max timestamp
 	gboolean timestamps_in_order;

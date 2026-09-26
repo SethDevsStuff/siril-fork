@@ -45,6 +45,7 @@ src_files = [
   'algos/line_detection.c',
   'algos/median_fast.c',
   'algos/noise.c',
+  'algos/occult_time.c',
   'algos/pave.c',
   'algos/photometry.c',
   'algos/photometric_cc.c',
@@ -217,6 +218,7 @@ src_files = [
   'opencv/kombat/kombat.cpp',
   'opencv/tracks.cpp',
 
+
   'pixelMath/pixel_math_runner.c',
   'pixelMath/tinyexpr.c',
 
@@ -317,6 +319,7 @@ gui_filenames = [
   'mpp_shift_viewer.c',
   'newdeconv.c',
   'nina_light_curve.c',
+  'occultation.c',
   'open_dialog.c',
   'photometric_cc.c',
   'plot.c',

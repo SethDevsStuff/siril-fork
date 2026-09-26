@@ -2034,7 +2034,7 @@ int seqpsf_image_hook(struct generic_seq_args *args, int out_index, int index, f
 	free(ps);
 	if (data->psf) {
 		/* for photometry ? */
-		if (spsfargs->for_photometry) {
+		if (spsfargs->for_photometry && !com.pref.phot_set.t_delayed) {	// the second condition refeers to the specific occultation use case where we do not want all warnings messages
 			if (data->psf->s_mag > 9.0 || !data->psf->phot_is_valid) {
 				siril_log_warning(_("Photometry analysis failed for image %d (%s)\n"), index, psf_error_to_string(error));
 			}
@@ -2061,12 +2061,13 @@ int seqpsf_image_hook(struct generic_seq_args *args, int out_index, int index, f
 		args->seq->imgparam[index].airmass = fit->keywords.airmass;
 	}
 	else {
-		if (spsfargs->framing == FOLLOW_STAR_FRAME) {
+		if (spsfargs->framing == FOLLOW_STAR_FRAME && !com.pref.phot_set.t_delayed) {	// the second condition refers to the specific occultation use case where we do not want all warning messages
 			siril_log_error(_("No star found in the area image %d around %d,%d:"
 						" error %s (use a larger area?)\n"), index, area->x, area->y, psf_error_to_string(error));
 		} else {
-			siril_log_error(_("No star found in the area image %d around %d,%d:"
-					" error %s (use 'follow star' option?)\n"), index, area->x, area->y, psf_error_to_string(error));
+			if (!com.pref.phot_set.t_delayed)
+				siril_log_error(_("No star found in the area image %d around %d,%d:"
+						" error %s (use 'follow star' option?)\n"), index, area->x, area->y, psf_error_to_string(error));
 		}
 	}
 	if (handle_cfa) {

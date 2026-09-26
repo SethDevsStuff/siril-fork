@@ -41,6 +41,7 @@
 #include "nina_light_curve.h"
 #include "compstars.h"
 #include "catmag.h"
+#include "occultation.h"
 
 static gboolean dialog_is_opened = FALSE;
 static gboolean processing_dialog_is_opened = FALSE;
@@ -83,6 +84,7 @@ static const SirilDialogEntry entries[] =
 	{"merge_cfa_dialog", NULL, IMAGE_PROCESSING_DIALOG, FALSE, NULL},
 	{"mouse_actions_dialog", NULL, INFORMATION_DIALOG, FALSE, NULL},
 	{"nina_light_curve", get_nina_lc_dialog, OTHER_DIALOG, FALSE, NULL},
+	{"occultation", get_occult_dialog, OTHER_DIALOG, FALSE, NULL},
 	{"pixel_math_dialog", NULL, OTHER_DIALOG, FALSE, NULL},
 	{"resample_dialog", NULL, IMAGE_PROCESSING_DIALOG, FALSE, NULL},
 	{"rgradient_dialog", NULL, IMAGE_PROCESSING_DIALOG, FALSE, NULL},

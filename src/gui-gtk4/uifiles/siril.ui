@@ -2025,6 +2025,14 @@ Current state: linked.</property>
                   </object>
                 </child>
                 <child>
+                  <object class="GtkButton" id="occultation_button">
+                    <property name="action-name">win.occultation</property>
+                    <property name="label" translatable="yes">Occultation Time Calibration</property>
+                    <property name="tooltip-text" translatable="yes">Occultation utility to get the time offset from a specific camera setup.
+This offset can be applied to a light curve to resync the timestamps and match a precise time reference: the 1PPS (pulse per second) signal from GPS satellites. </property>
+                  </object>
+                </child>
+                <child>
                   <object class="GtkButton" id="proc_photometry_output">
                     <property name="action-name">tools.page</property>
                     <property name="action-target">'photometry_output'</property>

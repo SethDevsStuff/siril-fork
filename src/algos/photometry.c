@@ -21,6 +21,7 @@
 #include <math.h>
 #include <gsl/gsl_matrix.h>
 #include <gsl/gsl_statistics.h>
+#include <gsl/gsl_statistics_double.h>
 #include <string.h>
 
 #include "core/siril.h"
@@ -37,6 +38,7 @@
 #include "algos/photometric_cc.h"
 #include "core/gui_iface.h"
 #include "io/sequence.h"
+#include "io/ser.h"
 #include "io/siril_plot.h"
 #include "io/local_catalogues.h"
 #include "io/siril_catalogues.h"
@@ -307,6 +309,9 @@ static gboolean siril_plot_save_ETD_light_curve(siril_plot_data *spl_data, const
 		// spl_data->title is assumed to have the # signs at each line start as necessary
 		// and to finish by a \n character
 		header = g_string_new(spl_data->title);
+		if (com.pref.phot_set.t_delayed) g_string_append_printf(header, "#Applied offset of %0.3lf (%s)\n", 
+			fabs(com.pref.phot_set.time_offset) > 60000 ? com.pref.phot_set.time_offset / 60000.0 : com.pref.phot_set.time_offset,
+			fabs(com.pref.phot_set.time_offset) > 60000 ? "min" : "ms");	// Arbitrary limit of 60000ms=1min to switch from ms <-> s
 		g_string_append_printf(header, "# JD_UT V-C err");
 	} else
 		header = g_string_new("# JD_UT V-C err");
@@ -347,7 +352,7 @@ static gboolean siril_plot_save_ETD_light_curve(siril_plot_data *spl_data, const
 	fprintf(fileout, "%s", header->str);
 	index = 0;
 	for (int r = 0 ; r < nbpoints ; r++) {
-		fprintf(fileout, "\n%f", data[index++]); // print newline and x
+		fprintf(fileout, "\n%0.8f", data[index++]); // print newline and x. 8 digits to account with the ms precision
 		for (int c = 1 ; c < nbcols ; c++)
 			fprintf(fileout, " %g", data[index++]);
 	}
@@ -438,13 +443,22 @@ int new_light_curve(const char *filename, struct light_curve_args *lcargs) {
 		if (seq->imgparam[i].date_obs) {
 			double julian;
 			GDateTime *tsi = g_date_time_ref(seq->imgparam[i].date_obs);
+			julian = date_time_to_Julian(tsi);
+			gchar *str = NULL;
+			str = date_time_to_FITS_date(tsi);
 			if (seq->exposure > 0.0) {
-				GDateTime *new_dt = g_date_time_add_seconds(tsi, seq->exposure * 0.5);
+//				GDateTime *new_dt = g_date_time_add_seconds(tsi, seq->exposure * 0.5);
+				GDateTime *new_dt = g_date_time_add_seconds(tsi, com.pref.phot_set.t_delayed ? seq->exposure * 0.5 + com.pref.phot_set.time_offset / 1000.0 : seq->exposure * 0.5);
+				str = date_time_to_FITS_date(new_dt);
 				julian = date_time_to_Julian(new_dt);
 				g_date_time_unref(new_dt);
 			} else {
-				julian = date_time_to_Julian(tsi);
+				GDateTime *new_dt = g_date_time_add_seconds(tsi, com.pref.phot_set.t_delayed ? com.pref.phot_set.time_offset / 1000.0 : 0.0);
+				str = date_time_to_FITS_date(new_dt);
+				julian = date_time_to_Julian(new_dt);
+				g_date_time_unref(new_dt);
 			}
+			free(str);
 			g_date_time_unref(tsi);
 			date[j] = julian;
 			if (julian < min_date)

@@ -150,6 +150,10 @@ struct phot_config {
 				// b0 (LSB) sets (or not) the VSX catologue
 				// b1 sets (or not) the GCVS catologue
 				// b2 sets (or not) the Varisum catologue
+	gboolean t_delayed;	// force the cuve to be time delayed
+	double time_offset;	// The offset in time to use in the light curve
+	int time_disp_mask;	// binary mask to choose the display while processing a resync timestamp
+	double pulse_width;	// Width of the 1PPS pulse in [ms]. Standard GPS use 100ms. For a wider use, it must be set to 400ms
 };
 
 struct analysis_config {

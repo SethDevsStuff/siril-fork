@@ -967,6 +967,10 @@ void compstars_activate(GSimpleAction *action, GVariant *parameter, gpointer use
 	siril_open_dialog("compstars");
 }
 
+void occultation_activate(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
+	siril_open_dialog("occultation");
+}
+
 void catmag_activate(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
 	siril_open_dialog("catmag");
 }
