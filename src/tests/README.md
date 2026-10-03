@@ -31,24 +31,12 @@ used in the tests.
 
 Criterion is integrated to meson and it's the right way to run the unit tests:
 
+<<<<<<< HEAD
     # run all tests
     meson test
 
     # run the test ser_test and show the output
     meson test -v ser_test
-
-### Using test script
-
-To compile the test programs, compile siril with the autotools/make method,
-then run ./build.sh in src/tests.
-Since sorting makes some performance tests, siril has to be compiled with -O2
-to have realistic values.
-
-If build error occurs, check that the basic build script has all required
-package links for your OS and options for your compiler.
-If link error occurs, add the missing functions in dummy.c
-
-This is very rarely used, it will probably not work.
 
 ## Debugging tests
 
