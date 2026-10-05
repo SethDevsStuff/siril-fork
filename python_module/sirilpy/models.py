@@ -52,7 +52,12 @@ class ImageStats:
         Raises: SirilError: If received data size is incorrect
                 struct.error: If unpacking fails
         """
-        format_string = '!2q12d'  # '!' ensures network byte order
+        # Native byte order, standard sizes, no alignment — same-machine
+        # IPC, matches `COPY_FIELD(stats->total, int64_t)` etc. in
+        # imstats_to_py(). The C side keeps the explicit int64_t cast
+        # for total/ngoodpix because `long` is 4 bytes on Windows; the
+        # wire is always 8 bytes per int64.
+        format_string = '=2q12d'
 
         # Calculate expected size
         expected_size = struct.calcsize(format_string)
@@ -170,7 +175,9 @@ class FKeywords:
     FLEN_VALUE: ClassVar[int] = 71
 
     # Build keyword-format parts that mirror keywords_to_py() in C.
-    # This is the keyword block only (strings + numeric fields + timestamps + wcs + pltsolvd)
+    # Field widths match the native C struct widths (no widening): see
+    # `fkeywords` in core/siril.h and the COPY_FIELD calls in
+    # io/siril_pythoncommands.c::keywords_to_py.
     _KEYWORD_FORMAT_PARTS: ClassVar[List[str]] = [
         f'{FLEN_VALUE}s',  # program
         f'{FLEN_VALUE}s',  # filename
@@ -190,16 +197,16 @@ class FKeywords:
         f'{FLEN_VALUE}s',  # pltsolvd_comment
         'd',  # bscale
         'd',  # bzero
-        'Q',  # lo (uint64 padded)
-        'Q',  # hi (uint64 padded)
-        'd',  # flo
-        'd',  # fhi
+        'H',  # lo (WORD / uint16)
+        'H',  # hi (WORD / uint16)
+        'f',  # flo (float32)
+        'f',  # fhi (float32)
         'd',  # data_max
         'd',  # data_min
         'd',  # pixel_size_x
         'd',  # pixel_size_y
-        'Q',  # binning_x (uint64)
-        'Q',  # binning_y (uint64)
+        'I',  # binning_x (unsigned int / uint32)
+        'I',  # binning_y (unsigned int / uint32)
         'd',  # expstart
         'd',  # expend
         'd',  # centalt
@@ -207,8 +214,8 @@ class FKeywords:
         'd',  # sitelat
         'd',  # sitelong
         'd',  # siteelev
-        'q',  # bayer_xoffset (int64)
-        'q',  # bayer_yoffset (int64)
+        'i',  # bayer_xoffset (int / int32)
+        'i',  # bayer_yoffset (int / int32)
         'd',  # airmass
         'd',  # focal_length
         'd',  # flength
@@ -218,12 +225,12 @@ class FKeywords:
         'd',  # ccd_temp
         'd',  # set_temp
         'd',  # livetime
-        'Q',  # stackcnt (uint64)
+        'I',  # stackcnt (guint / uint32)
         'd',  # cvf
-        'q',  # key_gain (int64)
-        'q',  # key_offset (int64)
-        'q',  # focuspos (int64)
-        'q',  # focussz (int64)
+        'i',  # key_gain (int / int32)
+        'i',  # key_offset (int / int32)
+        'i',  # focuspos (int / int32)
+        'i',  # focussz (int / int32)
         'd',  # foctemp
         'q',  # date (int64 unix timestamp)
         'q',  # date_obs (int64 unix timestamp)
@@ -232,8 +239,10 @@ class FKeywords:
         '?',  # pltsolvd (bool 1 byte)
     ]
 
-    # Full struct format (network order)
-    KEYWORDS_FORMAT: ClassVar[str] = '!' + ''.join(_KEYWORD_FORMAT_PARTS)
+    # Full struct format. Native byte order, standard sizes, no
+    # alignment — mirrors the packed wire format that keywords_to_py
+    # writes via COPY_FIELD.
+    KEYWORDS_FORMAT: ClassVar[str] = '=' + ''.join(_KEYWORD_FORMAT_PARTS)
     KEYWORDS_SIZE: ClassVar[int] = struct.calcsize(KEYWORDS_FORMAT)
 
     @classmethod
@@ -377,6 +386,41 @@ class FFit:
 
     color_managed: bool = False #: Specifies whether the image is color managed or not.
     _icc_profile: Optional[bytes] = None #: Holds the ICC profile for the image as Bytes. This can be used by some modules including pillow.
+
+    # Wire format mirrors fits_to_py() in C at native widths (plan §4.2bis):
+    # 5 uint32 (rx, ry, naxes[2], bitpix, orig_bitpix) + 1 int32 checksum
+    # (gboolean) + 2 doubles (mini, maxi) + 1 float (neg_ratio) + 4 int32
+    # gbooleans (top_down, focalkey, pixelkey, color_managed)
+    # = 20 + 4 + 16 + 4 + 16 = 60 bytes.
+    _CORE_FORMAT: ClassVar[str] = '=IIIii i dd f iiii'.replace(' ', '')
+    _CORE_SIZE: ClassVar[int] = struct.calcsize(_CORE_FORMAT)
+
+    @classmethod
+    def deserialize_core(cls, data: bytes) -> Tuple[int, int, int, int, int, bool,
+                                                     float, float, float,
+                                                     bool, bool, bool, bool]:
+        """
+        Decode the 60-byte fits_to_py core block (the ffit fields before
+        the embedded keyword struct). Returns a 13-tuple in field order:
+        (rx, ry, naxes2, bitpix, orig_bitpix, checksum,
+         mini, maxi, neg_ratio,
+         top_down, focalkey, pixelkey, color_managed)
+
+        Callers compose the rest of an FFit themselves (keywords / stats /
+        pixeldata are fetched via separate calls or come from following
+        bytes in the response buffer).
+        """
+        if len(data) < cls._CORE_SIZE:
+            raise ValueError(
+                f"FFit core wire size {len(data)} smaller than expected {cls._CORE_SIZE}"
+            )
+        v = struct.unpack(cls._CORE_FORMAT, data[:cls._CORE_SIZE])
+        return (
+            v[0], v[1], v[2], v[3], v[4],     # rx, ry, naxes[2], bitpix, orig_bitpix
+            bool(v[5]),                        # checksum
+            v[6], v[7], v[8],                  # mini, maxi, neg_ratio
+            bool(v[9]), bool(v[10]), bool(v[11]), bool(v[12]),  # gbooleans
+        )
 
     def __post_init__(self):
         """Initialize after creation"""
@@ -750,6 +794,35 @@ class Homography:
     pair_matched: int = 0 #: number of pairs matched
     Inliers: int = 0 #: number of inliers kept after RANSAC step
 
+    # Wire format mirrors homography_to_py() in C: 9 doubles + 2 int32 = 80 bytes.
+    _FORMAT: ClassVar[str] = '=9d2i'
+    _SIZE: ClassVar[int] = struct.calcsize('=9d2i')
+
+    def serialize(self) -> bytes:
+        """Pack into the 80-byte wire format used by homography_to_py()."""
+        return struct.pack(
+            self._FORMAT,
+            self.h00, self.h01, self.h02,
+            self.h10, self.h11, self.h12,
+            self.h20, self.h21, self.h22,
+            self.pair_matched, self.Inliers,
+        )
+
+    @classmethod
+    def deserialize(cls, data: bytes) -> 'Homography':
+        """Decode 80 bytes (homography_to_py) into a Homography object."""
+        if len(data) != cls._SIZE:
+            raise ValueError(
+                f"Homography wire size {len(data)} doesn't match expected {cls._SIZE}"
+            )
+        v = struct.unpack(cls._FORMAT, data)
+        return cls(
+            h00=v[0], h01=v[1], h02=v[2],
+            h10=v[3], h11=v[4], h12=v[5],
+            h20=v[6], h21=v[7], h22=v[8],
+            pair_matched=v[9], Inliers=v[10],
+        )
+
 @dataclass
 class BGSample:
     """
@@ -908,9 +981,11 @@ class PSFStar:
             ValueError: If the buffer slice size does not match the expected size.
             struct.error: If there is an error unpacking the binary data.
         """
-        # CORRECTED format_string:
-        # 13d (B to sat) | 2q (R, has_saturated) | d (beta) | q (profile) | 7d (xpos to SNR) | q (phot_is_valid) | d (BV) | 8d (B_err to beta_err) | q (layer) | 2d (ra, dec)
-        format_string = '!13d2qdq7d q d8d q 2d'
+        # Wire format mirrors psfstar_to_py at native widths (plan §4.2bis):
+        # 13d (B to sat) | 2i (R, has_saturated) | d (beta) | i (profile) |
+        # 7d (xpos to SNR) | i (phot_is_valid) | d (BV) | 8d (B_err to beta_err) |
+        # i (layer) | 2d (ra, dec). 32 doubles + 5 int32 = 276 bytes.
+        format_string = '=13d2idi7did8di2d'
         expected_size = struct.calcsize(format_string)
         # Verify we got the expected amount of data
 
@@ -967,36 +1042,28 @@ class RegData:
             SirilError: If the received data doesn't match the expected size.
             struct.error: If unpacking fails.
         """
-        # Calculate expected size
-        format_string = '!5dQ9d2Q'
-        expected_size = struct.calcsize(format_string)
+        # RegData payload at native widths (mirrors regdata_to_py in C):
+        # 3 floats + 1 double + 1 float + 1 int32, followed by an
+        # embedded Homography (80 bytes). 28 + 80 = 108 bytes total.
+        head_fmt = '=fffdfi'
+        head_size = struct.calcsize(head_fmt)
+        expected_size = head_size + Homography._SIZE
 
-        # Verify we got the expected amount of data
         if len(data) != expected_size:
-            raise SirilError(f"Received stats data size {len(data)} doesn't match expected size {expected_size}")
+            raise SirilError(
+                f"Received regdata size {len(data)} doesn't match expected {expected_size}"
+            )
 
         try:
-            values = struct.unpack(format_string, data)
+            head = struct.unpack(head_fmt, data[:head_size])
             return cls(
-                fwhm=values[0],
-                weighted_fwhm=values[1],
-                roundness=values[2],
-                quality=values[3],
-                background_lvl=values[4],
-                number_of_stars=values[5],
-                H=Homography(
-                    h00=values[6],
-                    h01=values[7],
-                    h02=values[8],
-                    h10=values[9],
-                    h11=values[10],
-                    h12=values[11],
-                    h20=values[12],
-                    h21=values[13],
-                    h22=values[14],
-                    pair_matched=values[15],
-                    Inliers=values[16]
-                )
+                fwhm=head[0],
+                weighted_fwhm=head[1],
+                roundness=head[2],
+                quality=head[3],
+                background_lvl=head[4],
+                number_of_stars=head[5],
+                H=Homography.deserialize(data[head_size:]),
             )
         except struct.error as e:
             raise SirilError(f"Deserialization error: {e}") from e
@@ -1049,9 +1116,10 @@ class ImgData:
             ValueError: If received data size is incorrect.
             struct.error: If unpacking fails.
         """
-        format_string = '!3qd2q'
+        # Native widths (mirrors imgdata_to_py in C): 4 int32 + 1 int64
+        # (unix timestamp) + 1 double = 32 bytes.
+        format_string = '=iiqdii'
 
-        # Verify data size
         expected_size = struct.calcsize(format_string)
         if len(response) != expected_size:
             raise ValueError(
@@ -1059,12 +1127,10 @@ class ImgData:
             )
 
         try:
-            # Unpack the binary data
             values = struct.unpack(format_string, response)
-
             return cls(
                 filenum=values[0],
-                incl=values[1],
+                incl=bool(values[1]),
                 date_obs=datetime.fromtimestamp(values[2]) if values[2] != 0 else None,
                 airmass=values[3],
                 rx=values[4],
@@ -1079,6 +1145,36 @@ class DistoData:
     index: DistoType = DistoType.DISTO_UNDEF #: Specifies the distrosion type
     filename: str = ""                     #: filename if DISTO_FILE or DISTO_MASTER (and optional for DISTO_FILE_COMET)
     velocity: Tuple[float, float] = (0, 0) #: shift velocity if DISTO_FILE_COMET
+
+    # Fixed-header wire format mirrors distodata_to_py() in C: 1 int32
+    # (disto_source enum) + 2 floats (pointf velocity) = 12 bytes. The
+    # filename follows as a NUL-terminated UTF-8 string.
+    _HEAD_FORMAT: ClassVar[str] = '=iff'
+    _HEAD_SIZE: ClassVar[int] = struct.calcsize('=iff')
+
+    def serialize(self) -> bytes:
+        """Pack into the wire format used by distodata_to_py()."""
+        filename_bytes = self.filename.encode('utf-8') + b'\x00' if self.filename else b''
+        return struct.pack(
+            self._HEAD_FORMAT,
+            int(self.index),
+            float(self.velocity[0]),
+            float(self.velocity[1]),
+        ) + filename_bytes
+
+    @classmethod
+    def deserialize(cls, data: bytes) -> 'DistoData':
+        """Decode the distodata_to_py wire format (12-byte head + optional NUL-terminated filename)."""
+        if len(data) < cls._HEAD_SIZE:
+            raise ValueError(
+                f"DistoData wire size {len(data)} smaller than header {cls._HEAD_SIZE}"
+            )
+        index, vx, vy = struct.unpack(cls._HEAD_FORMAT, data[:cls._HEAD_SIZE])
+        if len(data) > cls._HEAD_SIZE:
+            filename = data[cls._HEAD_SIZE:].decode('utf-8').rstrip('\x00')
+        else:
+            filename = ''
+        return cls(index=DistoType(index), filename=filename, velocity=(vx, vy))
 
     def __str__(self):
         """For pretty-printing distortion information"""
@@ -1113,6 +1209,51 @@ class Sequence:
     type: SequenceType = None            #: the type of sequence
     cfa_opened_monochrome: bool = False  #: CFA SER opened in monochrome mode
     current: int = 0                     #: file number currently loaded
+
+    # Fixed-header wire format mirrors seq_to_py() in C: 9 int32
+    # (number, selnum, fixed, nb_layers, bitpix, reference_image, beg,
+    # end, current) interleaved with 2 uint32 (rx, ry), 4 int32
+    # gbooleans (is_variable, fz, cfa_opened_monochrome), 1 int32 enum
+    # (type), 1 double (exposure). Seqname follows as NUL-terminated UTF-8.
+    _HEAD_FORMAT: ClassVar[str] = '=iiiiIIiiiiidiiii'
+    _HEAD_SIZE: ClassVar[int] = struct.calcsize('=iiiiIIiiiiidiiii')
+
+    @classmethod
+    def deserialize_head(cls, data: bytes) -> Tuple[int, int, int, int, int, int,
+                                                     bool, int, int, int, int,
+                                                     float, bool, int, bool, int, str]:
+        """
+        Decode the seq_to_py fixed-header block (68 bytes) plus a
+        trailing NUL-terminated seqname. Returns a 17-tuple of the
+        decoded fields (booleans already wrapped in `bool(...)`):
+        (number, selnum, fixed, nb_layers, rx, ry, is_variable, bitpix,
+         reference_image, beg, end, exposure, fz, type_int,
+         cfa_opened_monochrome, current, seqname_str).
+
+        The expensive nested imgparam / regparam / stats / distoparam
+        lists are NOT fetched here — the caller assembles those itself
+        with per-frame requests, since they're not part of the same
+        wire response.
+        """
+        if len(data) < cls._HEAD_SIZE:
+            raise ValueError(
+                f"Sequence wire size {len(data)} smaller than head {cls._HEAD_SIZE}"
+            )
+        v = struct.unpack(cls._HEAD_FORMAT, data[:cls._HEAD_SIZE])
+        seqname = data[cls._HEAD_SIZE:].decode('utf-8').rstrip('\x00') if len(data) > cls._HEAD_SIZE else ''
+        return (
+            v[0], v[1], v[2], v[3],      # number, selnum, fixed, nb_layers
+            v[4], v[5],                   # rx, ry (uint32)
+            bool(v[6]),                   # is_variable
+            v[7], v[8],                   # bitpix, reference_image
+            v[9], v[10],                  # beg, end
+            v[11],                        # exposure (double)
+            bool(v[12]),                  # fz
+            v[13],                        # type (raw enum int — caller wraps in SequenceType)
+            bool(v[14]),                  # cfa_opened_monochrome
+            v[15],                        # current
+            seqname,
+        )
 
     def __post_init__(self):
         """Initialize lists that were set to None by default"""
@@ -1152,6 +1293,24 @@ class FPoint:
     """
     x: float #: x co-ordinate
     y: float #: y co-ordinate
+
+    # 2-double wire format used by Polygon.serialize / .deserialize_polygon.
+    _FORMAT: ClassVar[str] = '=dd'
+    _SIZE: ClassVar[int] = struct.calcsize('=dd')
+
+    def serialize(self) -> bytes:
+        """Pack one (x, y) point as 16 bytes (native double, no alignment)."""
+        return struct.pack(self._FORMAT, self.x, self.y)
+
+    @classmethod
+    def deserialize(cls, data: bytes) -> 'FPoint':
+        """Decode 16 bytes into an FPoint. Raises ValueError if too short."""
+        if len(data) < cls._SIZE:
+            raise ValueError(
+                f"FPoint wire size {len(data)} smaller than expected {cls._SIZE}"
+            )
+        x, y = struct.unpack(cls._FORMAT, data[:cls._SIZE])
+        return cls(x, y)
 
 # This is a very liberal limit, only there to protect C against unbounded g_malloc0
 # calls that could arise from attempts to create a Polygon with astronomical numbers
@@ -1326,21 +1485,21 @@ class Polygon:
         # Pack ID, number of points, color, and fill flag
         # Use 'I' for unsigned int and '?' for boolean
         buffer = bytearray()
-        buffer.extend(struct.pack('!iiI?', self.polygon_id, len(self.points), self.color, self.fill))
+        buffer.extend(struct.pack('=iiI?', self.polygon_id, len(self.points), self.color, self.fill))
 
         # Pack each point as float
         for point in self.points:
-            buffer.extend(struct.pack('!dd', point.x, point.y))
+            buffer.extend(struct.pack('=dd', point.x, point.y))
 
         # Pack the legend (if it exists)
         if self.legend is not None:
             legend_bytes = self.legend.encode('utf-8')
             # Pack the length of the string first, then the string itself
-            buffer.extend(struct.pack('!i', len(legend_bytes)))
+            buffer.extend(struct.pack('=i', len(legend_bytes)))
             buffer.extend(legend_bytes)
         else:
             # If legend is None, pack a length of 0
-            buffer.extend(struct.pack('!i', 0))
+            buffer.extend(struct.pack('=i', 0))
 
         return bytes(buffer)
 
@@ -1361,7 +1520,7 @@ class Polygon:
         if len(data) < 13:
             raise ValueError("Invalid data size for polygon")
 
-        polygon_id, n_points, color, fill = struct.unpack('!iiI?', data[:13])
+        polygon_id, n_points, color, fill = struct.unpack('=iiI?', data[:13])
         data = data[13:]
 
         if n_points < 0 or n_points > MAX_POINTS_PER_POLYGON:
@@ -1372,7 +1531,7 @@ class Polygon:
             if len(data) < 16:
                 raise ValueError("Not enough data for points")
 
-            x, y = struct.unpack('!dd', data[:16])
+            x, y = struct.unpack('=dd', data[:16])
             data = data[16:]
             points.append(FPoint(x, y))
 
@@ -1380,7 +1539,7 @@ class Polygon:
         if len(data) < 4:
             raise ValueError("Not enough data for legend length")
 
-        legend_length = struct.unpack('!i', data[:4])[0]
+        legend_length = struct.unpack('=i', data[:4])[0]
         data = data[4:]
 
         if legend_length > 0:
@@ -1409,7 +1568,7 @@ class Polygon:
         if len(data) < 4:
             raise ValueError("Invalid data size for polygon list")
 
-        num_polygons = struct.unpack('!I', data[:4])[0]
+        num_polygons = struct.unpack('=I', data[:4])[0]
         data = data[4:]
 
         polygons = []
@@ -1440,17 +1599,19 @@ class ImageAnalysis:
     width: int = 0          #: image width
     filter: str = ""        #: filter name (fixed-length string from C, max 70 chars)
 
-    # Network-safe format:
-    # ! = network (big-endian), standard sizes, no padding
-    # d = 8-byte double, q = 8-byte int, 70s = 70-byte string
-    _struct_fmt = f"!dddqdqqqqq{FLEN}s"
+    # Wire format mirrors analysis_to_py() in C at native widths
+    # (plan §4.2bis): 3 doubles + int32 (nbstars) + double (roundness)
+    # + int32 (imagetype) + int64 (unix timestamp) + 3 int32 (channels,
+    # height, width) + FLEN-byte filter string.
+    #   = = native byte order, standard sizes, no alignment
+    _struct_fmt = f"=dddidiqiii{FLEN}s"
     _struct = struct.Struct(_struct_fmt)
 
     def serialize(self) -> bytes:
-        """Pack the dataclass into a network-safe binary struct."""
+        """Pack the dataclass into the wire format used by analysis_to_py()."""
         # Ensure filter fits FLEN, pad with null bytes if shorter
-        filter_bytes = self.filter.encode("utf-8")[:FLEN]
-        filter_bytes = filter_bytes.ljust(FLEN, b"\x00")
+        filter_bytes = self.filter.encode("utf-8")[:self.FLEN]
+        filter_bytes = filter_bytes.ljust(self.FLEN, b"\x00")
 
         return self._struct.pack(
             self.bgnoise,

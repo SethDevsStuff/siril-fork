@@ -25,7 +25,256 @@ import requests
 import numpy as np
 from .version import __version__
 from .utility import ensure_installed, _check_package_installed, _install_package, \
-                     SuppressedStderr
+                     SuppressedStderr, _build_install_command, _build_uninstall_command, \
+                     _uv_subprocess_env_gpu, pip_list, pip_show
+
+
+# ----------------------------------------------------------------------------
+# GPU preferences (introduced in sirilpy 1.1.21)
+#
+# The user's "authoritative" GPU framework choices, written by GPU_Manager.py
+# whenever it successfully installs a specific variant (e.g. torch+cu118 to
+# override a faulty auto-detection on an older NVIDIA card). All
+# ensure_torch / ensure_onnxruntime / ensure_jax calls consult this file
+# first: if a preference is recorded they install that exact variant; if
+# absent they fall back to the existing hardware-detection heuristic.
+#
+# This keeps the user's manual choice authoritative across per-script venvs
+# without requiring every script to know about hardware variants.
+#
+# Storage: <SIRIL_DATA_DIR>/gpu-prefs.json (set by the C side when launching
+# the python child; falls back to platform conventions when sirilpy is used
+# outside a Siril-spawned process).
+# ----------------------------------------------------------------------------
+
+_GPU_PREFS_FILENAME = "gpu-prefs.json"
+_GPU_PREFS_VERSION = 1
+
+
+def _siril_data_dir() -> Optional[str]:
+    """Return Siril's user data dir.
+
+    Priority:
+      1. SIRIL_DATA_DIR env var (set by execute_python_script when launching
+         the python child from Siril 1.5+).
+      2. XDG_DATA_HOME or platform conventional fallback + "/siril".
+      3. None when nothing makes sense (e.g. import-only smoke tests).
+    """
+    explicit = os.environ.get("SIRIL_DATA_DIR")
+    if explicit:
+        return explicit
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA") or os.environ.get("LOCALAPPDATA")
+    elif sys.platform == "darwin":
+        base = os.path.expanduser("~/Library/Application Support")
+    else:
+        base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser(
+                "~/.local/share")
+    if not base:
+        return None
+    return os.path.join(base, "siril")
+
+
+def _gpu_prefs_path() -> Optional[str]:
+    """Return the absolute path to gpu-prefs.json, or None if no data dir."""
+    dd = _siril_data_dir()
+    if not dd:
+        return None
+    return os.path.join(dd, _GPU_PREFS_FILENAME)
+
+
+def load_gpu_preferences() -> Dict[str, Any]:
+    """Return the recorded GPU preferences as a dict. Empty dict if no file
+    exists yet, or if it cannot be parsed.
+
+    Introduced in sirilpy 1.1.21. Public read-only access to the
+    authoritative GPU config written by GPU_Manager.py. See
+    record_torch_preference / record_onnxruntime_preference /
+    record_jax_preference for the write side.
+    """
+    path = _gpu_prefs_path()
+    if not path or not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"Warning: could not parse {path}: {e}", file=sys.stderr)
+    return {}
+
+
+def _save_gpu_preferences(prefs: Dict[str, Any]) -> bool:
+    """Atomically persist prefs to gpu-prefs.json. Returns True on success."""
+    path = _gpu_prefs_path()
+    if not path:
+        print("Warning: cannot save GPU preferences — no Siril data dir "
+              "(set SIRIL_DATA_DIR or run from within Siril).",
+              file=sys.stderr)
+        return False
+    parent = os.path.dirname(path)
+    try:
+        os.makedirs(parent, exist_ok=True)
+    except OSError as e:
+        print(f"Warning: could not create {parent}: {e}", file=sys.stderr)
+        return False
+
+    prefs.setdefault("version", _GPU_PREFS_VERSION)
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(prefs, f, indent=2, sort_keys=True)
+            f.write("\n")
+        os.replace(tmp, path)
+        return True
+    except OSError as e:
+        print(f"Warning: could not write {path}: {e}", file=sys.stderr)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return False
+
+
+def _utc_now_iso() -> str:
+    """ISO-8601 UTC timestamp suitable for the 'set_at' field."""
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def record_torch_preference(*,
+                            packages,
+                            extra_index_url: Optional[str] = None,
+                            variant_label: Optional[str] = None) -> bool:
+    """Record the user's authoritative PyTorch variant preference.
+
+    Called by GPU_Manager.py after a successful manual install. Subsequent
+    `TorchHelper().ensure_torch()` calls from any script (in any per-script
+    venv) will use this recorded variant instead of running the
+    hardware-detection heuristic, so the user's chosen wheel propagates.
+
+    Args:
+        packages: list of package names exactly as they were installed
+            (e.g. ``["torch", "torchvision", "torchaudio"]``).
+        extra_index_url: optional ``--index-url`` value used at install
+            time (e.g. ``"https://download.pytorch.org/whl/cu118"``).
+        variant_label: optional short human-readable tag stored alongside
+            the install record (e.g. ``"cu118"``, ``"rocm6.2"``). Used by
+            the variant-check fast path inside ensure_torch.
+
+    Introduced in sirilpy 1.1.21.
+    """
+    prefs = load_gpu_preferences()
+    prefs["torch"] = {
+        "packages": list(packages),
+        "extra_index_url": extra_index_url,
+        "variant_label": variant_label,
+        "set_at": _utc_now_iso(),
+    }
+    return _save_gpu_preferences(prefs)
+
+
+def record_onnxruntime_preference(*,
+                                  package: str,
+                                  variant_label: Optional[str] = None) -> bool:
+    """Record the user's authoritative ONNX Runtime variant preference.
+
+    Args:
+        package: the exact PyPI package name installed (e.g.
+            ``"onnxruntime-gpu"``, ``"onnxruntime-directml"``,
+            ``"onnxruntime"``).
+        variant_label: optional short human-readable tag.
+
+    Introduced in sirilpy 1.1.21.
+    """
+    prefs = load_gpu_preferences()
+    prefs["onnxruntime"] = {
+        "package": package,
+        "variant_label": variant_label,
+        "set_at": _utc_now_iso(),
+    }
+    return _save_gpu_preferences(prefs)
+
+
+def record_jax_preference(*,
+                          packages,
+                          extra_index_url: Optional[str] = None,
+                          variant_label: Optional[str] = None) -> bool:
+    """Record the user's authoritative JAX variant preference.
+
+    Args:
+        packages: list of package names installed (e.g. ``["jax", "jaxlib"]``
+            or ``["jax[cuda12]"]``).
+        extra_index_url: optional ``--index-url`` value.
+        variant_label: optional short human-readable tag.
+
+    Introduced in sirilpy 1.1.21.
+    """
+    prefs = load_gpu_preferences()
+    prefs["jax"] = {
+        "packages": list(packages),
+        "extra_index_url": extra_index_url,
+        "variant_label": variant_label,
+        "set_at": _utc_now_iso(),
+    }
+    return _save_gpu_preferences(prefs)
+
+
+def clear_torch_preference() -> bool:
+    """Remove the recorded PyTorch preference; ensure_torch() falls back to
+    hardware-detection heuristic on next call.
+
+    Introduced in sirilpy 1.1.21."""
+    prefs = load_gpu_preferences()
+    if prefs.pop("torch", None) is None:
+        return True
+    return _save_gpu_preferences(prefs)
+
+
+def clear_onnxruntime_preference() -> bool:
+    """Remove the recorded ONNX Runtime preference.
+
+    Introduced in sirilpy 1.1.21."""
+    prefs = load_gpu_preferences()
+    if prefs.pop("onnxruntime", None) is None:
+        return True
+    return _save_gpu_preferences(prefs)
+
+
+def clear_jax_preference() -> bool:
+    """Remove the recorded JAX preference.
+
+    Introduced in sirilpy 1.1.21."""
+    prefs = load_gpu_preferences()
+    if prefs.pop("jax", None) is None:
+        return True
+    return _save_gpu_preferences(prefs)
+
+
+def _torch_variant_from_installed() -> Optional[str]:
+    """Best-effort detection of the currently-installed torch variant by
+    parsing the local-version suffix of the installed package's version
+    string (e.g. ``2.7.0+cu118`` → ``"cu118"``). Returns ``"cpu"`` for a
+    bare version with no suffix, or None if torch is not installed."""
+    info = pip_show("torch")
+    if not info:
+        return None
+    ver = info.get("Version", "")
+    if "+" in ver:
+        return ver.split("+", 1)[1]
+    return "cpu"
+
+
+def _installed_onnxruntime_package() -> Optional[str]:
+    """Return the name of whichever onnxruntime-* package is currently
+    installed in this venv, or None if none is installed."""
+    for pkg in ("onnxruntime-gpu", "onnxruntime-directml",
+                "onnxruntime-openvino", "onnxruntime-rocm", "onnxruntime"):
+        if pip_show(pkg):
+            return pkg
+    return None
+
 
 def _detect_cuda_version(system) -> Optional[str]:
     """
@@ -1191,9 +1440,45 @@ class ONNXHelper:
 
     def ensure_onnxruntime(self) -> bool:
         """
-        Wrapper for install_onnxruntime() that only installs it if needed, with
-        negligible overhead if it is already installed.
+        Ensure ONNX Runtime is installed with the appropriate variant.
+
+        Resolution order (since sirilpy 1.1.21):
+          1. Authoritative GPU preference recorded by GPU_Manager.py
+             (gpu-prefs.json). If present, the installed onnxruntime-*
+             package must match; reinstall the right variant if not.
+          2. Hardware-detection heuristic via install_onnxruntime.
+
+        ONNX Runtime variants are *different PyPI packages*
+        (onnxruntime, onnxruntime-gpu, onnxruntime-directml,
+        onnxruntime-openvino, onnxruntime-rocm) that all import as
+        `onnxruntime`. They are mutually exclusive on disk; the variant
+        check inspects which one is currently installed.
         """
+        pref = load_gpu_preferences().get("onnxruntime")
+        if pref:
+            wanted_pkg = pref.get("package")
+            installed_pkg = _installed_onnxruntime_package()
+            if installed_pkg and wanted_pkg and installed_pkg == wanted_pkg:
+                return True
+            if installed_pkg and wanted_pkg and installed_pkg != wanted_pkg:
+                print(f"ONNX Runtime is installed as '{installed_pkg}' but "
+                      f"the recorded preference is '{wanted_pkg}'. "
+                      f"Reinstalling to match.")
+                try:
+                    self.uninstall_onnxruntime()
+                except Exception as e:
+                    print(f"Warning: uninstall_onnxruntime failed: {e}")
+            if wanted_pkg:
+                print(f"Installing ONNX Runtime per recorded preference: "
+                      f"{wanted_pkg}")
+                try:
+                    ensure_installed(wanted_pkg)
+                    return True
+                except Exception as e:
+                    print(f"Error installing {wanted_pkg} per preference: {e}")
+                    return False
+
+        # No preference (or malformed) → existing behaviour.
         if not self.is_onnxruntime_installed():
             return self.install_onnxruntime()
         return True
@@ -1398,25 +1683,15 @@ class ONNXHelper:
 
         self.providers = None
 
-        # Get all installed packages
+        # §5.2: pip_list goes through uv when available.
         try:
-            result = subprocess.run(
-                [sys.executable, "-m", "pip", "list"],
-                capture_output=True,
-                text=True,
-                check=True
-            )
-            installed_packages = result.stdout.splitlines()
-        except subprocess.CalledProcessError as e:
+            installed_pairs = pip_list()
+        except Exception as e:
             print(f"Error getting installed packages: {e}")
             return []
 
-        # Find all packages that start with 'onnxruntime'
-        onnx_packages = []
-        for line in installed_packages:
-            parts = line.split()
-            if parts and parts[0].lower().startswith('onnxruntime'):
-                onnx_packages.append(parts[0])
+        onnx_packages = [name for (name, _ver) in installed_pairs
+                         if name.lower().startswith('onnxruntime')]
 
         # Uninstall found packages
         if not onnx_packages:
@@ -1428,11 +1703,9 @@ class ONNXHelper:
 
         for package in onnx_packages:
             print(f"Uninstalling {package}...")
+            argv, _backend = _build_uninstall_command(package)
             try:
-                subprocess.run(
-                    [sys.executable, "-m", "pip", "uninstall", "-y", package],
-                    check=True
-                )
+                subprocess.run(argv, check=True, env=_uv_subprocess_env_gpu())
                 uninstalled.append(package)
                 print(f"Successfully uninstalled {package}")
             except subprocess.CalledProcessError:
@@ -1559,12 +1832,56 @@ class TorchHelper:
         """
         Ensure PyTorch is installed with the appropriate backend.
 
-        Args:
-            cuda_version: Optional CUDA version to override auto-detection
-                            (e.g., 'cu118', 'cu126', 'cu128')
+        Resolution order (since sirilpy 1.1.21):
+          1. Authoritative GPU preference recorded by GPU_Manager.py
+             (gpu-prefs.json). If present, the installed torch must match
+             the recorded variant; reinstall if not.
+          2. Caller-provided cuda_version override (legacy, applies only
+             when the heuristic also picks CUDA).
+          3. Hardware-detection heuristic via get_recommended_backend.
 
-        Returns: True on success, False on failure
+        Args:
+            cuda_version: Optional CUDA version to override the auto-
+                detection heuristic (e.g., 'cu118', 'cu126', 'cu128').
+                Ignored when an authoritative preference is recorded.
+
+        Returns: True on success, False on failure.
         """
+        # ── Path 1: authoritative preference ─────────────────────────────
+        pref = load_gpu_preferences().get("torch")
+        if pref:
+            wanted_label = pref.get("variant_label")
+            installed_label = _torch_variant_from_installed()
+            if installed_label is not None and wanted_label is not None \
+                    and installed_label == wanted_label:
+                # Already matches — fast path, no work.
+                return True
+            if installed_label is not None and wanted_label is not None \
+                    and installed_label != wanted_label:
+                print(f"Torch is installed as variant '{installed_label}' "
+                      f"but the recorded preference is '{wanted_label}'. "
+                      f"Reinstalling to match.")
+                try:
+                    self.uninstall_torch()
+                except Exception as e:
+                    print(f"Warning: uninstall_torch failed: {e}")
+                # fall through to install
+            print(f"Installing PyTorch per recorded preference "
+                  f"(variant='{wanted_label}', "
+                  f"index={pref.get('extra_index_url') or 'PyPI default'})")
+            try:
+                self.install_torch(
+                    cuda_version=cuda_version,  # passed through for logs
+                    extra_index_url=pref.get("extra_index_url"),
+                    packages=pref.get("packages") or
+                        ['torch', 'torchvision', 'torchaudio'],
+                )
+                return True
+            except Exception as e:
+                print(f"Error installing Torch per preference: {e}")
+                return False
+
+        # ── Path 2/3: no preference; use existing behaviour ─────────────
         if self.is_torch_installed():
             print("Torch is already installed")
             return True
@@ -1605,14 +1922,23 @@ class TorchHelper:
         if packages is None:
             packages = ['torch', 'torchvision', 'torchaudio']
 
-        install_cmd = [sys.executable, '-m', 'pip', 'install'] + packages
-
-        if extra_index_url:
-            install_cmd.extend(['--index-url', extra_index_url])
+        # §5.2: Route through the shared install-command builder so that
+        # uv is used when available (cleaner resolver, faster, and dedup
+        # via the local wheel cache). The builder normally takes a single
+        # install_target; torch installs multiple packages in one go, so
+        # we build the prefix once and append the package list inline.
+        prefix, _backend = _build_install_command(
+            install_target=packages[0],
+            index_url=extra_index_url,
+        )
+        # Drop the trailing install_target appended by the builder and
+        # substitute the full package list.
+        prefix = prefix[:-1]
+        install_cmd = prefix + packages
 
         try:
             print(f"Installing: {' '.join(packages)}")
-            subprocess.run(install_cmd, check=True)
+            subprocess.run(install_cmd, check=True, env=_uv_subprocess_env_gpu())
             self.torch_installed = self.is_torch_installed()
             print("PyTorch installation completed successfully")
         except subprocess.CalledProcessError as e:
@@ -1969,25 +2295,16 @@ class TorchHelper:
             'fastai', 'transformers', 'accelerate', 'timm'
         ]
 
-        # Get all installed packages
+        # §5.2: Route through pip_list / _build_uninstall_command so that
+        # uv is used when available. pip_list returns (name, version)
+        # tuples already lower-cased on the names by pip's freeze format.
         try:
-            result = subprocess.run(
-                [sys.executable, "-m", "pip", "list"],
-                capture_output=True,
-                text=True,
-                check=True
-            )
-            installed_packages = result.stdout.splitlines()
-        except subprocess.CalledProcessError as e:
+            installed_pairs = pip_list()
+        except Exception as e:
             print(f"Error getting installed packages: {e}")
             return []
 
-        # Extract package names from pip list output
-        installed_package_names = set()
-        for line in installed_packages:
-            parts = line.split()
-            if parts:
-                installed_package_names.add(parts[0].lower())
+        installed_package_names = {name.lower() for (name, _ver) in installed_pairs}
 
         # Find torch packages that are actually installed
         torch_packages = []
@@ -2004,11 +2321,9 @@ class TorchHelper:
         uninstalled = []
         for package in torch_packages:
             print(f"Uninstalling {package}...")
+            argv, _backend = _build_uninstall_command(package)
             try:
-                subprocess.run(
-                    [sys.executable, "-m", "pip", "uninstall", "-y", package],
-                    check=True
-                )
+                subprocess.run(argv, check=True, env=_uv_subprocess_env_gpu())
                 uninstalled.append(package)
                 print(f"Successfully uninstalled {package}")
             except subprocess.CalledProcessError:
@@ -2319,9 +2634,44 @@ class JaxHelper:
 
     def ensure_jax(self) -> bool:
         """
-        Wrapper for install_jax() that only installs it if needed, with
-        negligible overhead if it is already installed.
+        Ensure JAX is installed with the appropriate variant.
+
+        Resolution order (since sirilpy 1.1.21):
+          1. Authoritative GPU preference recorded by GPU_Manager.py
+             (gpu-prefs.json). If present, install the exact package list.
+          2. is_jax_installed → install_jax (heuristic).
+
+        Note: unlike torch and onnxruntime there is no automatic
+        variant-mismatch detection here — jax variants are expressed via
+        a combination of packages + extras (e.g. `jax`, `jax[cuda12]`,
+        `jax-metal`, `jax-rocm`) that is hard to detect after the fact.
+        If the user changes their jax preference via GPU_Manager.py while
+        another script's venv has the old variant, they should also
+        invoke GPU_Manager.py's uninstall (or run `pyenv_maint
+        rebuild_script` for the affected script) to force a clean rebuild.
         """
+        pref = load_gpu_preferences().get("jax")
+        if pref and pref.get("packages"):
+            if self.is_jax_installed():
+                return True  # see docstring caveat
+            print(f"Installing JAX per recorded preference "
+                  f"(variant='{pref.get('variant_label')}')")
+            try:
+                packages = pref["packages"]
+                extra_index_url = pref.get("extra_index_url")
+                cmd, _backend = _build_install_command(
+                    install_target=packages[0],
+                    index_url=extra_index_url,
+                )
+                cmd = cmd[:-1] + packages
+                subprocess.run(cmd, check=True, env=_uv_subprocess_env_gpu())
+                self.jax_installed = True
+                return True
+            except Exception as e:
+                print(f"Error installing JAX per preference: {e}")
+                return False
+
+        # No preference → existing behaviour.
         if not self.is_jax_installed():
             return self.install_jax()
         return True
@@ -2471,21 +2821,9 @@ class JaxHelper:
         ]
 
         try:
-            # Get list of installed packages
-            result = subprocess.run(
-                [sys.executable, '-m', 'pip', 'list', '--format=freeze'],
-                capture_output=True,
-                text=True,
-                check=True
-            )
-
-            installed_packages = result.stdout.strip().split('\n')
-            installed_dict = {}
-
-            for package_line in installed_packages:
-                if '==' in package_line:
-                    name, version = package_line.split('==', 1)
-                    installed_dict[name.lower()] = version
+            # §5.2: pip_list goes through uv when available.
+            installed_dict = {name.lower(): version
+                              for (name, version) in pip_list()}
 
             # Find JAX-related packages
             detected = []
@@ -2532,11 +2870,13 @@ class JaxHelper:
 
                     try:
                         print(f"Uninstalling {pkg_name}...")
+                        argv, _backend = _build_uninstall_command(pkg_name)
                         subprocess.run(
-                            [sys.executable, '-m', 'pip', 'uninstall', pkg_name, '-y'],
+                            argv,
                             check=True,
                             capture_output=True,
-                            text=True
+                            text=True,
+                            env=_uv_subprocess_env_gpu(),
                         )
                         results['uninstalled_packages'].append(pkg_info)
                         print(f"Successfully uninstalled {pkg_name}")

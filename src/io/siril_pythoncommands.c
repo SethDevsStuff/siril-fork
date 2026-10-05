@@ -64,37 +64,31 @@ typedef enum {
 		ptr += len; \
 	}
 
-#define COPY_BE64(val, type) \
-	{ \
-		size_t len = sizeof(type); \
-		if ((ptr + len) - start_ptr > maxlen) { \
-			siril_log_debug("Error: Exceeded max length for COPY_BE64 at %s\n", #val); \
+// Write a single field of the given native C type to the serialisation
+// buffer, advancing ptr. Same-machine IPC, so the wire mirrors the C
+// struct exactly: no byte swap, no width widening. Both endpoints share
+// endianness and ABI.
+//
+// The `type` parameter exists so the macro accepts literal rvalues
+// (e.g. `COPY_FIELD(0.0, double)`) as well as lvalues uniformly — the
+// temporary `_tmp` lets us take its address regardless.
+//
+// Replaces the former COPY_BE64 / FROM_BE64_INTO / TO_BE64_INTO trio:
+//   - COPY_BE64 (write) → COPY_FIELD (this macro)
+//   - FROM_BE64_INTO (read) → call sites become `memcpy(&dest, &val,
+//     sizeof(type))` or direct assignment — no macro needed
+//   - TO_BE64_INTO (type-pun assignment) → call sites become a direct
+//     `dest = val` — no macro needed
+#define COPY_FIELD(val, type) \
+	do { \
+		type _tmp = (val); \
+		if ((ptr + sizeof(_tmp)) - start_ptr > maxlen) { \
+			siril_log_debug("Error: Exceeded max length for COPY_FIELD at %s\n", #val); \
 			return 1; \
 		} \
-		union { type v; uint64_t i; } conv; \
-		conv.v = val; \
-		uint64_t be = GUINT64_TO_BE(conv.i); \
-		memcpy(ptr, &be, len); \
-		ptr += len; \
-	}
-
-#define FROM_BE64_INTO(dest, val, type) \
-do { \
-	union { type v; uint64_t i; } conv; \
-	memcpy(&conv.i, &val, sizeof(type)); \
-	conv.i = GUINT64_FROM_BE(conv.i); \
-	(dest) = conv.v; \
-} while(0)
-
-#define TO_BE64_INTO(dest, val, type) \
-	do { \
-		union { type v; uint64_t i; } conv; \
-		conv.v = val; \
-		conv.i = GUINT64_TO_BE(conv.i); \
-		union { type v; uint64_t i; } result; \
-		result.i = conv.i; \
-		(dest) = result.v; \
-	} while(0)
+		memcpy(ptr, &_tmp, sizeof(_tmp)); \
+		ptr += sizeof(_tmp); \
+	} while (0)
 
 #define BOOL_FROM_BYTE(x) ((x) ? TRUE : FALSE)
 
@@ -123,121 +117,138 @@ static int keywords_to_py(fits *fit, unsigned char *ptr, size_t maxlen) {
 	COPY_FLEN_STRING(fit->keywords.wcsdata.objctra);
 	COPY_FLEN_STRING(fit->keywords.wcsdata.objctdec);
 	COPY_FLEN_STRING(fit->keywords.wcsdata.pltsolvd_comment);
-	// Copy numeric values with proper byte order conversion. All
-	// types shorter than 64bit are converted to 64bit types before
-	// endianness conversion and transmission, to simplify the data
-	COPY_BE64(1.0, double); // aligned to the code in fits_keywords.c
-	COPY_BE64(0.0, double); // aligned to the code in fits_keywords.c
-	COPY_BE64((uint64_t) fit->keywords.lo, uint64_t);
-	COPY_BE64((uint64_t) fit->keywords.hi, uint64_t);
-	COPY_BE64((double) fit->keywords.flo, double);
-	COPY_BE64((double) fit->keywords.fhi, double);
-	COPY_BE64(fit->keywords.data_max, double);
-	COPY_BE64(fit->keywords.data_min, double);
-	COPY_BE64(fit->keywords.pixel_size_x, double);
-	COPY_BE64(fit->keywords.pixel_size_y, double);
-	COPY_BE64((uint64_t) fit->keywords.binning_x, uint64_t);
-	COPY_BE64((uint64_t) fit->keywords.binning_y, uint64_t);
-	COPY_BE64(fit->keywords.expstart, double);
-	COPY_BE64(fit->keywords.expend, double);
-	COPY_BE64(fit->keywords.centalt, double);
-	COPY_BE64(fit->keywords.centaz, double);
-	COPY_BE64(fit->keywords.sitelat, double);
-	COPY_BE64(fit->keywords.sitelong, double);
-	COPY_BE64(fit->keywords.siteelev, double);
-	COPY_BE64((int64_t) fit->keywords.bayer_xoffset, int64_t);
-	COPY_BE64((int64_t) fit->keywords.bayer_yoffset, int64_t);
-	COPY_BE64(fit->keywords.airmass, double);
-	COPY_BE64(fit->keywords.focal_length, double);
-	COPY_BE64(fit->keywords.flength, double);
-	COPY_BE64(fit->keywords.iso_speed, double);
-	COPY_BE64(fit->keywords.exposure, double);
-	COPY_BE64(fit->keywords.aperture, double);
-	COPY_BE64(fit->keywords.ccd_temp, double);
-	COPY_BE64(fit->keywords.set_temp, double);
-	COPY_BE64(fit->keywords.livetime, double);
-	COPY_BE64((uint64_t) fit->keywords.stackcnt, uint64_t);
-	COPY_BE64(fit->keywords.cvf, double);
-	COPY_BE64((int64_t) fit->keywords.key_gain, int64_t);
-	COPY_BE64((int64_t) fit->keywords.key_offset, int64_t);
-	COPY_BE64((int64_t) fit->keywords.focuspos, int64_t);
-	COPY_BE64((int64_t) fit->keywords.focussz, int64_t);
-	COPY_BE64(fit->keywords.foctemp, double);
-	COPY_BE64(date_ts, int64_t);
-	COPY_BE64(date_obs_ts, int64_t);
+	// Copy numeric values at their native C widths (no widening, no
+	// byte swap — same-machine IPC, see plan §4.2bis).
+	COPY_FIELD(1.0, double); // aligned to the code in fits_keywords.c
+	COPY_FIELD(0.0, double); // aligned to the code in fits_keywords.c
+	COPY_FIELD(fit->keywords.lo, WORD);                     // uint16
+	COPY_FIELD(fit->keywords.hi, WORD);                     // uint16
+	COPY_FIELD(fit->keywords.flo, float);                   // float32
+	COPY_FIELD(fit->keywords.fhi, float);                   // float32
+	COPY_FIELD(fit->keywords.data_max, double);
+	COPY_FIELD(fit->keywords.data_min, double);
+	COPY_FIELD(fit->keywords.pixel_size_x, double);
+	COPY_FIELD(fit->keywords.pixel_size_y, double);
+	COPY_FIELD(fit->keywords.binning_x, unsigned int);      // uint32
+	COPY_FIELD(fit->keywords.binning_y, unsigned int);      // uint32
+	COPY_FIELD(fit->keywords.expstart, double);
+	COPY_FIELD(fit->keywords.expend, double);
+	COPY_FIELD(fit->keywords.centalt, double);
+	COPY_FIELD(fit->keywords.centaz, double);
+	COPY_FIELD(fit->keywords.sitelat, double);
+	COPY_FIELD(fit->keywords.sitelong, double);
+	COPY_FIELD(fit->keywords.siteelev, double);
+	COPY_FIELD(fit->keywords.bayer_xoffset, int);           // int32
+	COPY_FIELD(fit->keywords.bayer_yoffset, int);           // int32
+	COPY_FIELD(fit->keywords.airmass, double);
+	COPY_FIELD(fit->keywords.focal_length, double);
+	COPY_FIELD(fit->keywords.flength, double);
+	COPY_FIELD(fit->keywords.iso_speed, double);
+	COPY_FIELD(fit->keywords.exposure, double);
+	COPY_FIELD(fit->keywords.aperture, double);
+	COPY_FIELD(fit->keywords.ccd_temp, double);
+	COPY_FIELD(fit->keywords.set_temp, double);
+	COPY_FIELD(fit->keywords.livetime, double);
+	COPY_FIELD(fit->keywords.stackcnt, guint);              // uint32
+	COPY_FIELD(fit->keywords.cvf, double);
+	COPY_FIELD(fit->keywords.key_gain, int);                // int32
+	COPY_FIELD(fit->keywords.key_offset, int);              // int32
+	COPY_FIELD(fit->keywords.focuspos, int);                // int32
+	COPY_FIELD(fit->keywords.focussz, int);                 // int32
+	COPY_FIELD(fit->keywords.foctemp, double);
+	COPY_FIELD(date_ts, int64_t);                           // unix ts: int64
+	COPY_FIELD(date_obs_ts, int64_t);
 	double ra = fit->keywords.wcsdata.ra;
 	double dec = fit->keywords.wcsdata.dec;
 	uint8_t solved = fit->keywords.wcsdata.pltsolvd;
-	COPY_BE64(ra, double);
-	COPY_BE64(dec, double);
+	COPY_FIELD(ra, double);
+	COPY_FIELD(dec, double);
 	memcpy(ptr, &solved, sizeof(uint8_t));
 	return 0;
 }
 
+// Native widths (mirrors FFit.deserialize_core in models.py):
+// 5 uint32 (rx, ry, naxes[2], bitpix, orig_bitpix) + 1 int32
+// (checksum gboolean) + 2 doubles (mini, maxi) + 1 float (neg_ratio)
+// + 4 int32 (gboolean top_down/focalkey/pixelkey/color_managed)
+// = 20 + 4 + 16 + 4 + 16 = 60 bytes. Was 13 × 8 = 104.
 static int fits_to_py(fits *fit, unsigned char *ptr, size_t maxlen) {
 	if (!fit || !ptr)
 		return 1;
 
 	unsigned char *start_ptr = ptr;
 
-	// Copy numeric values with proper byte order conversion. All
-	// types shorter than 64bit are converted to 64bit types before
-	// endianness conversion and transmission, to simplify the data
-	COPY_BE64((int64_t) fit->rx, int64_t);
-	COPY_BE64((int64_t) fit->ry, int64_t);
-	COPY_BE64((int64_t) fit->naxes[2], int64_t);
-	COPY_BE64((int64_t) fit->bitpix, int64_t);
-	COPY_BE64((int64_t) fit->orig_bitpix, int64_t);
-	COPY_BE64((uint64_t) fit->checksum, uint64_t);
-	COPY_BE64(fit->mini, double);
-	COPY_BE64(fit->maxi, double);
-	COPY_BE64((double) fit->neg_ratio, double);
-	COPY_BE64((uint64_t) fit->top_down, uint64_t);
-	COPY_BE64((uint64_t) fit->focalkey, uint64_t);
-	COPY_BE64((uint64_t) fit->pixelkey, uint64_t);
-	COPY_BE64((uint64_t) fit->color_managed, uint64_t);
+	COPY_FIELD(fit->rx, unsigned int);                // uint32
+	COPY_FIELD(fit->ry, unsigned int);                // uint32
+	COPY_FIELD((int32_t) fit->naxes[2], int32_t);     // long → int32 (channels <= 3)
+	COPY_FIELD(fit->bitpix, int);                     // int32
+	COPY_FIELD(fit->orig_bitpix, int);                // int32
+	COPY_FIELD((int32_t) fit->checksum, int32_t);     // gboolean → int32
+	COPY_FIELD(fit->mini, double);
+	COPY_FIELD(fit->maxi, double);
+	COPY_FIELD(fit->neg_ratio, float);                // float32
+	COPY_FIELD((int32_t) fit->top_down, int32_t);     // gboolean → int32
+	COPY_FIELD((int32_t) fit->focalkey, int32_t);     // gboolean → int32
+	COPY_FIELD((int32_t) fit->pixelkey, int32_t);     // gboolean → int32
+	COPY_FIELD((int32_t) fit->color_managed, int32_t); // gboolean → int32
 	return 0;
 }
 
+// Wire size of one fits_to_py block. Use this rather than the magic
+// `sizeof(uint64_t) * 13` constant (= 104) that the pre-audit code
+// scattered across three call sites.
+#define FITS_TO_PY_SIZE (5 * sizeof(uint32_t) + sizeof(int32_t) \
+		+ 2 * sizeof(double) + sizeof(float) + 4 * sizeof(int32_t))
+
+// Serialise a Homography at native field widths: 9 doubles + 2 ints
+// = 80 bytes. Mirrors Homography.deserialize() in sirilpy/models.py.
 static int homography_to_py(const Homography* H, unsigned char *ptr, size_t maxlen) {
 	if (!H || !ptr)
 		return 1;
 
 	unsigned char *start_ptr = ptr;
 
-	COPY_BE64((double) H->h00, double);
-	COPY_BE64((double) H->h01, double);
-	COPY_BE64((double) H->h02, double);
-	COPY_BE64((double) H->h10, double);
-	COPY_BE64((double) H->h11, double);
-	COPY_BE64((double) H->h12, double);
-	COPY_BE64((double) H->h20, double);
-	COPY_BE64((double) H->h21, double);
-	COPY_BE64((double) H->h22, double);
-	COPY_BE64((int64_t) H->pair_matched, int64_t);
-	COPY_BE64((int64_t) H->Inliers, int64_t);
+	COPY_FIELD(H->h00, double);
+	COPY_FIELD(H->h01, double);
+	COPY_FIELD(H->h02, double);
+	COPY_FIELD(H->h10, double);
+	COPY_FIELD(H->h11, double);
+	COPY_FIELD(H->h12, double);
+	COPY_FIELD(H->h20, double);
+	COPY_FIELD(H->h21, double);
+	COPY_FIELD(H->h22, double);
+	COPY_FIELD(H->pair_matched, int);  // int32
+	COPY_FIELD(H->Inliers, int);       // int32
 	return 0;
 }
 
-static int analysis_to_py(const double bgnoise, const double fwhm, const double wfwhm, const int64_t nbstars,
-						  const double roundness, const int64_t imagetype, int64_t unix_timestamp,
-						  const int64_t channels, const int64_t height, const int64_t width, const char *filter,
+// Serialised wire size of a Homography (mirrors homography_to_py
+// above and Homography.deserialize() / serialize() in
+// sirilpy/models.py). Use this instead of `11 * sizeof(double)`.
+#define HOMOGRAPHY_WIRE_SIZE (9 * sizeof(double) + 2 * sizeof(int32_t))
+
+// Native widths (mirrors ImageAnalysis._struct_fmt in models.py):
+// 3 doubles + int32 + double + int32 + int64 (unix ts) + 3 int32 +
+// FLEN_VALUE string = 24 + 4 + 8 + 4 + 8 + 12 + 71 = 131 bytes.
+static int analysis_to_py(const double bgnoise, const double fwhm, const double wfwhm, const int32_t nbstars,
+						  const double roundness, const int32_t imagetype, int64_t unix_timestamp,
+						  const int32_t channels, const int32_t height, const int32_t width, const char *filter,
 						  unsigned char *ptr, size_t maxlen) {
 	if (!ptr)
 		return 1;
 
 	unsigned char *start_ptr = ptr;
 
-	COPY_BE64(bgnoise, double);
-	COPY_BE64(fwhm, double);
-	COPY_BE64(wfwhm, double);
-	COPY_BE64(nbstars, int64_t);
-	COPY_BE64(roundness, double);
-	COPY_BE64(imagetype, int64_t);
-	COPY_BE64(unix_timestamp, int64_t);
-	COPY_BE64(channels, int64_t);
-	COPY_BE64(height, int64_t);
-	COPY_BE64(width, int64_t);
+	COPY_FIELD(bgnoise, double);
+	COPY_FIELD(fwhm, double);
+	COPY_FIELD(wfwhm, double);
+	COPY_FIELD(nbstars, int32_t);
+	COPY_FIELD(roundness, double);
+	COPY_FIELD(imagetype, int32_t);
+	COPY_FIELD(unix_timestamp, int64_t);
+	COPY_FIELD(channels, int32_t);
+	COPY_FIELD(height, int32_t);
+	COPY_FIELD(width, int32_t);
 	COPY_FLEN_STRING(filter);
 	return 0;
 }
@@ -247,16 +258,16 @@ static int sample_to_py(const background_sample *sample, unsigned char *ptr, siz
 		return 1;
 	unsigned char *start_ptr = ptr;
 
-	COPY_BE64(sample->median[0], double);
-	COPY_BE64(sample->median[1], double);
-	COPY_BE64(sample->median[2], double);
-	COPY_BE64(sample->mean, double);
-	COPY_BE64(sample->min, double);
-	COPY_BE64(sample->max, double);
-	COPY_BE64((uint64_t) sample->size, uint64_t);
-	COPY_BE64(sample->position.x, double);
-	COPY_BE64(sample->position.y, double);
-	COPY_BE64((uint64_t) sample->valid, uint64_t);
+	COPY_FIELD(sample->median[0], double);
+	COPY_FIELD(sample->median[1], double);
+	COPY_FIELD(sample->median[2], double);
+	COPY_FIELD(sample->mean, double);
+	COPY_FIELD(sample->min, double);
+	COPY_FIELD(sample->max, double);
+	COPY_FIELD((uint64_t) sample->size, uint64_t);
+	COPY_FIELD(sample->position.x, double);
+	COPY_FIELD(sample->position.y, double);
+	COPY_FIELD((uint64_t) sample->valid, uint64_t);
 	return 0;
 }
 
@@ -266,13 +277,16 @@ static int regdata_to_py(const regdata *regparam, unsigned char *ptr, size_t max
 
 	unsigned char *start_ptr = ptr;
 
-	COPY_BE64((double) regparam->fwhm, double);
-	COPY_BE64((double) regparam->weighted_fwhm, double);
-	COPY_BE64((double) regparam->roundness, double);
-	COPY_BE64(regparam->quality, double);
-	COPY_BE64((double) regparam->background_lvl, double);
-	COPY_BE64((int64_t) regparam->number_of_stars, int64_t);
-	homography_to_py(&regparam->H, ptr, 11 * sizeof(double));
+	// Native widths: 3 floats + 1 double + 1 float + 1 int32 + Homography
+	// = 28 + 80 = 108 bytes. Mirrors RegData.deserialize() in
+	// sirilpy/models.py.
+	COPY_FIELD(regparam->fwhm, float);
+	COPY_FIELD(regparam->weighted_fwhm, float);
+	COPY_FIELD(regparam->roundness, float);
+	COPY_FIELD(regparam->quality, double);
+	COPY_FIELD(regparam->background_lvl, float);
+	COPY_FIELD(regparam->number_of_stars, int);  // int32
+	homography_to_py(&regparam->H, ptr, HOMOGRAPHY_WIRE_SIZE);
 	return 0;
 }
 
@@ -282,13 +296,15 @@ static int imgdata_to_py(const imgdata *imgparam, unsigned char* ptr, size_t max
 
 	unsigned char *start_ptr = ptr;
 
+	// Native widths: 4 int32 + 1 int64 (unix timestamp) + 1 double
+	// = 32 bytes. Mirrors ImgData.deserialize() in sirilpy/models.py.
 	int64_t date_obs_ts = imgparam->date_obs ? g_date_time_to_unix(imgparam->date_obs) : 0;
-	COPY_BE64((int64_t) imgparam->filenum, int64_t);
-	COPY_BE64((int64_t) imgparam->incl, int64_t);
-	COPY_BE64((int64_t) date_obs_ts, int64_t);
-	COPY_BE64((double) imgparam->airmass, double);
-	COPY_BE64((int64_t) imgparam->rx, int64_t);
-	COPY_BE64((int64_t) imgparam->ry, int64_t);
+	COPY_FIELD(imgparam->filenum, int);                // int32
+	COPY_FIELD((int32_t) imgparam->incl, int32_t);     // gboolean → int32 (truncate; only 0/1)
+	COPY_FIELD(date_obs_ts, int64_t);                  // unix ts: int64
+	COPY_FIELD(imgparam->airmass, double);
+	COPY_FIELD(imgparam->rx, int);                     // int32
+	COPY_FIELD(imgparam->ry, int);                     // int32
 	return 0;
 }
 
@@ -298,69 +314,80 @@ static int psfstar_to_py(const psf_star *data, unsigned char* ptr, size_t maxlen
 
 	unsigned char *start_ptr = ptr;
 
-	COPY_BE64(data->B, double);
-	COPY_BE64(data->A, double);
-	COPY_BE64(data->x0, double);
-	COPY_BE64(data->y0, double);
-	COPY_BE64(data->sx, double);
-	COPY_BE64(data->sy, double);
-	COPY_BE64(data->fwhmx, double);
-	COPY_BE64(data->fwhmy, double);
-	COPY_BE64(data->fwhmx_arcsec, double);
-	COPY_BE64(data->fwhmy_arcsec, double);
-	COPY_BE64(data->angle, double);
-	COPY_BE64(data->rmse, double);
-	COPY_BE64(data->sat, double);
-	COPY_BE64((int64_t) data->R, int64_t);
-	COPY_BE64((int64_t) data->has_saturated, int64_t);
-	COPY_BE64(data->beta, double);
-	COPY_BE64((int64_t) data->profile, int64_t);
-	COPY_BE64(data->xpos, double);
-	COPY_BE64(data->ypos, double);
-	COPY_BE64(data->mag, double);
-	COPY_BE64(data->Bmag, double);
-	COPY_BE64(data->s_mag, double);
-	COPY_BE64(data->s_Bmag, double);
-	COPY_BE64(data->SNR, double);
+	COPY_FIELD(data->B, double);
+	COPY_FIELD(data->A, double);
+	COPY_FIELD(data->x0, double);
+	COPY_FIELD(data->y0, double);
+	COPY_FIELD(data->sx, double);
+	COPY_FIELD(data->sy, double);
+	COPY_FIELD(data->fwhmx, double);
+	COPY_FIELD(data->fwhmy, double);
+	COPY_FIELD(data->fwhmx_arcsec, double);
+	COPY_FIELD(data->fwhmy_arcsec, double);
+	COPY_FIELD(data->angle, double);
+	COPY_FIELD(data->rmse, double);
+	COPY_FIELD(data->sat, double);
+	COPY_FIELD(data->R, int);                          // int32
+	COPY_FIELD((int32_t) data->has_saturated, int32_t); // gboolean → int32
+	COPY_FIELD(data->beta, double);
+	COPY_FIELD((int32_t) data->profile, int32_t);      // starprofile enum → int32
+	COPY_FIELD(data->xpos, double);
+	COPY_FIELD(data->ypos, double);
+	COPY_FIELD(data->mag, double);
+	COPY_FIELD(data->Bmag, double);
+	COPY_FIELD(data->s_mag, double);
+	COPY_FIELD(data->s_Bmag, double);
+	COPY_FIELD(data->SNR, double);
 	// photometry *phot not currently passed to python
-	COPY_BE64((int64_t) data->phot_is_valid, int64_t);
-	COPY_BE64(data->BV, double);
-	COPY_BE64(data->B_err, double);
-	COPY_BE64(data->A_err, double);
-	COPY_BE64(data->x_err, double);
-	COPY_BE64(data->y_err, double);
-	COPY_BE64(data->sx_err, double);
-	COPY_BE64(data->sy_err, double);
-	COPY_BE64(data->ang_err, double);
-	COPY_BE64(data->beta_err, double);
-	COPY_BE64((int64_t) data->layer, int64_t);
-	COPY_BE64(data->ra, double);
-	COPY_BE64(data->dec, double);
+	COPY_FIELD((int32_t) data->phot_is_valid, int32_t); // gboolean → int32
+	COPY_FIELD(data->BV, double);
+	COPY_FIELD(data->B_err, double);
+	COPY_FIELD(data->A_err, double);
+	COPY_FIELD(data->x_err, double);
+	COPY_FIELD(data->y_err, double);
+	COPY_FIELD(data->sx_err, double);
+	COPY_FIELD(data->sy_err, double);
+	COPY_FIELD(data->ang_err, double);
+	COPY_FIELD(data->beta_err, double);
+	COPY_FIELD(data->layer, int);                       // int32
+	COPY_FIELD(data->ra, double);
+	COPY_FIELD(data->dec, double);
 	return 0;
 }
 
+// Serialised wire size of one psf_star (mirrors psfstar_to_py above
+// and PSFStar.deserialize() in sirilpy/models.py). 32 doubles +
+// 5 int32 = 276 bytes.
+#define PSFSTAR_WIRE_SIZE (32 * sizeof(double) + 5 * sizeof(int32_t))
+
+// Native widths (mirrors Sequence.deserialize() in sirilpy/models.py):
+// 9 int32 (number, selnum, fixed, nb_layers, bitpix, reference_image,
+// beg, end, current) + 2 uint32 (rx, ry) + 4 int32 gbooleans
+// (is_variable, fz, cfa_opened_monochrome) + 1 int32 enum (type) +
+// 1 double (exposure) + variable-length NUL-terminated seqname.
+// Fixed header = 15 × 4 + 8 = 68 bytes (was 16 × 8 = 128).
 static int seq_to_py(const sequence *seq, unsigned char* ptr, size_t maxlen) {
 	if (!seq || !ptr)
 		return 1;
 
 	unsigned char *start_ptr = ptr;
 
-	COPY_BE64((int64_t) seq->number, int64_t);
-	COPY_BE64((int64_t) seq->selnum, int64_t);
-	COPY_BE64((int64_t) seq->fixed, int64_t);
-	COPY_BE64((int64_t) seq->nb_layers, int64_t);
-	COPY_BE64((uint64_t) seq->rx, uint64_t);
-	COPY_BE64((uint64_t) seq->ry, uint64_t);
-	COPY_BE64((uint64_t) seq->is_variable, uint64_t);
-	COPY_BE64((int64_t) seq->bitpix, int64_t);
-	COPY_BE64((int64_t) seq->reference_image, int64_t);
-	COPY_BE64((int64_t) seq->beg, int64_t);
-	COPY_BE64((int64_t) seq->end, int64_t);
-	COPY_BE64(seq->exposure, double);
-	COPY_BE64((uint64_t) seq->fz, uint64_t);
-	COPY_BE64((int64_t) seq->type, int64_t);
-	COPY_BE64((uint64_t) seq->cfa_opened_monochrome, uint64_t);
-	COPY_BE64((int64_t) seq->current, int64_t);
+	COPY_FIELD(seq->number, int);                        // int32
+	COPY_FIELD(seq->selnum, int);                        // int32
+	COPY_FIELD(seq->fixed, int);                         // int32
+	COPY_FIELD(seq->nb_layers, int);                     // int32
+	COPY_FIELD(seq->rx, unsigned int);                   // uint32
+	COPY_FIELD(seq->ry, unsigned int);                   // uint32
+	COPY_FIELD((int32_t) seq->is_variable, int32_t);     // gboolean → int32
+	COPY_FIELD(seq->bitpix, int);                        // int32
+	COPY_FIELD(seq->reference_image, int);               // int32
+	COPY_FIELD(seq->beg, int);                           // int32
+	COPY_FIELD(seq->end, int);                           // int32
+	COPY_FIELD(seq->exposure, double);
+	COPY_FIELD((int32_t) seq->fz, int32_t);              // gboolean → int32
+	COPY_FIELD((int32_t) seq->type, int32_t);            // sequence_type enum → int32
+	COPY_FIELD((int32_t) seq->cfa_opened_monochrome, int32_t); // gboolean → int32
+	COPY_FIELD(seq->current, int);                       // int32
 	COPY_STRING(seq->seqname);
 	// Registration preview coords are not passed to python
 	// The dirty and invalid reg flags are not passed to python
@@ -368,26 +395,29 @@ static int seq_to_py(const sequence *seq, unsigned char* ptr, size_t maxlen) {
 	return 0;
 }
 
+// Wire size of the seq_to_py fixed header (before the seqname string).
+#define SEQ_TO_PY_HEAD_SIZE (15 * sizeof(int32_t) + sizeof(double))
+
 static int imstats_to_py(const imstats *stats, unsigned char* ptr, size_t maxlen) {
 	if (!stats || !ptr)
 		return 1;
 
 	unsigned char *start_ptr = ptr;
 
-	COPY_BE64(stats->total, int64_t);
-	COPY_BE64(stats->ngoodpix, int64_t);
-	COPY_BE64(stats->mean, double);
-	COPY_BE64(stats->median, double);
-	COPY_BE64(stats->sigma, double);
-	COPY_BE64(stats->avgDev, double);
-	COPY_BE64(stats->mad, double);
-	COPY_BE64(stats->sqrtbwmv, double);
-	COPY_BE64(stats->location, double);
-	COPY_BE64(stats->scale, double);
-	COPY_BE64(stats->min, double);
-	COPY_BE64(stats->max, double);
-	COPY_BE64(stats->normValue, double);
-	COPY_BE64(stats->bgnoise, double);
+	COPY_FIELD(stats->total, int64_t);
+	COPY_FIELD(stats->ngoodpix, int64_t);
+	COPY_FIELD(stats->mean, double);
+	COPY_FIELD(stats->median, double);
+	COPY_FIELD(stats->sigma, double);
+	COPY_FIELD(stats->avgDev, double);
+	COPY_FIELD(stats->mad, double);
+	COPY_FIELD(stats->sqrtbwmv, double);
+	COPY_FIELD(stats->location, double);
+	COPY_FIELD(stats->scale, double);
+	COPY_FIELD(stats->min, double);
+	COPY_FIELD(stats->max, double);
+	COPY_FIELD(stats->normValue, double);
+	COPY_FIELD(stats->bgnoise, double);
 	return 0;
 }
 
@@ -414,9 +444,12 @@ static int distodata_to_py(const disto_params *disto, unsigned char* ptr, size_t
 
 	unsigned char *start_ptr = ptr;
 
-	COPY_BE64((int64_t) disto->index, int64_t);
-	COPY_BE64((double) disto->velocity.x, double);
-	COPY_BE64((double) disto->velocity.y, double);
+	// Native widths: 1 int32 (disto_source enum) + 2 floats
+	// (pointf velocity x/y) + filename string. Mirrors
+	// DistoData.deserialize() in sirilpy/models.py.
+	COPY_FIELD((int32_t) disto->index, int32_t);  // enum → int32
+	COPY_FIELD(disto->velocity.x, float);
+	COPY_FIELD(disto->velocity.y, float);
 	if (disto->filename)
 		COPY_STRING(disto->filename);
 	return 0;
@@ -436,14 +469,14 @@ static gboolean get_config_value(const char* group, const char* key, config_type
 	// You'll need to adjust this logic based on your actual configuration system
 	if (desc->type == STYPE_BOOL) {
 		uint32_t* bool_val = g_malloc(sizeof(uint32_t));
-		*bool_val = GUINT32_TO_BE(*(uint32_t*) desc->data);
+		*bool_val = (*(uint32_t*) desc->data);
 		*type = CONFIG_TYPE_BOOL;
 		*value = bool_val;
 		*value_size = sizeof(uint32_t);
 	}
 	else if (desc->type == STYPE_INT) {
 		gint32* int_val = g_malloc(sizeof(gint32));
-		*int_val = GINT32_TO_BE(*(int*) desc->data);
+		*int_val = (*(int*) desc->data);
 		*type = CONFIG_TYPE_INT;
 		*value = int_val;
 		*value_size = sizeof(gint32);
@@ -454,7 +487,7 @@ static gboolean get_config_value(const char* group, const char* key, config_type
 		double* double_val = g_malloc(maxlen);
 		unsigned char *ptr = (unsigned char*) double_val;
 		unsigned char *start_ptr = ptr;
-		COPY_BE64(*(double*) desc->data, double);
+		COPY_FIELD(*(double*) desc->data, double);
 		*type = CONFIG_TYPE_DOUBLE;
 		*value = double_val;
 		*value_size = sizeof(double);
@@ -555,7 +588,6 @@ siril_plot_data* unpack_plot_data(const uint8_t* buffer, size_t buffer_size) {
 	NEED(sizeof(uint32_t));
 	uint32_t num_series;
 	memcpy(&num_series, buffer + offset, sizeof(uint32_t));
-	num_series = GUINT32_FROM_BE(num_series);
 	offset += sizeof(uint32_t);
 	// Lenient sanity bound: each series consumes several bytes, so there cannot
 	// be more series than bytes in the buffer (also caps the loop count).
@@ -567,14 +599,11 @@ siril_plot_data* unpack_plot_data(const uint8_t* buffer, size_t buffer_size) {
 	offset += sizeof(uint8_t);
 	if (datamin_set) {
 		point datamin;
-		double x_BE, y_BE;
 		NEED(2 * sizeof(double));
-		memcpy(&x_BE, buffer + offset, sizeof(double));
+		memcpy(&datamin.x, buffer + offset, sizeof(double));
 		offset += sizeof(double);
-		FROM_BE64_INTO(datamin.x, x_BE, double);
-		memcpy(&y_BE, buffer + offset, sizeof(double));
+		memcpy(&datamin.y, buffer + offset, sizeof(double));
 		offset += sizeof(double);
-		FROM_BE64_INTO(datamin.y, y_BE, double);
 		memcpy(&plot_data->datamin, &datamin, sizeof(point));
 	}
 
@@ -583,14 +612,11 @@ siril_plot_data* unpack_plot_data(const uint8_t* buffer, size_t buffer_size) {
 	offset += sizeof(uint8_t);
 	if (datamax_set) {
 		point datamax;
-		double x_BE, y_BE;
 		NEED(2 * sizeof(double));
-		memcpy(&x_BE, buffer + offset, sizeof(double));
+		memcpy(&datamax.x, buffer + offset, sizeof(double));
 		offset += sizeof(double);
-		FROM_BE64_INTO(datamax.x, x_BE, double);
-		memcpy(&y_BE, buffer + offset, sizeof(double));
+		memcpy(&datamax.y, buffer + offset, sizeof(double));
 		offset += sizeof(double);
-		FROM_BE64_INTO(datamax.y, y_BE, double);
 		memcpy(&plot_data->datamax, &datamax, sizeof(point));
 	}
 
@@ -608,7 +634,6 @@ siril_plot_data* unpack_plot_data(const uint8_t* buffer, size_t buffer_size) {
 		NEED(sizeof(uint32_t));
 		uint32_t num_points;
 		memcpy(&num_points, buffer + offset, sizeof(uint32_t));
-		num_points = GUINT32_FROM_BE(num_points);
 		if (num_points > get_available_memory() / 64)
 			goto unpack_fail;   // would use more than ~half the available memory
 		offset += sizeof(uint32_t);
@@ -617,7 +642,6 @@ siril_plot_data* unpack_plot_data(const uint8_t* buffer, size_t buffer_size) {
 		NEED(sizeof(uint32_t));
 		uint32_t plot_type;
 		memcpy(&plot_type, buffer + offset, sizeof(uint32_t));
-		plot_type = GUINT32_FROM_BE(plot_type);
 		offset += sizeof(uint32_t);
 
 		// Ensure all point bytes are present before allocating/reading them.
@@ -633,31 +657,19 @@ siril_plot_data* unpack_plot_data(const uint8_t* buffer, size_t buffer_size) {
 		if (num_points > 0 && (!xdata || !ydata || (with_errors && (!nerror || !perror))))
 			goto unpack_fail;
 
-		// Read coordinates (network byte-order). All bytes are guaranteed
-		// present by the NEED() above.
+		// Read coordinates (native byte order, packed doubles). All bytes are
+		// guaranteed present by the NEED() above.
 		for (uint32_t point_idx = 0; point_idx < num_points; point_idx++) {
-			double x, y, x_BE, y_BE, ne, pe, ne_BE, pe_BE;
-
-			memcpy(&x_BE, buffer + offset, sizeof(double));
+			memcpy(&xdata[point_idx], buffer + offset, sizeof(double));
 			offset += sizeof(double);
-			FROM_BE64_INTO(x, x_BE, double);
-			xdata[point_idx] = x;
-
-			memcpy(&y_BE, buffer + offset, sizeof(double));
+			memcpy(&ydata[point_idx], buffer + offset, sizeof(double));
 			offset += sizeof(double);
-			FROM_BE64_INTO(y, y_BE, double);
-			ydata[point_idx] = y;
 
 			if (with_errors) {
-				memcpy(&ne_BE, buffer + offset, sizeof(double));
+				memcpy(&nerror[point_idx], buffer + offset, sizeof(double));
 				offset += sizeof(double);
-				FROM_BE64_INTO(ne, ne_BE, double);
-				nerror[point_idx] = ne;
-
-				memcpy(&pe_BE, buffer + offset, sizeof(double));
+				memcpy(&perror[point_idx], buffer + offset, sizeof(double));
 				offset += sizeof(double);
-				FROM_BE64_INTO(pe, pe_BE, double);
-				perror[point_idx] = pe;
 			}
 		}
 
@@ -697,7 +709,7 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 
 	// Get command header
 	CommandHeader* header = (CommandHeader*)buffer;
-	int32_t payload_length = GINT32_FROM_BE(header->length);  // Convert from network byte order
+	int32_t payload_length = header->length;  // Native byte order; same-machine IPC.
 	// Verify we have complete message
 	if (length < sizeof(CommandHeader) + payload_length) {
 		siril_log_error(_("Received incomplete command payload: length = %u, expected %u\n"), length, payload_length);
@@ -718,15 +730,15 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 
 				// Convert the integers to BE format for consistency across the UNIX socket
 				g_rw_lock_reader_lock(&gfit->rwlock);
-				uint32_t width_BE = GUINT32_TO_BE(gfit->rx);
-				uint32_t height_BE = GUINT32_TO_BE(gfit->ry);
-				uint32_t channels_BE = GUINT32_TO_BE(gfit->naxes[2]);
+				uint32_t width = gfit->rx;
+				uint32_t height = gfit->ry;
+				uint32_t channels = (uint32_t) gfit->naxes[2];
 				g_rw_lock_reader_unlock(&gfit->rwlock);
 
 				// Copy the packed data into the response buffer
-				memcpy(response_data, &width_BE, sizeof(uint32_t));      // First 4 bytes: width
-				memcpy(response_data + 4, &height_BE, sizeof(uint32_t)); // Next 4 bytes: height
-				memcpy(response_data + 8, &channels_BE, sizeof(uint32_t)); // Final 4 bytes: channels
+				memcpy(response_data, &width, sizeof(uint32_t));      // First 4 bytes: width
+				memcpy(response_data + 4, &height, sizeof(uint32_t)); // Next 4 bytes: height
+				memcpy(response_data + 8, &channels, sizeof(uint32_t)); // Final 4 bytes: channels
 
 				// Send success response with dimensions
 				success = send_response(conn, STATUS_OK, response_data, sizeof(response_data));
@@ -754,16 +766,16 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 				uint8_t response_data[16]; // 4 x 4 bytes for x,y, w, h
 
 				// Convert the integers to BE format for consistency across the UNIX socket
-				uint32_t x_BE = GUINT32_TO_BE(sel.x);
-				uint32_t y_BE = GUINT32_TO_BE(sel.y);
-				uint32_t w_BE = GUINT32_TO_BE(sel.w);
-				uint32_t h_BE = GUINT32_TO_BE(sel.h);
+				uint32_t x = sel.x;
+				uint32_t y = sel.y;
+				uint32_t w = sel.w;
+				uint32_t h = sel.h;
 
 				// Copy the packed data into the response buffer
-				memcpy(response_data, &x_BE, sizeof(uint32_t));
-				memcpy(response_data + 4, &y_BE, sizeof(uint32_t));
-				memcpy(response_data + 8, &w_BE, sizeof(uint32_t));
-				memcpy(response_data + 12, &h_BE, sizeof(uint32_t));
+				memcpy(response_data, &x, sizeof(uint32_t));
+				memcpy(response_data + 4, &y, sizeof(uint32_t));
+				memcpy(response_data + 8, &w, sizeof(uint32_t));
+				memcpy(response_data + 12, &h, sizeof(uint32_t));
 
 				// Send success response with dimensions
 				success = send_response(conn, STATUS_OK, response_data, sizeof(response_data));
@@ -783,10 +795,10 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 				uint8_t response_data[4]; // 4 bytes for int
 
 				// Convert the integers to BE format for consistency across the UNIX socket
-				uint32_t vport_BE = GUINT32_TO_BE(gui_iface.get_active_vport());
+				uint32_t vport = gui_iface.get_active_vport();
 
 				// Copy the packed data into the response buffer
-				memcpy(response_data, &vport_BE, sizeof(uint32_t));
+				memcpy(response_data, &vport, sizeof(uint32_t));
 
 				// Send success response with dimensions
 				success = send_response(conn, STATUS_OK, response_data, sizeof(response_data));
@@ -802,11 +814,7 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 			gboolean result = single_image_is_loaded() || sequence_is_loaded();
 			if (result) {
 				if (payload_length == 16) {
-					rectangle region_BE = *(rectangle*) payload;
-					rectangle selection = {GUINT32_FROM_BE(region_BE.x),
-										GUINT32_FROM_BE(region_BE.y),
-										GUINT32_FROM_BE(region_BE.w),
-										GUINT32_FROM_BE(region_BE.h)};
+					rectangle selection = *(rectangle*) payload;
 					g_rw_lock_reader_lock(&gfit->rwlock);
 					guint32 image_rx = gfit->rx;
 					guint32 image_ry = gfit->ry;
@@ -868,19 +876,12 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 			}
 
 			// Unpack the payload
-			guint32 x_BE = *((guint32*) payload);
-			guint32 y_BE = *((guint32*) (payload + 4));
-			guint32 w_BE = *((guint32*) (payload + 8));
-			guint32 h_BE = *((guint32*) (payload + 12));
-			guint32 channel_BE = *((guint32*) (payload + 16));
-			guint32 centred_BE = *((guint32*) (payload + 20));
-
-			guint32 x = GUINT32_FROM_BE(x_BE);
-			guint32 y = GUINT32_FROM_BE(y_BE);
-			guint32 w = GUINT32_FROM_BE(w_BE);
-			guint32 h = GUINT32_FROM_BE(h_BE);
-			guint32 channel_val = GUINT32_FROM_BE(channel_BE);
-			centred = GUINT32_FROM_BE(centred_BE) != 0;
+			guint32 x = *((guint32*) payload);
+			guint32 y = *((guint32*) (payload + 4));
+			guint32 w = *((guint32*) (payload + 8));
+			guint32 h = *((guint32*) (payload + 12));
+			guint32 channel_val = *((guint32*) (payload + 16));
+			centred = *((guint32*) (payload + 20)) != 0;
 
 			// Check if shape was provided (not sentinel values)
 			gboolean shape_provided = (x != SENTINEL_VALUE && y != SENTINEL_VALUE &&
@@ -988,7 +989,7 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 			}
 			g_rw_lock_reader_unlock(&gfit->rwlock);
 
-			const size_t psf_star_size = 37 * sizeof(double);
+			const size_t psf_star_size = PSFSTAR_WIRE_SIZE;
 			unsigned char* star = g_try_malloc0(psf_star_size);
 			unsigned char* ptr = star;
 			if (psfstar_to_py(psf, ptr, psf_star_size)) {
@@ -1013,11 +1014,7 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 			g_rw_lock_reader_lock(&gfit->rwlock);
 			if (payload_length == 16 || payload_length == 20) {
 				// Shape provided (with or without channel)
-				rectangle region_BE = *(rectangle*) payload;
-				selection = (rectangle) {GUINT32_FROM_BE(region_BE.x),
-									GUINT32_FROM_BE(region_BE.y),
-									GUINT32_FROM_BE(region_BE.w),
-									GUINT32_FROM_BE(region_BE.h)};
+				selection = *(rectangle*) payload;
 				if (selection.x < 0 || selection.x + selection.w > gfit->rx - 1 ||
 					selection.y < 0 || selection.y  + selection.h > gfit->ry - 1) {
 					g_rw_lock_reader_unlock(&gfit->rwlock);
@@ -1033,10 +1030,10 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 			// Determine layer/channel
 			if (payload_length == 20) {
 				// Shape + channel provided
-				layer = GUINT32_FROM_BE(*((int*) payload + 4));
+				layer = (*((int*) payload + 4));
 			} else if (payload_length == 4) {
 				// Only channel provided
-				layer = GUINT32_FROM_BE(*(int*) payload);
+				layer = (*(int*) payload);
 			} else {
 				// No channel specified, use default
 				layer = gui_iface.get_channel_for_vport();
@@ -1090,11 +1087,7 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 				gboolean as_preview = (gboolean) (uint8_t) payload[0];
 				gboolean linked = (gboolean) (uint8_t) payload[1];
 				unsigned char* rectptr = (unsigned char*) payload + 2;
-				rectangle region_BE = *(rectangle*) rectptr;
-				rectangle region = {GUINT32_FROM_BE(region_BE.x),
-									GUINT32_FROM_BE(region_BE.y),
-									GUINT32_FROM_BE(region_BE.w),
-									GUINT32_FROM_BE(region_BE.h)};
+				rectangle region = *(rectangle*) rectptr;
 				g_rw_lock_reader_lock(&gfit->rwlock);
 				shared_memory_info_t *info = handle_pixeldata_request(conn, gfit, region, as_preview, linked);
 				g_rw_lock_reader_unlock(&gfit->rwlock);
@@ -1132,19 +1125,19 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 			// but return the actual retval as the payload (this is handled
 			// by cmd() and results in exception raising for anything except
 			// CMD_OK or CMD_NO_WAIT)
-			int32_t be_retval = GINT32_TO_BE(retval);
+			int32_t be_retval = (retval);
 			success = send_response(conn, STATUS_OK, &be_retval, sizeof(int32_t));
 			break;
 		}
 
 		case CMD_GET_IS_IMAGE_LOADED: {
-			int32_t loaded = GINT32_TO_BE((int32_t) single_image_is_loaded());
+			int32_t loaded = ((int32_t) single_image_is_loaded());
 			success = send_response(conn, STATUS_OK, &loaded, sizeof(int));
 			break;
 		}
 
 		case CMD_GET_IS_SEQUENCE_LOADED: {
-			int32_t loaded = GINT32_TO_BE((int32_t) sequence_is_loaded());
+			int32_t loaded = ((int32_t) sequence_is_loaded());
 			success = send_response(conn, STATUS_OK, &loaded, sizeof(int));
 			break;
 		}
@@ -1370,7 +1363,7 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 				break;
 			}
 
-			int32_t index = GINT32_FROM_BE(*(int32_t*)payload);
+			int32_t index = (*(int32_t*)payload);
 			siril_log_debug("seq_frame_set_pixeldata index: %d\n", index);
 			// Check index is in range
 			if (index < 0 || index >= com.seq.number) {
@@ -1437,7 +1430,6 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 			} else {
 				incoming_image_info_t* info = (incoming_image_info_t*)payload;
 				info->shm_name[sizeof(info->shm_name) - 1] = '\0';
-				info->size = GUINT64_FROM_BE(info->size);
 				success = handle_plot_request(conn, info);
 			}
 			break;
@@ -1451,9 +1443,6 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 			} else {
 				incoming_image_info_t* info = (incoming_image_info_t*)payload;
 				info->shm_name[sizeof(info->shm_name) - 1] = '\0';
-				info->size = GUINT64_FROM_BE(info->size);
-				info->data_type = GUINT32_FROM_BE(info->data_type);
-				info->channels = GUINT32_FROM_BE(info->channels);
 				gboolean show_samples = (gboolean) info->data_type;
 				gboolean recalculate = (gboolean) info->channels;
 				success = handle_set_bgsamples_request(conn, info, show_samples, recalculate);
@@ -1480,8 +1469,7 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 			}
 
 			// Get the channel number from payload (convert from network byte order)
-			uint32_t channel_BE = *(uint32_t*)payload;
-			uint32_t channel = GUINT32_FROM_BE(channel_BE);
+			uint32_t channel = *(uint32_t*)payload;
 
 			// Check an image is loaded
 			if (!single_image_is_loaded()) {
@@ -1548,7 +1536,6 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 			memcpy(progress_convert.bytes, payload, sizeof(float));
 
 			// Convert from network byte order to host byte order
-			progress_convert.i = GUINT32_FROM_BE(progress_convert.i);
 			float progress = progress_convert.f;
 
 			// Get the message string (remaining bytes)
@@ -1577,8 +1564,13 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 			}
 
 			// Calculate size needed for the response
-			size_t strings_size = FLEN_VALUE * 16;  // 13 string fields of FLEN_VALUE
-			size_t numeric_size = sizeof(uint64_t) * 41 + sizeof(uint8_t); // 41 vars packed to 64-bit + 1 byte bool
+			size_t strings_size = FLEN_VALUE * 16;  // 16 string fields of FLEN_VALUE
+			// Numeric fields written by keywords_to_py at native widths
+			// (see plan §4.2bis): 26 doubles, 2 floats, 2 WORDs, 3 uint32,
+			// 6 int32, 2 int64, 1 uint8 = 273 bytes total.
+			size_t numeric_size = 26 * sizeof(double) + 2 * sizeof(float)
+				+ 2 * sizeof(WORD) + 3 * sizeof(uint32_t) + 6 * sizeof(int32_t)
+				+ 2 * sizeof(int64_t) + sizeof(uint8_t);
 
 			size_t total_size = strings_size + numeric_size;
 			unsigned char *response_buffer = g_try_malloc0(total_size);
@@ -1604,8 +1596,8 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 			}
 			int index, chan;
 			if (payload_length == 8) {
-				index = GUINT32_FROM_BE(*(int*) payload);
-				chan = GUINT32_FROM_BE(*((int*) payload + 1));
+				index = (*(int*) payload);
+				chan = (*((int*) payload + 1));
 			}
 			if (payload_length != 8 || index >= com.seq.number || chan < 0 || chan > com.seq.nb_layers) {
 				const char* error_msg = _("Incorrect command arguments");
@@ -1614,8 +1606,11 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 			}
 
 			// Calculate size needed for response
-			size_t total_size = 6 * sizeof(double) + 11 * sizeof(double);
-				// The representation of Homography is 11 x 64-bit vars
+			// RegData payload at native widths (see regdata_to_py): 3 floats
+			// + 1 double + 1 float + 1 int32 + Homography (80 bytes) =
+			// 108 bytes total.
+			size_t total_size = 3 * sizeof(float) + sizeof(double)
+				+ sizeof(float) + sizeof(int32_t) + HOMOGRAPHY_WIRE_SIZE;
 			unsigned char *response_buffer = g_try_malloc0(total_size);
 			if (!response_buffer) {
 				const char* error_msg = _("Memory allocation failed");
@@ -1649,7 +1644,7 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 			}
 			int index;
 			if (payload_length == 4) {
-				index = GUINT32_FROM_BE(*(int*) payload);
+				index = (*(int*) payload);
 			}
 			if (payload_length != 4 || index < 0 || index >= com.seq.number) {
 				const char* error_msg = _("Incorrect command arguments");
@@ -1689,8 +1684,8 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 			}
 			int index, chan;
 			if (payload_length == 8) {
-				index = GUINT32_FROM_BE(*(int*) payload);
-				chan = GUINT32_FROM_BE(*((int*) payload + 1));
+				index = (*(int*) payload);
+				chan = (*((int*) payload + 1));
 			}
 			if (payload_length != 8 || index >= com.seq.number || chan < 0 || chan > com.seq.nb_layers) {
 				const char* error_msg = _("Incorrect command arguments");
@@ -1736,7 +1731,7 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 			}
 			int index;
 			if (payload_length == 4) {
-				index = GUINT32_FROM_BE(*(int*) payload);
+				index = (*(int*) payload);
 			}
 			if (payload_length != 4 || index >= com.seq.number) {
 				const char* error_msg = _("Incorrect command argument");
@@ -1744,8 +1739,9 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 				break;
 			}
 
-			// Calculate size needed for response
-			size_t total_size = 6 * sizeof(double);
+			// ImgData payload at native widths (mirrors imgdata_to_py):
+			// 4 int32 + 1 int64 + 1 double = 32 bytes.
+			size_t total_size = 4 * sizeof(int32_t) + sizeof(int64_t) + sizeof(double);
 			unsigned char *response_buffer = g_try_malloc0(total_size);
 			unsigned char *ptr = response_buffer;
 
@@ -1775,7 +1771,7 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 			gboolean as_preview = (uint8_t)payload[0] ? TRUE : FALSE;
 			gboolean linked = (uint8_t) payload[1] ? TRUE : FALSE;
 			const char *indexptr = payload + 2;
-			int index = GUINT32_FROM_BE(*(int*) indexptr);
+			int index = (*(int*) indexptr);
 			rectangle region = com.seq.is_variable ?
 						(rectangle) {0, 0, com.seq.imgparam[index].rx, com.seq.imgparam[index].ry} :
 						(rectangle) {0, 0, com.seq.rx, com.seq.ry};
@@ -1783,10 +1779,6 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 				// Use the provided rectangle instead of the full image
 				const char *rectptr = payload + 6;
 				region = *(rectangle*) rectptr;
-				region.x = GUINT32_FROM_BE(region.x);
-				region.y = GUINT32_FROM_BE(region.y);
-				region.w = GUINT32_FROM_BE(region.w);
-				region.h = GUINT32_FROM_BE(region.h);
 			}
 			if(enforce_area_in_image(&region, &com.seq, index)) {
 				siril_log_message(_("Selection cropped to frame boundaries\n"));
@@ -1832,7 +1824,7 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 			gboolean linked = FALSE;
 			int index;
 			if (payload_length == 7) {
-				index = GUINT32_FROM_BE(*(int*) payload);
+				index = (*(int*) payload);
 				const char* pixelbool = payload + 4;
 				const char* previewbool = payload + 5;
 				const char* linkedbool = payload + 6;
@@ -1854,9 +1846,14 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 			}
 
 			// Calculate size needed for the response
-			size_t ffit_size = sizeof(uint64_t) * 13; // 13 vars packed to 64-bit
+			size_t ffit_size = FITS_TO_PY_SIZE;
 			size_t strings_size = FLEN_VALUE * 16;  // 16 string fields of FLEN_VALUE
-			size_t numeric_size = sizeof(uint64_t) * 41 + sizeof(uint8_t); // 41 vars packed to 64-bit + 1 byte bool
+			// Numeric fields written by keywords_to_py at native widths
+			// (see plan §4.2bis): 26 doubles, 2 floats, 2 WORDs, 3 uint32,
+			// 6 int32, 2 int64, 1 uint8 = 273 bytes total.
+			size_t numeric_size = 26 * sizeof(double) + 2 * sizeof(float)
+				+ 2 * sizeof(WORD) + 3 * sizeof(uint32_t) + 6 * sizeof(int32_t)
+				+ 2 * sizeof(int64_t) + sizeof(uint8_t);
 			size_t total_size = ffit_size + strings_size + numeric_size;
 
 			// Always include space for header and ICC profile shared memory info
@@ -1905,11 +1902,7 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 					goto CLEANUP;
 				}
 				// Convert the values to BE
-				TO_BE64_INTO(pixel_info->size, pixel_info->size, size_t);
-				pixel_info->data_type = GUINT32_TO_BE(pixel_info->data_type);
-				pixel_info->width = GUINT32_TO_BE(pixel_info->width);
-				pixel_info->height = GUINT32_TO_BE(pixel_info->height);
-				pixel_info->channels = GUINT32_TO_BE(pixel_info->channels);
+				/* native byte order: no conversion needed for pixel_info->size */
 				memcpy(ptr, pixel_info, sizeof(shared_memory_info_t));
 				free(pixel_info);
 				ptr += sizeof(shared_memory_info_t);
@@ -1926,11 +1919,7 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 			}
 			if (header_info) {
 				// Convert the values to BE
-				TO_BE64_INTO(header_info->size, header_info->size, size_t);
-				header_info->data_type = GUINT32_TO_BE(header_info->data_type);
-				header_info->width = GUINT32_TO_BE(header_info->width);
-				header_info->height = GUINT32_TO_BE(header_info->height);
-				header_info->channels = GUINT32_TO_BE(header_info->channels);
+				/* native byte order: no conversion needed for header_info->size */
 				memcpy(ptr, header_info, sizeof(shared_memory_info_t));
 				free(header_info);
 			} else {
@@ -1950,11 +1939,7 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 			}
 			if (icc_info) {
 				// Convert the values to BE
-				TO_BE64_INTO(icc_info->size, icc_info->size, size_t);
-				icc_info->data_type = GUINT32_TO_BE(icc_info->data_type);
-				icc_info->width = GUINT32_TO_BE(icc_info->width);
-				icc_info->height = GUINT32_TO_BE(icc_info->height);
-				icc_info->channels = GUINT32_TO_BE(icc_info->channels);
+				/* native byte order: no conversion needed for icc_info->size */
 				memcpy(ptr, icc_info, sizeof(shared_memory_info_t));
 				free(icc_info);
 			} else {
@@ -1977,10 +1962,11 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 				success = send_response(conn, STATUS_ERROR, error_msg, strlen(error_msg));
 				break;
 			}
-			// Calculate size needed for the response
+			// Calculate size needed for the response (mirrors seq_to_py
+			// in C and Sequence.deserialize in sirilpy/models.py): 68-byte
+			// fixed header at native widths + NUL-terminated seqname.
 			size_t stringsize = strlen(com.seq.seqname) + 1;
-			size_t varsize = sizeof(uint64_t) * 16;
-			size_t total_size = varsize + stringsize;
+			size_t total_size = SEQ_TO_PY_HEAD_SIZE + stringsize;
 			unsigned char *response_buffer = g_try_malloc0(total_size);
 			unsigned char *ptr = response_buffer;
 
@@ -2004,8 +1990,7 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 			// Parse channel from payload if provided
 			g_rw_lock_reader_lock(&gfit->rwlock);
 			if (payload_length == 4) {
-				guint32 channel_BE = *((guint32*) payload);
-				guint32 channel_val = GUINT32_FROM_BE(channel_BE);
+				guint32 channel_val = *((guint32*) payload);
 
 				if (channel_val != SENTINEL_VALUE) {
 					layer = channel_val;
@@ -2098,7 +2083,7 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 			}
 
 			// Allocate memory for all star data
-			const size_t psf_star_size = 37 * sizeof(double);
+			const size_t psf_star_size = PSFSTAR_WIRE_SIZE;
 			const size_t total_size = nb_stars * psf_star_size;
 			unsigned char* allstars = g_try_malloc0(total_size);
 			if (!allstars) {
@@ -2204,7 +2189,7 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 			}
 
 			// Calculate size needed for the response
-			size_t total_size = sizeof(uint64_t) * 13; // 14 vars packed to 64-bit
+			size_t total_size = FITS_TO_PY_SIZE;
 
 			unsigned char *response_buffer = g_try_malloc0(total_size);
 			unsigned char *ptr = response_buffer;
@@ -2424,27 +2409,20 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 					break;
 				}
 				if (payload_length == 16) {
-					double *DblPtrBE = (double*) payload;
-					double x_BE = DblPtrBE[0];
-					double y_BE = DblPtrBE[1];
-					double x, y;
-					FROM_BE64_INTO(x, x_BE, double);
-					FROM_BE64_INTO(y, y_BE, double);
-					double ra, dec, ra_BE, dec_BE;
-					double fx, fy;
-					fx = x;
-					fy = gfit->ry - y;
+					double *xy = (double*) payload;
+					double x = xy[0];
+					double y = xy[1];
+					double ra, dec;
+					double fx = x;
+					double fy = gfit->ry - y;
 					pix2wcs2(gfit->keywords.wcslib, fx, fy, &ra, &dec);
 					g_rw_lock_reader_unlock(&gfit->rwlock);
 					// ra and dec = -1 is the error code
-					TO_BE64_INTO(ra_BE, ra, double);
-					TO_BE64_INTO(dec_BE, dec, double);
-					unsigned char* payload = g_try_malloc0(2 * sizeof(double));
-					DblPtrBE = (double*) payload;
-					DblPtrBE[0] = ra_BE;
-					DblPtrBE[1] = dec_BE;
-					success = send_response(conn, STATUS_OK, payload, 2 * sizeof(double));
-					g_free(payload);
+					double *out = g_try_malloc0(2 * sizeof(double));
+					out[0] = ra;
+					out[1] = dec;
+					success = send_response(conn, STATUS_OK, out, 2 * sizeof(double));
+					g_free(out);
 					break;
 				}
 				g_rw_lock_reader_unlock(&gfit->rwlock);
@@ -2468,25 +2446,19 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 					break;
 				}
 				if (payload_length == 16) {
-					double *DblPtrBE = (double*) payload;
-					double ra_BE = DblPtrBE[0];
-					double dec_BE = DblPtrBE[1];
-					double ra, dec;
-					FROM_BE64_INTO(ra, ra_BE, double);
-					FROM_BE64_INTO(dec, dec_BE, double);
-					double x, y, fx, fy, x_BE, y_BE;
+					double *radec = (double*) payload;
+					double ra = radec[0];
+					double dec = radec[1];
+					double fx, fy;
 					wcs2pix(gfit, ra, dec, &fx, &fy);
-					x = fx;
-					y = gfit->ry - fy;
+					double x = fx;
+					double y = gfit->ry - fy;
 					g_rw_lock_reader_unlock(&gfit->rwlock);
-					TO_BE64_INTO(x_BE, x, double);
-					TO_BE64_INTO(y_BE, y, double);
-					unsigned char* payload = g_try_malloc0(2 * sizeof(double));
-					DblPtrBE = (double*) payload;
-					DblPtrBE[0] = x_BE;
-					DblPtrBE[1] = y_BE;
-					success = send_response(conn, STATUS_OK, payload, 2 * sizeof(double));
-					g_free(payload);
+					double *out = g_try_malloc0(2 * sizeof(double));
+					out[0] = x;
+					out[1] = y;
+					success = send_response(conn, STATUS_OK, out, 2 * sizeof(double));
+					g_free(out);
 					break;
 				}
 				g_rw_lock_reader_unlock(&gfit->rwlock);
@@ -2557,7 +2529,7 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 		case CMD_REQUEST_SHM: {
 			uint64_t total_size;
 			if (payload_length == 8) {
-				total_size = GUINT64_FROM_BE(*(uint64_t*) payload);
+				total_size = (*(uint64_t*) payload);
 				shared_memory_info_t *info = handle_rawdata_request(conn, NULL, total_size);
 				success = send_response(conn, STATUS_OK, (const char*)info, sizeof(*info));
 				free(info);
@@ -2585,7 +2557,6 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 			
 			uint32_t count;
 			memcpy(&count, payload, sizeof(uint32_t));
-			count = GUINT32_FROM_BE(count);
 
 			/* Compute the expected length in 64-bit to avoid a 32-bit overflow
 			 * of (4 * count), which would let a tiny payload pass validation and
@@ -2598,7 +2569,6 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 
 			uint32_t incl_encoded;
 			memcpy(&incl_encoded, payload + 4 + (4 * count), sizeof(uint32_t));
-			incl_encoded = GUINT32_FROM_BE(incl_encoded);
 			gboolean incl = (gboolean)incl_encoded;
 			
 			// Process each index
@@ -2606,7 +2576,6 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 			for (uint32_t i = 0; i < count; i++) {
 				uint32_t index;
 				memcpy(&index, payload + 4 + (i * sizeof(uint32_t)), sizeof(uint32_t));
-				index = GUINT32_FROM_BE(index);
 				if (index >= com.seq.number) {
 					const char* error_msg = _("Index is out of range");
 					success = send_response(conn, STATUS_ERROR, error_msg, strlen(error_msg));
@@ -2641,7 +2610,7 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 			}
 			int chan;
 			if (payload_length == 4) {
-				chan = GUINT32_FROM_BE(*(int*) payload);
+				chan = (*(int*) payload);
 			}
 			if (payload_length != 4 || chan < 0 || chan >= com.seq.nb_layers) {
 				const char* error_msg = _("Incorrect command arguments");
@@ -2657,7 +2626,9 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 			size_t stringsize = 0;
 			if (com.seq.distoparam[chan].filename)
 				stringsize = strlen(com.seq.distoparam[chan].filename) + 1;
-			size_t varsize = sizeof(int64_t) + 2 * sizeof(double);
+			// DistoData fixed header at native widths (mirrors
+			// distodata_to_py): 1 int32 + 2 floats = 12 bytes.
+			size_t varsize = sizeof(int32_t) + 2 * sizeof(float);
 			size_t total_size = varsize + stringsize;
 			unsigned char *response_buffer = g_malloc0(total_size);
 			unsigned char *ptr = response_buffer;
@@ -2680,7 +2651,6 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 			} else {
 				incoming_image_info_t* info = (incoming_image_info_t*)payload;
 				info->shm_name[sizeof(info->shm_name) - 1] = '\0';
-				info->size = GUINT64_FROM_BE(info->size);
 				g_rw_lock_writer_lock(&gfit->rwlock);
 				success = handle_set_image_header_request(conn, info);
 				g_rw_lock_writer_unlock(&gfit->rwlock);
@@ -2697,7 +2667,6 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 			} else {
 				incoming_image_info_t* info = (incoming_image_info_t*)payload;
 				info->shm_name[sizeof(info->shm_name) - 1] = '\0';
-				info->size = GUINT64_FROM_BE(info->size);
 				success = handle_add_user_polygon_request(conn, info);
 			}
 			break;
@@ -2705,7 +2674,7 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 
 		case CMD_DELETE_USER_POLYGON: {
 			if (payload_length == 4) {
-				int32_t id = GINT32_FROM_BE(*(int*) payload);
+				int32_t id = (*(int*) payload);
 				gboolean deleted = delete_user_polygon(id);
 				gui_iface.redraw_image_async(REDRAW_OVERLAY);
 				if (!deleted) {
@@ -2730,7 +2699,7 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 
 		case CMD_GET_USER_POLYGON: {
 			if (payload_length == 4) {
-				int32_t id = GINT32_FROM_BE(*(int*) payload);
+				int32_t id = (*(int*) payload);
 				UserPolygon *polygon = find_polygon_by_id(id);
 				if (!polygon) {
 					siril_log_debug("Failed to find a user polygon with id %d\n", id);
@@ -2813,7 +2782,7 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 			}
 			int index;
 			if (payload_length == 4) {
-				index = GUINT32_FROM_BE(*(int*) payload);
+				index = (*(int*) payload);
 			}
 			if (payload_length != 4 || index >= com.seq.number) {
 				const char* error_msg = _("Incorrect command argument");
@@ -2865,7 +2834,7 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 				success = send_response(conn, STATUS_NONE, error_msg, strlen(error_msg));
 			}*/
 			if (payload_length == 5) {
-				uint32_t color = GUINT32_FROM_BE(*(uint32_t*) payload);
+				uint32_t color = (*(uint32_t*) payload);
 				gboolean fill = (gboolean) (*(uint8_t*) (payload + 4) != 0);
 				gui_iface.set_poly_drawing(color, fill);
 				success = send_response(conn, STATUS_OK, NULL, 0);
@@ -2921,9 +2890,14 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 			g_free(filepath);
 
 			// Calculate size needed for the response (same as sequence frame)
-			size_t ffit_size = sizeof(uint64_t) * 13; // 13 vars packed to 64-bit
-			size_t strings_size = FLEN_VALUE * 16;  // 13 string fields of FLEN_VALUE
-			size_t numeric_size = sizeof(uint64_t) * 41 + sizeof(uint8_t); // 41 vars packed to 64-bit + 1-byte bool
+			size_t ffit_size = FITS_TO_PY_SIZE;
+			size_t strings_size = FLEN_VALUE * 16;  // 16 string fields of FLEN_VALUE
+			// Numeric fields written by keywords_to_py at native widths
+			// (see plan §4.2bis): 26 doubles, 2 floats, 2 WORDs, 3 uint32,
+			// 6 int32, 2 int64, 1 uint8 = 273 bytes total.
+			size_t numeric_size = 26 * sizeof(double) + 2 * sizeof(float)
+				+ 2 * sizeof(WORD) + 3 * sizeof(uint32_t) + 6 * sizeof(int32_t)
+				+ 2 * sizeof(int64_t) + sizeof(uint8_t);
 
 			// Add stats size - 14 doubles per channel, up to 3 channels
 			size_t stats_size = 3 * 14 * sizeof(double); // Stats for up to 3 channels
@@ -2995,11 +2969,7 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 					goto CLEANUP_FILE;
 				}
 				// Convert the values to BE
-				TO_BE64_INTO(info->size, info->size, size_t);
-				info->data_type = GUINT32_TO_BE(info->data_type);
-				info->width = GUINT32_TO_BE(info->width);
-				info->height = GUINT32_TO_BE(info->height);
-				info->channels = GUINT32_TO_BE(info->channels);
+				/* native byte order: no conversion needed for info->size */
 				memcpy(ptr, info, sizeof(shared_memory_info_t));
 				free(info);
 			}
@@ -3014,11 +2984,7 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 				goto CLEANUP_FILE;
 			}
 			// Convert the values to BE
-			TO_BE64_INTO(headerinfo->size, headerinfo->size, size_t);
-			headerinfo->data_type = GUINT32_TO_BE(headerinfo->data_type);
-			headerinfo->width = GUINT32_TO_BE(headerinfo->width);
-			headerinfo->height = GUINT32_TO_BE(headerinfo->height);
-			headerinfo->channels = GUINT32_TO_BE(headerinfo->channels);
+			/* native byte order: no conversion needed for headerinfo->size */
 			memcpy(ptr, headerinfo, sizeof(shared_memory_info_t));
 			free(headerinfo);
 			ptr += sizeof(shared_memory_info_t);
@@ -3034,11 +3000,7 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 					goto CLEANUP_FILE;
 				}
 				// Convert the values to BE
-				TO_BE64_INTO(info->size, info->size, size_t);
-				info->data_type = GUINT32_TO_BE(info->data_type);
-				info->width = GUINT32_TO_BE(info->width);
-				info->height = GUINT32_TO_BE(info->height);
-				info->channels = GUINT32_TO_BE(info->channels);
+				/* native byte order: no conversion needed for info->size */
 				memcpy(ptr, info, sizeof(shared_memory_info_t));
 				free(info);
 			}
@@ -3140,9 +3102,9 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 			}
 
 			int64_t unix_timestamp = g_date_time_to_unix(fit->keywords.date_obs);
-			int64_t channels = fit->naxes[2];
-			int64_t height   = fit->naxes[1];
-			int64_t width    = fit->naxes[0];
+			int32_t channels = (int32_t) fit->naxes[2];
+			int32_t height   = (int32_t) fit->naxes[1];
+			int32_t width    = (int32_t) fit->naxes[0];
 
 			// Capture filter string
 			char filter_str[FLEN_VALUE];
@@ -3153,7 +3115,12 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 			free(fit);
 
 			// --- Response ---
-			size_t total_size = 10 * sizeof(int64_t) + FLEN_VALUE; // numeric fields + filter string
+			// Analysis payload at native widths (mirrors analysis_to_py
+			// and ImageAnalysis._struct_fmt): 3 doubles + int32 + double
+			// + int32 + int64 + 3 int32 + FLEN_VALUE filter string =
+			// 24 + 4 + 8 + 4 + 8 + 12 + FLEN_VALUE = 60 + FLEN_VALUE bytes.
+			size_t total_size = 4 * sizeof(double) + 5 * sizeof(int32_t)
+				+ sizeof(int64_t) + FLEN_VALUE;
 			unsigned char *response_buffer = g_try_malloc0(total_size);
 			if (!response_buffer) {
 				const char* error_msg = _("Memory allocation failed");
@@ -3162,7 +3129,7 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 			}
 
 			unsigned char *ptr = response_buffer;
-			if (analysis_to_py(bgnoise, fwhm, 0.0, (int64_t) nb_stars, roundness, imagetype,
+			if (analysis_to_py(bgnoise, fwhm, 0.0, nb_stars, roundness, imagetype,
 				unix_timestamp, channels, height, width, filter_str, ptr, total_size)) {
 				const char* error_message = _("No analysis available");
 				success = send_response(conn, STATUS_ERROR, error_message, strlen(error_message));
@@ -3199,7 +3166,6 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 			} else {
 				incoming_image_info_t* info = (incoming_image_info_t*)payload;
 				info->shm_name[sizeof(info->shm_name) - 1] = '\0';
-				info->size = GUINT64_FROM_BE(info->size);
 				g_rw_lock_writer_lock(&gfit->rwlock);
 				success = handle_set_iccprofile_request(conn, info);
 				g_rw_lock_writer_unlock(&gfit->rwlock);
@@ -3214,14 +3180,14 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 			// Convert the integers to BE format for consistency across the UNIX socket
 			int ilo = 0, ihi = 0xFFFF;
 			gui_iface.get_display_lo_hi(&ilo, &ihi);
-			uint16_t lo_BE = GUINT16_TO_BE((guint16)ilo);
-			uint16_t hi_BE = GUINT16_TO_BE((guint16)ihi);
-			uint32_t mode_BE = GUINT32_TO_BE((guint32)gui_iface.get_sliders_mode());
+			uint16_t lo = (guint16)ilo;
+			uint16_t hi = (guint16)ihi;
+			uint32_t mode = (guint32)gui_iface.get_sliders_mode();
 
 			// Copy the packed data into the response buffer
-			memcpy(response_data, &lo_BE, sizeof(uint16_t));
-			memcpy(response_data + 2, &hi_BE, sizeof(uint16_t));
-			memcpy(response_data + 4, &mode_BE, sizeof(uint32_t));
+			memcpy(response_data, &lo, sizeof(uint16_t));
+			memcpy(response_data + 2, &hi, sizeof(uint16_t));
+			memcpy(response_data + 4, &mode, sizeof(uint32_t));
 
 			// Send success response with dimensions
 			success = send_response(conn, STATUS_OK, response_data, sizeof(response_data));
@@ -3233,10 +3199,10 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 			uint8_t response_data[4]; // 4 for STF mode
 
 			// Convert the integers to BE format for consistency across the UNIX socket
-			uint32_t mode_BE = GUINT32_TO_BE((guint32)gui_iface.get_rendering_mode());
+			uint32_t mode = (guint32)gui_iface.get_rendering_mode();
 
 			// Copy the packed data into the response buffer
-			memcpy(response_data, &mode_BE, sizeof(uint32_t));
+			memcpy(response_data, &mode, sizeof(uint32_t));
 
 			// Send success response with dimensions
 			success = send_response(conn, STATUS_OK, response_data, sizeof(response_data));
@@ -3249,10 +3215,10 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 
 			// Convert the integers to BE format for consistency across the UNIX socket
 			gboolean linked = gui_iface.get_channels_linked();
-			uint32_t linked_BE = GUINT32_TO_BE((uint32_t) linked);
+			uint32_t linked_word = (uint32_t) linked;
 
 			// Copy the packed data into the response buffer
-			memcpy(response_data, &linked_BE, sizeof(uint32_t));
+			memcpy(response_data, &linked_word, sizeof(uint32_t));
 
 			// Send success response with dimensions
 			success = send_response(conn, STATUS_OK, response_data, sizeof(response_data));
@@ -3267,8 +3233,7 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 				// Validate payload length - can be 4 (mode only), 8 (lo+hi), or 12 (lo+hi+mode)
 				if (payload_length == 4) {
 					// Mode only
-					guint32 mode_BE = *(guint32*) payload;
-					guint32 mode = GUINT32_FROM_BE(mode_BE);
+				guint32 mode = *(guint32*) payload;
 					display_mode stf = (display_mode) mode;
 
 					if (mode > DISPLAY_MODE_MAX) {
@@ -3327,9 +3292,9 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 			double x_off = 0.0, y_off = 0.0;
 			gui_iface.get_display_offset(&x_off, &y_off);
 			double zoom = gui_iface.get_zoom_value();
-			TO_BE64_INTO(x_off, x_off, double);
-			TO_BE64_INTO(y_off, y_off, double);
-			TO_BE64_INTO(zoom, zoom, double);
+			/* native byte order: no conversion needed for x_off */
+			/* native byte order: no conversion needed for y_off */
+			/* native byte order: no conversion needed for zoom */
 
 			// Copy the packed data into the response buffer
 			memcpy(response_data, &x_off, sizeof(double));
@@ -3349,8 +3314,7 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 				// Validate payload length - must be 4
 				if (payload_length == 4) {
 					// Mode only
-					guint32 mode_BE = *(guint32*) payload;
-					guint32 mode = GUINT32_FROM_BE(mode_BE);
+				guint32 mode = *(guint32*) payload;
 					sliders_mode sliders = (sliders_mode) mode;
 
 					if (mode > USER) {
@@ -3387,8 +3351,8 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 				if (payload_length == 8) {
 					// Mode only
 					guint32* values = (guint32*) payload;
-					guint32 lo = GUINT32_FROM_BE(values[0]);
-					guint32 hi = GUINT32_FROM_BE(values[1]);
+					guint32 lo = (values[0]);
+					guint32 hi = (values[1]);
 					if (lo >= hi || lo > 65535 || hi > 65535) {
 						const char* error_msg = _("Error: invalid slider values");
 						success = send_response(conn, STATUS_ERROR, error_msg, strlen(error_msg));
@@ -3423,8 +3387,8 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 					// Mode only
 					double* values = (double*) payload;
 					double xoff, yoff;
-					TO_BE64_INTO(xoff, values[0], double);
-					TO_BE64_INTO(yoff, values[1], double);
+					memcpy(&(xoff), &(values[0]), sizeof(double));
+					memcpy(&(yoff), &(values[1]), sizeof(double));
 					gui_iface.set_display_offset(xoff, yoff);
 					gui_iface.redraw_image_sync(REDRAW_IMAGE);
 					success = send_response(conn, STATUS_OK, NULL, 0);
@@ -3451,7 +3415,7 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 				if (payload_length == sizeof(double)) {
 					double* values = (double*) payload;
 					double zoom;
-					TO_BE64_INTO(zoom, values[0], double);
+					memcpy(&(zoom), &(values[0]), sizeof(double));
 					if (zoom <= 0.0)
 						zoom = ZOOM_FIT;
 					gui_iface.set_zoom_value(zoom);
@@ -3566,7 +3530,6 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 			} else {
 				incoming_image_info_t* info = (incoming_image_info_t*)payload;
 				info->shm_name[sizeof(info->shm_name) - 1] = '\0';
-				info->size = GUINT64_FROM_BE(info->size);
 				g_rw_lock_writer_lock(&gfit->rwlock);
 				success = handle_set_image_mask_request(conn, gfit, info);
 				g_rw_lock_writer_unlock(&gfit->rwlock);
@@ -3616,11 +3579,11 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 			}
 			// Convert the integers to BE format for consistency across the UNIX socket
 			gboolean linked = gfit->mask_active;
-			uint32_t linked_BE = GUINT32_TO_BE((uint32_t) linked);
+			uint32_t linked_word = (uint32_t) linked;
 			g_rw_lock_reader_unlock(&gfit->rwlock);
 
 			// Copy the packed data into the response buffer
-			memcpy(response_data, &linked_BE, sizeof(uint32_t));
+			memcpy(response_data, &linked_word, sizeof(uint32_t));
 
 			// Send success response with dimensions
 			success = send_response(conn, STATUS_OK, response_data, sizeof(response_data));
@@ -3636,7 +3599,6 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 			} else {
 				incoming_image_info_t* info = (incoming_image_info_t*)payload;
 				info->shm_name[sizeof(info->shm_name) - 1] = '\0';
-				info->size = GUINT64_FROM_BE(info->size);
 				success = handle_mask_update_polygon_request(conn, info);
 			}
 			break;
@@ -3654,7 +3616,7 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 				success = send_response(conn, STATUS_ERROR, error_msg, strlen(error_msg));
 				break;
 			} else {
-				index = (DialogID) GUINT32_FROM_BE(*(int*) payload);
+				index = (DialogID) (*(int*) payload);
 				if (index < 0 || index >= gui_iface.number_of_dialogs()) {
 					const char* error_msg = _("Incorrect command arguments");
 					success = send_response(conn, STATUS_ERROR, error_msg, strlen(error_msg));

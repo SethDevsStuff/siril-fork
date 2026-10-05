@@ -10,6 +10,13 @@
     <property name="upper">1000</property>
     <property name="value">10</property>
   </object>
+  <object class="GtkAdjustment" id="adjustment_python_prune_age">
+    <property name="lower">0</property>
+    <property name="upper">3650</property>
+    <property name="value">90</property>
+    <property name="step-increment">1</property>
+    <property name="page-increment">7</property>
+  </object>
   <object class="GtkAdjustment" id="adjGain">
     <property name="page-increment">10</property>
     <property name="step-increment">0.10</property>
@@ -3979,33 +3986,161 @@
                                     <child>
                                       <object class="GtkFrame">
                                         <child>
-                                          <object class="GtkGrid">
-                                            <property name="column-homogeneous">1</property>
-                                            <property name="column-spacing">6</property>
-                                            <property name="row-homogeneous">1</property>
-                                            <property name="row-spacing">6</property>
+                                          <object class="GtkBox">
+                                            <property name="orientation">vertical</property>
+                                            <property name="spacing">12</property>
+                                            <property name="margin-start">6</property>
+                                            <property name="margin-end">6</property>
+                                            <property name="margin-top">6</property>
+                                            <property name="margin-bottom">6</property>
+                                            <!-- Interpreter section -->
                                             <child>
-                                              <object class="GtkButton" id="button_python_reset_venv">
-                                                <property name="focusable">1</property>
-                                                <property name="label" translatable="yes">Reset python venv</property>
-                                                <property name="receives-default">1</property>
-                                                <property name="tooltip-markup" translatable="yes">&lt;b&gt;WARNING!!&lt;/b&gt; &lt;i&gt;This will kill all running python scripts and reset the virtual environment "venv" directory to an as-new state. Any modules that have been installed by scripts will require re-installation.&lt;/i&gt;
-
-    This is normally not necessary but is provided as a last resort to restore the venv to a pristine state as an aid to troubleshooting.</property>
-                                                <signal name="clicked" handler="on_button_python_reset_venv_clicked"/>
-                                                <layout>
-                                                  <property name="column">0</property>
-                                                  <property name="row">0</property>
-                                                </layout>
+                                              <object class="GtkBox">
+                                                <property name="orientation">vertical</property>
+                                                <property name="spacing">6</property>
+                                                <child>
+                                                  <object class="GtkCheckButton" id="checkbutton_python_uv_managed">
+                                                    <property name="label" translatable="yes">Use uv-managed Python interpreter</property>
+                                                    <property name="focusable">1</property>
+                                                    <property name="halign">start</property>
+                                                    <property name="tooltip-markup" translatable="yes">When enabled, Siril asks &lt;b&gt;uv&lt;/b&gt; to download and manage the Python interpreter used for scripts, isolated from system Python. Disable to use the Python installed on your system. Bundled Siril builds (Windows, macOS, AppImage, Flatpak) ship uv; only self-builders need to install it separately.</property>
+                                                    <signal name="toggled" handler="on_checkbutton_python_uv_managed_toggled"/>
+                                                  </object>
+                                                </child>
+                                                <child>
+                                                  <object class="GtkBox" id="box_python_version_row">
+                                                    <property name="orientation">horizontal</property>
+                                                    <property name="spacing">6</property>
+                                                    <property name="margin-start">24</property>
+                                                    <child>
+                                                      <object class="GtkLabel">
+                                                        <property name="label" translatable="yes">Python version:</property>
+                                                      </object>
+                                                    </child>
+                                                    <child>
+                                                      <!-- Entries are hardcoded to the four most-recent CPython
+                                                           minors (3.14, 3.13, 3.12, 3.11). Refresh this list at each
+                                                           CPython.org release when a new minor ships and an older one
+                                                           falls off the supported list. The index order here must
+                                                           match uv_python_versions[] in preferences.c. -->
+                                                      <object class="GtkDropDown" id="combo_python_uv_version">
+                                                        <property name="focusable">1</property>
+                                                        <property name="model">
+                                                          <object class="GtkStringList">
+                                                            <items>
+                                                              <item translatable="no">3.14</item>
+                                                              <item translatable="no">3.13</item>
+                                                              <item translatable="no">3.12</item>
+                                                              <item translatable="no">3.11</item>
+                                                            </items>
+                                                          </object>
+                                                        </property>
+                                                        <property name="selected">1</property>
+                                                        <property name="tooltip-text" translatable="yes">Python minor version that uv will install and use. Changing this requires rebuilding the Python environments.</property>
+                                                        <signal name="notify::selected" handler="on_combo_python_uv_version_changed"/>
+                                                      </object>
+                                                    </child>
+                                                  </object>
+                                                </child>
+                                                <child>
+                                                  <!-- Shown only when uv-managed Python is enabled but uv is not
+                                                       installed. preferences.c calls gtk_widget_set_visible()
+                                                       based on uv_executable_available(). -->
+                                                  <object class="GtkLabel" id="label_python_uv_missing_warn">
+                                                    <property name="visible">0</property>
+                                                    <property name="margin-start">24</property>
+                                                    <property name="label" translatable="yes">⚠ uv was not found on this system. The interpreter setting will be ignored and Siril will fall back to the system Python. Install uv (https://docs.astral.sh/uv/) or use a bundled Siril build to enable uv-managed Python.</property>
+                                                    <property name="wrap">1</property>
+                                                    <property name="xalign">0</property>
+                                                  </object>
+                                                </child>
                                               </object>
                                             </child>
+                                            <!-- Maintenance grid -->
                                             <child>
-                                              <object class="GtkLabel">
-                                                <property name="label" translatable="yes"> </property>
-                                                <layout>
-                                                  <property name="column">1</property>
-                                                  <property name="row">0</property>
-                                                </layout>
+                                              <object class="GtkGrid">
+                                                <property name="column-homogeneous">1</property>
+                                                <property name="column-spacing">6</property>
+                                                <property name="row-spacing">6</property>
+                                                <child>
+                                                  <object class="GtkButton" id="button_python_reset_base_venv">
+                                                    <property name="focusable">1</property>
+                                                    <property name="label" translatable="yes">Rebuild base Python environment</property>
+                                                    <property name="receives-default">1</property>
+                                                    <property name="tooltip-markup" translatable="yes">Rebuild the shared base Python environment only. Per-script environments and the uv wheel cache are preserved. Use this when sirilpy itself looks unhealthy but per-script setups are fine.</property>
+                                                    <signal name="clicked" handler="on_button_python_reset_base_venv_clicked"/>
+                                                    <layout>
+                                                      <property name="column">0</property>
+                                                      <property name="row">0</property>
+                                                    </layout>
+                                                  </object>
+                                                </child>
+                                                <child>
+                                                  <object class="GtkButton" id="button_python_reset_venv">
+                                                    <property name="focusable">1</property>
+                                                    <property name="label" translatable="yes">Rebuild ALL Python environments…</property>
+                                                    <property name="receives-default">1</property>
+                                                    <property name="tooltip-markup" translatable="yes">&lt;b&gt;WARNING!!&lt;/b&gt; &lt;i&gt;Kills all running Python scripts and wipes the base venv plus every per-script venv. They are rebuilt automatically on next use from the local wheel cache.&lt;/i&gt;
+
+Modules installed at runtime by scripts will be lost. A checkbox in the confirmation dialog offers to also clear the uv wheel cache (slow; forces re-download).</property>
+                                                    <signal name="clicked" handler="on_button_python_reset_venv_clicked"/>
+                                                    <layout>
+                                                      <property name="column">1</property>
+                                                      <property name="row">0</property>
+                                                    </layout>
+                                                  </object>
+                                                </child>
+                                                <child>
+                                                  <object class="GtkButton" id="button_python_prune_unused">
+                                                    <property name="focusable">1</property>
+                                                    <property name="label" translatable="yes">Prune unused script environments</property>
+                                                    <property name="receives-default">1</property>
+                                                    <property name="tooltip-markup" translatable="yes">Remove per-script Python environments whose script files no longer exist, or which have not been used for the configured number of days. The base venv and the uv wheel cache are preserved.</property>
+                                                    <signal name="clicked" handler="on_button_python_prune_unused_clicked"/>
+                                                    <layout>
+                                                      <property name="column">0</property>
+                                                      <property name="row">1</property>
+                                                    </layout>
+                                                  </object>
+                                                </child>
+                                                <child>
+                                                  <object class="GtkBox">
+                                                    <property name="orientation">horizontal</property>
+                                                    <property name="spacing">6</property>
+                                                    <child>
+                                                      <object class="GtkLabel">
+                                                        <property name="label" translatable="yes">Max age (days):</property>
+                                                      </object>
+                                                    </child>
+                                                    <child>
+                                                      <object class="GtkSpinButton" id="spin_python_prune_age_days">
+                                                        <property name="focusable">1</property>
+                                                        <property name="tooltip-text" translatable="yes">Per-script venvs not used within this many days are eligible for pruning. Set to 0 to prune only orphaned venvs (whose script files are gone).</property>
+                                                        <property name="adjustment">adjustment_python_prune_age</property>
+                                                        <property name="numeric">1</property>
+                                                      </object>
+                                                    </child>
+                                                    <layout>
+                                                      <property name="column">1</property>
+                                                      <property name="row">1</property>
+                                                    </layout>
+                                                  </object>
+                                                </child>
+                                                <child>
+                                                  <object class="GtkButton" id="button_python_prune_uv_cache">
+                                                    <property name="focusable">1</property>
+                                                    <property name="label" translatable="yes">Prune uv wheel cache</property>
+                                                    <property name="receives-default">1</property>
+                                                    <property name="tooltip-markup" translatable="yes">Reclaim disk by deleting cached wheels that are not referenced by any Python environment Siril is tracking. Wheels still in use by another script's environment are kept untouched.
+
+Compose with "Prune unused script environments" for maximum effect: pruning unused environments releases references, then this button collects the now-orphan wheels.</property>
+                                                    <signal name="clicked" handler="on_button_python_prune_uv_cache_clicked"/>
+                                                    <layout>
+                                                      <property name="column">0</property>
+                                                      <property name="row">2</property>
+                                                    </layout>
+                                                  </object>
+                                                </child>
                                               </object>
                                             </child>
                                           </object>

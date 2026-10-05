@@ -30,6 +30,7 @@
 #include "gui-gtk4/utils.h"
 #include "gui-gtk4/python_gui.h"
 #include "io/siril_git.h"
+#include "io/siril_pythonmodule.h"
 
 #ifdef HAVE_LIBGIT2
 
@@ -688,12 +689,78 @@ static void show_script_revision_dialog(const gchar *scriptpath) {
 	}
 }
 
+/* §4.8.2: rebuild one script's per-script venv (context-menu action). */
+static void rebuild_script_venv_for_path(const gchar *scriptpath) {
+	if (!scriptpath) return;
+	gchar *prompt = g_strdup_printf(_("Rebuild the per-script Python environment for "
+			"'%s'? The environment will be removed and rebuilt the next time the "
+			"script runs (using cached wheels — usually sub-second)."),
+			scriptpath);
+	gboolean ok = siril_confirm_dialog(_("Rebuild script environment?"),
+			prompt, _("_Rebuild"));
+	g_free(prompt);
+	if (!ok) return;
+
+	GError *err = NULL;
+	gboolean removed = rebuild_script_venv_by_path(scriptpath, &err);
+	if (err) {
+		siril_log_error(_("Could not rebuild script environment: %s\n"),
+				err->message);
+		g_clear_error(&err);
+		return;
+	}
+	if (!removed) {
+		siril_log_message(_("No per-script Python environment exists yet for "
+				"'%s'; nothing to rebuild.\n"), scriptpath);
+	}
+}
+
+/* Context-menu popover lifetime: defer the unparent to an idle so we never
+ * destroy the popover (and the button whose "clicked" we are handling)
+ * re-entrantly. */
+static gboolean ctx_menu_unparent_idle(gpointer p) {
+	gtk_widget_unparent(GTK_WIDGET(p));
+	return G_SOURCE_REMOVE;
+}
+static void ctx_menu_closed(GtkPopover *popover, gpointer ud) {
+	(void)ud;
+	g_idle_add(ctx_menu_unparent_idle, popover);
+}
+
+static GtkWidget *ctx_menu_button(const char *label) {
+	GtkWidget *btn = gtk_button_new_with_label(label);
+	gtk_button_set_has_frame(GTK_BUTTON(btn), FALSE);
+	GtkWidget *lbl = gtk_button_get_child(GTK_BUTTON(btn));
+	if (GTK_IS_LABEL(lbl)) {
+		gtk_label_set_xalign(GTK_LABEL(lbl), 0.0);
+		gtk_widget_set_halign(lbl, GTK_ALIGN_START);
+	}
+	return btn;
+}
+
+/* The menu-item "clicked" handlers dup the scriptpath into a local before
+ * popping the menu down (which can free the popover and its buttons), then
+ * run the — possibly modal, nested-loop — action from the safe copy. */
+static void ctx_open_revision(GtkButton *b, gpointer user_data) {
+	gchar *path = g_strdup(g_object_get_data(G_OBJECT(b), "scriptpath"));
+	gtk_popover_popdown(GTK_POPOVER(user_data));
+	if (path)
+		show_script_revision_dialog(path);
+	g_free(path);
+}
+static void ctx_rebuild_venv(GtkButton *b, gpointer user_data) {
+	gchar *path = g_strdup(g_object_get_data(G_OBJECT(b), "scriptpath"));
+	gtk_popover_popdown(GTK_POPOVER(user_data));
+	rebuild_script_venv_for_path(path);
+	g_free(path);
+}
+
 /* Secondary-click handler on the script GtkColumnView: pulls the
- * scriptpath of the *clicked* row (not the selected one — they aren't
- * the same on right-click) and opens the revision dialog.  The cell
- * factories' bind callbacks attach the SirilScriptRow as
- * "siril-script-row" data on every cell widget; we walk up from the
- * picked widget until we find one. */
+ * scriptpath of the *clicked* row (not the selected one — they aren't the
+ * same on right-click) and pops up a context menu of per-row actions. The
+ * cell factories' bind callbacks attach the SirilScriptRow as
+ * "siril-script-row" data on every cell widget; we walk up from the picked
+ * widget until we find one. */
 static void on_git_columnview_pressed(GtkGestureClick *gesture, int n_press,
 		double x, double y, gpointer user_data) {
 	(void)n_press; (void)user_data;
@@ -706,7 +773,37 @@ static void on_git_columnview_pressed(GtkGestureClick *gesture, int n_press,
 		if (w == GTK_WIDGET(git_columnview)) break;
 	}
 	if (!row || !row->scriptpath) return;
-	show_script_revision_dialog(row->scriptpath);
+
+	gboolean is_python = g_strcmp0(row->type, _("Python script")) == 0;
+
+	GtkWidget *popover = gtk_popover_new();
+	gtk_widget_set_parent(popover, GTK_WIDGET(git_columnview));
+	gtk_popover_set_has_arrow(GTK_POPOVER(popover), FALSE);
+	gtk_popover_set_pointing_to(GTK_POPOVER(popover),
+			&(GdkRectangle){ (int)x, (int)y, 1, 1 });
+
+	GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+	gtk_popover_set_child(GTK_POPOVER(popover), box);
+
+	GtkWidget *open_item = ctx_menu_button(_("Open at earlier revision…"));
+	g_object_set_data_full(G_OBJECT(open_item), "scriptpath",
+			g_strdup(row->scriptpath), g_free);
+	g_signal_connect(open_item, "clicked", G_CALLBACK(ctx_open_revision), popover);
+	gtk_box_append(GTK_BOX(box), open_item);
+
+	GtkWidget *rebuild_item = ctx_menu_button(_("Rebuild Python environment"));
+	gtk_widget_set_tooltip_text(rebuild_item,
+			_("Delete this script's per-script Python virtual environment. "
+			"It will be rebuilt the next time the script runs, using the "
+			"shared uv wheel cache."));
+	g_object_set_data_full(G_OBJECT(rebuild_item), "scriptpath",
+			g_strdup(row->scriptpath), g_free);
+	g_signal_connect(rebuild_item, "clicked", G_CALLBACK(ctx_rebuild_venv), popover);
+	gtk_widget_set_sensitive(rebuild_item, is_python);
+	gtk_box_append(GTK_BOX(box), rebuild_item);
+
+	g_signal_connect(popover, "closed", G_CALLBACK(ctx_menu_closed), NULL);
+	gtk_popover_popup(GTK_POPOVER(popover));
 	gtk_gesture_set_state(GTK_GESTURE(gesture), GTK_EVENT_SEQUENCE_CLAIMED);
 }
 

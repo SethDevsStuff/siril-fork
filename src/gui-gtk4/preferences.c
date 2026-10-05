@@ -96,6 +96,37 @@ static gchar *sw_dir = NULL;
 static gboolean update_custom_gamut = FALSE;
 void on_working_gamut_changed(GObject *obj, GParamSpec *pspec, gpointer user_data);
 
+// Re-entry guards for the Python interpreter widgets. When the user
+// cancels the confirmation dialog we revert the widget programmatically;
+// the guard prevents the resulting "toggled" / "notify::selected" signal
+// from re-opening the dialog.
+static gboolean python_uv_widget_reverting = FALSE;
+// Remembers the version that was either loaded from prefs at dialog-open
+// time or last confirmed by the user, so we can revert to it on cancel.
+static gchar *python_uv_version_confirmed = NULL;
+
+// uv-managed Python version choices. The order MUST match the GtkStringList
+// items of combo_python_uv_version in settings_window.ui, since the gtk4
+// GtkDropDown selects by index rather than a string id. Default is "3.13".
+static const char * const uv_python_versions[] = { "3.14", "3.13", "3.12", "3.11" };
+#define UV_PYTHON_VERSION_DEFAULT_INDEX 1
+
+static const gchar *uv_python_version_from_index(guint idx) {
+	if (idx >= G_N_ELEMENTS(uv_python_versions))
+		idx = UV_PYTHON_VERSION_DEFAULT_INDEX;
+	return uv_python_versions[idx];
+}
+
+static guint uv_python_index_from_version(const gchar *version) {
+	if (version) {
+		for (guint i = 0; i < G_N_ELEMENTS(uv_python_versions); i++) {
+			if (g_strcmp0(version, uv_python_versions[i]) == 0)
+				return i;
+		}
+	}
+	return UV_PYTHON_VERSION_DEFAULT_INDEX;
+}
+
 static gboolean scripts_updated = FALSE;
 
 void notify_script_update() {
@@ -271,6 +302,16 @@ static void update_scripts_preferences() {
 	com.pref.use_scripts_repository = FALSE;
 	com.pref.spcc.use_spcc_repository = FALSE;
 #endif
+	// Python interpreter section. Confirmation already happened at widget-
+	// change time (see on_checkbutton_python_uv_managed_toggled /
+	// on_combo_python_uv_version_changed); here we just snapshot the
+	// current widget state into the pref struct.
+	com.pref.python.uv_managed = siril_toggle_get_active(
+			GTK_WIDGET(GTK_CHECK_BUTTON(lookup_widget("checkbutton_python_uv_managed"))));
+	guint ver_idx = gtk_drop_down_get_selected(
+			GTK_DROP_DOWN(lookup_widget("combo_python_uv_version")));
+	g_free(com.pref.python.uv_python_version);
+	com.pref.python.uv_python_version = g_strdup(uv_python_version_from_index(ver_idx));
 }
 
 static void update_user_interface_preferences() {
@@ -787,6 +828,25 @@ void update_preferences_from_model() {
 	siril_toggle_set_active(GTK_WIDGET(GTK_CHECK_BUTTON(lookup_widget("spcc_repo_enable"))), pref->spcc.use_spcc_repository);
 	siril_toggle_set_active(GTK_WIDGET(GTK_CHECK_BUTTON(lookup_widget("spcc_repo_sync_at_startup"))), pref->spcc.auto_spcc_update);
 
+	/* Scripts tab — Python interpreter section. Guard against re-entry so the
+	 * programmatic widget set doesn't trigger our confirmation dialog. */
+	python_uv_widget_reverting = TRUE;
+	siril_toggle_set_active(GTK_WIDGET(GTK_CHECK_BUTTON(lookup_widget("checkbutton_python_uv_managed"))),
+			pref->python.uv_managed);
+	guint want_idx = uv_python_index_from_version(pref->python.uv_python_version);
+	gtk_drop_down_set_selected(GTK_DROP_DOWN(lookup_widget("combo_python_uv_version")), want_idx);
+	g_free(python_uv_version_confirmed);
+	python_uv_version_confirmed = g_strdup(uv_python_version_from_index(want_idx));
+	python_uv_widget_reverting = FALSE;
+
+	// Greyed-out controls + warning label when uv isn't available. The
+	// pref values still get saved as the user set them; they just won't
+	// take effect until uv is installed.
+	gboolean uv_present = uv_executable_available();
+	gtk_widget_set_sensitive(lookup_widget("checkbutton_python_uv_managed"), uv_present);
+	gtk_widget_set_sensitive(lookup_widget("box_python_version_row"), uv_present && pref->python.uv_managed);
+	gtk_widget_set_visible(lookup_widget("label_python_uv_missing_warn"), !uv_present);
+
 	/* tab Performances */
 	siril_toggle_set_active(GTK_WIDGET(GTK_CHECK_BUTTON(lookup_widget("memfreeratio_radio"))), pref->mem_mode == RATIO);
 	siril_toggle_set_active(GTK_WIDGET(GTK_CHECK_BUTTON(lookup_widget("memfixed_radio"))), pref->mem_mode == AMOUNT);
@@ -1034,15 +1094,191 @@ gchar *get_swap_dir() {
 	return sw_dir;
 }
 
-void on_button_python_reset_venv_clicked(gpointer user_data) {
-	if (siril_confirm_dialog(_("WARNING!"), _("This will kill all running python processes "
-			"and delete and reinstall the python venv directory. This is not normally "
-			"necessary for upgrades or similar as Siril will try to manage the venv "
-			"automatically. However the option is provided as a last resort bug mitigation "
-			"to reset the venv to a known good state. All modules installed by scripts "
-			"will be deleted and will require reinstallation."), _("Proceed"))) {
-		rebuild_venv();
+/* Scripts tab — uv-managed Python checkbox. Toggling the box rebuilds the
+ * interpreter on the next venv-init, so warn the user and offer an undo.
+ * On Cancel we revert the widget; the re-entry guard prevents the revert
+ * from re-firing this same handler. */
+void on_checkbutton_python_uv_managed_toggled(GtkCheckButton *button, gpointer user_data) {
+	if (python_uv_widget_reverting)
+		return;
+	gboolean now_on = siril_toggle_get_active(GTK_WIDGET(button));
+	gboolean was_on = com.pref.python.uv_managed;
+	if (now_on == was_on)
+		return;  // nothing to do (e.g. opened-then-closed without changing)
+
+	int confirm = siril_confirm_dialog(
+			_("Change Python interpreter source?"),
+			_("Are you sure you want to do this? You will need to rebuild "
+			  "Python environments to enact the change, which may involve "
+			  "significant dependency downloads."),
+			_("Change"));
+	if (!confirm) {
+		python_uv_widget_reverting = TRUE;
+		siril_toggle_set_active(GTK_WIDGET(button), was_on);
+		python_uv_widget_reverting = FALSE;
+		return;
 	}
+
+	// Combo sensitivity follows the new state. (Visibility of the warning
+	// label is uv-availability driven and doesn't change here.)
+	gtk_widget_set_sensitive(lookup_widget("box_python_version_row"),
+			now_on && uv_executable_available());
+}
+
+/* Scripts tab — Python version dropdown. Same confirmation flow as the
+ * checkbox above. We track the previously-confirmed version in
+ * python_uv_version_confirmed so we can revert correctly on cancel. */
+void on_combo_python_uv_version_changed(GObject *obj, GParamSpec *pspec, gpointer user_data) {
+	(void)pspec;
+	if (python_uv_widget_reverting)
+		return;
+	GtkDropDown *combo = GTK_DROP_DOWN(obj);
+	guint new_idx = gtk_drop_down_get_selected(combo);
+	const gchar *new_id = uv_python_version_from_index(new_idx);
+	if (python_uv_version_confirmed
+			&& g_strcmp0(new_id, python_uv_version_confirmed) == 0)
+		return;
+
+	int confirm = siril_confirm_dialog(
+			_("Change Python version?"),
+			_("Are you sure you want to do this? You will need to rebuild "
+			  "Python environments to enact the change, which may involve "
+			  "significant dependency downloads."),
+			_("Change"));
+	if (!confirm) {
+		python_uv_widget_reverting = TRUE;
+		gtk_drop_down_set_selected(combo,
+				uv_python_index_from_version(python_uv_version_confirmed));
+		python_uv_widget_reverting = FALSE;
+		return;
+	}
+	g_free(python_uv_version_confirmed);
+	python_uv_version_confirmed = g_strdup(new_id);
+}
+
+/* Nested-GMainLoop bridge for the "Rebuild ALL" dialog, which needs a
+ * checkbox in the message area — GTK4 removed gtk_dialog_run, so we run a
+ * local loop and record the response, mirroring the pattern in
+ * keywords_tree.c. */
+struct py_reset_dlg_ctx { GMainLoop *loop; gint result; };
+static void py_reset_dlg_accept(GtkButton *b, gpointer ud) { (void)b; struct py_reset_dlg_ctx *c = ud; c->result = GTK_RESPONSE_ACCEPT; if (c->loop && g_main_loop_is_running(c->loop)) g_main_loop_quit(c->loop); }
+static void py_reset_dlg_cancel(GtkButton *b, gpointer ud) { (void)b; struct py_reset_dlg_ctx *c = ud; c->result = GTK_RESPONSE_CANCEL; if (c->loop && g_main_loop_is_running(c->loop)) g_main_loop_quit(c->loop); }
+static gboolean py_reset_dlg_close(GtkWindow *w, gpointer ud) { (void)w; struct py_reset_dlg_ctx *c = ud; c->result = GTK_RESPONSE_CANCEL; if (c->loop && g_main_loop_is_running(c->loop)) g_main_loop_quit(c->loop); return FALSE; }
+
+/* §4.8.3: nuclear option. The historical "Reset python venv" button keeps
+ * the same UI handler name but now drives rebuild_all_python_state() —
+ * wiping the base venv, every per-script venv, and the ledger. uv cache is
+ * preserved by default; the confirm dialog offers an explicit checkbox to
+ * wipe it too. */
+void on_button_python_reset_venv_clicked(gpointer user_data) {
+	GtkWidget *dialog = gtk_window_new();
+	gtk_window_set_title(GTK_WINDOW(dialog), _("Rebuild ALL Python environments?"));
+	gtk_window_set_modal(GTK_WINDOW(dialog), TRUE);
+	gtk_window_set_destroy_with_parent(GTK_WINDOW(dialog), TRUE);
+	gtk_window_set_transient_for(GTK_WINDOW(dialog), GTK_WINDOW(lookup_widget("settings_window")));
+	gtk_window_set_resizable(GTK_WINDOW(dialog), FALSE);
+
+	GtkWidget *content = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
+	gtk_widget_set_margin_start(content, 12);
+	gtk_widget_set_margin_end(content, 12);
+	gtk_widget_set_margin_top(content, 12);
+	gtk_widget_set_margin_bottom(content, 12);
+	gtk_window_set_child(GTK_WINDOW(dialog), content);
+
+	GtkWidget *heading = gtk_label_new(NULL);
+	gtk_label_set_markup(GTK_LABEL(heading),
+			_("<b>Rebuild ALL Python environments?</b>"));
+	gtk_label_set_xalign(GTK_LABEL(heading), 0.0);
+	gtk_box_append(GTK_BOX(content), heading);
+
+	GtkWidget *body = gtk_label_new(
+			_("This will kill any running Python scripts and delete the base "
+			"Python environment and ALL per-script environments. They will be "
+			"rebuilt automatically the next time each script runs, using "
+			"wheels already in the local cache (fast).\n\n"
+			"All modules installed at runtime by scripts will be lost."));
+	gtk_label_set_wrap(GTK_LABEL(body), TRUE);
+	gtk_label_set_xalign(GTK_LABEL(body), 0.0);
+	gtk_widget_set_size_request(body, 420, -1);
+	gtk_box_append(GTK_BOX(content), body);
+
+	GtkWidget *check = gtk_check_button_new_with_mnemonic(
+			_("Also _clear the uv wheel cache (slow; forces re-download of "
+			"every dependency on next use)"));
+	gtk_box_append(GTK_BOX(content), check);
+
+	GtkWidget *bbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+	gtk_widget_set_halign(bbox, GTK_ALIGN_END);
+	gtk_widget_set_margin_top(bbox, 6);
+	GtkWidget *cancel_button = gtk_button_new_with_mnemonic(_("_Cancel"));
+	GtkWidget *rebuild_button = gtk_button_new_with_mnemonic(_("_Rebuild"));
+	gtk_widget_add_css_class(rebuild_button, "destructive-action");
+	gtk_box_append(GTK_BOX(bbox), cancel_button);
+	gtk_box_append(GTK_BOX(bbox), rebuild_button);
+	gtk_box_append(GTK_BOX(content), bbox);
+	gtk_window_set_default_widget(GTK_WINDOW(dialog), cancel_button);
+
+	struct py_reset_dlg_ctx ctx = { g_main_loop_new(NULL, FALSE), GTK_RESPONSE_CANCEL };
+	g_signal_connect(cancel_button, "clicked", G_CALLBACK(py_reset_dlg_cancel), &ctx);
+	g_signal_connect(rebuild_button, "clicked", G_CALLBACK(py_reset_dlg_accept), &ctx);
+	g_signal_connect(dialog, "close-request", G_CALLBACK(py_reset_dlg_close), &ctx);
+
+	gtk_widget_set_visible(dialog, TRUE);
+	g_main_loop_run(ctx.loop);
+	g_main_loop_unref(ctx.loop);
+
+	gboolean clear_cache = siril_toggle_get_active(check);
+	gint response = ctx.result;
+	gtk_window_destroy(GTK_WINDOW(dialog));
+
+	if (response == GTK_RESPONSE_ACCEPT)
+		rebuild_all_python_state(clear_cache);
+}
+
+/* §4.8.1: surgical — base venv only. Per-script venvs and uv cache survive. */
+void on_button_python_reset_base_venv_clicked(gpointer user_data) {
+	if (siril_confirm_dialog(_("Rebuild base Python environment?"),
+			_("This rebuilds the shared base Python environment. Per-script "
+			"environments and the uv wheel cache are preserved."),
+			_("_Rebuild"))) {
+		rebuild_base_venv();
+	}
+}
+
+/* §4.8.4: prune. Removes per-script venvs whose scripts no longer exist OR
+ * which haven't been used in N days (default 90). */
+void on_button_python_prune_unused_clicked(gpointer user_data) {
+	GtkSpinButton *spin = GTK_SPIN_BUTTON(lookup_widget("spin_python_prune_age_days"));
+	gint days = spin ? (gint)gtk_spin_button_get_value(spin) : 90;
+	GError *err = NULL;
+	guint removed = prune_unused_script_venvs(days, &err);
+	if (err) {
+		siril_log_error(_("Prune failed: %s\n"), err->message);
+		g_clear_error(&err);
+		return;
+	}
+	if (removed > 0)
+		siril_log_message(_("Pruned %u unused per-script Python "
+				"environments.\n"), removed);
+	else
+		siril_log_message(_("No unused per-script Python environments to "
+				"prune.\n"));
+}
+
+/* §4.8.4 cont.: reclaim disk by pruning the uv wheel cache. Removes wheel
+ * entries not referenced by any tracked venv. Pairs naturally with the
+ * "Prune unused script environments" button: prune venvs first to release
+ * references, then click this to collect the orphans. */
+void on_button_python_prune_uv_cache_clicked(gpointer user_data) {
+	GError *err = NULL;
+	if (!prune_uv_cache(&err)) {
+		if (err) {
+			siril_log_error(_("Prune uv cache failed: %s\n"), err->message);
+			g_clear_error(&err);
+		}
+		return;
+	}
+	/* prune_uv_cache() already logs uv's stdout/stderr summary. */
 }
 
 /* these one are not on the preference dialog */
