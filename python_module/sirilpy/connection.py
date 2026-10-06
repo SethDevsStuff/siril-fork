@@ -326,7 +326,7 @@ class SirilInterface:
 
             try:
                 # Pack command and length into fixed-size header
-                header = struct.pack('!Bi', command, data_length)
+                header = struct.pack('=Bi', command, data_length)
 
                 if os.name == 'nt':
                     # Create event for this write operation
@@ -359,7 +359,7 @@ class SirilInterface:
                         response_header = self._recv_exact(5, timeout)  # Pass timeout
                         if not response_header:
                             return None, None
-                        status, response_length = struct.unpack('!BI', response_header)
+                        status, response_length = struct.unpack('=BI', response_header)
 
                         response_data = None
                         if response_length > 0:
@@ -385,7 +385,7 @@ class SirilInterface:
                     if not response_header:
                         return None, None
 
-                    status, response_length = struct.unpack('!BI', response_header)
+                    status, response_length = struct.unpack('=BI', response_header)
                     response_data = None
                     if response_length > 0:
                         response_data = self._recv_exact(response_length, timeout)  # Pass timeout
@@ -525,7 +525,7 @@ class SirilInterface:
             ValueError: If the shared memory information is invalid
             SirilError: For other errors
         """
-        size_data = struct.pack('!Q', size)  # Pack the size as a uint64_t in network byte order.
+        size_data = struct.pack('=Q', size)  # Pack the size as a uint64_t.
 
         try:
             # Send the shared memory request command.
@@ -1091,9 +1091,8 @@ class SirilInterface:
             # Convert string to UTF-8 bytes
             message_bytes = message.encode('utf-8')
 
-            # Create payload: network-order float followed by string
-            # '!f' for network byte order 32-bit float
-            float_bytes = struct.pack('!f', progress)
+            # Create payload: (native byte order) float followed by string
+            float_bytes = struct.pack('=f', progress)
 
             # Combine float and string bytes
             payload = float_bytes + message_bytes
@@ -1149,7 +1148,7 @@ class SirilInterface:
             if response is None:
                 raise DataError(_(f"Error: _request_data({args}) failed."))
 
-            # Convert response bytes to integer from network byte order
+            # (native byte order)
             if len(response) == 4:  # Valid response is int32_t ie 4 bytes
                 status_code = int.from_bytes(response, byteorder='big')
 
@@ -1208,8 +1207,8 @@ class SirilInterface:
             else:
                 raise ValueError("Either provide a selection tuple or all four coordinate parameters (x, y, w, h)")
 
-            # Pack the coordinates and dimensions into bytes using network byte order (!)
-            payload = struct.pack('!IIII', x, y, w, h)
+            # Pack the coordinates and dimensions into bytes
+            payload = struct.pack('=IIII', x, y, w, h)
             self._execute_command(_Command.SET_SELECTION, payload)
             return True
         except Exception as e:
@@ -1234,7 +1233,7 @@ class SirilInterface:
 
         try:
             # Assuming the response is in the format: x (4 bytes), y (4 bytes), w (4 bytes), h (4 bytes)
-            x, y, w, h = struct.unpack('!IIII', response)
+            x, y, w, h = struct.unpack('=IIII', response)
             return x, y, w, h  # Returning as (x, y, w, h)
         except struct.error as e:
             raise SirilError(_("Error occurred in get_siril_selection(): {}").format(e)) from e
@@ -1268,7 +1267,7 @@ class SirilInterface:
 
         try:
             # Assuming the response is in the format: !I
-            vport = struct.unpack('!I', response)[0]
+            vport = struct.unpack('=I', response)[0]
             return vport
         except struct.error as e:
             raise SirilError(_("Error occurred in get_siril_active_vport()")) from e
@@ -1292,7 +1291,7 @@ class SirilInterface:
                 return None
 
             # Assuming the response is in the format: width (4 bytes), height (4 bytes), nb_channels (4 bytes)
-            width, height, channels = struct.unpack('!III', response)
+            width, height, channels = struct.unpack('=III', response)
             return channels, height, width  # Returning as (channels, height, width)
         except Exception as e:
             raise SirilError(_("Error occurred in get_image_shape()")) from e
@@ -1360,7 +1359,7 @@ class SirilInterface:
                 raise ValueError(_("Channel must be 0 (Red/Mono), 1 (Green), or 2 (Blue)"))
 
             # Always pack the same payload: x, y, w, h, channel, centred_flag (24 bytes)
-            shape_data = struct.pack('!IIIIII', x, y, w, h, channel_val, centred_flag)
+            shape_data = struct.pack('=IIIIII', x, y, w, h, channel_val, centred_flag)
 
             status, response = self._send_command(_Command.GET_STAR_IN_SELECTION, shape_data)
 
@@ -1422,14 +1421,14 @@ class SirilInterface:
             # Pack shape data for the command
             if len(shape) == 4:
                 if channel is None:
-                    shape_data = struct.pack('!IIII', *shape)
+                    shape_data = struct.pack('=IIII', *shape)
                 else:
-                    shape_data = struct.pack('!IIIII', *shape, channel)
+                    shape_data = struct.pack('=IIIII', *shape, channel)
             else:
                 raise ValueError(_("Incorrect shape data provided: must be (x,y,w,h)"))
         elif channel is not None:
             # Pack only channel data when no shape is provided but channel is specified
-            shape_data = struct.pack('!I', channel)
+            shape_data = struct.pack('=I', channel)
 
         status, response = self._send_command(_Command.GET_STATS_FOR_SELECTION, shape_data)
         # Handle error responses
@@ -1470,7 +1469,7 @@ class SirilInterface:
             SirilError: For errors during pix2radec execution.
         """
         try:
-            shape_data = struct.pack('!2d', x, y)
+            shape_data = struct.pack('=2d', x, y)
             status, response = self._send_command(_Command.PIX2WCS, shape_data)
             # Handle error responses
             if status == _Status.ERROR:
@@ -1489,9 +1488,9 @@ class SirilInterface:
             if not response:
                 raise SirilConnectionError(_("Failed to transfer coordinates: No data received"))
             # Define the format string for unpacking the C struct
-            # '!' for network byte order (big-endian)
+            # native byte order, standard sizes, no alignment
             # 'd' for double (all floating point values)
-            format_string = '!2d'  # '!' ensures network byte order
+            format_string = '!2d'  # native byte order
 
             # Calculate expected size
             expected_size = struct.calcsize(format_string)
@@ -1527,7 +1526,7 @@ class SirilInterface:
             SirilError: For errors during radec2pix execution.
         """
         try:
-            shape_data = struct.pack('!2d', ra, dec)
+            shape_data = struct.pack('=2d', ra, dec)
             status, response = self._send_command(_Command.WCS2PIX, shape_data)
             # Handle error responses
             if status == _Status.ERROR:
@@ -1547,9 +1546,9 @@ class SirilInterface:
                 raise SirilConnectionError(_("Failed to transfer coordinates: No data received"))
             try:
                 # Define the format string for unpacking the C struct
-                # '!' for network byte order (big-endian)
+                # native byte order, standard sizes, no alignment
                 # 'd' for double (all floating point values)
-                format_string = '!2d'  # '!' ensures network byte order
+                format_string = '!2d'  # native byte order
 
                 # Calculate expected size
                 expected_size = struct.calcsize(format_string)
@@ -1597,7 +1596,7 @@ class SirilInterface:
 
         shm = None
         try:
-            preview_data = struct.pack('!??', preview, linked)
+            preview_data = struct.pack('=??', preview, linked)
             # Validate shape if provided
             if shape is not None:
                 if len(shape) != 4:
@@ -1608,7 +1607,7 @@ class SirilInterface:
                     raise ValueError(_("All shape values must be non-negative"))
 
                 # Pack shape data for the command
-                shape_data = struct.pack('!IIII', *shape)
+                shape_data = struct.pack('=IIII', *shape)
                 command = _Command.GET_PIXELDATA_REGION
             else:
                 shape_data = None
@@ -1735,11 +1734,11 @@ class SirilInterface:
         """
 
         shm = None
-        # Convert channel number to network byte order bytes
+        # (native byte order)
 
         try:
-            preview_payload = struct.pack('!??', preview, linked)
-            frame_payload = struct.pack('!I', frame)
+            preview_payload = struct.pack('=??', preview, linked)
+            frame_payload = struct.pack('=I', frame)
             # Validate shape if provided
             if shape is not None:
                 if len(shape) != 4:
@@ -1750,7 +1749,7 @@ class SirilInterface:
                     raise ValueError(_("All shape values must be non-negative"))
 
                 # Pack shape data for the command
-                shape_data = struct.pack('!IIII', *shape)
+                shape_data = struct.pack('=IIII', *shape)
             else:
                 shape_data = None
             payload = preview_payload + frame_payload + shape_data if shape_data else preview_payload + frame_payload
@@ -1889,7 +1888,7 @@ class SirilInterface:
 
             # Pack the plot info structure
             info = struct.pack(
-                '!IIIIQ256s',
+                '=IIIIQ256s',
                 1 if save else 0,  # width (repurposed as a "save" flag)
                 1 if display else 0,  # height (repurposed as a "display" flag)
                 0,  # reserved/unused
@@ -2021,7 +2020,7 @@ class SirilInterface:
 
             # Pack the plot info structure
             info = struct.pack(
-                '!IIIIQ256s',
+                '=IIIIQ256s',
                 0,  # width (not used for plots)
                 0,  # height (not used for plots)
                 1 if recalc else 0,  # recalculate flag
@@ -2131,7 +2130,7 @@ class SirilInterface:
 
             # Pack the image info structure
             info = struct.pack(
-                '!IIIIQ256s',
+                '=IIIIQ256s',
                 width,
                 height,
                 channels,
@@ -2253,7 +2252,7 @@ class SirilInterface:
 
             # Pack the image info structure
             info = struct.pack(
-                '!IIIIQ256s',
+                '=IIIIQ256s',
                 width,
                 height,
                 channels,
@@ -2274,7 +2273,7 @@ class SirilInterface:
 
             # Create payload
             # We don't range check index here as it is done more efficiently in the C code
-            index_bytes = struct.pack('!i', index)
+            index_bytes = struct.pack('=i', index)
             payload = index_bytes + info + prefix_bytes
 
             # Send command using the existing _execute_command method
@@ -2756,7 +2755,7 @@ class SirilInterface:
             raise DataError(_("Error in is_image_loaded(): no response received from Siril"))
 
         try:
-            image_loaded = struct.unpack('!i', response)[0] != 0
+            image_loaded = struct.unpack('=i', response)[0] != 0
             return bool(image_loaded)
         except Exception as e:
             raise SirilError("Error in is_image_loaded()") from e
@@ -2779,7 +2778,7 @@ class SirilInterface:
             raise DataError(_("Error in is_sequence_loaded(): no response received from Siril"))
 
         try:
-            sequence_loaded = struct.unpack('!i', response)[0] != 0
+            sequence_loaded = struct.unpack('=i', response)[0] != 0
             return bool(sequence_loaded)
         except Exception as e:
             raise SirilError(_("Error in is_sequence_loaded()")) from e
@@ -2828,8 +2827,8 @@ class SirilInterface:
         if not self.is_sequence_loaded():
             raise NoSequenceError(_("Error in get_seq_frame_filename(): no sequence is loaded"))
 
-        # Convert frame number to network byte order bytes
-        frame_payload = struct.pack('!I', frame)  # '!I' for network byte order uint32_t
+        # (native byte order)
+        frame_payload = struct.pack('=I', frame)
 
         response = self._request_data(_Command.GET_SEQ_FRAME_FILENAME, payload=frame_payload)
 
@@ -2859,8 +2858,8 @@ class SirilInterface:
             SirilError: if an error occurs.
         """
 
-        # Convert channel number to network byte order bytes
-        channel_payload = struct.pack('!I', channel)  # '!I' for network byte order uint32_t
+        # (native byte order)
+        channel_payload = struct.pack('=I', channel)
 
         # Request data with the channel number as payload
         response = self._request_data(_Command.GET_IMAGE_STATS, payload=channel_payload)
@@ -2899,7 +2898,7 @@ class SirilInterface:
         if not self.is_sequence_loaded():
             raise NoSequenceError(_("Error in get_seq_regdata(): no sequence is loaded"))
 
-        data_payload = struct.pack('!II', frame, channel)  # '!I' for network byte order uint32_t
+        data_payload = struct.pack('=II', frame, channel)
 
         # Request data with the channel number as payload
         response = self._request_data(_Command.GET_SEQ_REGDATA, payload=data_payload)
@@ -2936,7 +2935,7 @@ class SirilInterface:
         if not self.is_sequence_loaded():
             raise NoSequenceError(_("Error in get_seq_stats(): no sequence is loaded"))
 
-        data_payload = struct.pack('!II', frame, channel)  # '!I' for network byte order uint32_t
+        data_payload = struct.pack('=II', frame, channel)
 
         # Request data with the channel number as payload
         response = self._request_data(_Command.GET_SEQ_STATS, payload=data_payload)
@@ -2971,7 +2970,7 @@ class SirilInterface:
         if not self.is_sequence_loaded():
             raise NoSequenceError(_("Error in get_seq_imgdata(): no sequence is loaded"))
 
-        data_payload = struct.pack('!I', frame)  # '!I' for network byte order uint32_t
+        data_payload = struct.pack('=I', frame)
 
         # Request data with the channel number as payload
         response = self._request_data(_Command.GET_SEQ_IMGDATA, payload=data_payload)
@@ -3002,28 +3001,13 @@ class SirilInterface:
             raise NoSequenceError(_("Error in get_seq_distodata(): no sequence is loaded"))
 
         # Request data with the channel number as payload
-        data_payload = struct.pack('!I', channel)
+        data_payload = struct.pack('=I', channel)
         response = self._request_data(_Command.GET_SEQ_DISTODATA, payload=data_payload)
         if response is None:
             return None
         try:
-            format_string = '!q2d'
-
-            fixed_length = struct.calcsize(format_string)
-            values = struct.unpack(format_string, response[:fixed_length])
-            # Extract remaining bytes for the null-terminated string
-            if len(response) > fixed_length:
-                remaining_data = response[fixed_length:]
-                distofilename_string = remaining_data.decode('utf-8').rstrip('\x00')
-            else:
-                distofilename_string = ''
-
-            return DistoData (
-                index = values[0],
-                velocity = (values[1], values[2]),
-                filename = distofilename_string
-            )
-        except struct.error as e:
+            return DistoData.deserialize(response)
+        except (struct.error, ValueError) as e:
             raise SirilError(f"Error in get_seq_distodata(): {e}") from e
 
     def get_seq(self) -> Optional[Sequence]:
@@ -3049,16 +3033,10 @@ class SirilInterface:
             return None
 
         try:
-            format_string = '!4q3Q4qdQqQq'
-            fixed_length = struct.calcsize(format_string)
-
-            values = struct.unpack(format_string, response[:fixed_length])
-            # Extract remaining bytes for the null-terminated string
-            remaining_data = response[fixed_length:]
-            seqname_string = remaining_data.decode('utf-8').rstrip('\x00')
-
-            number = values[0]
-            nb_layers = values[3]
+            (number, selnum, fixed, nb_layers, rx, ry,
+             is_variable, bitpix, reference_image, beg, end, exposure,
+             fz, type_int, cfa_opened_monochrome, current,
+             seqname_string) = Sequence.deserialize_head(response)
 
             imgparam_list = [self.get_seq_imgdata(frame)
                              for frame in range(number)]
@@ -3074,30 +3052,30 @@ class SirilInterface:
             disto_list = [self.get_seq_distodata(channel)
                              for channel in range(nb_layers)]
 
-            return Sequence (
-                number = values[0],
-                selnum = values[1],
-                fixed = values[2],
-                nb_layers = values[3],
-                rx = values[4],
-                ry = values[5],
-                is_variable = bool(values[6]),
-                bitpix = values[7],
-                reference_image = values[8],
+            return Sequence(
+                number = number,
+                selnum = selnum,
+                fixed = fixed,
+                nb_layers = nb_layers,
+                rx = rx,
+                ry = ry,
+                is_variable = is_variable,
+                bitpix = bitpix,
+                reference_image = reference_image,
                 imgparam = imgparam_list,
                 regparam = regdata_list,
                 stats = stats_list,
                 distoparam = disto_list,
-                beg = values[9],
-                end = values[10],
-                exposure = values[11],
-                fz = bool(values[12]),
-                type = SequenceType(values[13]),
-                cfa_opened_monochrome = bool(values[14]),
-                current = values[15],
+                beg = beg,
+                end = end,
+                exposure = exposure,
+                fz = fz,
+                type = SequenceType(type_int),
+                cfa_opened_monochrome = cfa_opened_monochrome,
+                current = current,
                 seqname = seqname_string
             )
-        except struct.error as e:
+        except (struct.error, ValueError) as e:
             raise SirilError(f"Error in get_seq(): {e}") from e
 
     def get_image_keywords(self) -> Optional[FKeywords]:
@@ -3147,33 +3125,16 @@ class SirilInterface:
             raise NoImageError(_("Error in get_image(): no image currently loaded in Siril"))
 
         try:
-            # Build format string for struct unpacking
-            # Network byte order for all values
-            format_parts = [
-                'q',  # rx padded to 64bit
-                'q',  # ry padded to 64bit
-                'q',  # naxes[2] padded to 64bit
-                'q',  # bitpix padded to 64bit
-                'q',  # orig_bitpix padded to 64bit
-                'Q',  # gboolean checksum padded to 64bit
-                'd',  # mini
-                'd',  # maxi
-                'd',  # neg_ratio padded to 64bit
-                'Q',  # gboolean top_down (padded to uint64_t)
-                'Q',  # gboolean focalkey (padded to uint64_t)
-                'Q',  # gboolean pixelkey (padded to uint64_t)
-                'Q',  # gboolean color_managed (padded to uint64_t)
-            ]
-
-            format_string = '!' + ''.join(format_parts)
-
-            # Verify data size
-            expected_size = struct.calcsize(format_string)
-            if len(response) != expected_size:
-                raise ValueError(f"Received image data size {len(response)} doesn't match expected size {expected_size}")
-
-            # Unpack the binary data
-            values = struct.unpack(format_string, response)
+            # Unpack the FFit core block (mirrors fits_to_py(); 60 bytes
+            # at native widths via FFit.deserialize_core).
+            if len(response) != FFit._CORE_SIZE:
+                raise ValueError(
+                    f"Received image data size {len(response)} doesn't match expected size {FFit._CORE_SIZE}"
+                )
+            (rx, ry, naxes2, bitpix, orig_bitpix, checksum_flag,
+             mini, maxi, neg_ratio,
+             top_down_flag, focalkey_flag, pixelkey_flag,
+             color_managed_flag) = FFit.deserialize_core(response)
 
             # Create FFit object
             try:
@@ -3211,23 +3172,23 @@ class SirilInterface:
                     print(f"Error: failed to retrieve pixel data: {e}")
 
             return FFit(
-                _naxes = (values[0], values[1], values[2]),
-                naxis = 2 if values[2] == 1 else 3,
-                bitpix=values[3],
-                orig_bitpix=values[4],
-                checksum=bool(values[5]),
-                mini=values[6],
-                maxi=values[7],
-                neg_ratio=values[8],
-                top_down=bool(values[9]),
-                _focalkey=bool(values[10]),
-                _pixelkey=bool(values[11]),
-                color_managed=bool(values[12]),
+                _naxes = (rx, ry, naxes2),
+                naxis = 2 if naxes2 == 1 else 3,
+                bitpix=bitpix,
+                orig_bitpix=orig_bitpix,
+                checksum=checksum_flag,
+                mini=mini,
+                maxi=maxi,
+                neg_ratio=neg_ratio,
+                top_down=top_down_flag,
+                _focalkey=focalkey_flag,
+                _pixelkey=pixelkey_flag,
+                color_managed=color_managed_flag,
                 _data = img_pixeldata,
                 stats=[
                     self.get_image_stats(0),
-                    self.get_image_stats(1) if values[2] > 1 else None,
-                    self.get_image_stats(2) if values[2] > 1 else None,
+                    self.get_image_stats(1) if naxes2 > 1 else None,
+                    self.get_image_stats(2) if naxes2 > 1 else None,
                 ],
                 keywords = img_keywords,
                 _icc_profile = img_icc_profile,
@@ -3276,36 +3237,19 @@ class SirilInterface:
         shm_header_info = None
         shm_icc_info = None
 
-        data_payload = struct.pack('!I???', frame, with_pixels, preview, linked)
+        data_payload = struct.pack('=I???', frame, with_pixels, preview, linked)
         response = self._request_data(_Command.GET_SEQ_IMAGE, data_payload, timeout = None)
         if response is None:
             return None
 
         try:
             # --- Unpack the core FFit (the fields before the keyword block) ---
-            core_format_parts = [
-                'q',  # rx
-                'q',  # ry
-                'q',  # naxes[2]
-                'q',  # bitpix
-                'q',  # orig_bitpix
-                'Q',  # checksum (padded boolean)
-                'd',  # mini
-                'd',  # maxi
-                'd',  # neg_ratio
-                'Q',  # top_down
-                'Q',  # focalkey
-                'Q',  # pixelkey
-                'Q',  # color_managed
-            ]
-            core_format = '!' + ''.join(core_format_parts)
-            core_size = struct.calcsize(core_format)
+            # Native widths via FFit.deserialize_core (mirrors fits_to_py).
+            core_size = FFit._CORE_SIZE
 
-            # Calculate expected size with shared memory info structs
-            # Header and ICC profile are always included, pixels only if requested
-            shminfo_size = 0
-            shminfo_format = '!Qiiii256s'  # One shm_info_t struct
-            single_shminfo_size = struct.calcsize(shminfo_format)
+            # Calculate expected size with shared memory info structs.
+            # Header and ICC profile are always included; pixels only if requested.
+            single_shminfo_size = _SharedMemoryInfo._STRUCT_SIZE
 
             # Always include header and ICC profile shared memory info structs
             shminfo_size = single_shminfo_size * 2  # header + icc_profile
@@ -3319,8 +3263,11 @@ class SirilInterface:
                     f"Received image data size {len(response)} doesn't match expected size {expected_total}"
                 )
 
-            # Unpack core part
-            core_vals = struct.unpack_from(core_format, response, 0)
+            # Unpack core part via the model classmethod
+            (rx, ry, naxes2, bitpix, orig_bitpix, checksum_flag,
+             mini, maxi, neg_ratio,
+             top_down_flag, focalkey_flag, pixelkey_flag,
+             color_managed_flag) = FFit.deserialize_core(response[:core_size])
 
             # Extract keyword block bytes and deserialize them
             kw_offset = core_size
@@ -3339,16 +3286,7 @@ class SirilInterface:
 
             # Extract pixel data shm_info (only if with_pixels=True)
             if with_pixels:
-                (size_be, data_type_be, width_be, height_be, channels_be, shm_name_bytes) = struct.unpack_from(shminfo_format, response, current_offset)
-
-                shm_pixels_info = _SharedMemoryInfo(
-                    size = size_be,
-                    data_type = data_type_be,
-                    width = width_be,
-                    height = height_be,
-                    channels = channels_be,
-                    shm_name = shm_name_bytes
-                )
+                shm_pixels_info = _SharedMemoryInfo.from_wire_buffer(response, current_offset)
 
                 # Check if pixel data is available (non-zero size and valid shm_name)
                 shm_name_str = shm_pixels_info.shm_name.decode('utf-8').rstrip('\x00')
@@ -3397,16 +3335,7 @@ class SirilInterface:
                 current_offset += single_shminfo_size
 
             # Extract header data shm_info (always present)
-            (size_be, data_type_be, width_be, height_be, channels_be, shm_name_bytes) = struct.unpack_from(shminfo_format, response, current_offset)
-
-            shm_header_info = _SharedMemoryInfo(
-                size = size_be,
-                data_type = data_type_be,
-                width = width_be,
-                height = height_be,
-                channels = channels_be,
-                shm_name = shm_name_bytes
-            )
+            shm_header_info = _SharedMemoryInfo.from_wire_buffer(response, current_offset)
 
             # Check if header data is available
             shm_name_str = shm_header_info.shm_name.decode('utf-8').rstrip('\x00')
@@ -3426,16 +3355,7 @@ class SirilInterface:
             current_offset += single_shminfo_size
 
             # Extract ICC profile data shm_info (always present)
-            (size_be, data_type_be, width_be, height_be, channels_be, shm_name_bytes) = struct.unpack_from(shminfo_format, response, current_offset)
-
-            shm_icc_info = _SharedMemoryInfo(
-                size = size_be,
-                data_type = data_type_be,
-                width = width_be,
-                height = height_be,
-                channels = channels_be,
-                shm_name = shm_name_bytes
-            )
+            shm_icc_info = _SharedMemoryInfo.from_wire_buffer(response, current_offset)
 
             # Check if ICC profile data is available
             shm_name_str = shm_icc_info.shm_name.decode('utf-8').rstrip('\x00')
@@ -3449,25 +3369,25 @@ class SirilInterface:
                 buffer = bytearray(shm_icc_profile.buf[:shm_icc_info.size])
                 icc_profile_data = bytes(buffer)  # Convert bytearray copy to immutable bytes
 
-            # Build FFit object using core_vals and fits_keywords
+            # Build FFit object using the core fields + fits_keywords
             fit = FFit(
-                _naxes = (core_vals[0], core_vals[1], core_vals[2]),
-                naxis = 2 if core_vals[2] == 1 else 3,
-                bitpix = core_vals[3],
-                orig_bitpix = core_vals[4],
-                checksum = bool(core_vals[5]),
-                mini = core_vals[6],
-                maxi = core_vals[7],
-                neg_ratio = core_vals[8],
-                top_down = bool(core_vals[9]),
-                _focalkey = bool(core_vals[10]),
-                _pixelkey = bool(core_vals[11]),
-                color_managed = bool(core_vals[12]),
+                _naxes = (rx, ry, naxes2),
+                naxis = 2 if naxes2 == 1 else 3,
+                bitpix = bitpix,
+                orig_bitpix = orig_bitpix,
+                checksum = checksum_flag,
+                mini = mini,
+                maxi = maxi,
+                neg_ratio = neg_ratio,
+                top_down = top_down_flag,
+                _focalkey = focalkey_flag,
+                _pixelkey = pixelkey_flag,
+                color_managed = color_managed_flag,
                 _data = pixeldata,
                 stats = [
                     self.get_seq_stats(frame, 0),
-                    self.get_seq_stats(frame, 1) if core_vals[2] > 1 else None,
-                    self.get_seq_stats(frame, 2) if core_vals[2] > 1 else None,
+                    self.get_seq_stats(frame, 1) if naxes2 > 1 else None,
+                    self.get_seq_stats(frame, 2) if naxes2 > 1 else None,
                 ],
                 keywords = fits_keywords,
                 _icc_profile = icc_profile_data,
@@ -3556,7 +3476,7 @@ class SirilInterface:
             raise NoSequenceError(_("Error in get_seq_frame_header(): no sequence is loaded"))
 
         try:
-            payload = struct.pack('!I', frame)
+            payload = struct.pack('=I', frame)
             # Request shared memory setup
             status, response = self._send_command(_Command.GET_SEQ_FRAME_HEADER, payload)
 
@@ -3664,7 +3584,7 @@ class SirilInterface:
             channel_val = SENTINEL_VALUE if channel is None else channel
 
             # Pack channel data for the command
-            channel_data = struct.pack('!I', channel_val)
+            channel_data = struct.pack('=I', channel_val)
 
             # Request shared memory setup
             status, response = self._send_command(_Command.GET_PSFSTARS, channel_data)
@@ -3789,11 +3709,11 @@ class SirilInterface:
 
             # Parse based on type
             if config_type == _ConfigType.BOOL:
-                return bool(struct.unpack('!I', value_data)[0])
+                return bool(struct.unpack('=I', value_data)[0])
             if config_type == _ConfigType.INT:
-                return struct.unpack('!i', value_data)[0]
+                return struct.unpack('=i', value_data)[0]
             if config_type == _ConfigType.DOUBLE:
-                return struct.unpack('!d', value_data)[0]
+                return struct.unpack('=d', value_data)[0]
             if config_type in (_ConfigType.STR, _ConfigType.STRDIR):
                 # Assume null-terminated string
                 string_value = value_data.split(b'\0')[0].decode('utf-8')
@@ -3819,8 +3739,8 @@ class SirilInterface:
         filters.
 
         Args:
-            index: integer or list of integers specifying which frame(s) to set the 
-                inclusion status for. This uses a 0-based indexing scheme, i.e. the 
+            index: integer or list of integers specifying which frame(s) to set the
+                inclusion status for. This uses a 0-based indexing scheme, i.e. the
                 first frame is frame number 0, not frame number 1.
                 Passing a list is available since sirilpy 1.0.17
             incl: bool specifying whether the frame(s) are included or not.
@@ -3833,7 +3753,7 @@ class SirilInterface:
         try:
             if not self.is_sequence_loaded():
                 raise NoSequenceError(_("Error in set_seq_frame_incl(): no sequence loaded"))
-            
+
             # Validate and normalize index parameter
             if isinstance(index, int):
                 indices = [index]
@@ -3845,13 +3765,13 @@ class SirilInterface:
                 indices = index
             else:
                 raise TypeError(_("Index must be an integer or list of integers"))
-            
+
             # Build payload: count, indices, incl
             # Format: count (I) + indices (I * count) + incl (I)
             count = len(indices)
             format_string = f'!I{count}II'  # count + indices + incl
             payload = struct.pack(format_string, count, *indices, incl)
-            
+
             self._execute_command(_Command.SET_SEQ_FRAME_INCL, payload)
             return
         except SirilError:
@@ -4045,7 +3965,7 @@ class SirilInterface:
 
             # Pack the image info structure
             info = struct.pack(
-                '!IIIIQ256s',
+                '=IIIIQ256s',
                 0,
                 0,
                 0,
@@ -4122,7 +4042,7 @@ class SirilInterface:
 
             # Pack the polygon info structure
             info = struct.pack(
-                '!IIIIQ256s',
+                '=IIIIQ256s',
                 0,  # unused field 1
                 0,  # unused field 2
                 0,  # unused field 3
@@ -4136,7 +4056,7 @@ class SirilInterface:
             if response is None:
                 raise SirilConnectionError(("Failed to get a response from the SirilInterface"))
             try:
-                polygon_id = struct.unpack('!i', response[:4])[0]
+                polygon_id = struct.unpack('=i', response[:4])[0]
                 polygon.polygon_id = polygon_id
                 return polygon
 
@@ -4167,9 +4087,8 @@ class SirilInterface:
             SirilError: on failure
         """
         try:
-            # Create payload: network-order int followed by string
-            # '!I' for network byte order 32-bit int
-            payload = struct.pack('!i', polygon_id)
+            # Create payload: (native byte order) int followed by string
+            payload = struct.pack('=i', polygon_id)
 
             self._execute_command(_Command.DELETE_USER_POLYGON, payload)
             return
@@ -4206,7 +4125,7 @@ class SirilInterface:
             color: uint32 specifying packed RGBA values. Default: 0x00FF0040, 75% transparent green)
             fill: bool specifying whether or not to fill the polygon (default: False)
         """
-        payload = struct.pack('!I?', color, fill)
+        payload = struct.pack('=I?', color, fill)
         status, response = self._send_command(_Command.DRAW_POLYGON, payload)
         if status == _Status.ERROR:
             if response:
@@ -4236,7 +4155,7 @@ class SirilInterface:
         """
         shm = None
         try:
-            payload = struct.pack('!i', polygon_id)
+            payload = struct.pack('=i', polygon_id)
             # Send it using _request_data
             status, response = self._send_command(_Command.GET_USER_POLYGON, payload)
             # Handle error responses
@@ -4459,14 +4378,14 @@ class SirilInterface:
         shm_icc_profile = None
 
         # Pack boolean flags + filepath
-        data_payload = struct.pack('!???', with_pixels, preview, linked) + filepath_bytes
+        data_payload = struct.pack('=???', with_pixels, preview, linked) + filepath_bytes
         response = self._request_data(_Command.GET_IMAGE_FILE, data_payload, timeout=None)
         if response is None:
             return None
 
         try:
             # Build format string for struct unpacking
-            # Network byte order for all values
+            # Native byte order, standard sizes
             FLEN_VALUE = 71  # Standard FITS keyword length
             format_parts = [
                 # Core FFfit (start at index 0)
@@ -4914,7 +4833,7 @@ class SirilInterface:
 
             # Pack the plot info structure
             info = struct.pack(
-                '!IIIIQ256s',
+                '=IIIIQ256s',
                 0,  # width (not used for ICC profile)
                 0,  # height (not used for ICC profile)
                 0, # not used
@@ -4956,7 +4875,7 @@ class SirilInterface:
             return None
 
         try:
-            lo, hi, mode = struct.unpack('!HHI', response)
+            lo, hi, mode = struct.unpack('=HHI', response)
             if float_range:
                 lo = lo / 65535.0
                 hi = hi / 65535.0
@@ -4984,9 +4903,9 @@ class SirilInterface:
             if not isinstance(mode, SlidersMode):
                 raise ValueError("Mode must be a SlidersMode enum value")
 
-            # Pack the values into bytes using network byte order (!)
+            # Pack the values into bytes
             # Format depends on which arguments are provided
-            payload = struct.pack('!I', mode.value)
+            payload = struct.pack('=I', mode.value)
             self._execute_command(_Command.SET_SLIDER_STATE, payload)
             return True
         except Exception as e:
@@ -5030,9 +4949,9 @@ class SirilInterface:
             converted_lo = convert_value(lo)
             converted_hi = convert_value(hi)
 
-            # Pack the values into bytes using network byte order (!)
+            # Pack the values into bytes
             # All values packed as 32-bit integers for consistency
-            payload = struct.pack('!II', converted_lo, converted_hi)
+            payload = struct.pack('=II', converted_lo, converted_hi)
             self._execute_command(_Command.SET_SLIDER_LOHI, payload)
             return True
         except Exception as e:
@@ -5055,7 +4974,7 @@ class SirilInterface:
             return None
 
         try:
-            mode = struct.unpack('!I', response)
+            mode = struct.unpack('=I', response)
             return mode[0]
         except struct.error as e:
             raise SirilError(_("Error occurred in get_siril_stf(): {}").format(e)) from e
@@ -5080,9 +4999,9 @@ class SirilInterface:
             if not isinstance(mode, STFType):
                 raise ValueError("Mode must be a STFType enum value")
 
-            # Pack the values into bytes using network byte order (!)
+            # Pack the values into bytes
             # Format depends on which arguments are provided
-            payload = struct.pack('!I', mode.value)
+            payload = struct.pack('=I', mode.value)
             self._execute_command(_Command.SET_STFMODE, payload)
             return True
         except Exception as e:
@@ -5105,7 +5024,7 @@ class SirilInterface:
             return None
 
         try:
-            x_off, y_off, zoomlevel = struct.unpack('!ddd', response)
+            x_off, y_off, zoomlevel = struct.unpack('=ddd', response)
             return x_off, y_off, zoomlevel
         except struct.error as e:
             raise SirilError(_("Error occurred in get_siril_slider_state(): {}").format(e)) from e
@@ -5128,9 +5047,9 @@ class SirilInterface:
         """
         try:
 
-            # Pack the values into bytes using network byte order (!)
+            # Pack the values into bytes
             # All values packed as 32-bit integers for consistency
-            payload = struct.pack('!dd', xoff, yoff)
+            payload = struct.pack('=dd', xoff, yoff)
             self._execute_command(_Command.SET_PAN, payload)
             return True
         except Exception as e:
@@ -5151,9 +5070,9 @@ class SirilInterface:
         """
         try:
 
-            # Pack the values into bytes using network byte order (!)
+            # Pack the values into bytes
             # All values packed as 32-bit integers for consistency
-            payload = struct.pack('!d', zoom)
+            payload = struct.pack('=d', zoom)
             self._execute_command(_Command.SET_ZOOM, payload)
             return True
         except Exception as e:
@@ -5257,7 +5176,7 @@ class SirilInterface:
             return None
 
         try:
-            mode = struct.unpack('!I', response)
+            mode = struct.unpack('=I', response)
             return bool(mode[0])
         except struct.error as e:
             raise SirilError(_("Error occurred in get_siril_stf(): {}").format(e)) from e
@@ -5541,7 +5460,7 @@ class SirilInterface:
             # Format: width, height, channels, data_type, image_size, image_shm_name,
             #         header_size, header_shm_name, filename
             info = struct.pack(
-                '!IIIIQ256sQ256s256s',
+                '=IIIIQ256sQ256s256s',
                 width,
                 height,
                 channels,
@@ -5774,7 +5693,7 @@ class SirilInterface:
 
             # Pack the image info structure
             info = struct.pack(
-                '!IIIIQ256s',
+                '=IIIIQ256s',
                 width,
                 height,
                 1,
@@ -5850,7 +5769,7 @@ class SirilInterface:
             return None
 
         try:
-            mode = struct.unpack('!I', response)
+            mode = struct.unpack('=I', response)
             return bool(mode[0])
         except struct.error as e:
             raise SirilError(_("Error occurred in get_image_mask_state(): {}").format(e)) from e
@@ -5909,7 +5828,7 @@ class SirilInterface:
 
             # Pack the polygon info structure
             info = struct.pack(
-                '!IIIIQ256s',
+                '=IIIIQ256s',
                 int_adding,  # representation of "adding"
                 0,  # unused field 2
                 0,  # unused field 3
@@ -5998,8 +5917,7 @@ class SirilInterface:
             raise TypeError(f"dialog must be a DialogID, got {type(dialog).__name__}")
 
         try:
-            # Convert dialog ID to network byte order bytes
-            dialog_payload = struct.pack('!I', dialog.value)  # '!I' for network byte order uint32_t
+            dialog_payload = struct.pack('=I', dialog.value)
 
             response = self._execute_command(_Command.OPEN_DIALOG, payload=dialog_payload)
 

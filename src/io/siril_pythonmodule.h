@@ -270,7 +270,35 @@ typedef struct {
 // Public functions
 //gpointer open_python_channel(gpointer user_data);
 //int release_python_channel();
-void execute_python_script(gchar* script_name, gboolean from_file, gboolean sync, gchar** argv_script, gboolean is_temp_file, gboolean from_cli, gboolean debug_mode);
+// venv_identity_path: canonical script path for venv lookup. When NULL the
+//   buffer-content rules apply (see §4.5 of the uv conversion plan): if a
+//   PEP 723 block is found in pep723_source, an "unsaved-<hash>" venv is
+//   reused across buffers with identical declared deps; otherwise the base
+//   venv is used. NULL is correct for one-off snippets (e.g. -c on the CLI)
+//   and for editor buffers that have never been saved.
+// pep723_source: text to parse PEP 723 metadata from. When NULL the file at
+//   script_name is read. Pass the *buffer* text from the editor (which may
+//   differ from the saved file).
+// Both new parameters are advisory: per-script venvs are only created when
+// the SIRIL_PER_SCRIPT_VENVS feature gate is set; otherwise the base venv
+// is used regardless.
+void execute_python_script(gchar* script_name, gboolean from_file, gboolean sync, gchar** argv_script, gboolean is_temp_file, gboolean from_cli, gboolean debug_mode, const gchar *venv_identity_path, const gchar *pep723_source, gboolean permissive);
+
+// Fire-and-forget async variant for GUI callers (script menu, editor).
+// execute_python_script's preamble — wait for venv init, run
+// select_venv_for_script, create/install the per-script venv if needed —
+// can take many seconds on first run. Calling that synchronously from the
+// GTK main thread freezes the UI; this wrapper hops onto a worker thread
+// instead. The wrapper takes ownership of `script_name`, `argv_script`
+// (frees them via execute_python_script's existing semantics), and the
+// strings passed via `venv_identity_path` / `pep723_source` (duped
+// internally).
+//
+// Always async (no sync flag) and never joined: GUI callers want the
+// menu/dialog to return immediately so the user can keep working while
+// the venv is built. Background lifecycle is handled by the existing
+// child-watch hooks in execute_python_script.
+void execute_python_script_async(gchar* script_name, gboolean from_file, gchar** argv_script, gboolean is_temp_file, gboolean from_cli, gboolean debug_mode, const gchar *venv_identity_path, const gchar *pep723_source);
 gboolean send_response(Connection *conn, uint8_t status, const void* data, uint32_t length);
 shared_memory_info_t* handle_pixeldata_request(Connection *conn, fits *fit, rectangle region, gboolean as_preview, gboolean linked);
 gboolean handle_set_pixeldata_request(Connection *conn, fits *fit, const char* payload, size_t payload_length);
@@ -287,7 +315,30 @@ void cleanup_shm_allocation(Connection *conn, const char* shm_name);
 shared_memory_info_t* handle_rawdata_request(Connection *conn, void* data, size_t total_bytes);
 void initialize_python_venv_in_thread();
 void shutdown_python_communication(CommunicationState *commstate);
-void rebuild_venv();
+// §4.8.1: surgical — reset just the base venv (cache + per-script venvs preserved).
+void rebuild_base_venv(void);
+
+// Returns TRUE if a uv executable can currently be located (PATH lookup
+// or SIRIL_UV override). Used by the Scripts preferences pane to show /
+// hide the "uv not found" warning next to the uv-managed-Python toggle.
+// Cheap (no subprocess); does NOT validate the version.
+gboolean uv_executable_available(void);
+// §4.8.2: surgical — reset one per-script venv. Takes the script's *path*; the
+// hash is computed internally to match `select_venv_for_script`. Returns TRUE
+// when the venv was removed, FALSE if nothing to do (no ledger entry / no
+// directory). On hard failure returns FALSE with *error set.
+gboolean rebuild_script_venv_by_path(const gchar *script_path, GError **error);
+// §4.8.3: nuclear — wipe base venv, all per-script venvs, the ledger.
+// If clear_cache is TRUE, also wipe the uv cache (forces re-download).
+void rebuild_all_python_state(gboolean clear_cache);
+// §4.8.4: maintenance — remove venvs whose script_path no longer exists OR
+// whose last_used is older than max_age_days. Returns count removed.
+guint prune_unused_script_venvs(gint max_age_days, GError **error);
+// §4.8.4 cont.: reclaim disk by pruning unreachable uv cache entries.
+// Wheels still referenced by another venv stay; only orphans go.
+// Returns FALSE on failure (uv not in use, spawn fail, non-zero exit).
+gboolean prune_uv_cache(GError **error);
+
 gboolean pyc_matches_magic(const char *pyc_path, const char *expected_hex_magic);
 
 #endif

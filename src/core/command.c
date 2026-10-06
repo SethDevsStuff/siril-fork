@@ -15238,11 +15238,15 @@ typedef struct _pyscript_data {
 	gchar *script_name;
 	gchar **argv_script;
 	gboolean from_cli;
+	gboolean permissive;
 } pyscript_data;
 
 gpointer execute_python_script_wrapper(gpointer user_data) {
 	pyscript_data *data = (pyscript_data*) user_data;
-	execute_python_script(data->script_name, TRUE, TRUE, data->argv_script, FALSE, data->from_cli, FALSE);
+	execute_python_script(data->script_name, TRUE, TRUE, data->argv_script, FALSE, data->from_cli, FALSE,
+			data->script_name /* venv_identity_path: real file on disk */,
+			NULL /* pep723_source: read from file */,
+			data->permissive);
 	// execute_python_script() frees data->script_name
 	g_strfreev(data->argv_script);
 	free(data);
@@ -15254,12 +15258,19 @@ int process_pyscript(int nb) {
 	GStatBuf statbuf;
 
 	gboolean async = FALSE;
+	gboolean permissive = FALSE;
 	int arg_offset = 1;
 
-	// Check for -async as first argument
-	if (nb >= 1 && g_strcmp0(word[1], "-async") == 0) {
-		async = TRUE;
-		arg_offset = 2;
+	// Consume any leading flags (-async / -permissive), in any order, before
+	// the script name.
+	while (arg_offset <= nb && word[arg_offset] && word[arg_offset][0] == '-') {
+		if (g_strcmp0(word[arg_offset], "-async") == 0)
+			async = TRUE;
+		else if (g_strcmp0(word[arg_offset], "-permissive") == 0)
+			permissive = TRUE;
+		else
+			break;   // unknown flag: treat as the script name/argument
+		arg_offset++;
 	}
 
 	// Ensure we still have a script name
@@ -15301,6 +15312,7 @@ int process_pyscript(int nb) {
 		data->script_name = script_name;
 		data->argv_script = argv_script;
 		data->from_cli = TRUE;
+		data->permissive = permissive;
 
 		// Cannot use start_in_new_thread here because of the possibility of the python script
 		// calling siril.cmd() and running commands that themselves require the processing thread
@@ -15328,6 +15340,91 @@ int process_pyscript(int nb) {
 	} else {
 		return CMD_FILE_NOT_FOUND;
 	}
+}
+
+// §4.8: maintenance operations on the Python venv state. Subcommands map
+// 1:1 to the four functions documented in uv-conversion-plan.md.
+//   pyenv_maint rebuild_base
+//   pyenv_maint rebuild_script <abs/path/to/script.py>
+//   pyenv_maint rebuild_all [-cache]
+//   pyenv_maint prune [-days=N]   (default 90)
+int process_pyenv_maint(int nb) {
+	if (nb < 2) {
+		siril_log_error(_("pyenv_maint: subcommand required "
+				"(rebuild_base | rebuild_script <path> | "
+				"rebuild_all [-cache] | prune [-days=N])\n"));
+		return CMD_ARG_ERROR;
+	}
+	const gchar *sub = word[1];
+
+	if (g_strcmp0(sub, "rebuild_base") == 0) {
+		rebuild_base_venv();
+		return CMD_OK;
+	}
+
+	if (g_strcmp0(sub, "rebuild_script") == 0) {
+		if (nb < 3 || !word[2] || !*word[2]) {
+			siril_log_error(_("pyenv_maint rebuild_script: script path required\n"));
+			return CMD_ARG_ERROR;
+		}
+		GError *err = NULL;
+		gboolean removed = rebuild_script_venv_by_path(word[2], &err);
+		if (err) {
+			siril_log_error("%s\n", err->message);
+			g_clear_error(&err);
+			return CMD_GENERIC_ERROR;
+		}
+		if (!removed) {
+			siril_log_message(_("No per-script environment to rebuild for '%s'.\n"),
+					word[2]);
+		}
+		return CMD_OK;
+	}
+
+	if (g_strcmp0(sub, "rebuild_all") == 0) {
+		gboolean clear_cache = FALSE;
+		for (int i = 2; i < nb; i++) {
+			if (g_strcmp0(word[i], "-cache") == 0)
+				clear_cache = TRUE;
+		}
+		rebuild_all_python_state(clear_cache);
+		return CMD_OK;
+	}
+
+	if (g_strcmp0(sub, "prune") == 0) {
+		gint days = 90;
+		for (int i = 2; i < nb; i++) {
+			if (g_str_has_prefix(word[i], "-days=")) {
+				days = atoi(word[i] + 6);
+				if (days < 0) days = 0;
+			}
+		}
+		GError *err = NULL;
+		guint removed = prune_unused_script_venvs(days, &err);
+		if (err) {
+			siril_log_error("%s\n", err->message);
+			g_clear_error(&err);
+			return CMD_GENERIC_ERROR;
+		}
+		siril_log_message(_("Pruned %u per-script Python environments "
+				"(threshold %d days).\n"), removed, days);
+		return CMD_OK;
+	}
+
+	if (g_strcmp0(sub, "prune_cache") == 0) {
+		GError *err = NULL;
+		if (!prune_uv_cache(&err)) {
+			if (err) {
+				siril_log_error("%s\n", err->message);
+				g_clear_error(&err);
+			}
+			return CMD_GENERIC_ERROR;
+		}
+		return CMD_OK;
+	}
+
+	siril_log_error(_("pyenv_maint: unknown subcommand '%s'\n"), sub);
+	return CMD_ARG_ERROR;
 }
 
 /* QHY GPS: there are two use cases:

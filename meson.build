@@ -188,6 +188,11 @@ elif platform_windows
   siril_link_arg += '-lpsapi'
   siril_link_arg += '-ldbghelp'
   siril_link_arg += '-lbcrypt'
+  # securescripts: the Windows AppContainer sandbox (src/io/siril_sandbox.c)
+  # calls CreateAppContainerProfile / DeriveAppContainerSidFromAppContainerName,
+  # which live in userenv.dll. advapi32 (ACL / SetEntriesInAcl / SID helpers)
+  # is auto-linked by MinGW-w64, so only userenv needs to be requested here.
+  siril_link_arg += '-luserenv'
   siril_c_flag += ['-D_WIN32_WINNT=0x0600', '-DWINVER=0x0600']
   siril_cpp_flag += ['-D_WIN32_WINNT=0x0600', '-DWINVER=0x0600']
 elif platform_osx
@@ -616,6 +621,7 @@ foreach header : [
     { 'm': 'HAVE_SYS_STATVFS_H',  'v': 'sys/statvfs.h' },
     { 'm': 'HAVE_SYS_VFS_H',      'v': 'sys/vfs.h' },
     { 'm': 'HAVE_SYS_PARAM_H',    'v': 'sys/param.h' },
+    { 'm': 'HAVE_LANDLOCK',       'v': 'linux/landlock.h' },
   ]
   conf_data.set(header['m'], cc.has_header(header['v']) ? 1 : false)
 endforeach

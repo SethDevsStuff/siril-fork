@@ -7,6 +7,8 @@
 #include <gio/gio.h>
 #ifdef _WIN32
 #include <windows.h>
+#include <sddl.h>     /* ConvertStringSidToSid — AppContainer pipe DACL */
+#include <aclapi.h>   /* SetEntriesInAcl / EXPLICIT_ACCESS */
 #include <gio/gwin32inputstream.h>
 #include <process.h>
 #define getpid _getpid
@@ -29,6 +31,7 @@
 
 #include "core/siril.h"
 #include "core/proto.h"
+#include "yyjson.h"
 #include "core/icc_profile.h"
 #include "core/masks.h"
 #include "core/OS_utils.h"
@@ -46,6 +49,7 @@
 #include "io/siril_git.h"
 #include "io/siril_pythoncommands.h"
 #include "io/siril_pythonmodule.h"
+#include "io/siril_sandbox.h"
 #include "io/siril_plot.h"
 #include "core/gui_iface.h"
 #include "gui-gtk4/user_polygons.h"
@@ -64,9 +68,15 @@
 
 #ifdef _WIN32
 #define PYTHON_EXE "python.exe"
+#define UV_EXE "uv.exe"
 #else
 #define PYTHON_EXE "python3"
+#define UV_EXE "uv"
 #endif
+
+// Minimum uv version that supports the features we rely on
+// (--seed, --python <interpreter>, and stable PEP 723 handling).
+#define UV_MINIMUM_VERSION "0.5.0"
 
 #define MODULE_DIR "python_module"
 // Statics
@@ -75,11 +85,52 @@
 static void cleanup_connection(Connection *conn);
 static gboolean wait_for_client(Connection *conn);
 static gboolean handle_client_communication(Connection *conn);
+static gchar *find_uv_executable(GError **error);
+static gboolean validate_uv_version(const gchar *uv_path,
+                                    const gchar *min_version,
+                                    GError **error);
+static void probe_uv_executable(void);
+static const gchar *get_uv_executable_path(void);
+static void clear_uv_state(void);
+static gchar *get_uv_managed_python_token(void);
+static void inject_uv_env(gchar ***env, const gchar *project_path);
+static gboolean managed_python_already_installed(const gchar *project_path,
+		const gchar *version_token);
+static gboolean install_or_update_sirilpy_module(const gchar *module_path,
+                                                 const gchar *user_module_path,
+                                                 const gchar *venv_path,
+                                                 const gchar *project_path,
+                                                 GError **error);
+typedef struct pep723_metadata pep723_metadata;
+static void pep723_metadata_free(pep723_metadata *meta);
+static pep723_metadata *parse_pep723(const gchar *source);
+static gchar *pep723_canonical_hash(const pep723_metadata *meta);
+static gchar *resolve_system_python_for_uv(GError **error);
+static gchar *make_writable_module_copy(const gchar *src_module_path, GError **error);
+static void chmod_tree_writable(const gchar *root);
+static gboolean uv_install_sirilpy_into_venv(const gchar *uv_path,
+                                             const gchar *venv_python_path,
+                                             const gchar *module_path,
+                                             const gchar *project_path,
+                                             GError **error);
+
+// Cached uv path. NULL only when uv was not found or is too old — which is now
+// a fatal Python-init error (uv is required), so past initialization this is
+// always non-NULL. Set by probe_uv_executable(), cleared by rebuild_venv().
+// Owned by this TU.
+//
+// All access is serialised through g_uv_mutex. In practice the path is set
+// once on the init thread and read by venv operations that follow on the
+// same thread; the mutex defends against rebuild_venv() racing with future
+// callers.
+static gchar *g_uv_path = NULL;
+static GMutex g_uv_mutex;
 
 gboolean send_response(Connection* conn, uint8_t status, const void* data, uint32_t length) {
+	// Native byte order — sirilpy is same-machine IPC.
 	ResponseHeader header = {
 		.status = status,
-		.length = GUINT32_TO_BE(length)  // Convert to network byte order
+		.length = length,
 	};
 #ifdef _WIN32
     DWORD bytes_written = 0;
@@ -579,17 +630,17 @@ gboolean handle_set_pixeldata_request(Connection *conn, fits *fit, const char* p
 
 	incoming_image_info_t* info = (incoming_image_info_t*)payload;
 	info->shm_name[sizeof(info->shm_name) - 1] = '\0';
-	info->width = GUINT32_FROM_BE(info->width);
-	info->height = GUINT32_FROM_BE(info->height);
-	info->channels = GUINT32_FROM_BE(info->channels);
-	info->size = GUINT64_FROM_BE(info->size);
+	/* info->width: native byte order */
+	/* info->height: native byte order */
+	/* info->channels: native byte order */
+	/* info->size: native byte order */
 	if (info->size > get_available_memory() / 2) {
 		const char* error_msg = _("Invalid image size: exceeds memory limit");
 		if (!send_response(conn, STATUS_ERROR, error_msg, strlen(error_msg)))
 			siril_log_error("Error in send_response\n");
 		return FALSE;
 	}
-	info->data_type = GUINT32_FROM_BE(info->data_type);
+	/* info->data_type: native byte order */
 	// Validate image dimensions and format. The width/height cap is deliberately
 	// far larger than any real image (100000 x 100000 = 1e10 px) but bounds the
 	// untrusted dimensions so width*height*channels cannot overflow below.
@@ -780,8 +831,8 @@ gboolean handle_set_image_mask_request(Connection *conn, fits *fit, incoming_ima
 	}
 
 	// Convert from network byte order to host byte order
-	info->width = GUINT32_FROM_BE(info->width);
-	info->height = GUINT32_FROM_BE(info->height);
+	/* info->width: native byte order */
+	/* info->height: native byte order */
 	// info->size already converted in the switch case, so skip here
 
 	if (info->size > get_available_memory() / 2) {
@@ -790,7 +841,7 @@ gboolean handle_set_image_mask_request(Connection *conn, fits *fit, incoming_ima
 			siril_log_error("Error in send_response\n");
 		return FALSE;
 	}
-	info->data_type = GUINT32_FROM_BE(info->data_type);
+	/* info->data_type: native byte order */
 	uint8_t bitpix = (uint8_t) info->data_type;
 	// Validate image dimensions and format
 	if (info->width != fit->rx || info->height != fit->ry || info->size == 0 ||
@@ -951,13 +1002,12 @@ gboolean handle_save_image_file_request(Connection *conn, const char* payload, s
 	info->filename[sizeof(info->filename) - 1] = '\0';
 
 	// Convert from network byte order
-	info->width = GUINT32_FROM_BE(info->width);
-	info->height = GUINT32_FROM_BE(info->height);
-	info->channels = GUINT32_FROM_BE(info->channels);
-	info->data_type = GUINT32_FROM_BE(info->data_type);
-	info->image_size = GUINT64_FROM_BE(info->image_size);
-	info->header_size = GUINT64_FROM_BE(info->header_size);
-
+	/* info->width: native byte order */
+	/* info->height: native byte order */
+	/* info->channels: native byte order */
+	/* info->data_type: native byte order */
+	/* info->image_size: native byte order */
+	/* info->header_size: native byte order */
 	// Validate image dimensions and format. The width/height cap is far larger
 	// than any real image but bounds the untrusted dimensions so the pixel-count
 	// products below cannot overflow.
@@ -1749,8 +1799,7 @@ gboolean handle_add_user_polygon_request(Connection* conn, const incoming_image_
 		polygon->id = id;
 		gui_iface.add_user_polygon_to_list(polygon);
 		gui_iface.redraw_image(REDRAW_OVERLAY);
-		int id_be = GINT32_TO_BE(id);
-		result = send_response(conn, STATUS_OK, &id_be, 4);
+		result = send_response(conn, STATUS_OK, &id, 4);
 	} else {
 		siril_log_debug("Failed to deserialize user polygon\n");
 		const char* error_msg = _("Failed to add user polygon");
@@ -1947,10 +1996,114 @@ gchar* get_venv_python_version(const gchar* venv_path) {
 }
 
 #ifdef _WIN32
+/* securescripts: build a SECURITY_ATTRIBUTES whose DACL grants the well-known
+ * "ALL APPLICATION PACKAGES" SID (S-1-15-2-1) generic read/write access to the
+ * IPC named pipe, in ADDITION to the normal owner rights the pipe would get by
+ * default. Without this ACE an AppContainer child (see siril_sandbox.c) is
+ * denied when it tries to open the pipe, and IPC breaks silently under the
+ * sandbox.
+ *
+ * The returned SECURITY_ATTRIBUTES points at heap allocations that must outlive
+ * the CreateNamedPipe call; the caller frees them with free_appcontainer_pipe_sa().
+ * On any failure this returns FALSE and leaves *sa_out zeroed so the caller
+ * passes NULL to CreateNamedPipe — i.e. it FAILS OPEN to the previous (default
+ * DACL) behaviour, which is correct for a non-sandboxed / pre-Win8 run.
+ *
+ * NB this uses ConvertStringSidToSid on the fixed string "S-1-15-2-1" rather
+ * than CreateWellKnownSid(WinBuiltinAnyPackageSid) so it compiles on older
+ * MinGW-w64 SDKs that lack that enum value; the SID string is a documented,
+ * stable well-known constant. */
+typedef struct {
+	PSID sid;                 /* ALL APPLICATION PACKAGES */
+	PACL dacl;                /* built by SetEntriesInAcl */
+	PSECURITY_DESCRIPTOR sd;  /* self-relative-free absolute SD */
+	SECURITY_ATTRIBUTES sa;
+} AppContainerPipeSA;
+
+static void free_appcontainer_pipe_sa(AppContainerPipeSA *p) {
+	if (!p)
+		return;
+	if (p->dacl)
+		LocalFree(p->dacl);           /* allocated by SetEntriesInAcl */
+	if (p->sd)
+		LocalFree(p->sd);             /* allocated by us via LocalAlloc */
+	if (p->sid)
+		LocalFree(p->sid);            /* allocated by ConvertStringSidToSid */
+	g_free(p);
+}
+
+static AppContainerPipeSA *make_appcontainer_pipe_sa(void) {
+	AppContainerPipeSA *p = g_new0(AppContainerPipeSA, 1);
+	EXPLICIT_ACCESSA ea;
+	DWORD rc;
+
+	/* "ALL APPLICATION PACKAGES" — every AppContainer child carries this SID. */
+	if (!ConvertStringSidToSidA("S-1-15-2-1", &p->sid)) {
+		siril_log_debug("pipe SD: ConvertStringSidToSid failed: %lu\n",
+		                GetLastError());
+		goto fail;
+	}
+
+	ZeroMemory(&ea, sizeof(ea));
+	ea.grfAccessPermissions = GENERIC_READ | GENERIC_WRITE;
+	ea.grfAccessMode        = SET_ACCESS;
+	ea.grfInheritance       = NO_INHERITANCE;
+	ea.Trustee.TrusteeForm  = TRUSTEE_IS_SID;
+	ea.Trustee.TrusteeType  = TRUSTEE_IS_WELL_KNOWN_GROUP;
+	ea.Trustee.ptstrName    = (LPSTR) p->sid;
+
+	/* WARNING (untested, verify on Windows): passing an explicit DACL REPLACES
+	 * the pipe's default DACL entirely — it is NOT merged with the token default.
+	 * This single-ACE DACL therefore grants access ONLY to ALL APPLICATION
+	 * PACKAGES. The server (Siril) is unaffected (it uses the handle it already
+	 * holds), and an AppContainer child carries that SID so it can connect. BUT a
+	 * NON-AppContainer client (the fail-open path when AppContainer can't be
+	 * created, or a normal-user run) lacks that SID and would be DENIED, breaking
+	 * IPC. Before relying on the fail-open path, add a second ACE granting the
+	 * current token user (OpenProcessToken + GetTokenInformation(TokenUser)) full
+	 * access here. */
+	rc = SetEntriesInAclA(1, &ea, NULL, &p->dacl);
+	if (rc != ERROR_SUCCESS) {
+		siril_log_debug("pipe SD: SetEntriesInAcl failed: %lu\n", rc);
+		goto fail;
+	}
+
+	p->sd = (PSECURITY_DESCRIPTOR) LocalAlloc(LPTR,
+	                                          SECURITY_DESCRIPTOR_MIN_LENGTH);
+	if (!p->sd) {
+		siril_log_debug("pipe SD: LocalAlloc(SD) failed\n");
+		goto fail;
+	}
+	if (!InitializeSecurityDescriptor(p->sd, SECURITY_DESCRIPTOR_REVISION)) {
+		siril_log_debug("pipe SD: InitializeSecurityDescriptor failed: %lu\n",
+		                GetLastError());
+		goto fail;
+	}
+	if (!SetSecurityDescriptorDacl(p->sd, TRUE, p->dacl, FALSE)) {
+		siril_log_debug("pipe SD: SetSecurityDescriptorDacl failed: %lu\n",
+		                GetLastError());
+		goto fail;
+	}
+
+	p->sa.nLength = sizeof(SECURITY_ATTRIBUTES);
+	p->sa.lpSecurityDescriptor = p->sd;
+	p->sa.bInheritHandle = FALSE;
+	return p;
+
+fail:
+	free_appcontainer_pipe_sa(p);
+	return NULL;
+}
+
 static Connection* create_connection(const gchar *pipe_name) {
 	Connection *conn = g_new0(Connection, 1);
 	g_mutex_init(&conn->mutex);
 	g_cond_init(&conn->condition);
+
+	/* Grant the AppContainer child (ALL APPLICATION PACKAGES) access to the
+	 * pipe. If the SD cannot be built we pass NULL (default DACL) and IPC keeps
+	 * its previous behaviour — correct for a non-sandboxed run. */
+	AppContainerPipeSA *pipe_sa = make_appcontainer_pipe_sa();
 
 	conn->pipe_handle = CreateNamedPipe(
 		pipe_name,
@@ -1960,8 +2113,10 @@ static Connection* create_connection(const gchar *pipe_name) {
 		BUFFER_SIZE,
 		BUFFER_SIZE,
 		0,
-		NULL
+		pipe_sa ? &pipe_sa->sa : NULL
 	);
+
+	free_appcontainer_pipe_sa(pipe_sa);
 
 	if (conn->pipe_handle == INVALID_HANDLE_VALUE) {
 		siril_log_debug("Failed to create pipe: %lu\n", GetLastError());
@@ -2246,8 +2401,67 @@ static gpointer connection_worker(gpointer data) {
 typedef struct {
 	gchar *venv_path;
 	gchar *python_version;
-	GHashTable *env_vars;
+	gchar *bin_dir;		// the venv's bin/Scripts directory
 } PythonVenvInfo;
+
+/* The base venv's environment belongs to the python child, not to Siril.  It
+ * used to be exported into our own environ with g_setenv() once the
+ * initialisation had finished, which is unsound twice over.
+ *
+ * g_setenv() rewrites a table every thread reads through g_getenv() /
+ * g_get_environ() without any lock — glibc may reallocate `environ` — and the
+ * initialisation no longer runs after script execution but alongside it, so that
+ * overlap is now reachable rather than theoretical.  The com.env_mutex the
+ * export held is only taken by the other *writers*; readers all over Siril do
+ * not, and cannot be made to.
+ *
+ * And it put a python venv's bin directory at the front of the PATH Siril itself
+ * searches, so g_find_program_in_path() could hand back a program from inside
+ * the venv — the very lookups used to find the system python and uv.
+ *
+ * So the venv's environment is kept here instead, behind its own lock, and
+ * folded into the child's environment block at spawn time, which is the only
+ * place it was ever wanted. */
+static GMutex venv_env_mutex;
+static gchar *venv_env_virtual_env = NULL;	// base venv path, or NULL
+static gchar *venv_env_bin_dir = NULL;		// its bin dir, or NULL
+
+/* Publish the prepared venv's environment.  Called by the initialisation thread
+ * in place of the old g_setenv() loop. */
+static void publish_venv_environment(const gchar *venv_path, const gchar *bin_dir) {
+	g_mutex_lock(&venv_env_mutex);
+	g_free(venv_env_virtual_env);
+	g_free(venv_env_bin_dir);
+	venv_env_virtual_env = g_strdup(venv_path);
+	venv_env_bin_dir = g_strdup(bin_dir);
+	g_mutex_unlock(&venv_env_mutex);
+}
+
+/* Fold the base venv's environment into a g_get_environ()-style block: its bin
+ * directory at the front of PATH, and VIRTUAL_ENV.  A no-op until the
+ * initialisation has published one — and callers that then select a per-script
+ * venv overwrite VIRTUAL_ENV afterwards, exactly as they did when this arrived
+ * through the inherited environment. */
+static gchar **apply_venv_environment(gchar **envp) {
+	g_mutex_lock(&venv_env_mutex);
+	gchar *virtual_env = g_strdup(venv_env_virtual_env);
+	gchar *bin_dir = g_strdup(venv_env_bin_dir);
+	g_mutex_unlock(&venv_env_mutex);
+
+	if (virtual_env)
+		envp = g_environ_setenv(envp, "VIRTUAL_ENV", virtual_env, TRUE);
+	if (bin_dir) {
+		const gchar *path = g_environ_getenv(envp, "PATH");
+		gchar *new_path = path ?
+			g_strjoin(G_SEARCHPATH_SEPARATOR_S, bin_dir, path, NULL) :
+			g_strdup(bin_dir);
+		envp = g_environ_setenv(envp, "PATH", new_path, TRUE);
+		g_free(new_path);
+	}
+	g_free(virtual_env);
+	g_free(bin_dir);
+	return envp;
+}
 
 static gchar* build_venv_subdir_path(const gchar *venv_path, const gchar *subdir) {
 #ifdef _WIN32
@@ -2284,6 +2498,1957 @@ static gchar* find_venv_python_exe(const gchar *venv_path, const gboolean verbos
 		return NULL;
 	}
 	return python_exe;
+}
+
+// Locate the uv executable.
+//
+// Resolution order (per uv-conversion-plan.md §4.1):
+//   1. SIRIL_UV env var (full path; debug/override).
+//   2. <bundle>/bin/uv[.exe] on Windows (we ship uv there).
+//      macOS falls through to step 3: the launcher prepends the bundled
+//      bin dir to PATH and get_siril_bundle_path() is _WIN32-only here.
+//   3. g_find_program_in_path() (Linux / Flatpak / AppImage / macOS bundle).
+//   4. On macOS, well-known install dirs. GUI apps inherit launchd's
+//      minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin), so a uv installed by
+//      the standalone installer or Homebrew is invisible to step 3 even
+//      though it is on the user's shell PATH.
+//   5. NULL with *error set; caller falls back to the legacy pip path.
+static gchar *find_uv_executable(GError **error) {
+	const gchar *override = g_getenv("SIRIL_UV");
+	if (override && *override) {
+		if (g_file_test(override, G_FILE_TEST_IS_EXECUTABLE)) {
+			siril_log_debug("Using uv from SIRIL_UV: %s\n", override);
+			return g_strdup(override);
+		}
+		g_set_error(error, G_FILE_ERROR, G_FILE_ERROR_NOENT,
+				"SIRIL_UV points to '%s' but it is not executable",
+				override);
+		return NULL;
+	}
+
+#ifdef _WIN32
+	gchar *bundle_root = get_siril_bundle_path();
+	if (bundle_root) {
+		gchar *bundled = g_build_filename(bundle_root, "bin", UV_EXE, NULL);
+		g_free(bundle_root);
+		if (g_file_test(bundled, G_FILE_TEST_IS_EXECUTABLE)) {
+			siril_log_debug("Using bundled uv: %s\n", bundled);
+			return bundled;
+		}
+		g_free(bundled);
+	}
+#endif
+
+	gchar *on_path = g_find_program_in_path(UV_EXE);
+	if (on_path) {
+		siril_log_debug("Using uv from PATH: %s\n", on_path);
+		return on_path;
+	}
+
+#ifdef __APPLE__
+	const gchar *home = g_get_home_dir();
+	gchar *candidates[] = {
+		g_build_filename(home, ".local", "bin", UV_EXE, NULL),  // standalone installer
+		g_build_filename(home, ".cargo", "bin", UV_EXE, NULL),  // older standalone installer
+		g_build_filename("/opt/homebrew/bin", UV_EXE, NULL),    // Homebrew (Apple silicon)
+		g_build_filename("/usr/local/bin", UV_EXE, NULL),       // Homebrew (Intel)
+		g_build_filename("/opt/local/bin", UV_EXE, NULL),       // MacPorts
+		NULL
+	};
+	gchar *found = NULL;
+	for (gchar **p = candidates; *p; p++) {
+		if (!found && g_file_test(*p, G_FILE_TEST_IS_EXECUTABLE))
+			found = g_strdup(*p);
+		g_free(*p);
+	}
+	if (found) {
+		siril_log_debug("Using uv from well-known macOS location: %s\n", found);
+		return found;
+	}
+#endif
+
+	g_set_error(error, G_FILE_ERROR, G_FILE_ERROR_NOENT,
+			"uv executable not found");
+	return NULL;
+}
+
+// Public counterpart used by the preferences UI (see header). Just calls
+// find_uv_executable() and discards the error; the actual probe + version
+// check happens later in probe_uv_executable() at python-venv-init time.
+gboolean uv_executable_available(void) {
+	gchar *uv = find_uv_executable(NULL);
+	if (!uv) return FALSE;
+	g_free(uv);
+	return TRUE;
+}
+
+// Run `uv --version` and confirm the parsed version is >= min_version.
+// On success returns TRUE; on failure returns FALSE with *error set.
+static gboolean validate_uv_version(const gchar *uv_path,
+                                    const gchar *min_version,
+                                    GError **error) {
+	g_return_val_if_fail(uv_path != NULL, FALSE);
+	g_return_val_if_fail(min_version != NULL, FALSE);
+
+	gchar *argv[] = { (gchar *)uv_path, "--version", NULL };
+	gchar *stdout_data = NULL;
+	gchar *stderr_data = NULL;
+	gint exit_status = 0;
+	GError *spawn_error = NULL;
+
+	if (!g_spawn_sync(NULL, argv, NULL, G_SPAWN_DEFAULT,
+			NULL, NULL,
+			&stdout_data, &stderr_data,
+			&exit_status, &spawn_error)) {
+		g_propagate_prefixed_error(error, spawn_error,
+				"Failed to execute uv: ");
+		g_free(stdout_data);
+		g_free(stderr_data);
+		return FALSE;
+	}
+
+	if (!g_spawn_check_wait_status(exit_status, &spawn_error)) {
+		g_propagate_prefixed_error(error, spawn_error,
+				"uv --version exited with error: ");
+		g_free(stdout_data);
+		g_free(stderr_data);
+		return FALSE;
+	}
+
+	// Expected output format: "uv 0.5.11" (possibly followed by build metadata).
+	gboolean ok = FALSE;
+	if (stdout_data) {
+		gchar **tokens = g_strsplit_set(g_strstrip(stdout_data), " \t\n", -1);
+		if (tokens && tokens[0] && tokens[1]) {
+			version_number installed = get_version_number_from_string(tokens[1]);
+			version_number minimum = get_version_number_from_string(min_version);
+			if (compare_version(installed, minimum) >= 0) {
+				siril_log_debug("uv version %s satisfies minimum %s\n",
+						tokens[1], min_version);
+				ok = TRUE;
+			} else {
+				g_set_error(error, G_FILE_ERROR, G_FILE_ERROR_FAILED,
+						"uv version %s is older than required minimum %s",
+						tokens[1], min_version);
+			}
+		} else {
+			g_set_error(error, G_FILE_ERROR, G_FILE_ERROR_FAILED,
+					"Could not parse uv version from output: '%s'",
+					stdout_data);
+		}
+		g_strfreev(tokens);
+	} else {
+		g_set_error(error, G_FILE_ERROR, G_FILE_ERROR_FAILED,
+				"uv --version produced no output");
+	}
+
+	g_free(stdout_data);
+	g_free(stderr_data);
+	return ok;
+}
+
+// Probe for uv and cache the result. uv is REQUIRED: it is the only backend
+// that understands the PEP 723 inline dependencies this integration provisions
+// each script's venv from (pip has no PEP 723 support), so the former "legacy
+// pip" fallback can no longer set up a working environment and has been removed.
+// On success g_uv_path holds the absolute path; on failure g_uv_path stays NULL
+// and initialize_python_venv() aborts Python init with a fatal error — the same
+// treatment as a missing Python interpreter.
+//
+// Safe to call repeatedly; each call resets state and re-probes (so that
+// rebuild_*_venv() picks up a freshly installed uv).
+static void probe_uv_executable(void) {
+	clear_uv_state();
+
+	GError *error = NULL;
+	gchar *uv = find_uv_executable(&error);
+	if (!uv) {
+		siril_log_warning(_("uv was not found: %s. uv is required for Python "
+				"script support.\n"), error ? error->message : "unknown");
+		g_clear_error(&error);
+		return;
+	}
+
+	if (!validate_uv_version(uv, UV_MINIMUM_VERSION, &error)) {
+		siril_log_warning(_("Found uv at %s but it is unusable: %s. A newer uv "
+				"(>= %s) is required for Python script support.\n"),
+				uv, error ? error->message : "unknown", UV_MINIMUM_VERSION);
+		g_clear_error(&error);
+		g_free(uv);
+		return;
+	}
+
+	siril_log_message(_("uv discovered: %s (>= minimum %s).\n"),
+			uv, UV_MINIMUM_VERSION);
+
+	g_mutex_lock(&g_uv_mutex);
+	g_uv_path = uv;  // ownership transferred to the static
+	g_mutex_unlock(&g_uv_mutex);
+}
+
+// Returns the cached uv executable path, or NULL if uv is not in use.
+// The returned pointer is valid until the next clear_uv_state() /
+// probe_uv_executable() call; callers must not free it.
+static const gchar *get_uv_executable_path(void) {
+	g_mutex_lock(&g_uv_mutex);
+	const gchar *p = g_uv_path;
+	g_mutex_unlock(&g_uv_mutex);
+	return p;
+}
+
+// Drop the cached uv path. Called from rebuild_venv() so that a subsequent
+// initialize_python_venv() re-probes (allowing the user to install/uninstall
+// uv on the side and have the change picked up).
+static void clear_uv_state(void) {
+	g_mutex_lock(&g_uv_mutex);
+	g_free(g_uv_path);
+	g_uv_path = NULL;
+	g_mutex_unlock(&g_uv_mutex);
+}
+
+// §4.4: when the user opts in to uv-managed Python (SIRIL_UV_MANAGED_PYTHON=1),
+// return a version token suitable for `uv venv --python <token>`. uv will
+// fetch and install the toolchain on demand, sidestepping distro python3-venv
+// / ensurepip pain. Returns NULL when opt-out; caller frees on non-NULL.
+//
+// Phase 0 wiring: env-var gated, no preference UI yet (§4.4 plan checklist:
+// "Preference added" remains unticked until the prefs panel work lands).
+// Resolve "do we want uv to manage the interpreter, and if so which minor
+// version?" from env-var override + preferences. Returns NULL when we
+// should fall through to system Python (PATH / bundle); otherwise a
+// freshly-g_strdup'd version token like "3.13" that uv accepts as
+// `--python <token>`.
+//
+// Precedence:
+//   1. SIRIL_UV_MANAGED_PYTHON env var — useful for CI and the
+//      AppImage/Flatpak builders. Values:
+//        "0" / "off" / "false"  → force off (overrides pref-on)
+//        "1" / "on" / "true"    → force on with the pref-selected
+//                                  version
+//        "3.13" / "3.12" / …    → force on with the given version
+//        unset / empty          → fall through to pref
+//   2. com.pref.python.uv_managed + com.pref.python.uv_python_version.
+//
+// Caller frees the returned string.
+static gchar *get_uv_managed_python_token(void) {
+	const gchar *gate = g_getenv("SIRIL_UV_MANAGED_PYTHON");
+	if (gate && *gate) {
+		// Explicit off: "0", "off", "false" (case-insensitive).
+		if (g_strcmp0(gate, "0") == 0
+				|| g_ascii_strcasecmp(gate, "off") == 0
+				|| g_ascii_strcasecmp(gate, "false") == 0)
+			return NULL;
+		// Explicit on with a specific version: anything that doesn't
+		// match the "boolean true" tokens is taken as a version string.
+		if (g_strcmp0(gate, "1") != 0
+				&& g_ascii_strcasecmp(gate, "on") != 0
+				&& g_ascii_strcasecmp(gate, "true") != 0)
+			return g_strdup(gate);
+		// Boolean true: fall through to the pref-selected version.
+	}
+
+	if (!com.pref.python.uv_managed)
+		return NULL;
+
+	// pref.python.uv_python_version is initialised to "3.13" in
+	// initialize_default_settings(); be defensive against an ini that
+	// somehow blanked it out.
+	const gchar *ver = com.pref.python.uv_python_version;
+	if (!ver || !*ver)
+		ver = "3.13";
+	return g_strdup(ver);
+}
+
+// PEP 723 inline script metadata. We only care about the `dependencies`
+// array; everything else (requires-python, tool tables, etc.) is currently
+// ignored. Storage: gchar*-owning GPtrArray.
+struct pep723_metadata {
+	GPtrArray *dependencies;  // sorted list of dependency strings
+};
+
+static void pep723_metadata_free(pep723_metadata *meta) {
+	if (!meta) return;
+	if (meta->dependencies) g_ptr_array_free(meta->dependencies, TRUE);
+	g_free(meta);
+}
+
+// g_ptr_array_sort comparator: receives gchar** (pointers to array slots).
+static gint pep723_compare_strings(gconstpointer a, gconstpointer b) {
+	return g_ascii_strcasecmp(*(const gchar * const *)a,
+	                          *(const gchar * const *)b);
+}
+
+// Extract the "# /// script ... # ///" inline-metadata block from `source` and
+// strip the leading "# " from each line, yielding a TOML-ish chunk. Returns a
+// GString the caller frees with g_string_free(), or NULL if no block is present.
+// Shared by parse_pep723() (dependencies) and parse_siril_permissions().
+static GString *pep723_cleaned_block(const gchar *source) {
+	if (!source || !*source) return NULL;
+
+	GRegex *block_re = g_regex_new(
+			"^#\\s*///\\s*script\\s*$([\\s\\S]*?)^#\\s*///\\s*$",
+			G_REGEX_MULTILINE, 0, NULL);
+	if (!block_re) return NULL;
+
+	GMatchInfo *block_match = NULL;
+	gchar *block_inner = NULL;
+	if (g_regex_match(block_re, source, 0, &block_match))
+		block_inner = g_match_info_fetch(block_match, 1);
+	g_match_info_free(block_match);
+	g_regex_unref(block_re);
+	if (!block_inner) return NULL;
+
+	GString *cleaned = g_string_new(NULL);
+	gchar **lines = g_strsplit(block_inner, "\n", -1);
+	for (gchar **p = lines; *p; p++) {
+		const gchar *line = *p;
+		while (*line == ' ' || *line == '\t') line++;
+		if (*line != '#')   // PEP 723 blocks are entirely comment-prefixed
+			continue;
+		line++;             // skip '#'
+		if (*line == ' ') line++;   // skip optional single space
+		g_string_append(cleaned, line);
+		g_string_append_c(cleaned, '\n');
+	}
+	g_strfreev(lines);
+	g_free(block_inner);
+	return cleaned;
+}
+
+// Extract the PEP 723 metadata block from a source string. Returns NULL if
+// no block is found or no `dependencies` array is present. The caller owns
+// the returned struct.
+//
+// PEP 723 block format:
+//   # /// script
+//   # dependencies = [
+//   #   "numpy>=1.20",
+//   #   "scipy",
+//   # ]
+//   # requires-python = ">=3.11"
+//   # ///
+//
+// We support both single-line `dependencies = ["a", "b"]` and the multi-line
+// form shown above. We do NOT support full TOML — comments inside the array,
+// trailing commas, environment markers, etc. all just work as long as the
+// strings between `[` and `]` are simple double-quoted entries. Anything
+// fancier should be expressed in pyproject.toml, not in inline metadata.
+static pep723_metadata *parse_pep723(const gchar *source) {
+	GString *cleaned = pep723_cleaned_block(source);
+	if (!cleaned) return NULL;
+
+	// Find `dependencies = [ ... ]` — the `]` may be on the same line or a
+	// later one. We capture everything between the brackets non-greedily.
+	GRegex *deps_re = g_regex_new(
+			"dependencies\\s*=\\s*\\[([\\s\\S]*?)\\]",
+			G_REGEX_MULTILINE, 0, NULL);
+	if (!deps_re) {
+		g_string_free(cleaned, TRUE);
+		return NULL;
+	}
+
+	GMatchInfo *deps_match = NULL;
+	gchar *deps_inner = NULL;
+	if (g_regex_match(deps_re, cleaned->str, 0, &deps_match)) {
+		deps_inner = g_match_info_fetch(deps_match, 1);
+	}
+	g_match_info_free(deps_match);
+	g_regex_unref(deps_re);
+	g_string_free(cleaned, TRUE);
+
+	if (!deps_inner) return NULL;
+
+	// Extract each "..."-quoted string. Single quotes accepted too.
+	GRegex *str_re = g_regex_new("[\"']([^\"']*)[\"']", 0, 0, NULL);
+	if (!str_re) {
+		g_free(deps_inner);
+		return NULL;
+	}
+
+	pep723_metadata *meta = g_new0(pep723_metadata, 1);
+	meta->dependencies = g_ptr_array_new_with_free_func(g_free);
+
+	GMatchInfo *str_match = NULL;
+	g_regex_match(str_re, deps_inner, 0, &str_match);
+	while (g_match_info_matches(str_match)) {
+		gchar *dep = g_match_info_fetch(str_match, 1);
+		if (dep && *dep)
+			g_ptr_array_add(meta->dependencies, dep);
+		else
+			g_free(dep);
+		g_match_info_next(str_match, NULL);
+	}
+	g_match_info_free(str_match);
+	g_regex_unref(str_re);
+	g_free(deps_inner);
+
+	if (meta->dependencies->len == 0) {
+		pep723_metadata_free(meta);
+		return NULL;
+	}
+
+	// Canonicalise: sort case-insensitively so {numpy, scipy} and
+	// {scipy, numpy} hash to the same identity. NOTE: g_ptr_array_sort
+	// passes pointer-to-pointer (gchar**), not gchar*, to the comparator,
+	// so we cannot use g_ascii_strcasecmp directly.
+	g_ptr_array_sort(meta->dependencies, pep723_compare_strings);
+
+	return meta;
+}
+
+// SHA-256 of the canonicalised dependencies array, used as part of the
+// per-script venv identity for unsaved editor buffers. Returns the first
+// 16 hex chars (64 bits) as a newly-allocated string.
+static gchar *pep723_canonical_hash(const pep723_metadata *meta) {
+	if (!meta || !meta->dependencies || meta->dependencies->len == 0)
+		return NULL;
+	GString *buf = g_string_new(NULL);
+	for (guint i = 0; i < meta->dependencies->len; i++) {
+		g_string_append(buf, (const gchar *)g_ptr_array_index(meta->dependencies, i));
+		g_string_append_c(buf, '\n');
+	}
+	gchar *full = g_compute_checksum_for_string(G_CHECKSUM_SHA256, buf->str, buf->len);
+	g_string_free(buf, TRUE);
+	if (!full) return NULL;
+	gchar *truncated = g_strndup(full, 16);
+	g_free(full);
+	return truncated;
+}
+
+// ---- [tool.siril.permissions] manifest (phase B) -----------------------
+// A script may declare the sandbox permissions it needs in an inline-metadata
+// table (parsed statically, BEFORE the script runs):
+//
+//   # /// script
+//   # [tool.siril.permissions]
+//   # network = true
+//   # write = ["$WORKDIR/out", "$HOME/astro"]
+//   # read  = ["$HOME/catalogues"]
+//   # ///
+//
+// This is a REQUEST only; the consent layer (phase C) decides what is actually
+// granted. Path tokens $WORKDIR / $TMPDIR / $HOME / $USERDATA / $CONFIG expand
+// to the matching directory. `network` is a boolean — per-host allow-listing is
+// not enforceable by the underlying sandboxes (seccomp / Seatbelt / AppContainer).
+typedef struct {
+	gboolean present;        // a [tool.siril.permissions] table was found
+	gboolean network;        // network = true
+	gboolean unsandboxed;    // unsandboxed = true (escape hatch; overrides all)
+	GPtrArray *write_paths;  // gchar*, token-expanded
+	GPtrArray *read_paths;   // gchar*
+} siril_script_perms;
+
+static void siril_script_perms_free(siril_script_perms *p) {
+	if (!p) return;
+	if (p->write_paths) g_ptr_array_free(p->write_paths, TRUE);
+	if (p->read_paths)  g_ptr_array_free(p->read_paths, TRUE);
+	g_free(p);
+}
+
+// Expand a leading $TOKEN in a manifest path to its directory. Unknown/absent
+// tokens leave the string unchanged. Caller frees.
+static gchar *expand_perm_path_tokens(const gchar *raw, const char *workdir) {
+	gchar *cfg = g_build_filename(siril_get_config_dir(), PACKAGE, NULL);
+	const struct { const char *tok; const char *val; } map[] = {
+		{ "$WORKDIR",  workdir },
+		{ "$TMPDIR",   g_get_tmp_dir() },
+		{ "$HOME",     g_get_home_dir() },
+		{ "$USERDATA", siril_get_user_data_dir() },
+		{ "$CONFIG",   cfg },
+	};
+	gchar *out = NULL;
+	for (gsize i = 0; i < G_N_ELEMENTS(map); i++) {
+		gsize tlen = strlen(map[i].tok);
+		if (map[i].val && strncmp(raw, map[i].tok, tlen) == 0) {
+			out = g_strconcat(map[i].val, raw + tlen, NULL);
+			break;
+		}
+	}
+	g_free(cfg);
+	return out ? out : g_strdup(raw);
+}
+
+// Pull quoted strings out of `KEY = [ "a", "b" ]` within `table`, token-expand
+// them and append to `dest`.
+static void parse_perm_path_array(const gchar *table, const gchar *key,
+                                  GPtrArray *dest, const char *workdir) {
+	gchar *pat = g_strdup_printf("%s\\s*=\\s*\\[([\\s\\S]*?)\\]", key);
+	GRegex *arr_re = g_regex_new(pat, G_REGEX_MULTILINE, 0, NULL);
+	g_free(pat);
+	if (!arr_re) return;
+	GMatchInfo *m = NULL;
+	gchar *inner = NULL;
+	if (g_regex_match(arr_re, table, 0, &m))
+		inner = g_match_info_fetch(m, 1);
+	g_match_info_free(m);
+	g_regex_unref(arr_re);
+	if (!inner) return;
+
+	GRegex *str_re = g_regex_new("[\"']([^\"']*)[\"']", 0, 0, NULL);
+	if (str_re) {
+		GMatchInfo *sm = NULL;
+		g_regex_match(str_re, inner, 0, &sm);
+		while (g_match_info_matches(sm)) {
+			gchar *s = g_match_info_fetch(sm, 1);
+			if (s && *s)
+				g_ptr_array_add(dest, expand_perm_path_tokens(s, workdir));
+			g_free(s);
+			g_match_info_next(sm, NULL);
+		}
+		g_match_info_free(sm);
+		g_regex_unref(str_re);
+	}
+	g_free(inner);
+}
+
+// Parse the [tool.siril.permissions] table from a script's inline metadata.
+// Always returns a struct (never NULL); present==FALSE means no manifest so the
+// safe defaults apply. `workdir` seeds the $WORKDIR token (may be NULL).
+static siril_script_perms *parse_siril_permissions(const gchar *source,
+                                                   const char *workdir) {
+	siril_script_perms *p = g_new0(siril_script_perms, 1);
+	p->write_paths = g_ptr_array_new_with_free_func(g_free);
+	p->read_paths  = g_ptr_array_new_with_free_func(g_free);
+
+	GString *cleaned = pep723_cleaned_block(source);
+	if (!cleaned) return p;
+
+	// Isolate the table body: from its header to the next "[...]" header or EOF.
+	GRegex *tbl_re = g_regex_new(
+			"^\\[tool\\.siril\\.permissions\\]\\s*$([\\s\\S]*?)(?=^\\[|\\z)",
+			G_REGEX_MULTILINE, 0, NULL);
+	gchar *table = NULL;
+	if (tbl_re) {
+		GMatchInfo *tm = NULL;
+		if (g_regex_match(tbl_re, cleaned->str, 0, &tm))
+			table = g_match_info_fetch(tm, 1);
+		g_match_info_free(tm);
+		g_regex_unref(tbl_re);
+	}
+	g_string_free(cleaned, TRUE);
+	if (!table) return p;   // block present but no permissions table
+
+	p->present = TRUE;
+
+	GRegex *net_re = g_regex_new("network\\s*=\\s*true\\b",
+	                             G_REGEX_MULTILINE, 0, NULL);
+	if (net_re) {
+		p->network = g_regex_match(net_re, table, 0, NULL);
+		g_regex_unref(net_re);
+	}
+
+	// unsandboxed = true — the all-or-nothing escape hatch for glue scripts
+	// spawning opaque third-party software. Overrides the granular fields; the
+	// consent layer must gate it with a sterner warning than the rest.
+	GRegex *uns_re = g_regex_new("unsandboxed\\s*=\\s*true\\b",
+	                             G_REGEX_MULTILINE, 0, NULL);
+	if (uns_re) {
+		p->unsandboxed = g_regex_match(uns_re, table, 0, NULL);
+		g_regex_unref(uns_re);
+	}
+
+	parse_perm_path_array(table, "write", p->write_paths, workdir);
+	parse_perm_path_array(table, "read",  p->read_paths,  workdir);
+
+	g_free(table);
+	return p;
+}
+
+// TRUE if the request asks for anything beyond the safe defaults.
+static gboolean perms_request_is_elevated(const siril_script_perms *p) {
+	return p && p->present && (p->unsandboxed || p->network ||
+			p->write_paths->len > 0 || p->read_paths->len > 0);
+}
+
+// ---- [tool.siril.gpu] manifest --------------------------------------------
+// A script that needs a GPU ML framework declares it here rather than as a
+// normal PEP 723 dependency, because the correct wheel (CUDA / ROCm / DirectML /
+// CPU variant) is hardware-specific and is chosen + recorded by GPU_Manager.py,
+// not resolved by uv. Siril installs the recorded variant into the script's venv
+// during UNSANDBOXED provisioning (provision_gpu_frameworks), so the sandboxed
+// script itself never has to invoke uv — which is what makes this work with a
+// snap-packaged uv (snap-confine cannot elevate under the sandbox's
+// no_new_privs). `extra` lists ordinary packages that depend on the framework
+// (e.g. spandrel needs torch) and so must be installed AFTER it.
+//
+//   # [tool.siril.gpu]
+//   # torch = true
+//   # extra = ["spandrel"]
+typedef struct {
+	gboolean present;
+	gboolean torch;
+	gboolean onnxruntime;
+	gboolean jax;
+	GPtrArray *extra;   // gchar* package names, installed after the framework(s)
+} script_gpu_req;
+
+static void script_gpu_req_free(script_gpu_req *g) {
+	if (!g) return;
+	if (g->extra) g_ptr_array_free(g->extra, TRUE);
+	g_free(g);
+}
+
+static gboolean script_gpu_req_any(const script_gpu_req *g) {
+	return g && (g->torch || g->onnxruntime || g->jax ||
+			(g->extra && g->extra->len > 0));
+}
+
+static script_gpu_req *parse_script_gpu(const gchar *source) {
+	script_gpu_req *g = g_new0(script_gpu_req, 1);
+	g->extra = g_ptr_array_new_with_free_func(g_free);
+
+	GString *cleaned = pep723_cleaned_block(source);
+	if (!cleaned) return g;
+
+	GRegex *tbl_re = g_regex_new(
+			"^\\[tool\\.siril\\.gpu\\]\\s*$([\\s\\S]*?)(?=^\\[|\\z)",
+			G_REGEX_MULTILINE, 0, NULL);
+	gchar *table = NULL;
+	if (tbl_re) {
+		GMatchInfo *tm = NULL;
+		if (g_regex_match(tbl_re, cleaned->str, 0, &tm))
+			table = g_match_info_fetch(tm, 1);
+		g_match_info_free(tm);
+		g_regex_unref(tbl_re);
+	}
+	g_string_free(cleaned, TRUE);
+	if (!table) return g;
+
+	g->present = TRUE;
+	const struct { const char *key; gboolean *flag; } bools[] = {
+		{ "torch",       &g->torch },
+		{ "onnxruntime", &g->onnxruntime },
+		{ "jax",         &g->jax },
+	};
+	for (gsize i = 0; i < G_N_ELEMENTS(bools); i++) {
+		gchar *pat = g_strdup_printf("^%s\\s*=\\s*true\\b", bools[i].key);
+		GRegex *re = g_regex_new(pat, G_REGEX_MULTILINE, 0, NULL);
+		g_free(pat);
+		if (re) {
+			*bools[i].flag = g_regex_match(re, table, 0, NULL);
+			g_regex_unref(re);
+		}
+	}
+	// `extra` package names have no path tokens; parse_perm_path_array with a
+	// NULL workdir leaves them unchanged.
+	parse_perm_path_array(table, "extra", g->extra, NULL);
+	g_free(table);
+	return g;
+}
+
+// Best-effort: ensure the NVIDIA kernel modules + device nodes exist BEFORE the
+// sandbox is built. CUDA lazily creates /dev/nvidia-uvm via the setuid-root
+// nvidia-modprobe helper on first use, but the sandbox's PR_SET_NO_NEW_PRIVS
+// makes that setuid elevation fail (the same wall as snap-confine), so the node
+// never appears and cudaSetDevice() dies with error 304 ("OS call failed"),
+// forcing a CPU fallback. Running nvidia-modprobe here — UNSANDBOXED, before the
+// spawn and before the sandbox enumerates /dev — creates /dev/nvidia0,
+// /dev/nvidiactl and /dev/nvidia-uvm[-tools] so the confined child can open them
+// under the GPU device grant. Silently skipped when nvidia-modprobe is absent
+// (AMD/Intel, or no NVIDIA driver); ROCm (/dev/kfd) and Intel (/dev/dri) nodes
+// are created by their drivers at boot and need no equivalent. Idempotent and
+// cheap, so calling it on every GPU-script launch is fine.
+static void warmup_nvidia_devices(void) {
+	gchar *nm = g_find_program_in_path("nvidia-modprobe");
+	if (!nm)
+		return;
+	gchar *argv[] = { nm, "-u", "-c", "0", NULL };
+	GError *e = NULL;
+	if (!g_spawn_sync(NULL, argv, NULL,
+			G_SPAWN_STDOUT_TO_DEV_NULL | G_SPAWN_STDERR_TO_DEV_NULL,
+			NULL, NULL, NULL, NULL, NULL, &e))
+		siril_log_debug("nvidia-modprobe warm-up skipped: %s\n",
+				e ? e->message : "unknown");
+	g_clear_error(&e);
+	g_free(nm);
+}
+
+// Install the GPU framework(s) a script declared in [tool.siril.gpu] into its
+// venv, UNSANDBOXED (this is provisioning, before the sandboxed script runs).
+// Installs only a variant the user has already recorded via GPU_Manager.py
+// (load_gpu_preferences), so it is a fast hard-link from the shared uv cache and
+// never a surprise multi-GB heuristic download. `extra` packages install after
+// the framework so torch-dependent wheels resolve against it. Best-effort: any
+// failure is logged and does NOT block the script — the script's own import
+// guard then tells the user to run the GPU Manager. Idempotent, so it is safe to
+// call on every launch (ensure_*'s fast path is a no-op when already satisfied,
+// and it re-syncs the venv if the user later changes the recorded variant).
+static void provision_gpu_frameworks(const gchar *venv_python,
+                                     const script_gpu_req *gpu) {
+	if (!venv_python || !script_gpu_req_any(gpu))
+		return;
+
+	GString *prog = g_string_new(
+		"import sys\n"
+		"try:\n"
+		"    import sirilpy.gpuhelper as _g\n"
+		"    _p = _g.load_gpu_preferences()\n"
+		"    _have = False\n");
+	if (gpu->torch)
+		g_string_append(prog,
+			"    if 'torch' in _p:\n"
+			"        _g.TorchHelper().ensure_torch(); _have = True\n");
+	if (gpu->onnxruntime)
+		g_string_append(prog,
+			"    if 'onnxruntime' in _p:\n"
+			"        _g.ONNXHelper().ensure_onnxruntime(); _have = True\n");
+	if (gpu->jax)
+		g_string_append(prog,
+			"    if 'jax' in _p:\n"
+			"        _g.JaxHelper().ensure_jax(); _have = True\n");
+	if (gpu->extra && gpu->extra->len > 0) {
+		// Only install the extras once a framework variant is actually present,
+		// so a torch-dependent wheel (spandrel) does not pull a CPU torch when
+		// the user has not set up the GPU framework via GPU_Manager yet.
+		g_string_append(prog,
+			"    if _have:\n"
+			"        import sirilpy as _s\n"
+			"        _s.ensure_installed(");
+		for (guint i = 0; i < gpu->extra->len; i++) {
+			gchar *esc = g_strescape(g_ptr_array_index(gpu->extra, i), NULL);
+			g_string_append_printf(prog, "%s\"%s\"", i ? ", " : "", esc);
+			g_free(esc);
+		}
+		g_string_append(prog, ")\n");
+	}
+	g_string_append(prog,
+		"except Exception as _e:\n"
+		"    print('GPU provisioning: %s' % _e, file=sys.stderr)\n"
+		"    sys.exit(1)\n");
+
+	gchar *project_path = g_build_filename(g_get_user_data_dir(), "siril", NULL);
+	gchar *argv[] = { (gchar *)venv_python, "-c", prog->str, NULL };
+	gchar **env = g_get_environ();
+	inject_uv_env(&env, project_path);   // shared UV_CACHE_DIR (as GPU_Manager)
+	env = g_environ_setenv(env, "SIRIL_DATA_DIR", project_path, TRUE);  // gpu-prefs.json
+
+	siril_log_message(_("Checking the script's GPU framework(s)…\n"));
+	gchar *sout = NULL, *serr = NULL;
+	gint status = 0;
+	GError *err = NULL;
+	gboolean ok = g_spawn_sync(NULL, argv, env, G_SPAWN_DEFAULT, NULL, NULL,
+			&sout, &serr, &status, &err);
+	g_strfreev(env);
+	g_free(project_path);
+	if (!ok || !g_spawn_check_wait_status(status, NULL)) {
+		siril_log_warning(_("Could not provision GPU framework(s) for this "
+				"script: %s. The script will still run; if it needs a GPU "
+				"framework, install it with the GPU Manager script.\n"),
+				(serr && *serr) ? g_strchomp(serr)
+						: (err ? err->message : "unknown"));
+	} else if (sout && *sout) {
+		siril_log_debug("GPU provisioning output:\n%s\n", sout);
+	}
+	g_clear_error(&err);
+	g_free(sout);
+	g_free(serr);
+	g_string_free(prog, TRUE);
+}
+
+// ---- remembered consent store (phase C) --------------------------------
+// A grant records exactly what the user approved for a script, keyed by its
+// hash, in <project>/script_perms.json (mirrors script_venvs.json). It is
+// re-applied on a later run only if it still COVERS the script's current
+// request, so adding a permission re-prompts. Only a GUI Approve or the
+// `pyscript -permissive` flag ever creates a grant.
+typedef struct {
+	gboolean unsandboxed;
+	gboolean network;
+	GPtrArray *write_paths;   // gchar*
+	GPtrArray *read_paths;    // gchar*
+	gchar *approved_iso;
+	gchar *script_path;       // informational
+} perms_grant;
+
+static void perms_grant_free(perms_grant *g) {
+	if (!g) return;
+	if (g->write_paths) g_ptr_array_free(g->write_paths, TRUE);
+	if (g->read_paths)  g_ptr_array_free(g->read_paths, TRUE);
+	g_free(g->approved_iso);
+	g_free(g->script_path);
+	g_free(g);
+}
+
+// Build a grant capturing exactly what the request asks for.
+static perms_grant *perms_grant_from_request(const siril_script_perms *req,
+                                             const gchar *script_path) {
+	perms_grant *g = g_new0(perms_grant, 1);
+	g->unsandboxed = req->unsandboxed;
+	g->network = req->network;
+	g->write_paths = g_ptr_array_new_with_free_func(g_free);
+	g->read_paths  = g_ptr_array_new_with_free_func(g_free);
+	for (guint i = 0; i < req->write_paths->len; i++)
+		g_ptr_array_add(g->write_paths,
+				g_strdup(g_ptr_array_index(req->write_paths, i)));
+	for (guint i = 0; i < req->read_paths->len; i++)
+		g_ptr_array_add(g->read_paths,
+				g_strdup(g_ptr_array_index(req->read_paths, i)));
+	g->script_path = script_path ? g_strdup(script_path) : NULL;
+	GDateTime *now = g_date_time_new_now_utc();
+	g->approved_iso = now ? g_date_time_format_iso8601(now) : NULL;
+	if (now) g_date_time_unref(now);
+	return g;
+}
+
+static gboolean ptrarray_contains_str(GPtrArray *a, const char *s) {
+	for (guint i = 0; i < a->len; i++)
+		if (g_strcmp0(g_ptr_array_index(a, i), s) == 0)
+			return TRUE;
+	return FALSE;
+}
+
+// TRUE if `grant` covers everything `req` asks for (grant is a superset).
+static gboolean perms_grant_covers(const perms_grant *grant,
+                                   const siril_script_perms *req) {
+	if (!grant) return FALSE;
+	if (req->unsandboxed && !grant->unsandboxed) return FALSE;
+	if (req->network && !grant->network) return FALSE;
+	for (guint i = 0; i < req->write_paths->len; i++)
+		if (!ptrarray_contains_str(grant->write_paths,
+				g_ptr_array_index(req->write_paths, i)))
+			return FALSE;
+	for (guint i = 0; i < req->read_paths->len; i++)
+		if (!ptrarray_contains_str(grant->read_paths,
+				g_ptr_array_index(req->read_paths, i)))
+			return FALSE;
+	return TRUE;
+}
+
+static gchar *perms_store_path(const gchar *project_path) {
+	return g_build_filename(project_path, "script_perms.json", NULL);
+}
+
+// Load hash -> perms_grant* from disk (missing file => empty table). Caller
+// destroys the table (values freed via perms_grant_free).
+static GHashTable *perms_store_load(const gchar *project_path) {
+	GHashTable *t = g_hash_table_new_full(g_str_hash, g_str_equal, g_free,
+			(GDestroyNotify) perms_grant_free);
+	gchar *path = perms_store_path(project_path);
+	yyjson_doc *doc = g_file_test(path, G_FILE_TEST_EXISTS)
+			? yyjson_read_file(path, 0, NULL, NULL) : NULL;
+	g_free(path);
+	if (!doc) return t;
+	yyjson_val *root = yyjson_doc_get_root(doc);
+	yyjson_val *entries = root ? yyjson_obj_get(root, "entries") : NULL;
+	if (entries && yyjson_is_obj(entries)) {
+		yyjson_obj_iter it;
+		yyjson_obj_iter_init(entries, &it);
+		yyjson_val *key;
+		while ((key = yyjson_obj_iter_next(&it))) {
+			yyjson_val *e = yyjson_obj_iter_get_val(key);
+			if (!yyjson_is_obj(e)) continue;
+			perms_grant *g = g_new0(perms_grant, 1);
+			g->write_paths = g_ptr_array_new_with_free_func(g_free);
+			g->read_paths  = g_ptr_array_new_with_free_func(g_free);
+			yyjson_val *v;
+			if ((v = yyjson_obj_get(e, "unsandboxed"))) g->unsandboxed = yyjson_get_bool(v);
+			if ((v = yyjson_obj_get(e, "network")))     g->network = yyjson_get_bool(v);
+			if ((v = yyjson_obj_get(e, "approved")) && yyjson_is_str(v))
+				g->approved_iso = g_strdup(yyjson_get_str(v));
+			if ((v = yyjson_obj_get(e, "script_path")) && yyjson_is_str(v))
+				g->script_path = g_strdup(yyjson_get_str(v));
+			yyjson_val *arr, *item; yyjson_arr_iter ait;
+			if ((arr = yyjson_obj_get(e, "write")) && yyjson_is_arr(arr)) {
+				yyjson_arr_iter_init(arr, &ait);
+				while ((item = yyjson_arr_iter_next(&ait)))
+					if (yyjson_is_str(item))
+						g_ptr_array_add(g->write_paths, g_strdup(yyjson_get_str(item)));
+			}
+			if ((arr = yyjson_obj_get(e, "read")) && yyjson_is_arr(arr)) {
+				yyjson_arr_iter_init(arr, &ait);
+				while ((item = yyjson_arr_iter_next(&ait)))
+					if (yyjson_is_str(item))
+						g_ptr_array_add(g->read_paths, g_strdup(yyjson_get_str(item)));
+			}
+			g_hash_table_replace(t, g_strdup(yyjson_get_str(key)), g);
+		}
+	}
+	yyjson_doc_free(doc);
+	return t;
+}
+
+// Rewrite the whole store atomically (.tmp + rename), mirroring ledger_save.
+static gboolean perms_store_save(GHashTable *t, const gchar *project_path) {
+	yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+	yyjson_mut_val *root = yyjson_mut_obj(doc);
+	yyjson_mut_doc_set_root(doc, root);
+	yyjson_mut_obj_add_int(doc, root, "version", 1);
+	yyjson_mut_val *entries = yyjson_mut_obj(doc);
+	yyjson_mut_obj_add_val(doc, root, "entries", entries);
+
+	GHashTableIter it; gpointer k, v;
+	g_hash_table_iter_init(&it, t);
+	while (g_hash_table_iter_next(&it, &k, &v)) {
+		perms_grant *g = v;
+		yyjson_mut_val *obj = yyjson_mut_obj(doc);
+		yyjson_mut_obj_add_bool(doc, obj, "unsandboxed", g->unsandboxed);
+		yyjson_mut_obj_add_bool(doc, obj, "network", g->network);
+		if (g->approved_iso)
+			yyjson_mut_obj_add_strcpy(doc, obj, "approved", g->approved_iso);
+		if (g->script_path)
+			yyjson_mut_obj_add_strcpy(doc, obj, "script_path", g->script_path);
+		yyjson_mut_val *warr = yyjson_mut_arr(doc);
+		for (guint i = 0; i < g->write_paths->len; i++)
+			yyjson_mut_arr_add_strcpy(doc, warr, g_ptr_array_index(g->write_paths, i));
+		yyjson_mut_obj_add_val(doc, obj, "write", warr);
+		yyjson_mut_val *rarr = yyjson_mut_arr(doc);
+		for (guint i = 0; i < g->read_paths->len; i++)
+			yyjson_mut_arr_add_strcpy(doc, rarr, g_ptr_array_index(g->read_paths, i));
+		yyjson_mut_obj_add_val(doc, obj, "read", rarr);
+		/* key `k` is the hash-table key; it outlives this write (the table is
+		 * destroyed only after save returns), so add_val's non-copying key is
+		 * safe — mirrors ledger_save. */
+		yyjson_mut_obj_add_val(doc, entries, (const char *) k, obj);
+	}
+
+	gchar *path = perms_store_path(project_path);
+	gchar *tmp = g_strdup_printf("%s.tmp.%d", path, getpid());
+	gboolean ok = yyjson_mut_write_file(tmp, doc, YYJSON_WRITE_PRETTY, NULL, NULL);
+	yyjson_mut_doc_free(doc);
+	if (ok && g_rename(tmp, path) != 0) ok = FALSE;
+	if (!ok) g_unlink(tmp);
+	g_free(tmp);
+	g_free(path);
+	return ok;
+}
+
+// NULL-terminated gchar** copy of a GPtrArray of strings (for the policy's
+// extra_write/read_paths). An empty array yields a 1-element {NULL} vector,
+// which the platform backends treat as "no extra paths".
+static gchar **strv_from_ptrarray(GPtrArray *a) {
+	gchar **v = g_new0(gchar *, a->len + 1);
+	for (guint i = 0; i < a->len; i++)
+		v[i] = g_strdup(g_ptr_array_index(a, i));
+	return v;
+}
+
+// Human-readable consent text for the GUI dialog. Unsandboxed gets a distinct,
+// sterner message.
+static gchar *build_perms_consent_message(const siril_script_perms *req) {
+	if (req->unsandboxed)
+		return g_strdup(_("This script has asked to run with NO sandbox. It will have "
+				"the same full access to your files and network as any program you "
+				"run.\n\nOnly approve scripts you fully trust."));
+	GString *s = g_string_new(
+			_("This script has requested the following extra permissions:\n"));
+	if (req->network)
+		g_string_append(s, _("\n  \xe2\x80\xa2 Network access"));
+	for (guint i = 0; i < req->write_paths->len; i++)
+		g_string_append_printf(s, _("\n  \xe2\x80\xa2 Write access to: %s"),
+				(const char *) g_ptr_array_index(req->write_paths, i));
+	for (guint i = 0; i < req->read_paths->len; i++)
+		g_string_append_printf(s, _("\n  \xe2\x80\xa2 Read access to: %s"),
+				(const char *) g_ptr_array_index(req->read_paths, i));
+	g_string_append(s, _("\n\nApprove only if you trust this script."));
+	return g_string_free(s, FALSE);
+}
+
+// Per-script venv ledger.
+//
+// Maps script_hash → metadata about the venv we created for it. Lives on
+// disk at <project_path>/script_venvs.json. Loaded lazily on first use of
+// the per-script feature; saved synchronously after each mutation.
+//
+// File format (versioned for forward compat):
+//   { "version": 1,
+//     "entries": {
+//       "<script-hash>": {
+//         "script_path": "/path/to/script.py",   (may be missing)
+//         "created":      "2026-05-25T01:23:45Z",
+//         "last_used":    "2026-05-25T01:30:00Z",
+//         "pep723_hash":  "08b3f2c357e52145",    (may be missing)
+//         "sirilpy_version": "1.1.12"
+//       }, ...
+//     }
+//   }
+typedef struct {
+	gchar *script_hash;       // venv identity (also hash table key)
+	gchar *script_path;       // absolute path of the script, may be NULL
+	gchar *created_iso;       // ISO-8601 UTC
+	gchar *last_used_iso;     // ISO-8601 UTC
+	gchar *pep723_hash;       // canonical-deps hash, may be NULL
+	gchar *sirilpy_version;   // e.g. "1.1.12"
+} venv_ledger_entry;
+
+typedef struct {
+	GHashTable *entries;      // script_hash -> venv_ledger_entry*
+	GMutex mutex;             // serialises mutations and disk I/O
+} venv_ledger;
+
+static venv_ledger *g_venv_ledger = NULL;
+static GMutex g_venv_ledger_init_mutex;
+
+static void venv_ledger_entry_free(venv_ledger_entry *e) {
+	if (!e) return;
+	g_free(e->script_hash);
+	g_free(e->script_path);
+	g_free(e->created_iso);
+	g_free(e->last_used_iso);
+	g_free(e->pep723_hash);
+	g_free(e->sirilpy_version);
+	g_free(e);
+}
+
+static gchar *ledger_path_for(const gchar *project_path) {
+	return g_build_filename(project_path, "script_venvs.json", NULL);
+}
+
+// Load ledger from disk. Missing file → empty ledger (not an error).
+static venv_ledger *ledger_load(const gchar *project_path) {
+	venv_ledger *ledger = g_new0(venv_ledger, 1);
+	g_mutex_init(&ledger->mutex);
+	ledger->entries = g_hash_table_new_full(g_str_hash, g_str_equal,
+			g_free, (GDestroyNotify)venv_ledger_entry_free);
+
+	gchar *path = ledger_path_for(project_path);
+	if (!g_file_test(path, G_FILE_TEST_EXISTS)) {
+		g_free(path);
+		return ledger;
+	}
+
+	yyjson_doc *doc = yyjson_read_file(path, 0, NULL, NULL);
+	g_free(path);
+	if (!doc) {
+		siril_log_warning(_("Could not parse %s; starting with an empty ledger.\n"),
+				"script_venvs.json");
+		return ledger;
+	}
+
+	yyjson_val *root = yyjson_doc_get_root(doc);
+	yyjson_val *entries = root ? yyjson_obj_get(root, "entries") : NULL;
+	if (!entries || !yyjson_is_obj(entries)) {
+		yyjson_doc_free(doc);
+		return ledger;
+	}
+
+	yyjson_obj_iter iter;
+	yyjson_obj_iter_init(entries, &iter);
+	yyjson_val *key, *val;
+	while ((key = yyjson_obj_iter_next(&iter))) {
+		val = yyjson_obj_iter_get_val(key);
+		if (!yyjson_is_obj(val)) continue;
+		venv_ledger_entry *e = g_new0(venv_ledger_entry, 1);
+		e->script_hash = g_strdup(yyjson_get_str(key));
+		yyjson_val *v;
+		if ((v = yyjson_obj_get(val, "script_path")) && yyjson_is_str(v))
+			e->script_path = g_strdup(yyjson_get_str(v));
+		if ((v = yyjson_obj_get(val, "created")) && yyjson_is_str(v))
+			e->created_iso = g_strdup(yyjson_get_str(v));
+		if ((v = yyjson_obj_get(val, "last_used")) && yyjson_is_str(v))
+			e->last_used_iso = g_strdup(yyjson_get_str(v));
+		if ((v = yyjson_obj_get(val, "pep723_hash")) && yyjson_is_str(v))
+			e->pep723_hash = g_strdup(yyjson_get_str(v));
+		if ((v = yyjson_obj_get(val, "sirilpy_version")) && yyjson_is_str(v))
+			e->sirilpy_version = g_strdup(yyjson_get_str(v));
+		g_hash_table_replace(ledger->entries, g_strdup(e->script_hash), e);
+	}
+	yyjson_doc_free(doc);
+	return ledger;
+}
+
+// Atomic save: write to .tmp then rename. Returns FALSE with *error set on
+// failure; on success the on-disk ledger reflects the in-memory state.
+static gboolean ledger_save(venv_ledger *ledger, const gchar *project_path,
+                            GError **error) {
+	yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+	yyjson_mut_val *root = yyjson_mut_obj(doc);
+	yyjson_mut_doc_set_root(doc, root);
+	yyjson_mut_obj_add_int(doc, root, "version", 1);
+
+	yyjson_mut_val *entries = yyjson_mut_obj(doc);
+	yyjson_mut_obj_add_val(doc, root, "entries", entries);
+
+	GHashTableIter iter;
+	gpointer k, v;
+	g_hash_table_iter_init(&iter, ledger->entries);
+	while (g_hash_table_iter_next(&iter, &k, &v)) {
+		venv_ledger_entry *e = (venv_ledger_entry *)v;
+		yyjson_mut_val *obj = yyjson_mut_obj(doc);
+		if (e->script_path)
+			yyjson_mut_obj_add_str(doc, obj, "script_path", e->script_path);
+		if (e->created_iso)
+			yyjson_mut_obj_add_str(doc, obj, "created", e->created_iso);
+		if (e->last_used_iso)
+			yyjson_mut_obj_add_str(doc, obj, "last_used", e->last_used_iso);
+		if (e->pep723_hash)
+			yyjson_mut_obj_add_str(doc, obj, "pep723_hash", e->pep723_hash);
+		if (e->sirilpy_version)
+			yyjson_mut_obj_add_str(doc, obj, "sirilpy_version", e->sirilpy_version);
+		yyjson_mut_obj_add_val(doc, entries, e->script_hash, obj);
+	}
+
+	gchar *final_path = ledger_path_for(project_path);
+	gchar *tmp_path = g_strdup_printf("%s.tmp.%d", final_path, getpid());
+
+	yyjson_write_err werr;
+	gboolean wrote = yyjson_mut_write_file(tmp_path, doc,
+			YYJSON_WRITE_PRETTY, NULL, &werr);
+	yyjson_mut_doc_free(doc);
+
+	if (!wrote) {
+		g_set_error(error, G_FILE_ERROR, G_FILE_ERROR_FAILED,
+				"yyjson write failed: %s", werr.msg ? werr.msg : "unknown");
+		g_unlink(tmp_path);
+		g_free(tmp_path);
+		g_free(final_path);
+		return FALSE;
+	}
+
+	if (g_rename(tmp_path, final_path) != 0) {
+		g_set_error(error, G_FILE_ERROR, g_file_error_from_errno(errno),
+				"Could not rename ledger tmp file: %s", g_strerror(errno));
+		g_unlink(tmp_path);
+		g_free(tmp_path);
+		g_free(final_path);
+		return FALSE;
+	}
+	g_free(tmp_path);
+	g_free(final_path);
+	return TRUE;
+}
+
+static void ledger_free(venv_ledger *ledger) {
+	if (!ledger) return;
+	if (ledger->entries) g_hash_table_destroy(ledger->entries);
+	g_mutex_clear(&ledger->mutex);
+	g_free(ledger);
+}
+
+// Lazily initialise the global ledger from disk. Returns the singleton
+// (never NULL). Subsequent callers see whatever state mutations have
+// produced.
+static venv_ledger *get_venv_ledger(const gchar *project_path) {
+	g_mutex_lock(&g_venv_ledger_init_mutex);
+	if (!g_venv_ledger)
+		g_venv_ledger = ledger_load(project_path);
+	g_mutex_unlock(&g_venv_ledger_init_mutex);
+	return g_venv_ledger;
+}
+
+// Returns a deep copy of the ledger entry for `script_hash`, or NULL if no
+// such entry exists. Caller owns the result and must free with
+// venv_ledger_entry_free().
+//
+// Returning a copy rather than a borrowed pointer protects callers from
+// concurrent mutation: ledger_record / g_hash_table_remove may destroy
+// the underlying entry (via the table's destroy_func) between lookup and
+// field access, which previously caused a UAF window.
+static venv_ledger_entry *ledger_lookup(venv_ledger *ledger,
+                                        const gchar *script_hash) {
+	if (!ledger || !script_hash) return NULL;
+	g_mutex_lock(&ledger->mutex);
+	venv_ledger_entry *src = g_hash_table_lookup(ledger->entries, script_hash);
+	venv_ledger_entry *copy = NULL;
+	if (src) {
+		copy = g_new0(venv_ledger_entry, 1);
+		copy->script_hash    = g_strdup(src->script_hash);
+		copy->script_path    = g_strdup(src->script_path);
+		copy->created_iso    = g_strdup(src->created_iso);
+		copy->last_used_iso  = g_strdup(src->last_used_iso);
+		copy->pep723_hash    = g_strdup(src->pep723_hash);
+		copy->sirilpy_version = g_strdup(src->sirilpy_version);
+	}
+	g_mutex_unlock(&ledger->mutex);
+	return copy;
+}
+
+// Insert or update an entry. The `created` timestamp is preserved when
+// updating an existing entry; `last_used` is always refreshed. Caller is
+// responsible for calling ledger_save() afterwards to persist.
+static void ledger_record(venv_ledger *ledger,
+                          const gchar *script_hash,
+                          const gchar *script_path,
+                          const gchar *pep723_hash,
+                          const gchar *sirilpy_version) {
+	if (!ledger || !script_hash) return;
+	GDateTime *now = g_date_time_new_now_utc();
+	gchar *now_iso = g_date_time_format_iso8601(now);
+	g_date_time_unref(now);
+
+	g_mutex_lock(&ledger->mutex);
+	venv_ledger_entry *existing = g_hash_table_lookup(ledger->entries, script_hash);
+	venv_ledger_entry *e = g_new0(venv_ledger_entry, 1);
+	e->script_hash = g_strdup(script_hash);
+	e->script_path = g_strdup(script_path);
+	e->created_iso = g_strdup(existing && existing->created_iso ? existing->created_iso : now_iso);
+	e->last_used_iso = g_strdup(now_iso);
+	e->pep723_hash = g_strdup(pep723_hash);
+	e->sirilpy_version = g_strdup(sirilpy_version);
+	g_hash_table_replace(ledger->entries, g_strdup(script_hash), e);
+	g_mutex_unlock(&ledger->mutex);
+
+	g_free(now_iso);
+}
+
+// Per-script venv selection (§4.5 of the uv conversion plan).
+//
+// Default-on when uv is in use AND the caller provided enough context
+// (either an identity path or a PEP 723 block). Set
+// SIRIL_PER_SCRIPT_VENVS=0 to force every script to share the base venv
+// (mimics pre-§4.5 behaviour for debugging).
+
+static gboolean per_script_venvs_enabled(void) {
+	const gchar *gate = g_getenv("SIRIL_PER_SCRIPT_VENVS");
+	return !gate || g_strcmp0(gate, "0") != 0;
+}
+
+// Compute the venv identity hash. Returns a newly-allocated string the
+// caller must free. The two cases:
+//   - identity_path != NULL: SHA-256(canonical_path) → 16 hex chars
+//   - identity_path == NULL but pep723 present: "unsaved-<deps_hash>"
+//   - both absent: NULL (caller should use base venv)
+
+// Resolve identity_path to a cwd-independent, symlink-resolved absolute
+// form so equivalent invocations of the same script hash identically.
+//
+// Scenarios that now collapse to one venv:
+//   - `pyscript /abs/path/foo.py` (absolute).
+//   - `pyscript ./foo.py` run from /abs/path/ (relative against cwd).
+//   - `pyscript ~/link-to-foo.py` where the link points at /abs/path/foo.py.
+//   - `pyscript /abs/path/../path/foo.py` (with redundant segments).
+//
+// All resolve to /abs/path/foo.py via realpath()/_fullpath(), so they
+// all hash to the same per-script venv key.
+//
+// Scenarios that intentionally remain distinct:
+//   - Two physically different files happening to share a basename
+//     (`./foo.py` from /a vs from /b — those are different files).
+//   - A script moved to a new location after its venv was first built
+//     (the old venv becomes an orphan, recoverable via prune).
+//
+// Returns a newly-allocated path string. On failure (e.g. the file no
+// longer exists), falls back to g_canonicalize_filename which is at
+// least stable for absolute inputs.
+static gchar *resolve_script_path_for_identity(const gchar *path) {
+	if (!path || !*path) return NULL;
+#ifdef _WIN32
+	gchar *resolved = _fullpath(NULL, path, 0);
+	if (resolved) {
+		gchar *out = g_strdup(resolved);
+		free(resolved);
+		return out;
+	}
+#else
+	char *resolved = realpath(path, NULL);
+	if (resolved) {
+		gchar *out = g_strdup(resolved);
+		free(resolved);
+		return out;
+	}
+#endif
+	return g_canonicalize_filename(path, NULL);
+}
+
+static gchar *compute_script_hash(const gchar *identity_path,
+                                  const pep723_metadata *pep723) {
+	if (identity_path && *identity_path) {
+		gchar *abs_path = resolve_script_path_for_identity(identity_path);
+		if (!abs_path) return NULL;
+		gchar *full = g_compute_checksum_for_string(G_CHECKSUM_SHA256,
+				abs_path, -1);
+		g_free(abs_path);
+		if (!full) return NULL;
+		gchar *out = g_strndup(full, 16);
+		g_free(full);
+		return out;
+	}
+	if (pep723) {
+		gchar *deps_hash = pep723_canonical_hash(pep723);
+		if (!deps_hash) return NULL;
+		gchar *out = g_strdup_printf("unsaved-%s", deps_hash);
+		g_free(deps_hash);
+		return out;
+	}
+	return NULL;
+}
+
+// Format the on-disk path for a per-script venv given its hash.
+static gchar *per_script_venv_path(const gchar *project_path,
+                                   const gchar *script_hash) {
+	return g_build_filename(project_path, "script_venvs", script_hash, NULL);
+}
+
+// Format the currently-installed sirilpy version (from com.python_version)
+// as a dotted string for ledger comparison.
+static gchar *current_sirilpy_version_string(void) {
+	return g_strdup_printf("%u.%u.%u",
+			com.python_version.major_version,
+			com.python_version.minor_version,
+			com.python_version.micro_version);
+}
+
+// ── Streaming uv output → progress bar + log ────────────────────────────────
+//
+// Historically every uv invocation went through g_spawn_sync(), which buffers
+// the child's whole output and only surfaces it on failure. For a first-time
+// PEP 723 dependency install — uv may resolve, download and build a dozen
+// packages over tens of seconds — that reads as a dead hang: no log lines, no
+// progress-bar movement (the tester complaint this addresses). run_uv_streaming()
+// spawns uv with a live stderr pipe (uv writes all status to stderr) and reads
+// it line by line, translating uv's own output into log milestones and progress
+// updates as they happen. Callers pass "-v" in the argv so uv emits per-package
+// Downloading/Building lines; UV_NO_PROGRESS stays set (see inject_uv_env) so uv
+// prints plain text rather than ANSI progress bars we'd have to unpick.
+
+typedef struct {
+	const gchar *phase;   // short, already-translated label (e.g. "Installing dependencies")
+	int total;            // packages to prepare/install, learned from "Resolved N packages"
+	int done;             // packages seen changed so far
+} uv_stream_state;
+
+// If the line reports live activity on a package (download/build/etc.), return a
+// short label ("Downloading numpy==1.26.0") for the progress bar; else NULL.
+// Matches anywhere in the line, so it catches both uv's plain status lines and
+// the "DEBUG …"-prefixed -v firehose. Caller frees.
+static gchar *uv_activity_label(const gchar *body) {
+	static const char *kw[] = { "Downloading", "Building", "Preparing",
+	                            "Updating", "Fetching", NULL };
+	for (int i = 0; kw[i]; i++) {
+		const gchar *p = strstr(body, kw[i]);
+		if (p) {
+			gchar *s = g_strndup(p, 64);   // cap: -v lines can be very long
+			return g_strchomp(s);
+		}
+	}
+	return NULL;
+}
+
+// Translate a single line of uv's stderr into progress-bar + log updates.
+static void uv_stream_handle_line(const gchar *raw, uv_stream_state *st) {
+	gchar *line = g_strchomp(g_strdup(raw));   // drop trailing CR/space
+	if (!*line) {
+		g_free(line);
+		return;
+	}
+	// With NO_COLOR set (see inject_uv_env) uv emits plain text, so status
+	// lines start at column 0 and we can match them directly. The -v DEBUG
+	// lines start with "DEBUG " and thus fall through to the progress-only path.
+	const gchar *body = line;
+
+	int n = 0;
+	// Summary milestones — the only lines we surface in the log (default
+	// colour). Everything else is progress-bar-only, below.
+	if (sscanf(body, "Resolved %d package", &n) == 1) {
+		if (st->total < n)
+			st->total = n;
+		gui_iface.set_progress(PROGRESS_PULSATE, st->phase);
+		siril_log_message(_("%s: resolved %d package(s)\n"), st->phase, n);
+	} else if (sscanf(body, "Prepared %d package", &n) == 1) {
+		if (st->total < n)
+			st->total = n;
+		siril_log_message(_("%s: prepared %d package(s)\n"), st->phase, n);
+	} else if (sscanf(body, "Installed %d package", &n) == 1) {
+		gui_iface.set_progress(PROGRESS_DONE, st->phase);
+		siril_log_message(_("%s: installed %d package(s)\n"), st->phase, n);
+	} else if (sscanf(body, "Audited %d package", &n) == 1) {
+		siril_log_message(_("%s: %d package(s) already satisfied\n"),
+				st->phase, n);
+	} else if (g_str_has_prefix(body, "Using Python")
+			|| g_str_has_prefix(body, "Using CPython")) {
+		// "Using Python 3.13.14 environment at: …" / interpreter line.
+		siril_log_message("  %s\n", body);
+	}
+	// Per-package change list (" + name==ver", " - …", " ~ …"): drives the
+	// determinate bar, not the log.
+	else if (line[0] == ' ' && line[1] && strchr("+-~", line[1])
+			&& line[2] == ' ' && line[3]) {
+		st->done++;
+		double frac = st->total > 0
+				? MIN(1.0, (double)st->done / st->total)
+				: PROGRESS_PULSATE;
+		gchar *label = g_strdup_printf("%s: %s", st->phase, line + 3);
+		gui_iface.set_progress(frac, label);
+		g_free(label);
+	}
+	// Anything else (downloads, builds, the -v DEBUG firehose): mine only for
+	// live progress-bar text; never logged.
+	else {
+		gchar *act = uv_activity_label(body);
+		if (act) {
+			double frac = (st->total > 0 && st->done > 0)
+					? MIN(1.0, (double)st->done / st->total)
+					: PROGRESS_PULSATE;
+			gchar *label = g_strdup_printf("%s: %s", st->phase, act);
+			gui_iface.set_progress(frac, label);
+			g_free(label);
+			g_free(act);
+		}
+	}
+	g_free(line);
+}
+
+// Spawn `argv` (a uv command) with a live stderr pipe and stream its output to
+// the progress bar + log via uv_stream_handle_line(), instead of buffering it
+// the way g_spawn_sync() does. env is a g_get_environ()-style array (ownership
+// stays with the caller). phase is a short, already-translated label shown on
+// the progress bar. Returns TRUE on a clean (exit 0) run; on failure returns
+// FALSE and sets *error, embedding the tail of uv's stderr for diagnosis.
+static gboolean run_uv_streaming(gchar **argv, gchar **env,
+                                 const gchar *phase, GError **error) {
+	GError *spawn_err = NULL;
+	// STDERR piped; stdout inherited (uv writes status to stderr, and not
+	// piping stdout means no risk of a full-pipe deadlock while we block on
+	// stderr). Absolute uv path in argv[0], so no PATH search is needed.
+	GSubprocessLauncher *launcher =
+			g_subprocess_launcher_new(G_SUBPROCESS_FLAGS_STDERR_PIPE);
+	if (env)
+		g_subprocess_launcher_set_environ(launcher, env);
+	GSubprocess *proc = g_subprocess_launcher_spawnv(launcher,
+			(const gchar * const *)argv, &spawn_err);
+	g_object_unref(launcher);
+	if (!proc) {
+		g_set_error(error, G_FILE_ERROR, G_FILE_ERROR_FAILED,
+				"Failed to spawn uv: %s",
+				spawn_err ? spawn_err->message : "unknown error");
+		g_clear_error(&spawn_err);
+		return FALSE;
+	}
+
+	gui_iface.set_progress(PROGRESS_PULSATE, phase);
+
+	// get_stderr_pipe() is owned by `proc`; do not unref it.
+	GDataInputStream *din =
+			g_data_input_stream_new(g_subprocess_get_stderr_pipe(proc));
+	g_object_set(din, "buffer-size", 1024, NULL);
+
+	uv_stream_state st = { phase, 0, 0 };
+	// Retain a bounded tail of raw stderr so a non-zero exit can still explain
+	// itself (uv_stream_handle_line only forwards a curated subset to the log).
+	GString *tail = g_string_new(NULL);
+	gchar *l;
+	while ((l = g_data_input_stream_read_line_utf8(din, NULL, NULL, NULL))) {
+		g_string_append(tail, l);
+		g_string_append_c(tail, '\n');
+		if (tail->len > 8192)
+			g_string_erase(tail, 0, tail->len - 8192);
+		uv_stream_handle_line(l, &st);
+		g_free(l);
+	}
+	g_object_unref(din);
+
+	GError *wait_err = NULL;
+	gboolean ok = g_subprocess_wait_check(proc, NULL, &wait_err);
+	g_object_unref(proc);
+
+	if (!ok) {
+		g_set_error(error, G_FILE_ERROR, G_FILE_ERROR_FAILED,
+				"%s failed: %s%s%s", phase,
+				wait_err ? wait_err->message : "non-zero exit",
+				tail->len ? "\n" : "", tail->str);
+		g_clear_error(&wait_err);
+	}
+	g_string_free(tail, TRUE);
+	return ok;
+}
+
+// Create or refresh a per-script venv. Returns the venv path on success
+// (newly allocated, caller frees), or NULL on failure with *error set.
+//
+// Reuses the existing venv when:
+//   - the directory exists,
+//   - the ledger entry's pep723_hash matches the current block hash, and
+//   - the ledger entry's sirilpy_version matches the currently-installed
+//     module version.
+// Otherwise (re)creates from scratch: blow away any existing dir, run
+// `uv venv --python … --seed …`, install sirilpy, install the PEP 723
+// deps, update the ledger.
+static gchar *ensure_per_script_venv(const gchar *project_path,
+                                     const gchar *uv_path,
+                                     const gchar *script_hash,
+                                     const gchar *script_path,
+                                     const pep723_metadata *pep723,
+                                     GError **error) {
+	gchar *venv_path = per_script_venv_path(project_path, script_hash);
+	venv_ledger *ledger = get_venv_ledger(project_path);
+
+	gchar *pep723_hash = pep723 ? pep723_canonical_hash(pep723) : NULL;
+	gchar *current_sirilpy = current_sirilpy_version_string();
+
+	// Check freshness against the ledger. ledger_lookup returns a deep
+	// copy (the live entry may be mutated/destroyed by a concurrent
+	// ledger_record or prune); we must free `entry` below before
+	// returning regardless of outcome.
+	venv_ledger_entry *entry = ledger_lookup(ledger, script_hash);
+	gboolean had_entry = (entry != NULL);
+	gboolean dir_exists = g_file_test(venv_path, G_FILE_TEST_IS_DIR);
+	gboolean pep_ok = FALSE;
+	gboolean sirilpy_ok = FALSE;
+	if (had_entry && dir_exists) {
+		pep_ok = (entry->pep723_hash == NULL && pep723_hash == NULL)
+				|| (entry->pep723_hash && pep723_hash
+					&& g_strcmp0(entry->pep723_hash, pep723_hash) == 0);
+		sirilpy_ok = entry->sirilpy_version
+				&& g_strcmp0(entry->sirilpy_version, current_sirilpy) == 0;
+	}
+	venv_ledger_entry_free(entry);
+	entry = NULL;
+
+	if (had_entry && dir_exists && pep_ok && sirilpy_ok) {
+		// FRESH: nothing to do but touch last_used.
+		ledger_record(ledger, script_hash, script_path,
+				pep723_hash, current_sirilpy);
+		GError *save_err = NULL;
+		if (!ledger_save(ledger, project_path, &save_err)) {
+			siril_log_warning(_("Could not update script venv ledger: %s\n"),
+					save_err ? save_err->message : "unknown");
+			g_clear_error(&save_err);
+		}
+		g_free(pep723_hash);
+		g_free(current_sirilpy);
+		return venv_path;
+	}
+
+	// SURGICAL UPDATE: only the sirilpy version is stale (typical case
+	// when Siril has been upgraded but a script's declared deps are
+	// unchanged). `uv pip install --reinstall-package sirilpy` is
+	// package-scoped, so the PEP 723 deps and any ad-hoc
+	// ensure_installed()'d packages inside the venv survive — vs the
+	// full-rebuild path below which loses ad-hoc packages.
+	//
+	// On any failure here, fall through to the full rebuild — safer to
+	// nuke and recreate than to leave the venv in a half-updated state.
+	if (had_entry && dir_exists && pep_ok && !sirilpy_ok) {
+		gchar *venv_python = find_venv_python_exe(venv_path, FALSE);
+		if (venv_python) {
+			gchar *module_path = g_build_filename(siril_get_system_data_dir(),
+					MODULE_DIR, NULL);
+			GError *install_err = NULL;
+			siril_log_message(_("Updating sirilpy in per-script venv %s "
+					"to match Siril's installed version...\n"), script_hash);
+			gboolean ok = uv_install_sirilpy_into_venv(uv_path, venv_python,
+					module_path, project_path, &install_err);
+			g_free(module_path);
+			g_free(venv_python);
+			if (ok) {
+				ledger_record(ledger, script_hash, script_path,
+						pep723_hash, current_sirilpy);
+				GError *save_err = NULL;
+				if (!ledger_save(ledger, project_path, &save_err)) {
+					siril_log_warning(_("Could not update script venv "
+							"ledger: %s\n"),
+							save_err ? save_err->message : "unknown");
+					g_clear_error(&save_err);
+				}
+				g_free(pep723_hash);
+				g_free(current_sirilpy);
+				return venv_path;
+			}
+			siril_log_warning(_("Surgical sirilpy update failed for %s; "
+					"falling back to full rebuild: %s\n"),
+					script_hash,
+					install_err ? install_err->message : "unknown");
+			g_clear_error(&install_err);
+		}
+	}
+
+	// Stale or absent → wipe and recreate.
+	siril_log_message(_("Building per-script venv %s\n"), script_hash);
+	if (g_file_test(venv_path, G_FILE_TEST_EXISTS)) {
+		GError *del_err = NULL;
+		if (!delete_directory(venv_path, &del_err)) {
+			g_set_error(error, G_FILE_ERROR, G_FILE_ERROR_FAILED,
+					"Could not remove stale per-script venv %s: %s",
+					venv_path,
+					del_err ? del_err->message : "unknown");
+			g_clear_error(&del_err);
+			g_free(venv_path);
+			g_free(pep723_hash);
+			g_free(current_sirilpy);
+			return NULL;
+		}
+	}
+
+	GError *local_err = NULL;
+	gchar *sys_python = resolve_system_python_for_uv(&local_err);
+	if (!sys_python) {
+		g_propagate_error(error, local_err);
+		g_free(venv_path);
+		g_free(pep723_hash);
+		g_free(current_sirilpy);
+		return NULL;
+	}
+
+	gchar *argv[] = {
+		(gchar *)uv_path, "venv",
+		"-v",
+		"--python", sys_python,
+		"--seed",
+		venv_path,
+		NULL
+	};
+	gchar **env = g_get_environ();
+	inject_uv_env(&env, project_path);
+	// Same heads-up as the base-venv path: a first-time interpreter download
+	// can take a while. (Base venv normally runs first and primes the cache,
+	// so this branch only fires when the user just changed Python versions in
+	// prefs.) run_uv_streaming() then keeps the progress bar alive throughout.
+	gchar *managed_for_script = get_uv_managed_python_token();
+	if (managed_for_script && !managed_python_already_installed(project_path, managed_for_script)) {
+		siril_log_message(_("Downloading Python %s interpreter for per-script "
+				"venv (first-time setup may take up to a minute)…\n"),
+				managed_for_script);
+	}
+	g_free(managed_for_script);
+	siril_log_message(_("Creating per-script Python venv with uv: %s\n"), venv_path);
+	gboolean ok = run_uv_streaming(argv, env,
+			_("Creating script environment"), &local_err);
+	g_strfreev(env);
+	g_free(sys_python);
+	if (!ok) {
+		g_propagate_error(error, local_err);
+		g_free(venv_path);
+		g_free(pep723_hash);
+		g_free(current_sirilpy);
+		return NULL;
+	}
+
+	// Install sirilpy into the new venv via the shared helper.
+	gchar *venv_python = find_venv_python_exe(venv_path, TRUE);
+	if (!venv_python) {
+		g_set_error(error, G_FILE_ERROR, G_FILE_ERROR_NOENT,
+				"per-script venv was created but its python is missing");
+		g_free(venv_path);
+		g_free(pep723_hash);
+		g_free(current_sirilpy);
+		return NULL;
+	}
+	gchar *module_path = g_build_filename(siril_get_system_data_dir(),
+			MODULE_DIR, NULL);
+	GError *install_err = NULL;
+	gboolean sirilpy_installed = uv_install_sirilpy_into_venv(
+			uv_path, venv_python, module_path, project_path, &install_err);
+	g_free(module_path);
+	if (!sirilpy_installed) {
+		g_propagate_error(error, install_err);
+		g_free(venv_python);
+		g_free(venv_path);
+		g_free(pep723_hash);
+		g_free(current_sirilpy);
+		return NULL;
+	}
+
+	// Install PEP 723 declared dependencies (if any). Done in a single uv
+	// invocation so uv's resolver sees them together.
+	if (pep723 && pep723->dependencies && pep723->dependencies->len > 0) {
+		GPtrArray *deps_argv = g_ptr_array_new();
+		g_ptr_array_add(deps_argv, (gpointer)uv_path);
+		g_ptr_array_add(deps_argv, "pip");
+		g_ptr_array_add(deps_argv, "install");
+		// -v makes uv emit per-package Downloading/Building lines that
+		// run_uv_streaming() turns into live progress feedback.
+		g_ptr_array_add(deps_argv, "-v");
+		g_ptr_array_add(deps_argv, "--python");
+		g_ptr_array_add(deps_argv, venv_python);
+		for (guint i = 0; i < pep723->dependencies->len; i++)
+			g_ptr_array_add(deps_argv, g_ptr_array_index(pep723->dependencies, i));
+		g_ptr_array_add(deps_argv, NULL);
+
+		env = g_get_environ();
+		inject_uv_env(&env, project_path);
+		siril_log_message(_("Installing script dependencies with uv…\n"));
+		gboolean deps_ok = run_uv_streaming((gchar **)deps_argv->pdata, env,
+				_("Installing script dependencies"), &local_err);
+		g_strfreev(env);
+		g_ptr_array_free(deps_argv, TRUE);
+		if (!deps_ok) {
+			g_propagate_error(error, local_err);
+			g_free(venv_python);
+			g_free(venv_path);
+			g_free(pep723_hash);
+			g_free(current_sirilpy);
+			return NULL;
+		}
+	}
+
+	g_free(venv_python);
+
+	// Record + persist.
+	ledger_record(ledger, script_hash, script_path,
+			pep723_hash, current_sirilpy);
+	GError *save_err = NULL;
+	if (!ledger_save(ledger, project_path, &save_err)) {
+		siril_log_warning(_("Could not save script venv ledger: %s\n"),
+				save_err ? save_err->message : "unknown");
+		g_clear_error(&save_err);
+	}
+	g_free(pep723_hash);
+	g_free(current_sirilpy);
+	return venv_path;
+}
+
+// Top-level dispatcher used by execute_python_script(). Returns the
+// venv path to use, newly allocated; caller frees. Returns NULL only on
+// catastrophic error (e.g. base venv missing).
+//
+// Decision tree:
+//   - Per-script feature gate off OR uv unavailable → base venv.
+//   - Caller provided no identity AND no PEP 723 → base venv.
+//   - Otherwise → per-script venv (created/refreshed as needed).
+//
+// On any per-script error, logs a warning and falls back to base venv
+// rather than refusing to run the script.
+static gchar *select_venv_for_script(const gchar *venv_identity_path,
+                                     const gchar *pep723_source,
+                                     GError **error) {
+	gchar *project_path = g_build_filename(g_get_user_data_dir(), "siril", NULL);
+	gchar *base_venv = g_build_filename(project_path, "venv", NULL);
+
+	if (!per_script_venvs_enabled()) {
+		g_free(project_path);
+		return base_venv;
+	}
+	const gchar *uv_path = get_uv_executable_path();
+	if (!uv_path) {
+		g_free(project_path);
+		return base_venv;
+	}
+
+	// PEP 723 source: when the caller didn't supply buffer text, fall back
+	// to reading the file at venv_identity_path. This is the common case
+	// for `pyscript`-style callers that pass a path; the editor passes
+	// buffer text explicitly so we don't read a stale on-disk version.
+	gchar *file_contents = NULL;
+	const gchar *parse_input = pep723_source;
+	if (!parse_input && venv_identity_path
+			&& g_file_test(venv_identity_path, G_FILE_TEST_IS_REGULAR)) {
+		gsize len = 0;
+		GError *read_err = NULL;
+		if (g_file_get_contents(venv_identity_path, &file_contents, &len, &read_err)) {
+			parse_input = file_contents;
+		} else {
+			siril_log_debug("Could not read %s for PEP 723 parse: %s\n",
+					venv_identity_path,
+					read_err ? read_err->message : "unknown");
+			g_clear_error(&read_err);
+		}
+	}
+
+	pep723_metadata *pep723 = parse_input ? parse_pep723(parse_input) : NULL;
+	g_free(file_contents);
+	gchar *script_hash = compute_script_hash(venv_identity_path, pep723);
+	if (!script_hash) {
+		// No identity to key off. Fall back to base.
+		pep723_metadata_free(pep723);
+		g_free(project_path);
+		return base_venv;
+	}
+
+	GError *local_err = NULL;
+	gchar *venv = ensure_per_script_venv(project_path, uv_path,
+			script_hash, venv_identity_path, pep723, &local_err);
+	if (!venv) {
+		siril_log_warning(_("Per-script venv creation failed (falling back "
+				"to base venv): %s\n"),
+				local_err ? local_err->message : "unknown");
+		g_clear_error(&local_err);
+		pep723_metadata_free(pep723);
+		g_free(script_hash);
+		g_free(project_path);
+		return base_venv;
+	}
+
+	g_free(base_venv);
+	g_free(script_hash);
+	g_free(project_path);
+	pep723_metadata_free(pep723);
+	return venv;
+}
+
+// Set uv-specific environment variables on a g_get_environ()-style env array.
+// Pins UV_CACHE_DIR to project_path/uv-cache so that hardlink dedup stays on
+// the same volume as the venvs (critical on Windows multi-drive layouts).
+// Sets UV_PYTHON_INSTALL_DIR when managed Python is on so the downloaded
+// toolchain lives next to the rest of the Siril Python data. The
+// "managed Python is on" check matches get_uv_managed_python_token()
+// (env var override → pref toggle), so the install-dir override is
+// consistent with whether uv will actually fetch its own interpreter.
+static void inject_uv_env(gchar ***env, const gchar *project_path) {
+	gchar *cache_dir = g_build_filename(project_path, "uv-cache", NULL);
+	*env = g_environ_setenv(*env, "UV_CACHE_DIR", cache_dir, TRUE);
+	*env = g_environ_setenv(*env, "UV_NO_PROGRESS", "1", TRUE);
+	// Disable uv's ANSI colouring: otherwise its status/-v lines arrive wrapped
+	// in escape codes, which both defeats run_uv_streaming()'s line matching and
+	// dumps raw codes into the log. NO_COLOR covers uv's output and its -v logs.
+	*env = g_environ_setenv(*env, "NO_COLOR", "1", TRUE);
+	g_free(cache_dir);
+
+	// Pin the child (and any uv sub-invocation) to the exact uv Siril
+	// discovered and version-validated. sirilpy's _resolve_uv_path() reads
+	// SIRIL_UV first; without this a script's ensure_installed() would fall
+	// back to its own shutil.which("uv") and, if that misses (uv found by
+	// Siril via a bundle/AppImage path not on the child's PATH), silently drop
+	// to plain pip — inconsistent with the uv-built venv.
+	const gchar *uv_path = get_uv_executable_path();
+	if (uv_path)
+		*env = g_environ_setenv(*env, "SIRIL_UV", uv_path, TRUE);
+
+	gchar *managed = get_uv_managed_python_token();
+	if (managed) {
+		gchar *python_install_dir = g_build_filename(project_path, "python", NULL);
+		*env = g_environ_setenv(*env, "UV_PYTHON_INSTALL_DIR",
+				python_install_dir, TRUE);
+		g_free(python_install_dir);
+		g_free(managed);
+	} else {
+		// Default (and what the signed macOS/Windows bundles ship): forbid uv
+		// from downloading or selecting one of its own managed interpreters.
+		// uv is then confined to the bundled/system Python we hand it via
+		// `--python`, so no general-purpose python-build-standalone binary —
+		// usable outside Siril and outside the installer's code signature —
+		// ever lands on disk. uv keeps doing everything else (venv, resolve,
+		// wheel install, caching). Users who explicitly opt into uv-managed
+		// Python take the branch above, where downloads stay enabled.
+		*env = g_environ_setenv(*env, "UV_PYTHON_DOWNLOADS", "never", TRUE);
+		*env = g_environ_setenv(*env, "UV_NO_MANAGED_PYTHON", "1", TRUE);
+	}
+}
+
+// Relocate the package cache/config/data locations of the script's dependency
+// tree into `cache_dir` (a Siril-managed scratch dir under the user-data root)
+// by setting the standard locator env vars on a g_get_environ()-style array
+// (securescripts §13.5a). This lets the sandbox withhold the real ~/.cache,
+// ~/.config, ~/.local (where credentials live) while astropy/matplotlib/torch/…
+// keep working. Applied to every sandboxed spawn.
+//
+// The three XDG base vars relocate the high-volume core (matplotlib, astropy,
+// astroquery, huggingface_hub, torch, numba — all empirically verified to honour
+// XDG, §13.5a). We SET (not just rely on XDG for) the vars whose package has a
+// known non-XDG fallback that fails hard: NUMBA_CACHE_DIR (numba's cache=True
+// otherwise writes __pycache__ next to the read-only source and *aborts* rather
+// than falling back to XDG) and MPLCONFIGDIR (conservative; older matplotlib did
+// not honour XDG). Plus the three XDG-ignorers (scikit-learn, plotly, vispy). All
+// set with overwrite=TRUE so a stray inherited value cannot escape the scratch.
+// The remaining higher-precedence aliases (ASTROPY_*, TORCH_*, HF_*) honour XDG,
+// so we only UNSET them — an inherited value would otherwise override our XDG
+// redirect and leak outside the scratch.
+static void relocate_pkg_caches(gchar ***env, const gchar *cache_dir) {
+	if (!cache_dir || !*cache_dir)
+		return;
+	// Create the scratch dir and each subdir (some libs adopt a dir only if it
+	// already exists). Best-effort; a failure just means the package falls back
+	// and the sandbox denies it — not our concern here.
+	const struct { const char *var, *sub; } redirect[] = {
+		{ "XDG_CACHE_HOME",    "cache" },
+		{ "XDG_CONFIG_HOME",   "config" },
+		{ "XDG_DATA_HOME",     "data" },
+		{ "NUMBA_CACHE_DIR",   "numba" },
+		{ "MPLCONFIGDIR",      "matplotlib" },
+		{ "SCIKIT_LEARN_DATA", "sklearn" },
+		{ "PLOTLY_DIR",        "plotly" },
+		{ "VISPY_CONFIG_DIR",  "vispy" },
+		// GPU compute/kernel caches. These default into hidden ~/.cache / ~/.config
+		// sub-dirs that read/write-confinement withholds and which many of these
+		// libraries do NOT resolve via XDG_*_HOME, so relocate each explicitly into
+		// the writable scratch. Otherwise the runtime recompiles kernels every run
+		// (slow) or errors on the denied cache. Harmless for scripts that don't use
+		// the corresponding stack (the var just points at an unused scratch dir).
+		{ "CUDA_CACHE_PATH",        "cuda" },     // NVIDIA CUDA JIT cache (~/.nv/ComputeCache)
+		{ "MIOPEN_USER_DB_PATH",    "miopen" },   // AMD ROCm/MIOpen perf DB (~/.config/miopen)
+		{ "MIOPEN_CUSTOM_CACHE_DIR","miopen" },   // AMD ROCm/MIOpen kernel cache (~/.cache/miopen)
+		{ "NEO_CACHE_DIR",          "neo" },      // Intel compute-runtime (NEO) compiler cache
+		{ "SYCL_CACHE_DIR",         "sycl" },     // Intel oneAPI/SYCL persistent kernel cache
+	};
+	g_mkdir_with_parents(cache_dir, 0700);
+	for (gsize i = 0; i < G_N_ELEMENTS(redirect); i++) {
+		gchar *dir = g_build_filename(cache_dir, redirect[i].sub, NULL);
+		g_mkdir_with_parents(dir, 0700);
+		*env = g_environ_setenv(*env, redirect[i].var, dir, TRUE);
+		g_free(dir);
+	}
+	// Unset the XDG-honouring higher-precedence aliases so an inherited value
+	// cannot win over XDG_*_HOME and leak the cache outside the scratch.
+	static const char *const clear[] = {
+		"ASTROPY_HOME", "ASTROPY_CACHE_DIR", "ASTROPY_CONFIG_DIR",
+		"TORCH_HOME", "TORCH_HUB", "HF_HOME", "HUGGINGFACE_HUB_CACHE", NULL
+	};
+	for (int i = 0; clear[i]; i++)
+		*env = g_environ_unsetenv(*env, clear[i]);
+
+	// Theme/appearance integration. Qt/KDE/GTK read their theme (kdeglobals,
+	// gtk settings, qt6ct, fontconfig, icon/colour themes) from XDG_CONFIG_HOME /
+	// XDG_DATA_HOME — which we have just pointed at the empty scratch, so a GUI
+	// script would lose the user's system theme and fall back to distro defaults.
+	// Add the user's REAL ~/.config and ~/.local/share to the *_DIRS SEARCH path
+	// (read-only, and lower priority than the scratch *_HOME so package WRITES
+	// still land in the scratch, not the real dirs). This only tells the toolkits
+	// WHERE to look; actual read access is still gated by Landlock, which grants
+	// only the appearance files (see the carve-out in siril_sandbox.c) — secrets
+	// elsewhere under ~/.config / ~/.local/share stay withheld.
+	{
+		const gchar *home = g_get_home_dir();
+		if (home && *home) {
+			gchar *real_cfg  = g_build_filename(home, ".config", NULL);
+			gchar *real_data = g_build_filename(home, ".local", "share", NULL);
+			const gchar *cur_cfg  = g_environ_getenv(*env, "XDG_CONFIG_DIRS");
+			const gchar *cur_data = g_environ_getenv(*env, "XDG_DATA_DIRS");
+			gchar *new_cfg  = g_strdup_printf("%s:%s", real_cfg,
+					(cur_cfg && *cur_cfg) ? cur_cfg : "/etc/xdg");
+			gchar *new_data = g_strdup_printf("%s:%s", real_data,
+					(cur_data && *cur_data) ? cur_data : "/usr/local/share:/usr/share");
+			*env = g_environ_setenv(*env, "XDG_CONFIG_DIRS", new_cfg, TRUE);
+			*env = g_environ_setenv(*env, "XDG_DATA_DIRS",   new_data, TRUE);
+			g_free(new_cfg);
+			g_free(new_data);
+
+#ifdef __linux__
+			// dconf (GNOME/GTK theme via gsettings) reads its user DB at
+			// XDG_CONFIG_HOME/dconf/user but does NOT honour XDG_CONFIG_DIRS, so the
+			// search-path trick above cannot reach the real DB. Point the relocated
+			// config's dconf dir at the real one with a symlink
+			// (<scratch>/config/dconf -> ~/.config/dconf), so dconf reads the user's
+			// real settings (granted read via the appearance carve-out). Best-effort;
+			// skipped if the real dir is absent or something already exists there.
+			gchar *scratch_cfg = g_build_filename(cache_dir, "config", NULL);
+			g_mkdir_with_parents(scratch_cfg, 0700);
+			gchar *scratch_dconf = g_build_filename(scratch_cfg, "dconf", NULL);
+			if (g_file_test(real_cfg, G_FILE_TEST_IS_DIR)) {
+				gchar *real_dconf = g_build_filename(real_cfg, "dconf", NULL);
+				if (g_file_test(real_dconf, G_FILE_TEST_IS_DIR)
+						&& !g_file_test(scratch_dconf, G_FILE_TEST_EXISTS)
+						&& symlink(real_dconf, scratch_dconf) != 0)
+					siril_log_debug("dconf theme symlink skipped (%s)\n",
+							g_strerror(errno));
+				g_free(real_dconf);
+			}
+			g_free(scratch_dconf);
+			g_free(scratch_cfg);
+#endif
+			g_free(real_cfg);
+			g_free(real_data);
+		}
+	}
+}
+
+// Returns TRUE if uv's managed Python install dir already contains an
+// interpreter for the requested minor version (e.g. "3.13" matches
+// `<install_dir>/cpython-3.13.0-linux-x86_64-gnu/`). Used to decide
+// whether the next `uv venv` is going to trigger a multi-minute
+// interpreter download or just reuse the cached one. Best-effort: a
+// FALSE return means "we couldn't see it"; the spawn may still complete
+// quickly if uv finds it via some other mechanism.
+static gboolean managed_python_already_installed(const gchar *project_path,
+		const gchar *version_token) {
+	if (!project_path || !version_token || !*version_token)
+		return FALSE;
+	gchar *install_dir = g_build_filename(project_path, "python", NULL);
+	GDir *dir = g_dir_open(install_dir, 0, NULL);
+	g_free(install_dir);
+	if (!dir)
+		return FALSE;
+	// uv names entries `cpython-<full version>-<platform>`; match on the
+	// minor prefix so "3.13" finds "cpython-3.13.0-linux-…".
+	gchar *prefix = g_strdup_printf("cpython-%s.", version_token);
+	gboolean found = FALSE;
+	const gchar *name;
+	while ((name = g_dir_read_name(dir)) != NULL) {
+		if (g_str_has_prefix(name, prefix)) {
+			found = TRUE;
+			break;
+		}
+	}
+	g_free(prefix);
+	g_dir_close(dir);
+	return found;
 }
 
 static gchar* get_setup_path(const gchar* module_dir) {
@@ -2801,6 +4966,10 @@ gboolean install_module_with_pip(const gchar* module_path, const gchar* user_mod
 			g_free(python_path);
 			return FALSE;
 		}
+		// Ensure the copy is writable — copy_directory_recursive preserves
+		// source modes, and setuptools needs to write egg_info into the
+		// source tree during build. Same fix as in make_writable_module_copy.
+		chmod_tree_writable(temp_install_path);
 
 		// RETRY LOGIC: Install with pip with timeout and retry
 		gboolean install_success = FALSE;
@@ -2937,6 +5106,295 @@ gboolean install_module_with_pip(const gchar* module_path, const gchar* user_mod
 	return TRUE;
 }
 
+// Recursively add u+w (and u+x on directories) to every entry under
+// root. copy_directory_recursive() preserves source modes, so a copy
+// from a read-only system path inherits 0444/0555 and setuptools then
+// cannot write its egg_info there.
+static void chmod_tree_writable(const gchar *root) {
+	GStatBuf st;
+	if (g_stat(root, &st) != 0) return;
+	mode_t mode = st.st_mode | S_IWUSR;
+	if (S_ISDIR(st.st_mode)) mode |= S_IXUSR | S_IRUSR;
+	g_chmod(root, mode);
+
+	if (!S_ISDIR(st.st_mode)) return;
+	GDir *dir = g_dir_open(root, 0, NULL);
+	if (!dir) return;
+	const gchar *name;
+	while ((name = g_dir_read_name(dir)) != NULL) {
+		gchar *child = g_build_filename(root, name, NULL);
+		chmod_tree_writable(child);
+		g_free(child);
+	}
+	g_dir_close(dir);
+}
+
+// Make a writable copy of the on-disk sirilpy module directory in a
+// freshly-created tempdir. Returns the tempdir path; caller owns the
+// string AND must delete_directory() the tempdir after use. Returns NULL
+// with *error set on failure.
+//
+// Why this exists: setuptools' build_meta egg_info step writes to the
+// *source* directory during wheel build. When sirilpy ships from a
+// read-only system path (/usr/local/share/siril/python_module on
+// Linux, "Program Files\siril\python_module" on Windows, etc.) the
+// egg_info creation fails with EROFS / EACCES. The legacy
+// install_module_with_pip path copied the module to a writable user
+// path for the same reason; we preserve that workaround for the uv
+// path. Using a fresh tempdir per install avoids any race between
+// concurrent per-script-venv installs that all try to build sirilpy.
+//
+// copy_directory_recursive preserves source modes, so we follow up with
+// chmod_tree_writable to add u+w throughout — otherwise files copied
+// from a /usr/local install (0444) remain unwritable in the tmpdir and
+// the build still fails when setuptools tries to drop egg_info there.
+static gchar *make_writable_module_copy(const gchar *src_module_path,
+                                        GError **error) {
+	GError *mk_err = NULL;
+	gchar *tmpdir = g_dir_make_tmp("siril-sirilpy-build-XXXXXX", &mk_err);
+	if (!tmpdir) {
+		g_propagate_prefixed_error(error, mk_err,
+				"Could not create tempdir for sirilpy build: ");
+		return NULL;
+	}
+	GError *copy_err = NULL;
+	if (!copy_directory_recursive(src_module_path, tmpdir, &copy_err)) {
+		g_propagate_prefixed_error(error, copy_err,
+				"Could not copy sirilpy source to tempdir: ");
+		delete_directory(tmpdir, NULL);
+		g_free(tmpdir);
+		return NULL;
+	}
+	chmod_tree_writable(tmpdir);
+	return tmpdir;
+}
+
+// Query the installed sirilpy version via `uv pip show --python <venv_python>
+// sirilpy`. The output format is the standard `Name:/Version:/...` form that
+// pip produces, so we reuse the same Version: regex used by the legacy
+// helper. On any error returns a zero-init version_number with *error set.
+static version_number uv_get_installed_module_version(const gchar *uv_path,
+                                                     const gchar *venv_python,
+                                                     const gchar *project_path,
+                                                     GError **error) {
+	version_number ver = { 0 };
+	gchar *argv[] = {
+		(gchar *)uv_path, "pip", "show",
+		"--python", (gchar *)venv_python,
+		"sirilpy", NULL
+	};
+
+	gchar **env = g_get_environ();
+	inject_uv_env(&env, project_path);
+
+	gchar *stdout_data = NULL;
+	gchar *stderr_data = NULL;
+	gint exit_status = 0;
+	GError *spawn_error = NULL;
+
+	gboolean spawned = g_spawn_sync(NULL, argv, env, G_SPAWN_DEFAULT,
+			NULL, NULL,
+			&stdout_data, &stderr_data,
+			&exit_status, &spawn_error);
+	g_strfreev(env);
+
+	if (!spawned) {
+		g_set_error(error, G_FILE_ERROR, G_FILE_ERROR_FAILED,
+				"Failed to execute uv: %s",
+				spawn_error ? spawn_error->message : "Unknown error");
+		g_clear_error(&spawn_error);
+		g_free(stdout_data);
+		g_free(stderr_data);
+		return ver;
+	}
+
+	if (exit_status != 0) {
+		// Treat "package not installed" as a non-error: caller compares
+		// against ver={0,0,0} and triggers an install. exit_status is the
+		// raw waitpid status; on Unix the real exit code is in
+		// WEXITSTATUS() but on Windows it is the value directly. Log the
+		// raw status; precise interpretation isn't needed here.
+		siril_log_debug("uv pip show sirilpy: not installed (status=%d)\n",
+				exit_status);
+		g_free(stdout_data);
+		g_free(stderr_data);
+		return ver;
+	}
+
+	GRegex *regex = g_regex_new("^Version:\\s*([^\\s]+)",
+			G_REGEX_MULTILINE, 0, error);
+	if (!regex) {
+		g_free(stdout_data);
+		g_free(stderr_data);
+		return ver;
+	}
+
+	GMatchInfo *match = NULL;
+	if (g_regex_match(regex, stdout_data, 0, &match)) {
+		gchar *version_str = g_match_info_fetch(match, 1);
+		if (version_str)
+			ver = get_version_number_from_string(version_str);
+		g_free(version_str);
+	} else {
+		g_set_error(error, G_FILE_ERROR, G_FILE_ERROR_FAILED,
+				"Version number not found in uv pip show output");
+	}
+	g_match_info_free(match);
+	g_regex_unref(regex);
+	g_free(stdout_data);
+	g_free(stderr_data);
+	return ver;
+}
+
+// uv-backed sirilpy install. Equivalent to install_module_with_pip but:
+//   - no retry loop (uv handles network retries internally);
+//   - no atomic-rename temp-dir dance (uv pip install writes atomically and
+//     takes a process-wide lock around the cache);
+//   - no string-matching on stderr for retry/fatal classification;
+//   - upgrade and downgrade are both expressed as a single
+//     `uv pip install --reinstall-package sirilpy <module_path>` call.
+//
+// The legacy user_module_path marker dir is no longer needed (uv operates
+// directly on <module_path>) but the parameter is kept so the dispatcher
+// has one signature.
+// Install (or re-install) sirilpy into a specific venv via
+// `uv pip install --reinstall-package sirilpy <module_path>`. Used by
+// both the base-venv install path and the per-script-venv surgical
+// update path (§4.5 / option-3 from the audit). The
+// `--reinstall-package` form is package-scoped, so other packages in
+// the venv (PEP 723 deps, ad-hoc ensure_installed()'d packages) are
+// not disturbed.
+//
+// Handles the read-only system data dir by copying the module into a
+// writable tempdir first; see make_writable_module_copy() comment.
+//
+// Caller owns all parameters and the venv must already exist. Returns
+// TRUE on success; on failure returns FALSE with *error set.
+static gboolean uv_install_sirilpy_into_venv(const gchar *uv_path,
+                                             const gchar *venv_python_path,
+                                             const gchar *module_path,
+                                             const gchar *project_path,
+                                             GError **error) {
+	g_return_val_if_fail(uv_path != NULL, FALSE);
+	g_return_val_if_fail(venv_python_path != NULL, FALSE);
+	g_return_val_if_fail(module_path != NULL, FALSE);
+
+	GError *copy_err = NULL;
+	gchar *build_path = make_writable_module_copy(module_path, &copy_err);
+	if (!build_path) {
+		g_propagate_error(error, copy_err);
+		return FALSE;
+	}
+
+	gchar *argv[] = {
+		(gchar *)uv_path, "pip", "install",
+		"-v",
+		"--python", (gchar *)venv_python_path,
+		"--reinstall-package", "sirilpy",
+		build_path,
+		NULL
+	};
+
+	gchar **env = g_get_environ();
+	inject_uv_env(&env, project_path);
+
+	gboolean ok = run_uv_streaming(argv, env,
+			_("Installing Siril Python module"), error);
+	g_strfreev(env);
+	delete_directory(build_path, NULL);
+	g_free(build_path);
+
+	return ok;
+}
+
+static gboolean uv_install_sirilpy(const gchar *module_path,
+                                   const gchar *user_module_path,
+                                   const gchar *venv_path,
+                                   const gchar *uv_path,
+                                   const gchar *project_path,
+                                   GError **error) {
+	(void)user_module_path;  // intentionally unused; see comment above
+
+	g_return_val_if_fail(module_path != NULL, FALSE);
+	g_return_val_if_fail(venv_path != NULL, FALSE);
+	g_return_val_if_fail(uv_path != NULL, FALSE);
+
+	gchar *venv_python = find_venv_python_exe(venv_path, TRUE);
+	if (!venv_python) {
+		g_set_error(error, G_FILE_ERROR, G_FILE_ERROR_NOENT,
+				"venv python not found at %s", venv_path);
+		return FALSE;
+	}
+
+	GError *modver_error = NULL;
+	gchar *setup_path = get_setup_path(module_path);
+	version_number module_version = get_module_version(setup_path, &modver_error);
+	g_free(setup_path);
+	if (modver_error) {
+		g_propagate_error(error, modver_error);
+		g_free(venv_python);
+		return FALSE;
+	}
+
+	GError *ver_error = NULL;
+	version_number installed_version = uv_get_installed_module_version(
+			uv_path, venv_python, project_path, &ver_error);
+	if (ver_error) {
+		// `uv pip show` exits 0 even when the package is missing (the
+		// "Package(s) not found" message goes to stderr). We end up here
+		// via the regex-miss path, which is exactly how we detect a
+		// not-yet-installed sirilpy. Treat as harmless and proceed to
+		// install.
+		siril_log_debug("uv pip show sirilpy: not yet installed (%s)\n",
+				ver_error->message);
+		g_clear_error(&ver_error);
+	}
+
+	siril_log_debug("Installed sirilpy: %u.%u.%u, on-disk: %u.%u.%u\n",
+			installed_version.major_version,
+			installed_version.minor_version,
+			installed_version.micro_version,
+			module_version.major_version,
+			module_version.minor_version,
+			module_version.micro_version);
+
+	if (compare_version(module_version, installed_version) == 0
+			&& installed_version.major_version + installed_version.minor_version
+				+ installed_version.micro_version > 0) {
+		siril_log_debug("uv: sirilpy already at target version, skipping install\n");
+		memcpy(&com.python_version, &module_version, sizeof(version_number));
+		g_free(venv_python);
+		return TRUE;
+	}
+
+	siril_log_message(_("Installing / updating Siril python module with uv...\n"));
+
+	GError *install_err = NULL;
+	gboolean ok = uv_install_sirilpy_into_venv(uv_path, venv_python,
+			module_path, project_path, &install_err);
+	g_free(venv_python);
+	if (!ok) {
+		g_propagate_error(error, install_err);
+		return FALSE;
+	}
+	memcpy(&com.python_version, &module_version, sizeof(version_number));
+	return TRUE;
+}
+
+// Dispatcher: pick uv or legacy pip based on whether uv is in use.
+static gboolean install_or_update_sirilpy_module(const gchar *module_path,
+                                                 const gchar *user_module_path,
+                                                 const gchar *venv_path,
+                                                 const gchar *project_path,
+                                                 GError **error) {
+	const gchar *uv_path = get_uv_executable_path();
+	if (uv_path)
+		return uv_install_sirilpy(module_path, user_module_path, venv_path,
+				uv_path, project_path, error);
+	return install_module_with_pip(module_path, user_module_path,
+			venv_path, error);
+}
+
 gboolean get_python_magic_number(char *out_buf, gsize out_buf_size) {
 	gchar* venv_path = g_build_filename(g_get_user_data_dir(), "siril", "venv", NULL);
 	gchar *python_path = find_venv_python_exe(venv_path, TRUE);
@@ -2965,6 +5423,8 @@ gboolean get_python_magic_number(char *out_buf, gsize out_buf_size) {
 	if (!success || exit_status != 0) {
 		siril_log_warning(_("Error checking python magic number: pyc files will not work"));
 		g_free(stdout_str);
+		g_free(python_path);
+		g_free(venv_path);
 		return FALSE;
 	}
 
@@ -2981,19 +5441,8 @@ gboolean get_python_magic_number(char *out_buf, gsize out_buf_size) {
 static PythonVenvInfo* prepare_venv_environment(const gchar *venv_path, GError **error) {
 	PythonVenvInfo *info = g_new0(PythonVenvInfo, 1);
 	info->venv_path = g_strdup(venv_path);
-	info->env_vars = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
 
 	siril_log_message(_("Preparing python virtual environment: %s.\n"), venv_path);
-	// Copy current environment
-	gchar **current_env = g_get_environ();
-	for (gchar **env = current_env; env && *env; env++) {
-		gchar **parts = g_strsplit(*env, "=", 2);
-		if (parts && parts[0] && parts[1]) {
-			g_hash_table_insert(info->env_vars, g_strdup(parts[0]), g_strdup(parts[1]));
-		}
-		g_strfreev(parts);
-	}
-	g_strfreev(current_env);
 
 	// Get Python version
 	info->python_version = get_venv_python_version(venv_path);
@@ -3003,47 +5452,41 @@ static PythonVenvInfo* prepare_venv_environment(const gchar *venv_path, GError *
 		goto cleanup;
 	}
 
-	// Set VIRTUAL_ENV
-	g_hash_table_insert(info->env_vars, g_strdup("VIRTUAL_ENV"), g_strdup(venv_path));
-
-	// Update PATH
-	gchar *bin_dir = find_venv_bin_dir(venv_path);
-	if (!bin_dir) {
-	g_set_error(error, G_FILE_ERROR, G_FILE_ERROR_FAILED,
+	/* The venv's bin directory, kept for the child's PATH (see
+	 * publish_venv_environment).  Locating it also validates the venv layout,
+	 * which is why this is a hard failure. */
+	info->bin_dir = find_venv_bin_dir(venv_path);
+	if (!info->bin_dir) {
+		g_set_error(error, G_FILE_ERROR, G_FILE_ERROR_FAILED,
 				"Failed to locate virtual environment binary directory");
 		goto cleanup;
 	}
-	gchar *old_path = g_hash_table_lookup(info->env_vars, "PATH");
-	gchar *new_path = old_path ?
-		g_strjoin(G_SEARCHPATH_SEPARATOR_S, bin_dir, old_path, NULL) :
-		g_strdup(bin_dir);
-	g_hash_table_insert(info->env_vars, g_strdup("PATH"), new_path);
-	g_free(bin_dir);
-
-	// Remove PYTHONPATH and PYTHONHOME to allow natural path discovery
-	g_hash_table_remove(info->env_vars, "PYTHONPATH");
-	g_hash_table_remove(info->env_vars, "PYTHONHOME");
 
 	// Check the sirilpy python module is the latest version and install or
-	// update it using the venv pip if not.
+	// update it using the venv pip (or uv pip) if not.
 	siril_log_message(_("Checking the python module is up-to-date...\n"));
 	gchar *module_path = g_build_filename(siril_get_system_data_dir(), MODULE_DIR, NULL);
 	gchar *user_module_path = g_build_filename(g_get_user_data_dir(), "siril", ".python_module", NULL);
+	gchar *project_path = g_path_get_dirname(venv_path);
 	GError *install_error = NULL;
-	if (!install_module_with_pip(module_path, user_module_path, venv_path, &install_error)) {
+	if (!install_or_update_sirilpy_module(module_path, user_module_path,
+			venv_path, project_path, &install_error)) {
+		g_free(project_path);
 		siril_log_warning(_("Warning: unable to install or update the "
 					"Siril python module.\n"));
 		g_warning("Failed to install Python module: %s",
 				install_error ? install_error->message : "Unknown error");
-		// Propagate as a critical failure.  Read the message before
-		// freeing install_error to avoid a use-after-free in the %s
-		// argument below.
+		// Pre-existing bug fixed in passing: the previous code freed
+		// install_error here and then read ->message in the next
+		// g_set_error call, which was a use-after-free. We now defer
+		// the free to g_clear_error() after the propagation.
 		g_set_error(error, G_FILE_ERROR, G_FILE_ERROR_FAILED,
 				"Failed to install Python module: %s",
 				install_error ? install_error->message : "Unknown error");
 		g_clear_error(&install_error);
 		goto cleanup;
 	} else {
+		g_free(project_path);
 		siril_log_info(_("Python module is up-to-date\n"));
 		get_python_magic_number(com.python_magic, 9);
 		// this repopulates gui.repo_scripts and updates the script menu
@@ -3062,8 +5505,7 @@ cleanup:
 	// and if the g_new0 alloc fails the program will abort.
 	g_free(info->venv_path);
 	g_free(info->python_version);
-	if (info->env_vars)
-		g_hash_table_destroy(info->env_vars);
+	g_free(info->bin_dir);
 	g_free(info);
 	return NULL;
 }
@@ -3108,32 +5550,483 @@ static void wait_for_python_init(const gchar *waiting_message) {
 // have been installed by scripts will require reinstallation.
 //***********************************************************************************
 
-void rebuild_venv() {
-	// The venv directory is about to be deleted, so an initialisation still
-	// building it has to be waited out, not just noticed.
-	wait_for_python_init(_("Warning: Python initialization in progress. "
-				"Waiting for it to complete...\n"));
-	gchar* venv_path = g_build_filename(g_get_user_data_dir(), "siril", "venv", NULL);
-	gchar *user_module_path = g_build_filename(g_get_user_data_dir(), "siril", ".python_module", NULL);
-	GError *error = NULL, *error2 = NULL;
+// Each of the four §4.8 operations deletes state that an in-flight
+// initialisation may still be building, so each waits it out first — through
+// wait_for_python_init(), which lives with the init-thread bookkeeping near the
+// top of this file — and warns if there is anything to wait for.
+#define PYTHON_INIT_WAIT_WARNING _("Warning: Python initialization in progress. " \
+		"Waiting for it to complete...\n")
+
+// §4.8.1: rebuild just the base venv. Per-script venvs and the uv cache
+// remain untouched. Caller is expected to have shown a confirm dialog.
+void rebuild_base_venv(void) {
+	wait_for_python_init(PYTHON_INIT_WAIT_WARNING);
 	kill_all_python_scripts();
-	delete_directory(venv_path, &error);
-	delete_directory(user_module_path, &error2);
-	g_free(venv_path);
-	g_free(user_module_path);
-	if (error) {
-		siril_log_error(error->message);
-		g_error_free(error);
+
+	const gchar *targets[] = { "venv", ".python_module", NULL };
+	for (int i = 0; targets[i]; i++) {
+		gchar *p = g_build_filename(g_get_user_data_dir(), "siril", targets[i], NULL);
+		if (g_file_test(p, G_FILE_TEST_IS_DIR)) {
+			GError *err = NULL;
+			if (!delete_directory(p, &err)) {
+				siril_log_error(_("Could not remove %s: %s\n"), p,
+						err ? err->message : "unknown");
+				g_clear_error(&err);
+			}
+		}
+		g_free(p);
 	}
-	if (error2) {
-		siril_log_error(error2->message);
-		g_error_free(error2);
-	}
+	// Force a re-probe on next init so uv install/uninstall on the side
+	// is picked up.
+	clear_uv_state();
 	initialize_python_venv_in_thread();
 }
 
-// Updated check_or_create_venv function with health validation
-static gboolean check_or_create_venv(const gchar *project_path, GError **error) {
+// §4.8.2: rebuild one per-script venv by script path. Hashes the path the
+// same way select_venv_for_script() does, looks up the ledger, removes the
+// directory + entry, persists. The script's per-script venv will be
+// recreated on its next launch (cheap because the uv cache survives).
+gboolean rebuild_script_venv_by_path(const gchar *script_path, GError **error) {
+	g_return_val_if_fail(script_path != NULL, FALSE);
+
+	gchar *script_hash = compute_script_hash(script_path, NULL);
+	if (!script_hash) {
+		g_set_error(error, G_FILE_ERROR, G_FILE_ERROR_INVAL,
+				"could not derive a venv hash from path %s", script_path);
+		return FALSE;
+	}
+
+	gchar *project_path = g_build_filename(g_get_user_data_dir(), "siril", NULL);
+	gchar *venv_path = per_script_venv_path(project_path, script_hash);
+	venv_ledger *ledger = get_venv_ledger(project_path);
+
+	gboolean had_ledger_entry = FALSE;
+	gboolean had_directory = g_file_test(venv_path, G_FILE_TEST_IS_DIR);
+
+	// Remove ledger entry (the lookup + delete must hold the ledger mutex)
+	g_mutex_lock(&ledger->mutex);
+	if (g_hash_table_remove(ledger->entries, script_hash))
+		had_ledger_entry = TRUE;
+	g_mutex_unlock(&ledger->mutex);
+
+	if (had_directory) {
+		GError *del_err = NULL;
+		if (!delete_directory(venv_path, &del_err)) {
+			g_set_error(error, G_FILE_ERROR, G_FILE_ERROR_FAILED,
+					"failed to delete %s: %s", venv_path,
+					del_err ? del_err->message : "unknown");
+			g_clear_error(&del_err);
+			g_free(venv_path);
+			g_free(project_path);
+			g_free(script_hash);
+			return FALSE;
+		}
+	}
+
+	if (had_ledger_entry) {
+		GError *save_err = NULL;
+		if (!ledger_save(ledger, project_path, &save_err)) {
+			siril_log_warning(_("Could not save script venv ledger: %s\n"),
+					save_err ? save_err->message : "unknown");
+			g_clear_error(&save_err);
+		}
+	}
+
+	g_free(venv_path);
+	g_free(project_path);
+	g_free(script_hash);
+
+	if (!had_directory && !had_ledger_entry) {
+		// Nothing existed for this script — not an error, but the caller
+		// may want to tell the user "no environment to rebuild."
+		return FALSE;
+	}
+	siril_log_message(_("Per-script Python environment for '%s' removed; "
+			"it will be rebuilt next time the script runs.\n"), script_path);
+	return TRUE;
+}
+
+// §4.8.3: nuclear. Wipes base venv, per-script venvs, ledger, and optionally
+// the uv cache itself. Re-runs init to recreate the base venv.
+void rebuild_all_python_state(gboolean clear_cache) {
+	wait_for_python_init(PYTHON_INIT_WAIT_WARNING);
+	kill_all_python_scripts();
+
+	gchar *project = g_build_filename(g_get_user_data_dir(), "siril", NULL);
+	const gchar *targets[] = {
+		"venv",
+		".python_module",
+		"script_venvs",
+		"script_venvs.json",
+		NULL,
+	};
+	for (int i = 0; targets[i]; i++) {
+		gchar *p = g_build_filename(project, targets[i], NULL);
+		if (g_file_test(p, G_FILE_TEST_EXISTS)) {
+			GError *err = NULL;
+			gboolean ok;
+			if (g_file_test(p, G_FILE_TEST_IS_DIR))
+				ok = delete_directory(p, &err);
+			else
+				ok = (g_unlink(p) == 0);
+			if (!ok) {
+				siril_log_error(_("Could not remove %s: %s\n"), p,
+						err ? err->message : "unknown");
+				g_clear_error(&err);
+			}
+		}
+		g_free(p);
+	}
+
+	if (clear_cache) {
+		gchar *cache = g_build_filename(project, "uv-cache", NULL);
+		if (g_file_test(cache, G_FILE_TEST_IS_DIR)) {
+			siril_log_message(_("Clearing uv wheel cache (this can free a "
+					"lot of disk but will force re-download of every "
+					"dependency on next use)...\n"));
+			GError *err = NULL;
+			if (!delete_directory(cache, &err)) {
+				siril_log_error(_("Could not clear uv cache: %s\n"),
+						err ? err->message : "unknown");
+				g_clear_error(&err);
+			}
+		}
+		g_free(cache);
+	}
+	g_free(project);
+
+	// Drop the in-memory ledger so the next access re-reads the (now absent)
+	// file. Without this, stale entries from the previous session would
+	// linger until process restart.
+	g_mutex_lock(&g_venv_ledger_init_mutex);
+	if (g_venv_ledger) {
+		ledger_free(g_venv_ledger);
+		g_venv_ledger = NULL;
+	}
+	g_mutex_unlock(&g_venv_ledger_init_mutex);
+
+	clear_uv_state();
+	initialize_python_venv_in_thread();
+}
+
+// §4.8.4: prune. Walk the ledger and delete venvs whose script_path is
+// gone OR whose last_used is older than max_age_days. The uv cache is
+// preserved — this is routine maintenance, not corruption recovery.
+guint prune_unused_script_venvs(gint max_age_days, GError **error) {
+	(void)error;  // Reserved for future error paths; currently only logs.
+
+	gchar *project_path = g_build_filename(g_get_user_data_dir(), "siril", NULL);
+	venv_ledger *ledger = get_venv_ledger(project_path);
+
+	GDateTime *now = g_date_time_new_now_utc();
+	GDateTime *cutoff = max_age_days > 0
+			? g_date_time_add_days(now, -max_age_days)
+			: NULL;
+
+	// Collect victims under the ledger lock; do the disk work outside so
+	// we don't hold the lock across slow operations.
+	GPtrArray *victims = g_ptr_array_new_with_free_func(g_free);
+	g_mutex_lock(&ledger->mutex);
+	GHashTableIter iter;
+	gpointer key, val;
+	g_hash_table_iter_init(&iter, ledger->entries);
+	while (g_hash_table_iter_next(&iter, &key, &val)) {
+		venv_ledger_entry *e = val;
+		gboolean orphan = (e->script_path
+				&& !g_file_test(e->script_path, G_FILE_TEST_IS_REGULAR));
+		gboolean stale = FALSE;
+		if (cutoff && e->last_used_iso) {
+			GDateTime *t = g_date_time_new_from_iso8601(e->last_used_iso, NULL);
+			if (t) {
+				stale = (g_date_time_compare(t, cutoff) < 0);
+				g_date_time_unref(t);
+			}
+		}
+		if (orphan || stale)
+			g_ptr_array_add(victims, g_strdup(e->script_hash));
+	}
+	g_mutex_unlock(&ledger->mutex);
+
+	guint removed = 0;
+	for (guint i = 0; i < victims->len; i++) {
+		const gchar *hash = g_ptr_array_index(victims, i);
+		gchar *venv_path = per_script_venv_path(project_path, hash);
+
+		g_mutex_lock(&ledger->mutex);
+		g_hash_table_remove(ledger->entries, hash);
+		g_mutex_unlock(&ledger->mutex);
+
+		if (g_file_test(venv_path, G_FILE_TEST_IS_DIR)) {
+			GError *del_err = NULL;
+			if (!delete_directory(venv_path, &del_err)) {
+				siril_log_warning(_("prune: could not delete %s: %s\n"),
+						venv_path, del_err ? del_err->message : "unknown");
+				g_clear_error(&del_err);
+				g_free(venv_path);
+				continue;
+			}
+		}
+		removed++;
+		g_free(venv_path);
+	}
+
+	if (removed > 0) {
+		GError *save_err = NULL;
+		if (!ledger_save(ledger, project_path, &save_err)) {
+			siril_log_warning(_("Could not save script venv ledger after "
+					"prune: %s\n"),
+					save_err ? save_err->message : "unknown");
+			g_clear_error(&save_err);
+		}
+	}
+
+	g_ptr_array_free(victims, TRUE);
+	if (cutoff) g_date_time_unref(cutoff);
+	g_date_time_unref(now);
+	g_free(project_path);
+	return removed;
+}
+
+// Reclaim disk by running `uv cache prune`. This removes wheel cache
+// entries that are not referenced by any of uv's tracked venvs — so
+// torch wheels still in use by another script's venv stay, while
+// genuinely-orphan entries get reclaimed.
+//
+// Composes naturally with prune_unused_script_venvs(): pruning script
+// venvs first releases references; then this call collects the now-
+// unreferenced cache entries.
+//
+// Captures uv's stdout/stderr and forwards both via siril_log_message
+// so the user sees how much was freed.
+//
+// Returns TRUE on success (including the "nothing to prune" case),
+// FALSE on failure (uv not in use, spawn failure, non-zero exit) with
+// *error set when applicable.
+gboolean prune_uv_cache(GError **error) {
+	// uv discovery happens inside the python init thread (via
+	// probe_uv_executable). For CLI-driven invocations the script
+	// dispatcher can fire before that thread has finished, in which case
+	// get_uv_executable_path() would return NULL and we'd report "uv is
+	// not in use" even when uv is installed. Wait first.
+	wait_for_python_init(PYTHON_INIT_WAIT_WARNING);
+
+	const gchar *uv_path = get_uv_executable_path();
+	if (!uv_path) {
+		g_set_error(error, G_FILE_ERROR, G_FILE_ERROR_NOENT,
+				"uv is not in use; nothing to prune");
+		siril_log_message(_("uv is not in use; nothing to prune.\n"));
+		return FALSE;
+	}
+
+	gchar *project_path = g_build_filename(g_get_user_data_dir(), "siril", NULL);
+	gchar *argv[] = {
+		(gchar *)uv_path, "cache", "prune", NULL
+	};
+	gchar **env = g_get_environ();
+	inject_uv_env(&env, project_path);
+
+	gchar *std_out = NULL;
+	gchar *std_err = NULL;
+	gint exit_status = 0;
+	GError *spawn_err = NULL;
+	gboolean spawned = g_spawn_sync(NULL, argv, env, G_SPAWN_DEFAULT,
+			NULL, NULL, &std_out, &std_err, &exit_status, &spawn_err);
+	g_strfreev(env);
+	g_free(project_path);
+
+	if (!spawned) {
+		g_set_error(error, G_FILE_ERROR, G_FILE_ERROR_FAILED,
+				"Failed to spawn uv: %s",
+				spawn_err ? spawn_err->message : "unknown");
+		g_clear_error(&spawn_err);
+		g_free(std_out);
+		g_free(std_err);
+		return FALSE;
+	}
+
+	if (!g_spawn_check_wait_status(exit_status, &spawn_err)) {
+		g_set_error(error, G_FILE_ERROR, G_FILE_ERROR_FAILED,
+				"uv cache prune failed: %s%s%s",
+				spawn_err ? spawn_err->message : "non-zero exit",
+				std_err && *std_err ? "\n" : "",
+				std_err ? std_err : "");
+		g_clear_error(&spawn_err);
+		g_free(std_out);
+		g_free(std_err);
+		return FALSE;
+	}
+
+	// uv writes its progress / summary to stderr ("DEBUG Removed N
+	// files, ..." or "Removed N entries from the cache.") and an
+	// occasional informational message to stdout. Surface both so the
+	// user sees how much was reclaimed.
+	if (std_out && *std_out) {
+		g_strstrip(std_out);
+		siril_log_message("%s\n", std_out);
+	}
+	if (std_err && *std_err) {
+		g_strstrip(std_err);
+		siril_log_message("%s\n", std_err);
+	}
+	g_free(std_out);
+	g_free(std_err);
+	return TRUE;
+}
+
+// Resolve the Python interpreter we will hand to `uv venv --python`.
+//
+// Order of preference:
+//   1. SIRIL_UV_MANAGED_PYTHON=1 → a version token (e.g. "3.12") that uv
+//      will resolve against its own toolchain, downloading if necessary
+//      (see §4.4). Returns immediately without touching the filesystem.
+//   2. SIRIL_PYTHON → an absolute path to a specific interpreter (the
+//      bundle launcher points this at the bundled, signed Python so uv is
+//      pinned explicitly rather than via PATH ordering).
+//   3. Windows: bundled python under <bundle>/python/.
+//   4. Anything else: PATH lookup (the macOS bundle launcher prepends its
+//      bin dir to PATH; get_siril_bundle_path() is _WIN32-only here).
+//
+// Returns NULL with *error set if nothing usable is found. Caller frees.
+static gchar *resolve_system_python_for_uv(GError **error) {
+	gchar *managed = get_uv_managed_python_token();
+	if (managed)
+		return managed;
+
+	// SIRIL_PYTHON: absolute path to a specific interpreter to hand uv via
+	// `--python`. The macOS/Linux bundle launchers set this to the bundled,
+	// signed interpreter so uv is pinned to it explicitly rather than relying
+	// on PATH ordering (which anything ahead of the bundle bin dir could
+	// hijack). Honoured before the platform bundle/PATH probes below.
+	const gchar *forced = g_getenv("SIRIL_PYTHON");
+	if (forced && *forced) {
+		if (g_file_test(forced, G_FILE_TEST_IS_EXECUTABLE))
+			return g_strdup(forced);
+		siril_log_warning(_("SIRIL_PYTHON points to '%s' but it is not an "
+				"executable; ignoring and falling back to bundle/PATH\n"),
+				forced);
+	}
+
+#ifdef _WIN32
+	gchar *bundle_root = get_siril_bundle_path();
+	if (bundle_root) {
+		gchar *bundle_python = g_build_filename(bundle_root, "python", PYTHON_EXE, NULL);
+		g_free(bundle_root);
+		if (g_file_test(bundle_python, G_FILE_TEST_IS_EXECUTABLE))
+			return bundle_python;
+		g_free(bundle_python);
+	}
+#endif
+	gchar *on_path = g_find_program_in_path(PYTHON_EXE);
+	if (on_path)
+		return on_path;
+
+	g_set_error(error, G_FILE_ERROR, G_FILE_ERROR_NOENT,
+			"No Python interpreter found in bundle or on PATH");
+	return NULL;
+}
+
+// Create / validate the base venv using uv. Equivalent to the legacy
+// `python -m venv <path>` flow but driven by `uv venv --python <python>
+// --seed <venv_path>`. The --seed flag installs pip into the venv so that
+// scripts which still shell out to pip directly keep working during the
+// transition.
+//
+// UV_CACHE_DIR is pinned to <project_path>/uv-cache to ensure the wheel
+// cache lives on the same volume as the venvs (critical on Windows for
+// hardlink dedup — see uv-conversion-plan.md §6.3 / §3.1).
+//
+// uv_path is the result of get_uv_executable_path(); caller has already
+// validated that it is non-NULL and the version is acceptable.
+static gboolean uv_create_or_check_base_venv(const gchar *project_path,
+                                             const gchar *uv_path,
+                                             GError **error) {
+	gchar *venv_path = g_build_filename(project_path, "venv", NULL);
+	siril_log_debug("uv venv path: %s\n", venv_path);
+
+	// If a usable venv already exists, keep it.
+	gchar *python_exe = find_venv_python_exe(venv_path, FALSE);
+	if (python_exe) {
+		GError *health_error = NULL;
+		if (validate_venv_health(venv_path, &health_error)) {
+			siril_log_debug("uv: existing venv is healthy\n");
+			g_free(python_exe);
+			g_free(venv_path);
+			return TRUE;
+		}
+		siril_log_warning(_("Virtual environment health check failed: %s\n"),
+				health_error ? health_error->message : "unknown error");
+		siril_log_message(_("Venv exists but is unhealthy. Recreating with uv...\n"));
+		g_clear_error(&health_error);
+
+		GError *del_error = NULL;
+		if (!delete_directory(venv_path, &del_error)) {
+			g_set_error(error, G_FILE_ERROR, G_FILE_ERROR_FAILED,
+					"Failed to remove unhealthy venv: %s",
+					del_error ? del_error->message : "unknown error");
+			g_clear_error(&del_error);
+			g_free(python_exe);
+			g_free(venv_path);
+			return FALSE;
+		}
+		g_free(python_exe);
+	}
+
+	GError *local_error = NULL;
+	gchar *sys_python = resolve_system_python_for_uv(&local_error);
+	if (!sys_python) {
+		g_propagate_error(error, local_error);
+		g_free(venv_path);
+		return FALSE;
+	}
+
+	gchar *argv[] = {
+		(gchar *)uv_path,
+		"venv",
+		"-v",
+		"--python", sys_python,
+		"--seed",
+		venv_path,
+		NULL
+	};
+
+	gchar **env = g_get_environ();
+	inject_uv_env(&env, project_path);
+
+	// Heads-up for the user: a first-time interpreter download can take a
+	// while. run_uv_streaming() then streams uv's -v output to the progress
+	// bar + log so this no longer looks like Siril hung.
+	gchar *managed = get_uv_managed_python_token();
+	if (managed && !managed_python_already_installed(project_path, managed)) {
+		siril_log_message(_("Downloading Python %s interpreter (first-time "
+				"setup may take up to a minute)…\n"), managed);
+	}
+	g_free(managed);
+	siril_log_message(_("Creating Python virtual environment with uv: %s\n"),
+			venv_path);
+	siril_log_debug("uv venv command: %s venv --python %s --seed %s\n",
+			uv_path, sys_python, venv_path);
+
+	GError *spawn_err = NULL;
+	gboolean ok = run_uv_streaming(argv, env,
+			_("Creating Python environment"), &spawn_err);
+	g_strfreev(env);
+	g_free(sys_python);
+
+	if (!ok) {
+		g_propagate_error(error, spawn_err);
+		g_free(venv_path);
+		return FALSE;
+	}
+
+	g_free(venv_path);
+	return TRUE;
+}
+
+// Legacy `python -m venv` path. DEAD CODE as of the uv-required change: uv is
+// now mandatory (Python init aborts fatally without it), so check_or_create_venv
+// never reaches this fallback. Retained until the follow-up cleanup that deletes
+// the legacy pip/venv paths wholesale; do not wire new callers to it.
+static gboolean legacy_check_or_create_venv(const gchar *project_path, GError **error) {
 	gchar *venv_path = g_build_filename(project_path, "venv", NULL);
 	siril_log_debug("venv path: %s\n", venv_path);
 
@@ -3321,6 +6214,16 @@ cleanup:
 	return success;
 }
 
+// Dispatcher: route to the uv-backed implementation when uv is in use,
+// otherwise to the legacy `python -m venv` path. Callers (initialize_python_venv)
+// see no signature change.
+static gboolean check_or_create_venv(const gchar *project_path, GError **error) {
+	const gchar *uv_path = get_uv_executable_path();
+	if (uv_path)
+		return uv_create_or_check_base_venv(project_path, uv_path, error);
+	return legacy_check_or_create_venv(project_path, error);
+}
+
 static void execute_startup_scripts(void) {
 	if (!com.pref.startup_scripts)
 		return;
@@ -3353,7 +6256,10 @@ static void execute_startup_scripts(void) {
 							NULL,                    /* argv_script  */
 							FALSE,                   /* is_temp_file */
 							FALSE,                   /* from_cli     */
-							FALSE);
+							FALSE,                   /* debug_mode   */
+							script_path,             /* venv_identity_path */
+							NULL,                    /* pep723_source */
+							FALSE                    /* permissive: startup scripts are not -permissive */);
 	}
 }
 
@@ -3388,6 +6294,24 @@ static gpointer initialize_python_venv(gpointer user_data) {
 	GError *error = NULL;
 	gchar* project_path = g_build_filename(g_get_user_data_dir(), "siril", NULL);
 
+	// Phase 0: probe for uv. uv is REQUIRED — it is the only backend that can
+	// install the PEP 723 inline dependencies each script's venv is provisioned
+	// from (the old pip fallback cannot, so it has been removed). The binary
+	// distributions all bundle uv; source builds must install it.
+	probe_uv_executable();
+	if (!get_uv_executable_path()) {
+		siril_log_error(_("Failed to initialize Python: uv was not found or is "
+				"too old (minimum %s). uv is required for Python script support "
+				"— please install uv and restart Siril.\n"), UV_MINIMUM_VERSION);
+		g_free(project_path);
+		/* Release the waiters: this is an exit point of the initialisation like
+		 * any other, and master's readiness flag stays set until it is told
+		 * otherwise.  Without this, every wait_for_python_init() — pyscript, the
+		 * four §4.8 maintenance operations — blocks forever on a box with no uv. */
+		python_init_finished();
+		return GINT_TO_POINTER(1);
+	}
+
 	// Check/create venv
 	if (!check_or_create_venv(project_path, &error)) {
 		siril_log_error(_("Failed to initialize Python virtual environment: %s\n"),
@@ -3411,38 +6335,17 @@ static gpointer initialize_python_venv(gpointer user_data) {
 		return GINT_TO_POINTER(1);
 	}
 
-	// Set up environment for connection
-	GHashTableIter iter;
-	gpointer key, value;
-	g_hash_table_iter_init(&iter, venv_info->env_vars);
-	// Pre-build array of environment changes to minimize mutex hold time
-	GPtrArray *env_changes = g_ptr_array_new_full(
-		g_hash_table_size(venv_info->env_vars),
-		(GDestroyNotify)g_strfreev);
-
-	g_hash_table_iter_init(&iter, venv_info->env_vars);
-	while (g_hash_table_iter_next(&iter, &key, &value)) {
-		gchar **pair = g_new(gchar*, 3);
-		pair[0] = g_strdup((const gchar*)key);
-		pair[1] = g_strdup((const gchar*)value);
-		pair[2] = NULL;
-		g_ptr_array_add(env_changes, pair);
-	}
-	// Lock the mutex
-	g_mutex_lock(&com.env_mutex);
-	for (guint i = 0; i < env_changes->len; i++) {
-		gchar **pair = g_ptr_array_index(env_changes, i);
-		if (!g_setenv(pair[0], pair[1], TRUE))
-			siril_log_debug("Error in g_setenv: key = %s, value = %s\n", pair[0], pair[1]);
-	}
-	g_mutex_unlock(&com.env_mutex);
-	g_ptr_array_free(env_changes, TRUE);
+	/* Hand the venv's environment to the spawn path rather than exporting it
+	 * into our own: nothing in Siril reads it, and mutating environ from this
+	 * thread races every unlocked g_getenv() elsewhere now that the
+	 * initialisation runs alongside script execution. */
+	publish_venv_environment(venv_info->venv_path, venv_info->bin_dir);
 
 	// Clean up
 	if (venv_info) {
 		g_free(venv_info->venv_path);
 		g_free(venv_info->python_version);
-		g_hash_table_destroy(venv_info->env_vars);
+		g_free(venv_info->bin_dir);
 		g_free(venv_info);
 	}
 	g_free(venv_path);
@@ -3553,10 +6456,8 @@ static void python_process_cleanup(GPid pid, gint status, gpointer user_data) {
 		// Re-enable widgets
 		gui_iface.script_widgets_async(TRUE);
 
-		// Free the cleanup structure
-		if (cleanup->temp_filename && g_unlink(cleanup->temp_filename)) {
-			siril_log_debug("g_unlink() failed in python_process_cleanup()\n");
-		}
+		// Free the cleanup structure. (The temp file, if any, was already
+		// unlinked above under the `cleanup->is_temp_file` guard.)
 		g_free(cleanup->temp_filename);
 		g_free(cleanup);
 	}
@@ -3591,9 +6492,71 @@ gboolean pyc_matches_magic(const char *pyc_path, const char *expected_hex_magic)
 	return g_strcmp0(actual_hex, expected_hex_magic) == 0;
 }
 
+// Argument bundle for execute_python_script_async's worker thread.
+// Ownership: the wrapper takes ownership of every pointer it stores —
+// script_name and argv_script are consumed by execute_python_script
+// (existing semantics for script_name; we add explicit g_strfreev for
+// argv_script). venv_identity_path and pep723_source are dup'd by the
+// wrapper at call time and freed by the thread.
+typedef struct {
+	gchar *script_name;
+	gboolean from_file;
+	gchar **argv_script;
+	gboolean is_temp_file;
+	gboolean from_cli;
+	gboolean debug_mode;
+	gchar *venv_identity_path;
+	gchar *pep723_source;
+} python_script_async_args;
+
+static gpointer execute_python_script_async_thread(gpointer user_data) {
+	python_script_async_args *a = user_data;
+	execute_python_script(a->script_name, a->from_file, FALSE /* sync */,
+			a->argv_script, a->is_temp_file, a->from_cli, a->debug_mode,
+			a->venv_identity_path, a->pep723_source,
+			FALSE /* permissive: GUI/async runs use the consent dialog, not -permissive */);
+	// script_name was consumed by execute_python_script. argv_script is
+	// borrowed (used during spawn but not freed there), so we free it
+	// here once execute_python_script has returned (post-spawn).
+	g_strfreev(a->argv_script);
+	g_free(a->venv_identity_path);
+	g_free(a->pep723_source);
+	g_free(a);
+	return NULL;
+}
+
+// Fire-and-forget. Takes ownership of script_name AND argv_script —
+// callers MUST NOT free them after this returns. venv_identity_path and
+// pep723_source are dup'd internally; callers retain ownership of their
+// originals.
+void execute_python_script_async(gchar *script_name, gboolean from_file,
+                                 gchar **argv_script, gboolean is_temp_file,
+                                 gboolean from_cli, gboolean debug_mode,
+                                 const gchar *venv_identity_path,
+                                 const gchar *pep723_source) {
+	python_script_async_args *a = g_new0(python_script_async_args, 1);
+	a->script_name = script_name;
+	a->from_file = from_file;
+	a->argv_script = argv_script;
+	a->is_temp_file = is_temp_file;
+	a->from_cli = from_cli;
+	a->debug_mode = debug_mode;
+	a->venv_identity_path = venv_identity_path ? g_strdup(venv_identity_path) : NULL;
+	a->pep723_source = pep723_source ? g_strdup(pep723_source) : NULL;
+
+	GThread *thread = g_thread_new("python-launch",
+			execute_python_script_async_thread, a);
+	// Fire-and-forget: the spawned python child has its own child-watch
+	// hook for cleanup; we don't need to track this thread.
+	g_thread_unref(thread);
+}
+
 void execute_python_script(gchar* script_name, gboolean from_file, gboolean sync,
 						gchar** argv_script, gboolean is_temp_file, gboolean from_cli,
-						gboolean debug_mode) {
+						gboolean debug_mode,
+						const gchar *venv_identity_path,
+						const gchar *pep723_source,
+						gboolean permissive) {
 	/* Wait for the initialisation whenever one is in flight, rather than only
 	 * when com.python_version is still unset: the version is assigned early in
 	 * the venv setup, while the venv's environment variables are only exported
@@ -3630,12 +6593,12 @@ void execute_python_script(gchar* script_name, gboolean from_file, gboolean sync
 
 	if (!commstate.python_conn) {
 		siril_log_error(_("Error: failed to create Python connection.\n"));
-		// Clean up the temporary file if it's one
+		// Clean up the temporary file if it's one; always free script_name.
 		if (is_temp_file && script_name) {
 			if (g_unlink(script_name))
 				siril_log_debug("g_unlink() failed in execute_python_script()\n");
-			g_free(script_name);
 		}
+		g_free(script_name);
 		g_free(connection_path);
 		return;
 	}
@@ -3647,12 +6610,13 @@ void execute_python_script(gchar* script_name, gboolean from_file, gboolean sync
 
 	if (!commstate.worker_thread) {
 		siril_log_error(_("Error: Python worker thread not available.\n"));
-		cleanup_connection(commstate.python_conn);
-		// Clean up the temporary file if it's one
+		// teardown handles the conn struct free (the worker never started
+		// so there's no thread to join, and worker_thread is NULL here).
+		teardown_connection_and_worker(commstate.python_conn, commstate.worker_thread);
 		if (is_temp_file && script_name) {
 			g_unlink(script_name);
-			g_free(script_name);
 		}
+		g_free(script_name);
 		g_free(connection_path);
 		return;
 	}
@@ -3663,8 +6627,7 @@ void execute_python_script(gchar* script_name, gboolean from_file, gboolean sync
 	if (!env) {
 		siril_log_error(_("Error: failed to get environment variables.\n"));
 		/* The worker thread is running (idle in accept(), no command in
-		 * flight); stop it, join it and free conn.  Safe to join inline even on
-		 * the main thread since the worker is not executing a command. */
+		 * flight); stop it, join it and free conn. */
 		teardown_connection_and_worker(commstate.python_conn, commstate.worker_thread);
 		if (is_temp_file && script_name) {
 			g_unlink(script_name);
@@ -3674,9 +6637,31 @@ void execute_python_script(gchar* script_name, gboolean from_file, gboolean sync
 		return;
 	}
 
-	// Handle virtual environment if active
-	const gchar* venv_path = g_getenv("VIRTUAL_ENV");
+	/* Fold in the base venv's environment — VIRTUAL_ENV and its bin directory on
+	 * PATH.  The initialisation used to g_setenv() these into Siril's own environ
+	 * and let the child inherit them; it publishes them instead, so they are
+	 * applied here.  Before the per-script selection below, which overrides
+	 * VIRTUAL_ENV just as it overrode the inherited one. */
+	env = apply_venv_environment(env);
+
+	// Pick the venv for this script (§4.5). When the per-script gate is
+	// off this just returns the base venv path, so behaviour matches the
+	// pre-existing VIRTUAL_ENV lookup. The owned string lifetime extends
+	// to the end of this function.
+	GError *venv_select_err = NULL;
+	gchar *venv_path = select_venv_for_script(venv_identity_path,
+			pep723_source, &venv_select_err);
+	if (venv_select_err) {
+		// Selector logs internally; just clear here so we don't leak.
+		g_clear_error(&venv_select_err);
+	}
+
 	if (venv_path != NULL) {
+		// Set VIRTUAL_ENV in the child env so the script sees the selected
+		// venv (per-script venvs differ from the process-wide VIRTUAL_ENV
+		// that was set by prepare_venv_environment for the base venv).
+		env = g_environ_setenv(env, "VIRTUAL_ENV", venv_path, TRUE);
+
 		// Get the specific Python version for the site-packages path
 		gchar* python_version = get_venv_python_version(venv_path);
 		if (python_version) {
@@ -3702,6 +6687,16 @@ void execute_python_script(gchar* script_name, gboolean from_file, gboolean sync
 		}
 	}
 
+	// §4.7: pin uv-related env on the spawned python child too. The script
+	// may call `uv pip install` via sirilpy.ensure_installed() once we
+	// rewire it (§5.1); UV_CACHE_DIR needs to live next to the venvs.
+	{
+		gchar *project_path_for_env = g_build_filename(
+				g_get_user_data_dir(), "siril", NULL);
+		inject_uv_env(&env, project_path_for_env);
+		g_free(project_path_for_env);
+	}
+
 	// Set up connection information in environment
 #ifdef _WIN32
 	env = g_environ_setenv(env, "MY_PIPE", connection_path, TRUE);
@@ -3719,11 +6714,31 @@ void execute_python_script(gchar* script_name, gboolean from_file, gboolean sync
 	if (debug_mode)
 		env = g_environ_setenv(env, "SIRIL_PYTHON_DEBUG", "1", TRUE);
 
+	// Tell the child process where Siril's user data dir is so sirilpy
+	// (and any other Python helper) can find sibling files like
+	// gpu-prefs.json (set by sirilpy.gpuhelper.record_*_preference()) and
+	// script_venvs.json without duplicating GLib's user-data-dir
+	// resolution logic in Python.
+	{
+		gchar *siril_data_dir = g_build_filename(g_get_user_data_dir(),
+				"siril", NULL);
+		env = g_environ_setenv(env, "SIRIL_DATA_DIR", siril_data_dir, TRUE);
+		g_free(siril_data_dir);
+	}
+
 	// Set PYTHONUNBUFFERED in environment
 	env = g_environ_setenv(env, "PYTHONUNBUFFERED", "1", TRUE);
 
 	// Force UTF8 mode
 	env = g_environ_setenv(env, "PYTHONUTF8", "1", TRUE);
+
+	// NB: package cache/config/data relocation (NUMBA/XDG/MPL/… → the
+	// script-cache scratch) is now done by relocate_pkg_caches() at the sandbox
+	// policy construction below, applied only to sandboxed spawns. It supersedes
+	// the earlier per-var redirects here (which are removed): it is complete
+	// (3 XDG vars + scikit-learn/plotly/vispy, empirically verified §13.5a) and
+	// unsets the higher-precedence override vars so an inherited value cannot
+	// escape the scratch.
 
 	gchar *python_path = find_venv_python_exe(venv_path, TRUE);
 	gboolean success = FALSE;
@@ -3737,6 +6752,7 @@ void execute_python_script(gchar* script_name, gboolean from_file, gboolean sync
 		// no command in flight); stop it, join it and free conn.
 		teardown_connection_and_worker(commstate.python_conn, commstate.worker_thread);
 		g_strfreev(env);
+		g_free(venv_path);
 		if (is_temp_file && script_name) {
 			g_unlink(script_name);
 		}
@@ -3769,18 +6785,170 @@ void execute_python_script(gchar* script_name, gboolean from_file, gboolean sync
 		// Null-terminate the array
 		g_ptr_array_add(python_argv, NULL);
 
-		// Use the GPtrArray for spawning
-		GSpawnFlags spawn_flags = G_SPAWN_SEARCH_PATH | G_SPAWN_DO_NOT_REAP_CHILD;
+		// Spawn the interpreter under the platform sandbox (Linux Landlock+
+		// seccomp / macOS Seatbelt / Windows AppContainer / unsandboxed
+		// elsewhere). All platform divergence is encapsulated in
+		// siril_sandbox_spawn(); it returns the same child_pid + stdout/stderr
+		// fds g_spawn_async_with_pipes() would. venv_path is still in scope
+		// (freed after spawn).
+		/* Phase C: parse the script's [tool.siril.permissions] request, decide
+		 * whether to grant it (remembered consent / GUI dialog / -permissive /
+		 * headless default-deny), and build the applied policy. granted_* stay at
+		 * the safe default unless an elevated request is actually granted. */
+		gchar *perm_src = NULL;
+		gchar **granted_write = NULL, **granted_read = NULL;
+		gboolean granted_network = FALSE, granted_unsandboxed = FALSE;
+		gboolean want_gpu = FALSE;
+		{
+			const gchar *src_for_perms = script_name;
+			if (from_file && script_name
+					&& g_file_get_contents(script_name, &perm_src, NULL, NULL))
+				src_for_perms = perm_src;
 
-		success = g_spawn_async_with_pipes(
+			// Provision any GPU framework the script declared in [tool.siril.gpu]
+			// into its venv now, UNSANDBOXED, so the sandboxed script can simply
+			// import it. A sandboxed script cannot install it itself: a snap-
+			// packaged uv fails under the sandbox's no_new_privs (snap-confine
+			// cannot elevate). Best-effort — a failure never blocks the script.
+			// want_gpu also gates the GPU device-node grant in the sandbox policy.
+			if (venv_path) {
+				script_gpu_req *gpu = parse_script_gpu(src_for_perms);
+				if (script_gpu_req_any(gpu)) {
+					want_gpu = TRUE;
+					// Warm up NVIDIA modules/nodes before the sandbox is built, so
+					// CUDA's setuid nvidia-modprobe path (blocked by no_new_privs
+					// once confined) is not needed inside the child.
+					if (gpu->torch || gpu->onnxruntime || gpu->jax)
+						warmup_nvidia_devices();
+					gchar *vpy = find_venv_python_exe(venv_path, FALSE);
+					if (vpy) {
+						provision_gpu_frameworks(vpy, gpu);
+						g_free(vpy);
+					}
+				}
+				script_gpu_req_free(gpu);
+			}
+
+			siril_script_perms *req = parse_siril_permissions(src_for_perms, com.wd);
+
+			gboolean apply = FALSE;
+			if (perms_request_is_elevated(req)) {
+				gchar *project_path = g_build_filename(g_get_user_data_dir(),
+						"siril", NULL);
+				pep723_metadata *pep = parse_pep723(src_for_perms);
+				gchar *hash = compute_script_hash(venv_identity_path, pep);
+				pep723_metadata_free(pep);
+
+				GHashTable *store = perms_store_load(project_path);
+				perms_grant *existing = hash ? g_hash_table_lookup(store, hash) : NULL;
+
+				if (existing && perms_grant_covers(existing, req)) {
+					apply = TRUE;   /* previously approved, still covers request */
+				} else if (permissive) {
+					apply = TRUE;   /* explicit CLI approval: grant + remember */
+					if (hash) {
+						g_hash_table_replace(store, g_strdup(hash),
+								perms_grant_from_request(req,
+										from_file ? script_name : NULL));
+						perms_store_save(store, project_path);
+					}
+					siril_log_message(_("Approved and remembered sandbox permissions "
+							"for this script (-permissive).\n"));
+				} else if (!com.headless) {
+					gchar *msg = build_perms_consent_message(req);
+					const char *title = req->unsandboxed
+							? _("Script requests to run WITHOUT sandbox")
+							: _("Script requests extra permissions");
+					if (gui_iface.confirm_dialog(title, msg, _("Approve"))) {
+						apply = TRUE;
+						if (hash) {
+							g_hash_table_replace(store, g_strdup(hash),
+									perms_grant_from_request(req,
+											from_file ? script_name : NULL));
+							perms_store_save(store, project_path);
+						}
+					}
+					g_free(msg);
+				} else {
+					siril_log_warning(_("Script requested elevated sandbox "
+							"permissions but none are granted; running with default "
+							"confinement. Approve it once in the GUI, or run "
+							"'pyscript -permissive <script>'.\n"));
+				}
+
+				if (apply && req->unsandboxed)
+					siril_log_message(_("Running this script with NO sandbox — it has "
+							"full access to your files and network.\n"));
+
+				g_hash_table_destroy(store);
+				g_free(hash);
+				g_free(project_path);
+			}
+
+			if (apply) {
+				granted_network = req->network;
+				granted_unsandboxed = req->unsandboxed;
+				granted_write = strv_from_ptrarray(req->write_paths);
+				granted_read  = strv_from_ptrarray(req->read_paths);
+			}
+			siril_script_perms_free(req);
+		}
+
+		// Relocate the dependency tree's package caches into a Siril-managed
+		// scratch dir (§13.5a) so the sandbox can withhold the real ~/.cache /
+		// ~/.config / ~/.local (secrets) without breaking astropy/matplotlib/….
+		// Applied to every sandboxed spawn; skipped for a full sandbox waiver
+		// (unsandboxed), which runs the script with its normal environment.
+		gchar *script_cache_dir = NULL;
+		if (!granted_unsandboxed) {
+			script_cache_dir = g_build_filename(siril_get_user_data_dir(),
+					"script-cache", NULL);
+			relocate_pkg_caches(&env, script_cache_dir);
+			// Defense-in-depth: hide the ssh-agent socket from the sandboxed
+			// child. Its path is semi-random and lives only in this env var, so
+			// unsetting it blocks the naive "connect to $SSH_AUTH_SOCK and ask
+			// for a signature" grab (see siril_sandbox.c LIMITATIONS: the agent
+			// lets a same-UID process authenticate AS the user). Not airtight —
+			// the socket is discoverable by scanning $XDG_RUNTIME_DIR//tmp — and
+			// mostly moot for non-network scripts (egress is cut), but it is
+			// free and no astro script legitimately talks to ssh-agent.
+			env = g_environ_unsetenv(env, "SSH_AUTH_SOCK");
+
+			// If egress is cut (no network permission) a runtime uv/pip install
+			// can only succeed from the local cache. Force uv offline so it uses
+			// the shared UV_CACHE_DIR (populated unsandboxed by the GPU Manager /
+			// venv provisioning) and fails cleanly on a cache miss, instead of
+			// stalling on a seccomp-blocked network socket. This is what lets a
+			// sandboxed GPU script's TorchHelper.ensure_torch() /
+			// ONNXHelper.ensure_onnxruntime() install the recorded variant into
+			// its own venv with no network permission. A network-granted script
+			// keeps uv online (it still hits the cache first anyway).
+			if (!granted_network)
+				env = g_environ_setenv(env, "UV_OFFLINE", "1", TRUE);
+		}
+		// Directory of the script being executed — the interpreter must read the
+		// script file, which may live outside the working dir (e.g. a user script
+		// path). The scripts-repo/SPCC trees are granted by the backend itself.
+		gchar *script_dir = script_name ? g_path_get_dirname(script_name) : NULL;
+
+		SirilSandboxPolicy sandbox_policy = {
+			.wd = com.wd,
+			.venv_path = venv_path,
+			.script_dir = script_dir,
+			.cache_dir = script_cache_dir,
+			.uv_path = get_uv_executable_path(),
+			.allow_network = granted_network,
+			.gpu = want_gpu,
+			.extra_write_paths = (const char * const *) granted_write,
+			.extra_read_paths = (const char * const *) granted_read,
+			.unsandboxed = granted_unsandboxed,
+		};
+		success = siril_sandbox_spawn(
 			working_dir,
 			(gchar**)python_argv->pdata,
 			env,
-			spawn_flags,
-			NULL,
-			NULL,
+			&sandbox_policy,
 			&child_pid,
-			NULL,
 			&stdout_fd,
 			&stderr_fd,
 			&error
@@ -3788,6 +6956,13 @@ void execute_python_script(gchar* script_name, gboolean from_file, gboolean sync
 		// Free the GPtrArray (but not its contents - the caller must free argv_script)
 		g_ptr_array_free(python_argv, FALSE);
 		g_free(python_path);
+		g_free(script_cache_dir);
+		g_free(script_dir);
+		// The granted policy vectors were consumed by siril_sandbox_spawn (the
+		// backends copy or use them synchronously), so free them now.
+		g_strfreev(granted_write);
+		g_strfreev(granted_read);
+		g_free(perm_src);
 
 		if (success) {
 			// Set the flag that a python script is running
@@ -3813,6 +6988,7 @@ void execute_python_script(gchar* script_name, gboolean from_file, gboolean sync
 		// no command in flight); stop it, join it and free conn.
 		teardown_connection_and_worker(commstate.python_conn, commstate.worker_thread);
 		g_strfreev(env);
+		g_free(venv_path);
 		if (is_temp_file && script_name) {
 			g_unlink(script_name);
 		}
@@ -3828,6 +7004,7 @@ void execute_python_script(gchar* script_name, gboolean from_file, gboolean sync
 		gui_iface.script_widgets_async(TRUE);
 		return;
 	}
+	g_free(venv_path);
 
 	// Create cleanup info structure for either synchronous or async operation
 	python_cleanup_info *cleanup = g_malloc0(sizeof(python_cleanup_info));
@@ -3838,6 +7015,7 @@ void execute_python_script(gchar* script_name, gboolean from_file, gboolean sync
 	 * original must be freed here; the temp file itself is unlinked later by
 	 * python_process_cleanup via temp_filename. */
 	g_free(script_name);
+	script_name = NULL;
 	cleanup->child_pid = child_pid;
 	cleanup->is_temp_file = is_temp_file;
 	cleanup->python_conn = commstate.python_conn;
