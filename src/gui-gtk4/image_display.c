@@ -26,6 +26,8 @@
 #include "algos/colors.h"
 #include "algos/siril_wcs.h"
 #include "algos/sorting.h"
+#include "core/fits_region.h"
+#include "core/gui_iface.h"
 #include "core/icc_profile.h"
 #include "core/processing.h"
 #include "core/proto.h"
@@ -35,6 +37,7 @@
 #include "git-version.h"
 #include "gui-gtk4/callbacks.h"
 #include "gui-gtk4/ccd-inspector.h"
+#include "gui-gtk4/flis_gpu_compose.h"
 #include "gui-gtk4/histo_display.h"
 #include "gui-gtk4/histogram.h"
 #include "gui-gtk4/image_display.h"
@@ -45,7 +48,9 @@
 #include "gui-gtk4/siril_preview.h"
 #include "gui-gtk4/utils.h"
 #include "io/annotation_catalogues.h"
+#include "io/flis_compose.h"
 #include "io/image_format_fits.h"
+#include "io/image_format_flis.h"
 #include "io/sequence.h"
 #include "io/single_image.h"
 #include "livestacking/livestacking.h"
@@ -56,7 +61,7 @@
 #include "registration/mpp/mpp_shift.h"
 #include "registration/registration.h"
 
-/* is gfit->icc_profile identical to the monitor profile, if so we can avoid the
+/* is current_icc_profile() identical to the monitor profile, if so we can avoid the
  * transform */
 static cmsBool identical = FALSE;
 
@@ -111,6 +116,172 @@ static void image_display_init_statics(void) {
 }
 
 static void invalidate_image_render_cache(int vport);
+
+/* =========================================================================
+ * FLIS display composite cache (stage 3.1 — correctness baseline)
+ * =========================================================================
+ *
+ * The display pipeline works on a single fits* (gfit) and remaps its
+ * pixel data into per-viewport BGRA8 buffers.  For a FLIS file gfit is
+ * still the active layer, but the user expects to see the full
+ * composite of all visible layers.  We build that composite into a
+ * private fits* and swap gfit to point at it for the duration of
+ * remap_all() (see the swap at the top of that function).
+ *
+ * This stage-3.1 implementation rebuilds the entire composite on every
+ * invalidation.  Stages 3.2 and 3.3 layer a per-layer GdkTexture cache
+ * and per-tile materialisation on top, eliminating the full-canvas
+ * rebuild for property-only changes.  flis_display_composite remains
+ * useful as the CPU fallback and correctness oracle in those later
+ * stages.
+ *
+ * Threading: built and accessed under gui.cairo_mutex inside remap_all.
+ * The mutex covers both the composite build and the gfit swap, so
+ * concurrent worker-thread redraws serialise rather than race.
+ * ========================================================================= */
+static fits     *flis_display_composite = NULL;
+static gboolean  flis_composite_dirty   = TRUE;
+
+/* Ensure flis_display_composite reflects the current com.uniq->layers
+ * state.  Returns 0 if the composite is ready, non-zero on failure
+ * (caller should fall through to displaying gfit directly).  Must be
+ * called with gui.cairo_mutex held when concurrent remap callers are
+ * possible; remap_all takes the mutex around it. */
+static int flis_composite_ensure_built(void) {
+	if (!is_current_image_flis() || !com.uniq || !com.uniq->layers)
+		return 1;
+	if (!flis_composite_dirty && flis_display_composite)
+		return 0;
+	/* M-F12: the render walks the layer list and reads every layer's
+	 * pixel buffers; worker hooks mutate both under the stack writer
+	 * lock.  Order: gui.cairo_mutex (held by our callers) → stack.
+	 *
+	 * TRYLOCK, not a blocking acquire: a long layer operation (registration,
+	 * group calibration) holds the writer lock for its whole duration, and
+	 * blocking here would freeze every redraw until it finishes — a hang from
+	 * the user's side.  When the lock is unavailable, keep showing the last
+	 * composite (if any); the operation ends by invalidating and redrawing,
+	 * which rebuilds cleanly once the writer has released. */
+	if (!flis_stack_reader_trylock())
+		return flis_display_composite ? 0 : 1;
+	fits *fresh = flis_render_layers(com.uniq->layers);
+	flis_stack_reader_unlock();
+	if (!fresh) return 1;
+	if (flis_display_composite) {
+		clearfits(flis_display_composite);
+		free(flis_display_composite);
+	}
+	flis_display_composite = fresh;
+	flis_composite_dirty   = FALSE;
+	return 0;
+}
+
+/* Mark the cached composite stale so the next remap rebuilds it.
+ * Wired to gui_iface.flis_invalidate_composite from gui_iface_impl.c.
+ * Atomic write — no mutex needed: a concurrent ensure_built reading
+ * dirty either picks up TRUE (rebuilds) or FALSE (skips); both are
+ * acceptable in a brief race.
+ *
+ * Also drops the §3.2 per-layer GPU texture cache.  Coarse — every
+ * layer's texture is invalidated even if only one changed — but the
+ * granular API (§3.4) is more complex than is justified at this
+ * stage.  In practice the gui_iface callers (image_format_flis.c
+ * mutators) want all-or-nothing invalidation anyway. */
+static void flis_composite_invalidate(void) {
+	flis_composite_dirty = TRUE;
+	flis_gpu_compose_invalidate_all();
+}
+
+/* Release the cached composite entirely.  Called when an image is
+ * closed or a non-FLIS file replaces a FLIS file.  Wired to
+ * gui_iface.flis_composite_free.  Takes gui.cairo_mutex because a
+ * concurrent remap_all on the worker thread may be holding a pointer
+ * to flis_display_composite — we must not free under it.
+ *
+ * Also releases all GPU compose textures — these are GPU memory and
+ * should be reclaimed promptly when an image closes. */
+static void flis_composite_release(void) {
+	g_mutex_lock(&gui.cairo_mutex);
+	if (flis_display_composite) {
+		clearfits(flis_display_composite);
+		free(flis_display_composite);
+		flis_display_composite = NULL;
+	}
+	flis_composite_dirty = TRUE;
+	flis_gpu_compose_free_all();
+	g_mutex_unlock(&gui.cairo_mutex);
+}
+
+/* External wrappers — referenced by gui_iface_impl.c.  The impl can't
+ * see the static helpers above, so we expose thin trampolines with
+ * stable extern symbols.  Naming convention matches the gui_iface
+ * vtable entries. */
+void flis_display_invalidate_composite(void) {
+	flis_composite_invalidate();
+}
+void flis_display_composite_free(void) {
+	flis_composite_release();
+}
+
+/* Build the composite if it is stale and hand back a borrowed pointer to it,
+ * or NULL when there is nothing to composite (no FLIS document open, or the
+ * build failed).  Callers pass this to whatever has to measure or render the
+ * multi-layer image, rather than pointing gfit at it for the duration: gfit is
+ * read unsynchronised throughout the code base — including by the tile pool,
+ * which takes a lock on whichever fits it finds there — so aliasing it even
+ * briefly hands every one of those readers a different image mid-flight.
+ *
+ * Borrowed, not owned.  The composite lives until flis_composite_release() or
+ * the next rebuild, both of which run under cairo_mutex from the close and
+ * invalidate paths; that is exactly the lifetime the swap pair below offered
+ * its callers. */
+fits *flis_display_get_composite(void) {
+	if (!is_current_image_flis()) return NULL;
+	g_mutex_lock(&gui.cairo_mutex);
+	fits *composite = (flis_composite_ensure_built() == 0) ? flis_display_composite
+	                                                       : NULL;
+	g_mutex_unlock(&gui.cairo_mutex);
+	return composite;
+}
+
+/* Stage 3.4 — narrow-flag invalidation chokepoint.  Dispatched by
+ * gui_iface.flis_display_invalidate().  Translates declarative
+ * "what changed" flags into the minimal cache-drop pattern.
+ *
+ * Both cache layers (CPU float composite + per-layer GPU tile grid)
+ * are managed here:
+ *   • CPU composite is one flat buffer per FLIS — any layer change
+ *     (pixels, props, stack) invalidates it.
+ *   • GPU per-layer cache is keyed on item_id; only pixel/tint/lmask
+ *     changes invalidate one slot's textures.  Property changes
+ *     (opacity/blend/visible) don't touch tile contents — the
+ *     snapshot tree is rebuilt each frame and reads current
+ *     properties from the layer struct.
+ *
+ * Redraw is NOT triggered here — callers (typically end_generic_layer)
+ * dispatch redraw separately.  This keeps the cache state and the
+ * redraw lifecycle on independent timelines. */
+void flis_display_invalidate(int flags, int item_id) {
+	if (flags & FLIS_INV_ALL) {
+		flis_composite_invalidate();
+		return;
+	}
+	gboolean composite_dirty = FALSE;
+	if (flags & FLIS_INV_LAYER_PIXELS) {
+		composite_dirty = TRUE;
+		flis_gpu_compose_invalidate_layer(item_id);
+	}
+	if (flags & (FLIS_INV_LAYER_PROPS | FLIS_INV_STACK)) {
+		composite_dirty = TRUE;
+		/* No GPU work — props/order changes don't affect tile pixels. */
+	}
+	if (composite_dirty) {
+		/* Mark the CPU composite dirty without dropping GPU tiles.
+		 * Mirror flis_composite_invalidate's atomic write — see the
+		 * comment block above flis_composite_dirty. */
+		flis_composite_dirty = TRUE;
+	}
+}
 
 /* Tile side length.  Each viewport's buf is exposed to GSK as a grid of
  * GdkTextures of up to SIRIL_TILE_DIM × SIRIL_TILE_DIM pixels; right- and
@@ -393,11 +564,11 @@ void drop_lazy_tile_textures(void) {
  * on both axes) get eager mode — one contiguous buf, no LRU; anything
  * larger uses lazy mode — tile bytes materialised on demand and bounded
  * by SIRIL_LAZY_BUDGET.  Returns 0 on success. */
-static int allocate_full_surface(struct image_view *view) {
+static int allocate_full_surface(struct image_view *view, fits *fit) {
 	g_mutex_lock(&gui.cairo_mutex);
 
-	const int img_w = (int)gfit->rx;
-	const int img_h = (int)gfit->ry;
+	const int img_w = (int)fit->rx;
+	const int img_h = (int)fit->ry;
 	if (img_w <= 0 || img_h <= 0) {
 		g_mutex_unlock(&gui.cairo_mutex);
 		return 1;
@@ -871,7 +1042,7 @@ static gboolean materialise_tile(struct image_view *view, int vport,
 		 * no locks of its own, so nothing nests inside. */
 		cmsHTRANSFORM icc_tf = NULL;
 		gboolean tf_locked = FALSE;
-		if (gfit->color_managed && !identical
+		if (current_image_color_managed() && !identical
 				&& !com.gui_icc.same_primaries) {
 			lock_display_transform();
 			tf_locked = TRUE;
@@ -1029,7 +1200,7 @@ static void ensure_proxy(struct image_view *view, int vport) {
 		 * materialise_tile for the ordering argument. */
 		cmsHTRANSFORM icc_tf = NULL;
 		gboolean tf_locked = FALSE;
-		if (gfit->color_managed && !identical
+		if (current_image_color_managed() && !identical
 				&& !com.gui_icc.same_primaries) {
 			lock_display_transform();
 			tf_locked = TRUE;
@@ -1180,7 +1351,7 @@ static gboolean pick_render_luts(int vport, const BYTE *idx[3],
 			idx[c] = hd_mode ? gui.hd_remap_index[slot] : gui.remap_index[slot];
 		}
 		*out_icc_tf = NULL;
-		if (gfit->color_managed && !identical
+		if (current_image_color_managed() && !identical
 				&& !com.gui_icc.same_primaries) {
 			lock_display_transform();
 			*out_icc_tf = display_pixel_transform();
@@ -1369,14 +1540,25 @@ static void materialise_worker(gpointer data, gpointer user) {
 		return;
 
 	for (;;) {
-		if (!gfit) {
+		/* Read the global ONCE per job and work off `fit` from here on.
+		 * gfit is not a fixed struct in a FLIS build: uniq_set_active_layer()
+		 * retargets it whenever the active layer changes.
+		 * Re-reading it per dereference would let a retarget land between the
+		 * acquire below and the release at the bottom, so we would release a
+		 * lock we never took and leave the one we did take held for good —
+		 * every later writer, close included, would then block on it.  Filling
+		 * from the fits we locked is also the only self-consistent choice: a
+		 * retarget mid-fill costs one stale tile, which the generation and
+		 * invalidate_seq checks in phase 3 already discard. */
+		fits *fit = g_atomic_pointer_get(&gfit);
+		if (!fit) {
 			g_mutex_lock(&gui.cairo_mutex);
 			gui.view[vport].workers_active--;
 			g_mutex_unlock(&gui.cairo_mutex);
 			return;
 		}
 
-		g_rw_lock_reader_lock(&gfit->rwlock);
+		g_rw_lock_reader_lock(&fit->rwlock);
 		g_mutex_lock(&gui.cairo_mutex);
 		struct image_view *view = &gui.view[vport];
 
@@ -1384,7 +1566,7 @@ static void materialise_worker(gpointer data, gpointer user) {
 		    || g_atomic_int_get(&gui.suppress_drawarea_redraw)) {
 			view->workers_active--;
 			g_mutex_unlock(&gui.cairo_mutex);
-			g_rw_lock_reader_unlock(&gfit->rwlock);
+			g_rw_lock_reader_unlock(&fit->rwlock);
 			return;
 		}
 
@@ -1454,7 +1636,7 @@ static void materialise_worker(gpointer data, gpointer user) {
 		if (!found) {
 			view->workers_active--;
 			g_mutex_unlock(&gui.cairo_mutex);
-			g_rw_lock_reader_unlock(&gfit->rwlock);
+			g_rw_lock_reader_unlock(&fit->rwlock);
 			return;
 		}
 
@@ -1463,8 +1645,8 @@ static void materialise_worker(gpointer data, gpointer user) {
 
 		/* Phase 1b — snapshot every input the fill needs, so phase 2 touches no
 		 * shared mutable state.  LUT *pointers* are captured here (contents may
-		 * race a remap, see the section note); gfit pixel pointers stay valid
-		 * under the reader lock. */
+		 * race a remap, see the section note); `fit`'s pixel pointers stay valid
+		 * under the reader lock we hold on it. */
 		const guint gen = view->generation;
 		const guint seq = view->invalidate_seq;
 		int gx0, gy0, gtw, gth, gtex_w, gtex_h;
@@ -1475,13 +1657,13 @@ static void materialise_worker(gpointer data, gpointer user) {
 		const int out_h = MAX(1, gtex_h >> jmip);
 		const gsize tile_bytes = (gsize)out_w * out_h * 4;
 		const gboolean neg = view->render_neg;
-		const int gtype = gfit->type;
+		const int gtype = fit->type;
 		const guint hd_max = gui.hd_remap_max;
 		const BYTE *idx[3];
 		cmsHTRANSFORM icc_tf = NULL;
 		const gboolean hd_mode = pick_render_luts(vport, idx, &icc_tf);
-		const WORD *psrc[3] = { gfit->pdata[0], gfit->pdata[1], gfit->pdata[2] };
-		const float *fpsrc[3] = { gfit->fpdata[0], gfit->fpdata[1], gfit->fpdata[2] };
+		const WORD *psrc[3] = { fit->pdata[0], fit->pdata[1], fit->pdata[2] };
+		const float *fpsrc[3] = { fit->fpdata[0], fit->fpdata[1], fit->fpdata[2] };
 
 		g_mutex_unlock(&gui.cairo_mutex);   /* keep the reader lock for the fill */
 
@@ -1493,7 +1675,7 @@ static void materialise_worker(gpointer data, gpointer user) {
 		if (!buf) {
 			if (icc_tf)
 				unlock_display_transform();
-			g_rw_lock_reader_unlock(&gfit->rwlock);
+			g_rw_lock_reader_unlock(&fit->rwlock);
 			g_mutex_lock(&gui.cairo_mutex);
 			if (view->generation == gen && view->tiles
 			    && view->tile_cols == cols && view->tile_rows == rows)
@@ -1542,7 +1724,7 @@ static void materialise_worker(gpointer data, gpointer user) {
 			}
 		}
 		g_mutex_unlock(&gui.cairo_mutex);
-		g_rw_lock_reader_unlock(&gfit->rwlock);
+		g_rw_lock_reader_unlock(&fit->rwlock);
 
 		if (!assigned)
 			g_object_unref(tex);   /* discard; frees buf via the GBytes free func */
@@ -1610,30 +1792,85 @@ static void schedule_view_worker(struct image_view *view, int vport,
 	}
 }
 
-void check_gfit_profile_identical_to_monitor() {
-	if (!com.headless && gfit->icc_profile && gfit->color_managed)
-		identical = profiles_identical(gfit->icc_profile, com.gui_icc.monitor);
-	siril_log_debug("gfit profile identical to monitor profile: %d\n", identical);
+/* Stop the tile-materialisation pool and wait for its threads to leave.
+ *
+ * The caller MUST have suppressed redraws first (set_suppress_redraws(TRUE))
+ * and must keep the suppression up for as long as the pool has to stay idle:
+ * with the flag set the snapshot skips schedule_view_worker(), so nothing
+ * rebuilds the pool behind us, and a worker still inside its loop bails at the
+ * top rather than claiming another tile.
+ *
+ * Suppressing alone is not enough for a caller about to free the fits gfit
+ * points at, or to repoint gfit at another one: an in-flight worker holds a
+ * reader lock on the OLD struct across its fill, so neither the pixels nor the
+ * struct carrying the rwlock may go away until it has actually left.  That is
+ * what free_image_data() needs when it dismantles a FLIS layer stack; a writer
+ * lock cannot express it, because the lock being waited on lives inside the
+ * memory about to be freed.
+ *
+ * The pool is detached under cairo_mutex — schedule_view_worker() pushes with
+ * that held, so it cannot push into a pool being freed; it would find NULL and
+ * build a fresh one, which the caller's suppression prevents — and then freed
+ * OUTSIDE it, because the workers being joined need the mutex themselves to
+ * finish.  g_thread_pool_free() discards whatever is still queued and returns
+ * once every running worker has returned.  A fresh pool is created by the next
+ * schedule_view_worker() after the caller lifts the suppression.
+ *
+ * view->workers_active is reset rather than waited on.  It is the scheduler's
+ * own accounting and it over-counts: a live session sits at 12 "in flight" for
+ * a view whose pool has an empty queue and no thread anywhere inside
+ * materialise_worker, which also pins workers_active at `want` and stops that
+ * view scheduling any further tile work.  Joining the threads is the ground
+ * truth; the counters only mean anything again once they agree with it, and
+ * after a join that is zero.
+ *
+ * Callable from any thread, and it cannot deadlock against the main loop: a
+ * worker never waits on the GTK main context (its redraw request is an async
+ * g_idle_add), so every in-flight job finishes without our help.  Never call it
+ * while holding gfit's WRITER lock: a worker blocked on the reader lock would
+ * never return, and the join would never finish. */
+void materialise_pool_drain(void) {
+	g_mutex_lock(&gui.cairo_mutex);
+	GThreadPool *pool = materialise_pool;
+	materialise_pool = NULL;
+	g_mutex_unlock(&gui.cairo_mutex);
+
+	if (pool)
+		g_thread_pool_free(pool, TRUE, TRUE);
+
+	g_mutex_lock(&gui.cairo_mutex);
+	for (int vport = 0; vport <= RGB_VPORT; vport++)
+		gui.view[vport].workers_active = 0;
+	g_mutex_unlock(&gui.cairo_mutex);
 }
 
-static void remaprgb(void) {
+void check_gfit_profile_identical_to_monitor() {
+	/* Profile is stored authoritatively on com.uniq for both plain FITS
+	 * and FLIS images. */
+	cmsHPROFILE prof = current_icc_profile();
+	if (!com.headless && prof && current_image_color_managed())
+		identical = profiles_identical(prof, com.gui_icc.monitor);
+	siril_log_debug("current image profile identical to monitor profile: %d\n", identical);
+}
+
+static void remaprgb(fits *fit) {
 	guint32 *dst;
 	const guint32 *bufr, *bufg, *bufb;
 	gint i;
 	int nbdata;
 
 	siril_log_debug("remaprgb\n");
-	if (!isrgb(gfit))
+	if (!isrgb(fit))
 		return;
 
 	struct image_view *rgbview = &gui.view[RGB_VPORT];
-	if (allocate_full_surface(rgbview))
+	if (allocate_full_surface(rgbview, fit))
 		return;
 
 	g_mutex_lock(&gui.cairo_mutex);
 
 	/* Lazy mode: no gray bufs to composite from.  materialise_tile_rgb
-	 * reads gfit + the per-channel LUTs directly when it fills each
+	 * reads fit + the per-channel LUTs directly when it fills each
 	 * RGB tile, so we just invalidate here. */
 	if (rgbview->lazy) {
 		view_refresh_tile_textures(rgbview);
@@ -1662,7 +1899,7 @@ static void remaprgb(void) {
 	cmsHTRANSFORM icc_tf = NULL;
 	gboolean tf_locked = FALSE;
 	if ((gui.rendering_mode == STF_DISPLAY || gui.rendering_mode == HISTEQ_DISPLAY)
-			&& gfit->color_managed && !identical && !com.gui_icc.same_primaries) {
+			&& current_image_color_managed() && !identical && !com.gui_icc.same_primaries) {
 		/* cairo_mutex is already held; taking the display transform lock second
 		 * matches the order remap_all_vports() uses.  It is taken BEFORE the
 		 * lookup and held until after the last use: display_pixel_transform()
@@ -1766,7 +2003,7 @@ enum {
 	INDEX_REUSED		/* the previous LUT is still valid, transform already composed */
 };
 
-static int make_index_for_current_display(int vport, float *fidx);
+static int make_index_for_current_display(int vport, float *fidx, fits *fit);
 
 static int make_hd_index_for_current_display(int vport);
 
@@ -1777,7 +2014,7 @@ static void remap_mask(mask_t *mask) {
 
 	int vport = MASK_VPORT;
 	struct image_view *view = &gui.view[vport];
-	if (allocate_full_surface(view))
+	if (allocate_full_surface(view, gfit))
 		return;
 
 	g_mutex_lock(&gui.cairo_mutex);
@@ -1896,7 +2133,7 @@ static gboolean viewer_mode_sensitive_idle(gpointer data) {
 }
 
 // remapping one vport at a time is used for DISPLAY_STF and DISPLAY_HISTEQ
-static void remap(int vport) {
+static void remap(int vport, fits *fit) {
 	// This function maps fit data with a linear LUT between lo and hi levels
 	// to the buffer to be displayed; display only is modified
 	BYTE *dst, *index, rainbow_index[UCHAR_MAX + 1][3];
@@ -1905,16 +2142,16 @@ static void remap(int vport) {
 	gboolean inverted;
 	siril_log_debug("HISTEQ / STF remap %d\n", vport);
 	if (vport == RGB_VPORT) {
-		remaprgb();
+		remaprgb(fit);
 		return;
 	}
-	if (gfit->type == DATA_UNSUPPORTED) {
+	if (fit->type == DATA_UNSUPPORTED) {
 		siril_log_debug("data is not loaded yet\n");
 		return;
 	}
 
 	struct image_view *view = &gui.view[vport];
-	if (allocate_full_surface(view))
+	if (allocate_full_surface(view, fit))
 		return;
 
 	/* Cache the two GAction pointers on first call.
@@ -1942,14 +2179,14 @@ static void remap(int vport) {
 		 * free/recompute by notify_gfit_data_modified() and against the
 		 * histogram dialog's draw handler. */
 		g_mutex_lock(&com.histogram_mutex);
-		compute_histo_for_fit(gfit);
+		compute_histo_for_fit(fit);
 		histo = com.layers_hist[vport];
 		if (!histo) {
 			g_mutex_unlock(&com.histogram_mutex);
 			return;
 		}
 		hist_nb_bins = gsl_histogram_bins(histo);
-		nb_pixels = (double)(gfit->rx * gfit->ry);
+		nb_pixels = (double)(fit->rx * fit->ry);
 		// build the remap_index; HISTEQ derives a curve per channel, so it
 		// belongs in this channel's slot (see lut_slot_for_channel)
 		index = gui.remap_index[vport];
@@ -1967,21 +2204,21 @@ static void remap(int vport) {
 	} else {
 		if (gui.rendering_mode == STF_DISPLAY && !stf_computed) {
 			if (gui.unlink_channels)
-				find_unlinked_midtones_balance(gfit, AS_DEFAULT_SHADOWS_CLIPPING, gui.autostretch_target_bg, stf);
-			else find_linked_midtones_balance(gfit, AS_DEFAULT_SHADOWS_CLIPPING, gui.autostretch_target_bg, stf);
+				find_unlinked_midtones_balance(fit, AS_DEFAULT_SHADOWS_CLIPPING, gui.autostretch_target_bg, stf);
+			else find_linked_midtones_balance(fit, AS_DEFAULT_SHADOWS_CLIPPING, gui.autostretch_target_bg, stf);
 			stf_computed = TRUE;
 		}
-		if (gui.rendering_mode == STF_DISPLAY && gui.use_hd_remap && gfit->type == DATA_FLOAT) {
+		if (gui.rendering_mode == STF_DISPLAY && gui.use_hd_remap && fit->type == DATA_FLOAT) {
 			make_hd_index_for_current_display(vport);
 		}
 		else
-			make_index_for_current_display(vport, NULL);
+			make_index_for_current_display(vport, NULL, fit);
 		siril_add_idle(viewer_mode_sensitive_idle,
 		               GINT_TO_POINTER(gui.rendering_mode != STF_DISPLAY));
 	}
 
-	src = gfit->pdata[vport];
-	fsrc = gfit->fpdata[vport];
+	src = fit->pdata[vport];
+	fsrc = fit->fpdata[vport];
 
 	g_mutex_lock(&gui.cairo_mutex);
 
@@ -2007,7 +2244,7 @@ static void remap(int vport) {
 		make_index_for_rainbow(rainbow_index);
 	int target_index = lut_slot_for_channel(vport);
 
-	gboolean hd_mode = (gui.rendering_mode == STF_DISPLAY && gui.use_hd_remap && gfit->type == DATA_FLOAT);
+	gboolean hd_mode = (gui.rendering_mode == STF_DISPLAY && gui.use_hd_remap && fit->type == DATA_FLOAT);
 	if (hd_mode) {
 		index = gui.hd_remap_index[target_index];
 	}
@@ -2015,23 +2252,26 @@ static void remap(int vport) {
 		index = gui.remap_index[target_index];
 
 	// Check if mask overlay is active
-	gboolean apply_mask = (gfit->mask != NULL && gfit->mask_active && com.pref.gui.mask_tints_vports);
+	mask_t overlay_mask = { 0 };
+	gboolean apply_mask =
+	    (fit->mask_active && com.pref.gui.mask_tints_vports
+	     && flis_get_displayed_mask(&overlay_mask));
 	uint8_t *mask_u8 = NULL;
 	uint16_t *mask_u16 = NULL;
 	float *mask_f32 = NULL;
 	int mask_bitpix = 0;
 
 	if (apply_mask) {
-		mask_bitpix = gfit->mask->bitpix;
+		mask_bitpix = overlay_mask.bitpix;
 		switch (mask_bitpix) {
 			case 8:
-				mask_u8 = (uint8_t *)gfit->mask->data;
+				mask_u8 = (uint8_t *)overlay_mask.data;
 				break;
 			case 16:
-				mask_u16 = (uint16_t *)gfit->mask->data;
+				mask_u16 = (uint16_t *)overlay_mask.data;
 				break;
 			case 32:
-				mask_f32 = (float *)gfit->mask->data;
+				mask_f32 = (float *)overlay_mask.data;
 				break;
 			default:
 				apply_mask = FALSE; // Invalid bitpix, disable mask
@@ -2039,14 +2279,14 @@ static void remap(int vport) {
 		}
 	}
 
-	const guint width = gfit->rx;
-	const guint height = gfit->ry;
+	const guint width = fit->rx;
+	const guint height = fit->ry;
 
 /* Macro to compute a pixel from source index src_i and write it to dst+dst_i */
 #define REMAP_WRITE_PIXEL(src_i, dst_i) \
 	do { \
 		BYTE dpv; \
-		if (gfit->type == DATA_USHORT) { \
+		if (fit->type == DATA_USHORT) { \
 			const WORD sv = src[(src_i)]; \
 			dpv = hd_mode ? index[sv * gui.hd_remap_max / USHRT_MAX] : index[sv]; \
 		} else { \
@@ -2102,7 +2342,7 @@ static void remap(int vport) {
 	test_and_allocate_reference_image(vport);
 }
 
-static void remap_all_vports() {
+static void remap_all_vports(fits *fit) {
 	gboolean inverted;
 	/* Snapshot gui.hi/gui.lo: init_layers_hi_and_lo_values() may write them
 	 * from the worker thread concurrently while this path runs from
@@ -2136,24 +2376,28 @@ static void remap_all_vports() {
 	if (color == RAINBOW_COLOR)
 		make_index_for_rainbow(rainbow_index);
 
-	// Check if mask overlay is active
-	gboolean apply_mask = (gfit->mask != NULL && gfit->mask_active && com.pref.gui.mask_tints_vports);
+	// Check if mask overlay is active (§4.2 — honours the panel's
+	// mask-view radio via flis_get_displayed_mask).
+	mask_t overlay_mask = { 0 };
+	gboolean apply_mask =
+	    (fit->mask_active && com.pref.gui.mask_tints_vports
+	     && flis_get_displayed_mask(&overlay_mask));
 	uint8_t *mask_u8 = NULL;
 	uint16_t *mask_u16 = NULL;
 	float *mask_f32 = NULL;
 	int mask_bitpix = 0;
 
 	if (apply_mask) {
-		mask_bitpix = gfit->mask->bitpix;
+		mask_bitpix = overlay_mask.bitpix;
 		switch (mask_bitpix) {
 			case 8:
-				mask_u8 = (uint8_t *)gfit->mask->data;
+				mask_u8 = (uint8_t *)overlay_mask.data;
 				break;
 			case 16:
-				mask_u16 = (uint16_t *)gfit->mask->data;
+				mask_u16 = (uint16_t *)overlay_mask.data;
 				break;
 			case 32:
-				mask_f32 = (float *)gfit->mask->data;
+				mask_f32 = (float *)overlay_mask.data;
 				break;
 			default:
 				apply_mask = FALSE; // Invalid bitpix, disable mask
@@ -2167,24 +2411,26 @@ static void remap_all_vports() {
 	WORD *src[3];
 	float *fsrc[3];
 
-	if (gfit->type == DATA_UNSUPPORTED) {
+	if (fit->type == DATA_UNSUPPORTED) {
 		siril_log_debug("data is not loaded yet\n");
 		return;
 	}
 
+	gboolean managed = current_image_color_managed();
 	lock_display_transform();
-	if (gfit->color_managed) {
+	if (managed) {
 		// Set the transform in case it is missing
 		if (!com.gui_icc.proofing_transform) {
 			com.gui_icc.proofing_transform = initialize_proofing_transform();
 			com.gui_icc.profile_changed = TRUE;
 		}
 		if (com.gui_icc.profile_changed) {
-			com.gui_icc.same_primaries = same_primaries(gfit->icc_profile, com.gui_icc.monitor, (com.gui_icc.soft_proof && com.pref.icc.soft_proofing_profile_active) ? com.gui_icc.soft_proof : NULL);
+			com.gui_icc.same_primaries = same_primaries(current_icc_profile(), com.gui_icc.monitor, (com.gui_icc.soft_proof && com.pref.icc.soft_proofing_profile_active) ? com.gui_icc.soft_proof : NULL);
 //			com.gui_icc.same_primaries = FALSE;
 			check_gfit_profile_identical_to_monitor();
-			// Calling color_manage() like this updates the color management button tooltip
-			color_manage(gfit, gfit->color_managed);
+			// Re-set the color-managed flag through the accessor so the
+			// toolbar tooltip updates.
+			current_image_color_manage(managed);
 			if (is_preview_active())
 				copy_gfit_icc_to_backup();
 		}
@@ -2203,20 +2449,20 @@ static void remap_all_vports() {
 	 * most 3 code values, so the 8-bit composition is kept. If the scratch
 	 * cannot be allocated, fall back to it as well - posterised beats
 	 * uncolour-managed. */
-	const gboolean compose = (gfit->color_managed && com.gui_icc.same_primaries &&
+	const gboolean compose = (managed && com.gui_icc.same_primaries &&
 			com.gui_icc.proofing_transform && gui.rendering_mode != STF_DISPLAY);
 	float *fidx = NULL;
-	if (compose && fit_icc_is_linear(gfit)) {
+	if (compose && icc_profile_is_linear(current_icc_profile())) {
 		fidx = malloc((USHRT_MAX + 1) * sizeof(float));
 		if (!fidx)
 			PRINT_ALLOC_ERR;
 	}
 
-	int status = make_index_for_current_display(0, fidx);
+	int status = make_index_for_current_display(0, fidx, fit);
 	index[0] = gui.remap_index[0];
-	if (gfit->color_managed) {
+	if (managed) {
 		for (int i = 1 ; i < 3 ; i++) {
-			make_index_for_current_display(i, NULL);
+			make_index_for_current_display(i, NULL, fit);
 			index[i] = gui.remap_index[i];
 		}
 	}
@@ -2240,9 +2486,9 @@ static void remap_all_vports() {
 	// pointer race: a concurrent allocate_full_surface() could realloc view->buf
 	// between its internal unlock and the cairo_mutex acquisition below.
 	for (int i = 0 ; i < 3 ; i++) {
-		src[i] = gfit->pdata[i];
-		fsrc[i] = gfit->fpdata[i];
-		if (allocate_full_surface(view[i]))
+		src[i] = fit->pdata[i];
+		fsrc[i] = fit->fpdata[i];
+		if (allocate_full_surface(view[i], fit))
 			return;
 	}
 	g_mutex_lock(&gui.cairo_mutex);
@@ -2264,9 +2510,9 @@ static void remap_all_vports() {
 	for (int i = 0 ; i < 3 ; i++)
 		dst[i] = view[i]->buf;
 
-	int norm = (int) get_normalized_value(gfit);
-	const guint width = gfit->rx;
-	const guint height = gfit->ry;
+	int norm = (int) get_normalized_value(fit);
+	const guint width = fit->rx;
+	const guint height = fit->ry;
 
 	/* Render is always at the image's natural resolution now — the
 	 * downscaled path that worked around the Cairo 32767-px limit has
@@ -2357,7 +2603,7 @@ static void remap_all_vports() {
 				}
 			}
 
-			if (gfit->type == DATA_FLOAT) {
+			if (fit->type == DATA_FLOAT) {
 				for (int c = 0 ; c < 3 ; c++) {
 					WORD *line = linebuf[c];
 					float *source = fsrc[c];
@@ -2378,7 +2624,7 @@ static void remap_all_vports() {
 // No omp simd here as memcpy should already be highly optimized
 					memcpy(linebuf[c], src[c] + src_i, width * sizeof(WORD));
 			}
-			if (gfit->type == DATA_USHORT && norm == UCHAR_MAX) {
+			if (fit->type == DATA_USHORT && norm == UCHAR_MAX) {
 				for (int c = 0 ; c < 3 ; c++) {
 					WORD *line = linebuf[c];
 #pragma omp simd
@@ -2387,7 +2633,7 @@ static void remap_all_vports() {
 				}
 			}
 			for (int c = 0 ; c < 3 ; c++) {
-				const int cc = gfit->color_managed ? c : 0;
+				const int cc = managed ? c : 0;
 				for (x = 0; x < width; ++x) {
 					WORD val = linebuf[c][x];
 					if (gui.cut_over && val > remap_hi) {	// cut
@@ -2560,7 +2806,7 @@ static int make_hd_index_for_current_display(int vport) {
  *
  * If fidx is non-NULL it receives the stretch output before quantisation,
  * normalised to [0, 1], for the caller to compose from. */
-static int make_index_for_current_display(int vport, float *fidx) {
+static int make_index_for_current_display(int vport, float *fidx, fits *fit) {
 	g_mutex_lock(&com.mutex);
 	WORD lo = gui.lo;
 	WORD hi = gui.hi;
@@ -2633,7 +2879,7 @@ static int make_index_for_current_display(int vport, float *fidx) {
 				val = (float) i * slope;
 				break;
 			case STF_DISPLAY:
-				pxl = (gfit->orig_bitpix == BYTE_IMG ?
+				pxl = (fit->orig_bitpix == BYTE_IMG ?
 						(float) i / UCHAR_MAX_SINGLE :
 						(float) i / USHRT_MAX_SINGLE);
 				val = (MTFp(pxl, stf[target_index])) * slope;
@@ -2656,6 +2902,16 @@ static int make_index_for_current_display(int vport, float *fidx) {
 				fidx[i] = 1.f;
 		}
 	}
+	/* The display transform is no longer composed in here: it is applied by
+	 * the caller to the float LUT (fidx), once for all three channels, so
+	 * that it is not quantised to 8 bits first. See remap_all_vports(). */
+
+	/* The FLIS GPU compose tiles bake this LUT into their pixels; a
+	 * rebuilt LUT with unchanged lo/hi (mode switch, ICC change) would
+	 * otherwise leave stale tiles on screen. */
+	flis_gpu_compose_bump_lut_stamp();
+
+
 	last_pente = slope;
 	last_mode = gui.rendering_mode;
 	return INDEX_BUILT;
@@ -3030,35 +3286,126 @@ static void siril_image_view_snapshot(GtkWidget *widget, GtkSnapshot *snapshot) 
 			? GSK_SCALING_FILTER_TRILINEAR
 			: GSK_SCALING_FILTER_NEAREST;
 
-		/* Proxy backdrop: a single scaled-texture node covering the whole
-		 * image, drawn *under* the real tiles.  Any visible tile that hasn't
-		 * been materialised yet (fast zoom-out) shows the low-res proxy here
-		 * instead of a hole; the refine idle then paints sharp tiles over it
-		 * frame by frame.  Same widget-space rect convention as the tiles. */
-		if (draw_proxy && proxy_ref) {
-			gtk_snapshot_append_scaled_texture(snapshot, proxy_ref, filter,
-				&GRAPHENE_RECT_INIT(0.0f, 0.0f,
-					(float)(img_w * sx), (float)(img_h * sy)));
+		/* FLIS GPU compose dispatch (stage 3.2 + groups/sparse from
+		 * §3.3): if every layer in the stack is GPU-compatible (no
+		 * CHROMA blend, all blend modes GSK-translatable — see
+		 * flis_gpu_compose_compatible; sparse/offset base layers are
+		 * fine, a canvas_bg colour node bottoms the blend chain),
+		 * composite via GSK push_blend per layer.  Each layer becomes a per-tile GdkTexture cache,
+		 * reused across redraws.  Property-only changes (opacity /
+		 * blend mode / visibility toggle) cost zero texture work;
+		 * only the snapshot tree differs.
+		 *
+		 * Falls back to the per-tile path below for plain FITS, for
+		 * FLIS with any unsupported layer, or when only one layer is
+		 * present (tile path is already efficient for single-image
+		 * display).  The §3.1 CPU composite continues to fill the
+		 * tile buffers as a safety net for the fallback case.
+		 *
+		 * Only the RGB vport shows the full-colour composite; the
+		 * R/G/B channel vports must show a single channel of it, which
+		 * the GPU compose tree cannot produce — those keep the tile
+		 * path (whose buffers come from the CPU composite remap).  A
+		 * non-chromatic stack composes to R=G=B so the GPU tree is
+		 * valid on its single B&W vport too.
+		 *
+		 * All on-screen rects use sx/sy (= xx/yy * device-scale ds):
+		 * the snapshot carries a 1/ds inverse scale (above), so rect
+		 * dimensions must express physical pixels for the
+		 * TextureScaleNode to rasterise at true screen resolution. */
+		gboolean used_gpu_compose = FALSE;
+		/* Display modes the GPU bake cannot express — negative view,
+		 * per-channel (unlinked) LUTs, HD remap, and an active soft-proof
+		 * transform — fall back to the CPU composite + tile path, which
+		 * applies them per-pixel. */
+		gboolean gpu_display_state_ok = TRUE;
+		if (gui.rendering_mode == STF_DISPLAY && gui.unlink_channels)
+			gpu_display_state_ok = FALSE;
+		if (gui.rendering_mode == STF_DISPLAY && gui.use_hd_remap
+		    && gfit->type == DATA_FLOAT)
+			gpu_display_state_ok = FALSE;
+		/* Mirror the tile path's per-pixel ICC gate (see materialise_tile):
+		 * whenever the tile path may apply a display transform, the GPU bake
+		 * — which cannot express it — must not be used.  Testing the managed
+		 * flag rather than com.gui_icc.proofing_transform also covers the
+		 * gamut-only (linked STF) case where the full transform may be absent,
+		 * and avoids reading a cms handle without the display transform lock. */
+		if (current_image_color_managed() && !identical
+		    && !com.gui_icc.same_primaries)
+			gpu_display_state_ok = FALSE;
+		if (gpu_display_state_ok && imgdisp_app_win) {
+			GAction *action_neg = g_action_map_lookup_action(
+					G_ACTION_MAP(imgdisp_app_win), "negative-view");
+			if (action_neg) {
+				GVariant *st = g_action_get_state(action_neg);
+				if (g_variant_get_boolean(st))
+					gpu_display_state_ok = FALSE;
+				g_variant_unref(st);
+			}
+		}
+		if (gpu_display_state_ok && is_current_image_flis()
+		    && flis_layer_count() >= 2 && flis_stack_reader_trylock()) {
+			/* M-F12: the predicate and the render both walk the layer
+			 * list and read layer pixel buffers — hold the stack reader
+			 * lock across the whole span so a worker hook cannot free a
+			 * layer mid-render.  Order: stack → g_cache_mutex (taken
+			 * inside the render).  TRYLOCK (see flis_composite_ensure_built):
+			 * a long layer operation holds the writer lock throughout, and
+			 * blocking here would freeze the display for its whole duration.
+			 * On contention the tile path below draws the last composite. */
+			if ((vport == RGB_VPORT || !flis_composite_is_chromatic())
+			    && flis_gpu_compose_compatible(com.uniq->layers)) {
+				guint canvas_w = flis_canvas_rx();
+				guint canvas_h = flis_canvas_ry();
+				graphene_rect_t dst = GRAPHENE_RECT_INIT(
+					0.0f, 0.0f,
+					(float)(canvas_w * sx),
+					(float)(canvas_h * sy));
+				/* Pass the canvas-space visible rect so the GPU compose
+				 * path can cull per-layer tiles that fall outside the
+				 * viewport (§3.3 slice 3). */
+				graphene_rect_t vis_canvas = GRAPHENE_RECT_INIT(
+					(float)vis_xmin, (float)vis_ymin,
+					(float)(vis_xmax - vis_xmin),
+					(float)(vis_ymax - vis_ymin));
+				flis_gpu_compose_render(snapshot, com.uniq->layers,
+					canvas_w, canvas_h, &dst, &vis_canvas, filter);
+				used_gpu_compose = TRUE;
+			}
+			flis_stack_reader_unlock();
 		}
 
-		for (int ty = 0; ty < tile_rows; ty++) {
-			for (int tx = 0; tx < tile_cols; tx++) {
-				GdkTexture *tile = tiles_snapshot[ty * tile_cols + tx];
-				if (!tile) continue;
-				/* Rect is in WIDGET-SPACE (post-translate): image-space
-				 * coords multiplied by the per-axis zoom.  This makes
-				 * rect_size != texture_size at any zoom ≠ 1, so GSK's
-				 * TextureScaleNode rasteriser is what scales the texture
-				 * — and `filter` actually applies. */
-				int x0, y0, tw_unused, th_unused, tex_w_img, tex_h_img;
-				tile_dims_padded(view, tx, ty, &x0, &y0, &tw_unused,
-					&th_unused, &tex_w_img, &tex_h_img);
-				gtk_snapshot_append_scaled_texture(snapshot, tile, filter,
-					&GRAPHENE_RECT_INIT(
-						(float)(x0 * sx),
-						(float)(y0 * sy),
-						(float)(tex_w_img * sx),
-						(float)(tex_h_img * sy)));
+		if (!used_gpu_compose) {
+			/* Proxy backdrop: a single scaled-texture node covering the whole
+			 * image, drawn *under* the real tiles.  Any visible tile that hasn't
+			 * been materialised yet (fast zoom-out) shows the low-res proxy here
+			 * instead of a hole; the refine idle then paints sharp tiles over it
+			 * frame by frame.  Same widget-space rect convention as the tiles. */
+			if (draw_proxy && proxy_ref) {
+				gtk_snapshot_append_scaled_texture(snapshot, proxy_ref, filter,
+					&GRAPHENE_RECT_INIT(0.0f, 0.0f,
+						(float)(img_w * sx), (float)(img_h * sy)));
+			}
+
+			for (int ty = 0; ty < tile_rows; ty++) {
+				for (int tx = 0; tx < tile_cols; tx++) {
+					GdkTexture *tile = tiles_snapshot[ty * tile_cols + tx];
+					if (!tile) continue;
+					/* Rect is in WIDGET-SPACE (post-translate): image-space
+					 * coords multiplied by the per-axis zoom.  This makes
+					 * rect_size != texture_size at any zoom ≠ 1, so GSK's
+					 * TextureScaleNode rasteriser is what scales the texture
+					 * — and `filter` actually applies. */
+					int x0, y0, tw_unused, th_unused, tex_w_img, tex_h_img;
+					tile_dims_padded(view, tx, ty, &x0, &y0, &tw_unused,
+						&th_unused, &tex_w_img, &tex_h_img);
+					gtk_snapshot_append_scaled_texture(snapshot, tile, filter,
+						&GRAPHENE_RECT_INIT(
+							(float)(x0 * sx),
+							(float)(y0 * sy),
+							(float)(tex_w_img * sx),
+							(float)(tex_h_img * sy)));
+				}
 			}
 		}
 
@@ -3474,9 +3821,19 @@ static void draw_roi(const draw_data_t *dd) {
 
 static void draw_selection(const draw_data_t* dd) {
 	if (com.selection.w > 0 && com.selection.h > 0) {
-		if ((com.selection.x + com.selection.w > gfit->rx) ||
-		(com.selection.y + com.selection.h > gfit->ry)) {
-			rectangle area = {0, 0, gfit->rx, gfit->ry};
+		/* Selections live in DISPLAY (canvas) space — validate against
+		 * the displayed extent, not gfit: for a FLIS, gfit is the
+		 * active layer, and clamping against a smaller sparse layer
+		 * destroyed the user's selection on layer switch and replaced
+		 * it with a layer-sized box at the canvas origin.  Ops that
+		 * consume the selection translate to layer-local coordinates
+		 * themselves (flis_display_to_active_layer_rect).  flis_canvas_rx/ry return
+		 * gfit dims for non-FLIS images. */
+		const gint disp_rx = (gint)flis_canvas_rx();
+		const gint disp_ry = (gint)flis_canvas_ry();
+		if ((com.selection.x + com.selection.w > disp_rx) ||
+		(com.selection.y + com.selection.h > disp_ry)) {
+			rectangle area = {0, 0, disp_rx, disp_ry};
 			memcpy(&com.selection, &area, sizeof(rectangle));
 		}
 		if (!rotation_dlg) image_display_init_statics();
@@ -4854,10 +5211,21 @@ double get_zoom_val() {
 			}
 		}
 	}
-	if (gfit->rx == 0 || gfit->ry == 0 || window_height <= 1 || window_width <= 1)
+	/* FLIS: zoom-to-fit must use the canvas dimensions (the visible
+	 * composite), not gfit's dimensions.  gfit is the *active layer*,
+	 * which can be sparse / smaller than the canvas — switching to a
+	 * sparse layer via flis_active_layer would otherwise cause the
+	 * displayed image to zoom in dramatically.  The canvas size is
+	 * fixed for a given FLIS regardless of which layer is active. */
+	guint img_rx = gfit->rx, img_ry = gfit->ry;
+	if (is_current_image_flis()) {
+		img_rx = flis_canvas_rx();
+		img_ry = flis_canvas_ry();
+	}
+	if (img_rx == 0 || img_ry == 0 || window_height <= 1 || window_width <= 1)
 		return 1.0;
-	double wtmp = (double) window_width / (double) gfit->rx;
-	double htmp = (double) window_height / (double) gfit->ry;
+	double wtmp = (double) window_width / (double) img_rx;
+	double htmp = (double) window_height / (double) img_ry;
 	return min(wtmp, htmp);
 }
 
@@ -4893,67 +5261,6 @@ void adjust_vport_size_to_image() {
 	}
 }
 
-void copy_roi_into_gfit() {
-	size_t npixels_roi = gui.roi.selection.w * gui.roi.selection.h;
-	if (npixels_roi == 0 || com.script || com.python_command)
-		return;
-	g_rw_lock_writer_lock(&gfit->rwlock);
-	size_t npixels_gfit = gfit->rx * gfit->ry;
-	if (gui.roi.fit.type != gfit->type) {
-		size_t roi_ndata = gui.roi.fit.rx * gui.roi.fit.ry * gui.roi.fit.naxes[2];
-		if (gfit->type == DATA_FLOAT) {
-			fit_replace_buffer(&gui.roi.fit, gui.roi.fit.bitpix == BYTE_IMG ? ushort8_buffer_to_float(gui.roi.fit.data, roi_ndata): ushort_buffer_to_float(gui.roi.fit.data, roi_ndata), DATA_FLOAT);
-			if (is_preview_active()) {
-				fits *roi_backup = get_roi_backup();
-				fit_replace_buffer(roi_backup, roi_backup->bitpix == BYTE_IMG ? ushort8_buffer_to_float(roi_backup->data, roi_ndata) : ushort_buffer_to_float(roi_backup->data, roi_ndata), DATA_FLOAT);
-			}
-		} else {
-			fit_replace_buffer(&gui.roi.fit, float_buffer_to_ushort(gui.roi.fit.fdata, roi_ndata), DATA_USHORT);
-			if (gfit->bitpix == BYTE_IMG) {
-				for (size_t i = 0 ; i < roi_ndata ; i++) {
-					gui.roi.fit.data[i] >>= 8;
-				}
-				gui.roi.fit.bitpix = BYTE_IMG;
-			}
-			if (is_preview_active()) {
-				fits *roi_backup = get_roi_backup();
-				fit_replace_buffer(roi_backup, float_buffer_to_ushort(roi_backup->fdata, roi_ndata), DATA_USHORT);
-				if (gfit->bitpix == BYTE_IMG) {
-					for (size_t i = 0 ; i < roi_ndata ; i++) {
-						roi_backup->data[i] >>= 8;
-					}
-					roi_backup->bitpix = BYTE_IMG;
-				}
-			}
-		}
-	}
-
-	if (gui.roi.fit.type == DATA_FLOAT) {
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static) collapse(2)
-#endif
-		for (uint32_t c = 0 ; c < gui.roi.fit.naxes[2] ; c++) {
-			for (uint32_t y = 0; y < gui.roi.selection.h ; y++) {
-				const float *rowindex = gui.roi.fit.fdata + (y * gui.roi.fit.rx) + (c * npixels_roi);
-				float *destindex = gfit->fdata + (c * npixels_gfit) + ((gfit->ry - gui.roi.selection.y - y - 1) * gfit->rx) + gui.roi.selection.x;
-				memcpy(destindex, rowindex, gui.roi.selection.w * sizeof(float));
-			}
-		}
-	} else {
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static) collapse(2)
-#endif
-		for (uint32_t c = 0 ; c < gui.roi.fit.naxes[2] ; c++) {
-			for (uint32_t y = 0; y < gui.roi.selection.h ; y++) {
-				const WORD *rowindex = gui.roi.fit.data + (y * gui.roi.fit.rx) + (c * npixels_roi);
-				WORD *destindex = gfit->data + (npixels_gfit * c) + ((gfit->ry - gui.roi.selection.y - y - 1) * gfit->rx) + gui.roi.selection.x;
-				memcpy(destindex, rowindex, gui.roi.selection.w * sizeof(WORD));
-			}
-		}
-	}
-	g_rw_lock_writer_unlock(&gfit->rwlock);
-}
-
 /* Drop the cached autostretch parameters so the next STF remap recomputes the
  * midtones balance from the current image and target background. */
 void invalidate_autostretch_cache(void) {
@@ -4961,20 +5268,43 @@ void invalidate_autostretch_cache(void) {
 }
 
 void remap_all() {
+	/* The render source is DERIVED, not stored: the composite built from
+	 * com.uniq->layers for a FLIS document (stage 3.1), otherwise the plain
+	 * image in gfit.  This used to be done by pointing gfit at the composite
+	 * for the duration of the remap and putting it back at the end, which
+	 * every other reader of the global saw too — a worker measuring the image
+	 * got the composite instead of the layer it asked for, and anything
+	 * holding gfit's rwlock across the window released a different lock than
+	 * it acquired.  Passing the fits down the call chain costs nothing and has
+	 * neither problem.
+	 *
+	 * The pointer is borrowed for the duration of the call: the composite is
+	 * only released or rebuilt under cairo_mutex, on the close and invalidate
+	 * paths.
+	 *
+	 * Future stages 3.2/3.3 replace this with a per-layer GdkTexture cache and
+	 * per-tile materialisation; the composite cache here remains the CPU
+	 * fallback and the correctness oracle. */
+	fits *fit = flis_display_get_composite();
+	if (!fit)
+		fit = gfit;
+	if (!fit)
+		return;
+
 	/* When auto-refresh is on (default) the autostretch follows every image
 	 * change. When off, keep the previously computed parameters so the stretch
 	 * stays frozen as the pixels change. */
 	if (gui.autostretch_auto_refresh)
 		stf_computed = FALSE;
 	if (gui.rendering_mode == HISTEQ_DISPLAY || gui.rendering_mode == STF_DISPLAY) {
-		for (int i = 0; i < gfit->naxes[2]; i++) {
-			remap(i);
+		for (int i = 0; i < fit->naxes[2]; i++) {
+			remap(i, fit);
 		}
 	} else {
-		remap_all_vports();
+		remap_all_vports(fit);
 	}
-	if (gfit->naxis == 3)
-		remaprgb();
+	if (fit->naxis == 3)
+		remaprgb(fit);
 }
 
 void redraw(remap_type doremap) {
@@ -5017,8 +5347,12 @@ void queue_redraw_and_wait_for_it(remap_type doremap) {
 gboolean redraw_mask_idle(gpointer p) {
 	gboolean remap_tints = GPOINTER_TO_INT(p);
 	g_rw_lock_reader_lock(&gfit->rwlock);
-	if (gfit->mask && gfit->mask->data)
-		remap_mask(gfit->mask);
+	/* §4.2 mask-view radio: route through flis_get_displayed_mask so the
+	 * tab paints whichever source (processing or active-layer lmask) the
+	 * user picked.  For non-FLIS the helper just returns gfit->mask. */
+	mask_t display_mask = { 0 };
+	if (flis_get_displayed_mask(&display_mask))
+		remap_mask(&display_mask);
 	g_rw_lock_reader_unlock(&gfit->rwlock);
 	if (com.pref.gui.mask_tints_vports) {
 		/* Only remap the image vports when the mask data changed under them
@@ -5026,7 +5360,7 @@ gboolean redraw_mask_idle(gpointer p) {
 		 * notify_gfit_data_modified()) already have the tint applied, and a
 		 * second full remap here would be pure duplication.
 		 * Reader lock released before this call: notify_gfit_data_modified()
-		 * may call copy_roi_into_gfit() which acquires the writer lock. */
+		 * re-enters the remap path, which takes the lock itself. */
 		if (remap_tints)
 			notify_gfit_data_modified();
 		redraw(REDRAW_ALL); // need to redraw all so the tinted vports repaint

@@ -24,6 +24,7 @@
 #include "algos/Def_Wavelet.h"
 #include "algos/wavelet_denoise.h"
 #include "core/gui_iface.h"
+#include "core/nde/nde_history.h"
 #include "core/op_descriptors.h"
 #include "core/OS_utils.h"
 #include "core/processing.h"
@@ -36,14 +37,108 @@
 /* Op descriptors — single source of truth for the wavelet ops. The wrecons
  * command / GUI-apply / preview sites use different progress labels, kept as
  * per-site description overrides. */
+
+/* PERMANENT Tier B (maintainer verdict, NDE phase 4.5): wavelets.wrecons keeps
+ * NO serializer BY DESIGN.  The hook reads a decomposition transform file
+ * (r/g/b_rawdata.wave in the tmpdir) produced by a separate `wavelet`
+ * decomposition step that is not itself a descriptor op — the pixel output is
+ * not determined by wrecons_data alone, and that tmpdir multi-file lifecycle
+ * cannot live in a params blob.  Checkpoints are the intended editability UX.
+ * Do NOT add serialize/deserialize here — a future coverage sweep must not
+ * "fix" this. */
 const op_descriptor op_desc_wrecons = {
 	.id = "wavelets.wrecons", .version = 1,
 	.image_hook = wrecons_image_hook,
 	.log_hook = wrecons_log_hook,
 	.description = N_("Wavelet reconstruction"),
 	.mem_ratio = 0.0f,
-	.flags = 0,
+	/* ROI-capable in a different way from the pixel-local ops: the hook
+	 * cannot compute from the crop it is handed, because its input is a
+	 * decomposition of the whole image — but it CAN produce just that
+	 * window, reading only the transform rows the window covers
+	 * (wavelet_reconstruct_*_roi).  The rectangle comes from
+	 * generic_img_args.roi_rect; full_rx/full_ry pin the geometry the
+	 * transform was computed at. */
+	.flags = OP_ROI_CAPABLE,
 };
+
+/* NDE serializers for wavelets.atrous.  atrous_transform_image is a
+ * self-contained decompose+denoise+reconstruct that reads nbr_plan, type,
+ * anscombe, the per-layer coef[7] and the denoise sub-struct; seq/fit/seqEntry
+ * are runtime context and are skipped. */
+static gchar *atrous_serialize(gconstpointer user) {
+	const struct atrous_data *d = user;
+	GString *kv = nde_kv_start();
+	nde_kv_add_int(kv, "nbr_plan", d->nbr_plan);
+	nde_kv_add_int(kv, "type", d->type);
+	nde_kv_add_bool(kv, "anscombe", d->anscombe);
+	for (int i = 0; i < 7; i++) {
+		gchar key[8];
+		g_snprintf(key, sizeof key, "coef%d", i);
+		nde_kv_add_float(kv, key, d->coef[i]);
+	}
+	/* denoise sub-struct (all POD) */
+	nde_kv_add_bool(kv, "dn_enabled", d->denoise.enabled);
+	/* on-disk value: enum order is frozen by the NDE format — do not reorder */
+	nde_kv_add_int(kv, "dn_method", d->denoise.method);
+	nde_kv_add_float(kv, "dn_k", d->denoise.k);
+	for (int i = 0; i < WD_MAX_PLAN; i++) {
+		gchar key[12];
+		g_snprintf(key, sizeof key, "dn_f%d", i);
+		nde_kv_add_float(kv, key, d->denoise.f[i]);
+	}
+	/* on-disk value: enum order is frozen by the NDE format — do not reorder */
+	nde_kv_add_int(kv, "dn_sigma_source", d->denoise.sigma_source);
+	nde_kv_add_bool(kv, "dn_soft", d->denoise.soft);
+	nde_kv_add_bool(kv, "dn_anscombe", d->denoise.anscombe);
+	return nde_kv_end(kv);
+}
+
+static gpointer atrous_deserialize(const gchar *blob, int version) {
+	if (version > op_desc_atrous.version)
+		return NULL;
+	GHashTable *kv = nde_kv_parse(blob);
+	gint64 nbr_plan, type, dn_method, dn_sigma_source;
+	gboolean anscombe, dn_enabled, dn_soft, dn_anscombe;
+	float coef[7], dn_k, dn_f[WD_MAX_PLAN];
+	gboolean ok = nde_kv_get_int(kv, "nbr_plan", &nbr_plan) &&
+	              nde_kv_get_int(kv, "type", &type) &&
+	              nde_kv_get_bool(kv, "anscombe", &anscombe) &&
+	              nde_kv_get_bool(kv, "dn_enabled", &dn_enabled) &&
+	              nde_kv_get_int(kv, "dn_method", &dn_method) &&
+	              nde_kv_get_float(kv, "dn_k", &dn_k) &&
+	              nde_kv_get_int(kv, "dn_sigma_source", &dn_sigma_source) &&
+	              nde_kv_get_bool(kv, "dn_soft", &dn_soft) &&
+	              nde_kv_get_bool(kv, "dn_anscombe", &dn_anscombe);
+	for (int i = 0; ok && i < 7; i++) {
+		gchar key[8];
+		g_snprintf(key, sizeof key, "coef%d", i);
+		ok = nde_kv_get_float(kv, key, &coef[i]);
+	}
+	for (int i = 0; ok && i < WD_MAX_PLAN; i++) {
+		gchar key[12];
+		g_snprintf(key, sizeof key, "dn_f%d", i);
+		ok = nde_kv_get_float(kv, key, &dn_f[i]);
+	}
+	NDE_KV_REQUIRE(kv, ok);
+	struct atrous_data *d = calloc(1, sizeof(*d));
+	if (d) {
+		d->destroy_fn = free;
+		d->nbr_plan = (int)nbr_plan;
+		d->type = (int)type;
+		d->anscombe = anscombe;
+		memcpy(d->coef, coef, sizeof coef);
+		d->denoise.enabled = dn_enabled;
+		d->denoise.method = (int)dn_method;
+		d->denoise.k = dn_k;
+		memcpy(d->denoise.f, dn_f, sizeof dn_f);
+		d->denoise.sigma_source = (int)dn_sigma_source;
+		d->denoise.soft = dn_soft;
+		d->denoise.anscombe = dn_anscombe;
+	}
+	g_hash_table_unref(kv);
+	return d;
+}
 
 const op_descriptor op_desc_atrous = {
 	.id = "wavelets.atrous", .version = 1,
@@ -52,6 +147,7 @@ const op_descriptor op_desc_atrous = {
 	.description = N_("Wavelet transform"),
 	.mem_ratio = 0.0f,
 	.flags = 0,
+	.serialize = atrous_serialize, .deserialize = atrous_deserialize,
 };
 
 /************* decomposition held for the tool window's lifetime *************/
@@ -228,17 +324,20 @@ int wrecons_image_hook(struct generic_img_args *gargs, fits *fit, int threads) {
 	/* Held for the whole reconstruction so the tool window cannot free the
 	 * transform underneath a preview that is still running. For an ROI
 	 * preview the geometry to match is the full image, not the ROI fit. */
+	const gboolean for_roi = gargs->for_roi;
+	const int roi_x = gargs->roi_rect.x, roi_y = gargs->roi_rect.y;
+
 	g_mutex_lock(&wsession_mutex);
-	const gboolean cached = args->for_roi
+	const gboolean cached = for_roi
 			? (wsession.held && wsession.nb_chan == args->nb_chan
 					&& wsession.rx == args->full_rx && wsession.ry == args->full_ry)
 			: wsession_matches(fit, args->nb_chan);
 
 	for (int i = 0; i < args->nb_chan && !ret; i++) {
 		if (cached) {
-			if (args->for_roi)
+			if (for_roi)
 				ret = wavelet_reconstruct_data_roi(&wsession.chan[i], args->coef,
-						&args->denoise, args->roi_x, args->roi_y, fit->rx,
+						&args->denoise, roi_x, roi_y, fit->rx,
 						fit->ry, i, fit, threads);
 			else if (fit->type == DATA_USHORT) {
 				float *Imag = f_vector_alloc((size_t) fit->rx * (size_t) fit->ry);
@@ -270,11 +369,26 @@ int wrecons_image_hook(struct generic_img_args *gargs, fits *fit, int threads) {
 		}
 
 		gchar *dir = g_build_filename(tmpdir, File_Name_Transform[i], NULL);
-		if (args->for_roi) {
+		/* The file reconstruction writers size their output from the .wave
+		 * header, NOT from the destination: a transform of a larger image
+		 * would write past the end of the destination buffer.  Stale files
+		 * are easy to come by — they survive the image (and the FLIS active
+		 * layer) that produced them — so refuse any geometry mismatch here.
+		 * For an ROI preview the geometry to match is the full image. */
+		const int exp_nl = for_roi ? args->full_ry : (int) fit->ry;
+		const int exp_nc = for_roi ? args->full_rx : (int) fit->rx;
+		int wnl = 0, wnc = 0;
+		if (wave_io_read_header(dir, &wnl, &wnc, NULL)
+				|| wnl != exp_nl || wnc != exp_nc) {
+			siril_log_error(_("The stored wavelet transform (%d x %d) does not match "
+					"the current image (%d x %d): run the wavelet transform again.\n"),
+					wnc, wnl, exp_nc, exp_nl);
+			ret = 1;
+		} else if (for_roi) {
 			/* Reconstruct only the selection: reads just the ROI rows of the
 			 * transform and denoises/reconstructs that small window. */
 			ret = wavelet_reconstruct_file_roi(dir, args->coef, &args->denoise,
-					args->roi_x, args->roi_y, fit->rx, fit->ry, i, fit, threads);
+					roi_x, roi_y, fit->rx, fit->ry, i, fit, threads);
 		} else if (fit->type == DATA_USHORT) {
 			ret = wavelet_reconstruct_file(dir, args->coef, &args->denoise, fit->pdata[i], threads);
 		} else if (fit->type == DATA_FLOAT) {

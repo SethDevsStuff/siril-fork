@@ -408,13 +408,20 @@ static gpointer merge_cfa_img_worker(gpointer p) {
 		return GINT_TO_POINTER(1);
 	}
 	siril_log_message("Bayer pattern produced: 1 layer, %dx%d pixels\n", out->rx, out->ry);
-	/* close_single_image() must stay OUTSIDE the writer lock: it takes that
-	 * same non-recursive lock itself, inside free_image_data(), to clear gfit.
+	/* Quiesce the lazy-tile materialise pool before gfit's writer lock
+	 * (writer-starvation protocol, gui_iface_impl.c).
+	 *
+	 * close_single_image() must stay OUTSIDE that lock: it takes the same
+	 * non-recursive lock itself, inside free_image_data(), to clear gfit.
 	 * Closing from within the locked region makes GLib refuse the nested
 	 * acquisition — "Failed to get RW lock: Resource deadlock avoided" on
 	 * glibc, a hard hang where the platform has no such check — after which
-	 * the unlock paired with it releases the lock taken HERE, leaving the copy
-	 * below running unguarded and the final unlock with nothing to release. */
+	 * the unlock paired with it releases the lock taken HERE, leaving the
+	 * swap below running unguarded and the final unlock with nothing to
+	 * release.  The close also replaces the struct the lock lives in when a
+	 * FLIS document is open, so the lock has to be taken afterwards, on the
+	 * gfit the copy actually goes into. */
+	gui_iface.set_suppress_redraws(TRUE);
 	close_single_image();
 	g_rw_lock_writer_lock(&gfit->rwlock);
 	copyfits(out, gfit, CP_ALLOC | CP_COPYA | CP_FORMAT, -1);
@@ -424,11 +431,12 @@ static gpointer merge_cfa_img_worker(gpointer p) {
 	free_wcs(gfit);
 	update_fits_header(gfit);
 	g_rw_lock_writer_unlock(&gfit->rwlock);
+	gui_iface.set_suppress_redraws(FALSE);
 	clearfits(out);
 	free(out);
 	clear_stars_list(TRUE);
 	com.seq.current = UNRELATED_IMAGE;
-	if (!create_uniq_from_gfit(strdup(_("Unsaved Bayer pattern merge")), FALSE))
+	if (!create_uniq_from_gfit(strdup(_("Unsaved Bayer pattern merge")), FALSE, "generated"))
 		com.uniq->comment = strdup(_("Bayer pattern merge"));
 	if (!com.headless) {
 		notify_gfit_data_modified();

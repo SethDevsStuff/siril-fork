@@ -17,7 +17,6 @@ void hd_remap_indices_cleanup();
 
 void initialize_image_display();
 
-void copy_roi_into_gfit();
 
 void remap_all();
 void invalidate_autostretch_cache(void);

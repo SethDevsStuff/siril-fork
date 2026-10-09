@@ -41,6 +41,7 @@ preferences pref_init = {
 	.memory_amount = 10,
 	.hd_bitdepth = 20,
 	.lazy_tile_cache_mb = 128,
+	.nde_cache_mb = 2048,
 	.script_check_requires = TRUE,
 	.pipe_check_requires = FALSE,
  #ifdef SIRIL_UNSTABLE
@@ -113,6 +114,7 @@ preferences pref_init = {
 		.first_start = NULL,
 		.silent_quit = FALSE,
 		.silent_linear = FALSE,
+		.silent_hist_move = FALSE,
 		.remember_windows = TRUE,
 		.main_w_pos = {
 				.x = 0,
@@ -185,7 +187,8 @@ preferences pref_init = {
 			.dynamic_wrap = FALSE,
 			.code_folding = FALSE
 		},
-		.mask_tints_vports = TRUE
+		.mask_tints_vports = TRUE,
+		.flis_tile_budget_mb = 256
 	},
 	.debayer = {
 		.open_debayer = FALSE,
@@ -356,6 +359,7 @@ struct settings_access all_settings[] = {
 	{ "core", "mem_amount", STYPE_DOUBLE, N_("amount of memory in GB"), &com.pref.memory_amount, { .range_double = { 0.1, 1000000. } } },
 	{ "core", "hd_bitdepth", STYPE_INT, N_("HD AutoStretch bit depth"), &com.pref.hd_bitdepth, { .range_int = { 17, 24 } } },
 	{ "core", "lazy_tile_cache_mb", STYPE_INT, N_("RAM budget in MB for displaying very large images"), &com.pref.lazy_tile_cache_mb, { .range_int = { 128, 4096 } } },
+	{ "core", "nde_cache_mb", STYPE_INT, N_("disk budget in MB for all edit-history storage; over it, cached states go first, then the oldest steps become fixed"), &com.pref.nde_cache_mb, { .range_int = { 0, 65536 } } },
 	{ "core", "script_check_requires", STYPE_BOOL, N_("need requires cmd in script"), &com.pref.script_check_requires },
 	{ "core", "pipe_check_requires", STYPE_BOOL, N_("need requires cmd in pipe"), &com.pref.pipe_check_requires },
 	{ "core", "check_updates", STYPE_BOOL, N_("check update at start-up"), &com.pref.check_update },
@@ -483,6 +487,7 @@ struct settings_access all_settings[] = {
 	{ "gui", "first_start", STYPE_STR, N_("first start of siril"), &com.pref.gui.first_start },
 	{ "gui", "silent_quit", STYPE_BOOL, N_("don't confirm quit when exiting"), &com.pref.gui.silent_quit },
 	{ "gui", "silent_linear", STYPE_BOOL, N_("don't confirm save when non linear mode"), &com.pref.gui.silent_linear },
+	{ "gui", "silent_hist_move", STYPE_BOOL, N_("don't confirm edit-history reorders"), &com.pref.gui.silent_hist_move },
 	{ "gui", "remember_windows", STYPE_BOOL, N_("remember window position"), &com.pref.gui.remember_windows },
 	{ "gui", "main_win_pos_x", STYPE_INT, N_("main window position"), &com.pref.gui.main_w_pos.x },
 	{ "gui", "main_win_pos_y", STYPE_INT, N_("main window position"), &com.pref.gui.main_w_pos.y },
@@ -511,6 +516,7 @@ struct settings_access all_settings[] = {
 	{ "gui", "selection_guides", STYPE_INT, N_("number of elements of the grid guides"), &com.pref.gui.selection_guides },
 	{ "gui", "show_deciasec", STYPE_BOOL, N_("show tenths of arcseconds on hover"), &com.pref.gui.show_deciasec },
 	{ "gui", "default_rendering_mode", STYPE_INT, N_("default display mode"), &com.pref.gui.default_rendering_mode, { .range_int = { 0, 6 } } },
+	{ "gui", "flis_tile_budget_mb", STYPE_INT, N_("FLIS GPU tile cache byte budget (MiB)"), &com.pref.gui.flis_tile_budget_mb, { .range_int = { 128, 4096 } } },
 	{ "gui", "display_histogram_mode", STYPE_INT, N_("default histogram display mode"), &com.pref.gui.display_histogram_mode, { .range_int = { 0, 1 } } },
 	{ "gui", "roi_mode", STYPE_INT, N_("ROI selection mode"), &com.pref.gui.roi_mode },
 	{ "gui", "roi_warning", STYPE_BOOL, N_("enable ROI dialog warning"), &com.pref.gui.enable_roi_warning },

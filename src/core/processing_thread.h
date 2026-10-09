@@ -119,6 +119,16 @@ void     cancel_and_wait_for_preview (void);
  */
 gboolean processing_in_worker_thread (void);
 
+/* Python comm threads mark themselves at startup so job submissions can carry
+ * their origin.  processing_current_job_from_python() answers, from inside a
+ * running job, whether that job was submitted by a python comm thread (a
+ * script's cmd()/IPC request) rather than by the user.  The scope-suppression
+ * gates in the generic workers use it: a resident script's provenance scope
+ * must swallow only the script's own ops, not ops the user runs while the
+ * script happens to be connected. */
+void     processing_mark_python_comm_thread (void);
+gboolean processing_current_job_from_python (void);
+
 
 /* --------------------------------------------------------------------------
  * Python reservation
@@ -138,6 +148,32 @@ gboolean processing_in_worker_thread (void);
 int  claim_thread_for_python (void);
 void python_releases_thread  (void);
 gboolean processing_is_reserved_for_python(void);
+
+/* --------------------------------------------------------------------------
+ * NDE replay reservation
+ * --------------------------------------------------------------------------
+ *
+ * The NDE replay conductor (nde_replay.c) runs off the worker thread so the
+ * worker stays free for any Tier-C step's script to drive via cmd().  It
+ * reserves the slot for the whole replay so GUI actions and unrelated scripts
+ * cannot steal it between the replayed script's commands, while admitting the
+ * conductor's own submissions and those of the single script it launched.
+ *
+ *   replay_reserve_slot()   — atomic try-reserve (FALSE if busy/reserved; does
+ *                             not wait).  Call before spawning the conductor.
+ *   replay_bind_conductor() — conductor's first action; registers its identity.
+ *   replay_release_slot()   — release + wake waiters.
+ *   processing_register_replay_script() / _unregister_replay_script() —
+ *                             set/clear the launched script's comm GThread as an
+ *                             admitted identity (see execute_python_script).
+ *   processing_is_reserved_for_replay() — guard predicate.
+ */
+gboolean replay_reserve_slot (void);
+void     replay_bind_conductor (void);
+void     replay_release_slot (void);
+void     processing_register_replay_script (GThread *comm_thread);
+void     processing_unregister_replay_script (void);
+gboolean processing_is_reserved_for_replay (void);
 
 /* --------------------------------------------------------------------------
  * Main public API

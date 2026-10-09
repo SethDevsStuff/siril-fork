@@ -90,9 +90,26 @@ src_files = [
   'core/command.c',
   'core/command_line_processor.c',
   'core/exif.cpp',
+  'core/fits_region.c',
   'core/icc_profile.c',
   'core/initfile.c',
   'core/masks.c',
+  'core/nde/nde_checkpoint.c',
+  'core/nde/nde_composite.c',
+  'core/nde/nde_compositing.c',
+  'core/nde/nde_cat.c',
+  'core/nde/nde_history.c',
+  'core/nde/nde_joint.c',
+  'core/nde/nde_op_class.c',
+  'core/nde/nde_chain.c',
+  'core/nde/nde_edit.c',
+  'core/nde/nde_preview.c',
+  'core/nde/nde_replay.c',
+  'core/nde/nde_script_scope.c',
+  'core/nde/nde_graph.c',
+  'core/nde/nde_retention.c',
+  'core/nde/nde_snapstore.c',
+  'core/nde/nde_state.c',
   'core/op_descriptor.c',
   'core/OS_utils.c',
   'core/pipe.c',
@@ -189,6 +206,8 @@ src_files = [
   'io/healpix/xp_continuous.cpp',
   'io/healpix/gaia_xp_design.c',
   'io/image_format_fits.c',
+  'io/image_format_flis.c',
+  'io/flis_compose.c',
   'io/image_formats_internal.c',
   'io/image_formats_libraries.c',
   'io/local_catalogues.c',
@@ -232,6 +251,7 @@ src_files = [
   'registration/registration.c',
   'registration/applyreg.c',
   'registration/shift_methods.c',
+  'registration/flis_register.c',
   'registration/mpp.cpp',
   'registration/mpp/mpp_run.c',
   'registration/mpp/mpp_config.c',
@@ -270,6 +290,8 @@ gui_filenames = [
   'annotate.c',
   'asinh.c',
   'banding.c',
+  'nde_editors.c',
+  'nde_joint_editor.c',
   'clahe.c',
   'cosmetic_correction.c',
   'fft.c',
@@ -355,6 +377,9 @@ gui_filenames = [
   'utils.c',
   'wavelets.c',
   'file_browser.c',  # custom GtkDirectoryList-based file picker with preview
+  'flis_gpu_compose.c',  # per-layer GdkTexture cache + GSK push_blend (stage 3.2)
+  'flis_gui.c',          # FLIS layers panel (stage 4)
+  'nde_graph_view.c',    # History window: nodes by level, edges drawn (#61)
 ]
 
 src_files_gui = []

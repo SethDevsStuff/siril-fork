@@ -24,6 +24,9 @@
 #include <string.h>
 
 #include "core/icc_profile.h"
+#include "core/nde/nde_checkpoint.h"
+#include "core/nde/nde_history.h"
+#include "core/nde/nde_replay.h"
 #include "core/op_descriptors.h"
 #include "core/processing.h"
 #include "core/processing_thread.h"
@@ -37,6 +40,7 @@
 #include "gui-gtk4/dialogs.h"
 #include "gui-gtk4/histogram_utils.h"
 #include "gui-gtk4/image_interactions.h"
+#include "gui-gtk4/nde_editors.h"
 #include "gui-gtk4/progress_and_log.h"
 #include "gui-gtk4/siril_preview.h"
 #include "gui-gtk4/utils.h"
@@ -47,7 +51,7 @@
 // ---------------------------------------------------------------------------
 // FORWARD DECLARATIONS
 // ---------------------------------------------------------------------------
-static int curves_process_with_worker(gboolean for_preview, gboolean for_roi);
+static int curves_process_with_worker(gboolean for_preview);
 static gboolean is_curves_log_scale();
 static void update_range_ui_from_state();
 static int curves_update_preview();
@@ -56,6 +60,7 @@ static void _initialize_clip_text();
 static void curves_setup_hsl();
 static void curves_clear_hsl();
 static void curves_compute_special_histograms();
+static void refresh_stats_fit(void);
 static gsl_histogram* curves_compute_histo_from_buffer(void* buf, fits* f);
 static void init_all_curves();
 static void init_all_curves_and_reset_channel();
@@ -122,7 +127,12 @@ static enum curve_channel current_channel = CHAN_RGB_K;
 enum curve_algorithm algorithm = AKIMA_SPLINE;
 
 static gboolean closing = FALSE;
+/* The image the DISPLAYED histograms are computed from: gfit, or a snapshot of
+ * the ROI when one is active (roi_stats_source, callbacks.h).  A snapshot and
+ * not an alias, so it has to be re-taken before pixels are read — see
+ * refresh_stats_fit() below. */
 static fits *fit = NULL;
+static fits roi_stats_cache = { 0 };
 static long clipped[] = {0, 0};
 static gsl_histogram *display_histogram[MAXVPORT] = {NULL, NULL, NULL, NULL};
 static gsl_histogram *display_histogram_lum = NULL;
@@ -139,6 +149,14 @@ static gboolean is_drawingarea_pressed = FALSE;
 static void *curves_chromabuf = NULL, *curves_satbuf = NULL, *curves_lumbuf = NULL;
 static cmsHPROFILE original_icc = NULL;
 static gboolean single_image_stretch_applied = FALSE;
+static GtkWidget *curves_amend_note = NULL;
+
+/* Amend mode (convergence C5): the dialog edits an existing history record.
+ * gfit holds the pre-record state installed by nde_amend_preview_start; the
+ * record's point list opens in the real curve editor, previews run against
+ * the pre-record backup, and Apply/Cancel route through
+ * nde_amend_preview_end instead of a worker run + undo save. */
+static gboolean curves_amend_mode = FALSE;
 static point *selected_point = NULL;
 static double point_size = 5.0;
 
@@ -275,6 +293,7 @@ static void update_display_histogram_from_curve() {
  * guards it against the worker thread, which frees and recomputes it in
  * notify_gfit_data_modified(). */
 static void refresh_display_histogram_from_fit() {
+	refresh_stats_fit();
 	if (!fit) return;
 	g_mutex_lock(&com.histogram_mutex);
 	compute_histo_for_fit(fit);
@@ -333,8 +352,10 @@ static curve_state_snapshot *snapshot_current_state() {
 	return snap;
 }
 
-static void apply_snapshot_to_fit(fits *f, curve_state_snapshot *snap) {
+// Caller owns the result and must free it with free_curve_params().
+static struct curve_params *params_from_snapshot(const curve_state_snapshot *snap) {
 	struct curve_params *p = new_curve_params();
+	if (!p) return NULL;
 	for (int i = 0; i < CHAN_COUNT; i++) {
 		p->channels[i].active       = snap->channels[i].active;
 		p->channels[i].range_enabled= snap->channels[i].range_enabled;
@@ -346,15 +367,94 @@ static void apply_snapshot_to_fit(fits *f, curve_state_snapshot *snap) {
 			: NULL;
 	}
 	p->algorithm = snap->algorithm;
+	return p;
+}
+
+static void apply_snapshot_to_fit(fits *f, curve_state_snapshot *snap) {
+	struct curve_params *p = params_from_snapshot(snap);
+	if (!p) { PRINT_ALLOC_ERR; return; }
 	p->fit = f;
 	p->verbose = FALSE;
+	/* Blend through the processing mask exactly as the preview/apply worker
+	 * does (curves_process_with_worker sets mask_aware).  Without this, a
+	 * stage frozen with the preview off — or any stage replayed by
+	 * curves_rebuild_from_stages — would ignore a mask the preview honoured,
+	 * and the history record would describe pixels that were never produced. */
+	fits *orig = NULL;
+	if (f->mask && f->mask_active) {
+		orig = calloc(1, sizeof(fits));
+		if (orig && copyfits(f, orig, CP_ALLOC | CP_FORMAT | CP_COPYA, 0)) {
+			free(orig);
+			orig = NULL;
+		}
+	}
 	apply_curve(f, f, p, TRUE);
+	if (orig) {
+		blend_fits_with_mask(f, orig);
+		clearfits(orig);
+		free(orig);
+	}
 	free_curve_params(p);
 }
 
 static void update_stage_buttons() {
 	if (curves_undo_stage_button)
 		gtk_widget_set_sensitive(GTK_WIDGET(curves_undo_stage_button), stage_stack != NULL);
+	/* Amend mode rewrites a single history record: a second stage would have
+	 * nowhere to be recorded, so freezing one is not offered. */
+	if (curves_apply_stage_button)
+		gtk_widget_set_sensitive(GTK_WIDGET(curves_apply_stage_button), !curves_amend_mode);
+}
+
+static gboolean params_any_curve_active(const struct curve_params *p) {
+	for (int i = 0; i < CHAN_COUNT; i++)
+		if (!channel_is_identity(&p->channels[i]))
+			return TRUE;
+	return FALSE;
+}
+
+/* Append one Tier-A record for @p, extending the [@first_id, @last_id] range
+ * the caller will tag its undo entry with. */
+static void curves_capture_one(const struct curve_params *p, const fits *post,
+		gint64 *first_id, gint64 *last_id) {
+	gchar *summary = curves_log_hook((gpointer) p, SUMMARY);
+	gint64 rid = nde_capture_from_descriptor(&op_desc_curves, p, summary, post, TRUE);
+	g_free(summary);
+	if (!rid)
+		return;
+	if (!*first_id)
+		*first_id = rid;
+	*last_id = rid;
+}
+
+/* Emit the NDE provenance for a completed commit.  A commit is up to N frozen
+ * stages followed by the curves still live in the editor, all applied to the
+ * image since the tool was opened (or last fully applied), so it captures one
+ * Tier-A record per stage in application order plus one for @final_params —
+ * each individually amendable, and together replayable from @pre.
+ *
+ * @pre is the image as it stood before the FIRST stage: the baseline the
+ * chain replays from.  @post is the committed result; only the LAST record
+ * gets it, since the intermediate pixel states were never retained and a
+ * barrier record must not claim the final image as its output.
+ *
+ * Returns the id range through @first_id / @last_id, for the caller to hand
+ * to undo_tag_top_nde_record_range() — the whole commit is ONE undo entry. */
+static void curves_capture_records(const fits *pre, const fits *post,
+		const struct curve_params *final_params,
+		gint64 *first_id, gint64 *last_id) {
+	*first_id = *last_id = 0;
+	if (pre)
+		nde_checkpoint_baseline_ensure(pre, nde_checkpoint_active_item_id());
+
+	for (GList *l = stage_stack; l; l = l->next) {
+		struct curve_params *staged = params_from_snapshot((const curve_state_snapshot *) l->data);
+		if (!staged) { PRINT_ALLOC_ERR; continue; }
+		curves_capture_one(staged, NULL, first_id, last_id);
+		free_curve_params(staged);
+	}
+	if (final_params && params_any_curve_active(final_params))
+		curves_capture_one(final_params, post, first_id, last_id);
 }
 
 static void curves_rebuild_from_stages() {
@@ -547,6 +647,8 @@ void curves_dialog_init_statics() {
 		curves_log_check = GTK_CHECK_BUTTON(gtk_builder_get_object(gui.builder, "curves_log_check"));
 		curves_grid_toggle = GTK_TOGGLE_BUTTON(gtk_builder_get_object(gui.builder, "curves_grid_toggle"));
 		curves_viewport = GTK_WIDGET(gtk_builder_get_object(gui.builder, "curves_viewport"));
+		// Amend-mode note
+		curves_amend_note = GTK_WIDGET(gtk_builder_get_object(gui.builder, "curves_amend_note"));
 
 		curves_range_check = GTK_CHECK_BUTTON(gtk_builder_get_object(gui.builder, "curve_check_range_button"));
 		curves_show_mask_check = GTK_CHECK_BUTTON(gtk_builder_get_object(gui.builder, "curves_show_mask_button"));
@@ -976,6 +1078,7 @@ static void curves_clear_hsl() {
 }
 
 static void curves_compute_special_histograms() {
+	refresh_stats_fit();
 	if (!fit || fit->naxes[2] != 3) return;
 
 	// Free existing special histograms
@@ -1072,11 +1175,19 @@ gboolean redraw_curves(GtkWidget *widget, cairo_t *cr, gpointer data) {
 	return FALSE;
 }
 
+/* Re-take the ROI snapshot immediately before pixels are read through `fit`.
+ * A no-op when `fit` is gfit: the whole-image case needs no snapshot, and the
+ * apply paths that deliberately point `fit` at gfit must stay there. */
+static void refresh_stats_fit(void) {
+	if (fit == &roi_stats_cache)
+		fit = roi_stats_source(&roi_stats_cache);
+}
+
 static int curves_update_preview() {
-	fit = gui.roi.active ? &gui.roi.fit : gfit;
+	fit = roi_stats_source(&roi_stats_cache);
 	if (!closing) {
 		copy_backup_to_gfit();
-		curves_process_with_worker(TRUE, gui.roi.active);
+		curves_process_with_worker(TRUE);
 	}
 	return 0;
 }
@@ -1181,7 +1292,7 @@ static void clear_display_histogram() {
 static void curves_startup() {
 	init_all_curves();
 	add_roi_callback(curves_histogram_change_between_roi_and_image);
-	roi_supported(TRUE);
+	roi_declare_op(&op_desc_curves);
 	copy_gfit_to_backup();
 
 	// Save a copy of the original image for stage-stack undo (only at first open)
@@ -1237,15 +1348,20 @@ static void curves_close(gboolean update_image_if_needed, gboolean revert_icc_pr
 		gfit_modified_update_gui();
 	}
 	if (revert_icc_profile && !single_image_stretch_applied) {
-		if (gfit->icc_profile) cmsCloseProfile(gfit->icc_profile);
-		gfit->icc_profile = copyICCProfile(original_icc);
-		color_manage(gfit, gfit->icc_profile != NULL);
+		current_image_set_icc_profile(original_icc
+			? copyICCProfile(original_icc) : NULL);
+		current_image_color_manage(original_icc != NULL);
 	}
 	clear_backup();
 	clear_display_histogram();
 	curves_clear_hsl();
-	roi_supported(FALSE);
+	roi_declare_op(NULL);
 	remove_roi_callback(curves_histogram_change_between_roi_and_image);
+	/* Drop the region snapshot: it can be the size of the whole image and the
+	 * dialog may not be reopened.  Point `fit` away from it first — several
+	 * draw handlers read fit->naxes[2] without checking whether we are open. */
+	fit = gfit;
+	clearfits(&roi_stats_cache);
 }
 
 // Build a fully-populated curve_params from the GUI channel state. Caller owns
@@ -1284,7 +1400,7 @@ static void disable_mask_preview() {
 	g_signal_handlers_unblock_by_func(curves_show_mask_check, on_curves_show_mask_toggled, NULL);
 }
 
-static int curves_process_with_worker(gboolean for_preview, gboolean for_roi) {
+static int curves_process_with_worker(gboolean for_preview) {
 	struct curve_params *params = build_curve_params_from_gui();
 	if (!params) { PRINT_ALLOC_ERR; return 1; }
 
@@ -1293,7 +1409,7 @@ static int curves_process_with_worker(gboolean for_preview, gboolean for_roi) {
 	clipped[1] = 0;
 	params->clipped_count = clipped;
 
-	params->fit = for_roi ? &gui.roi.fit : gfit;
+	params->fit = gfit;
 	params->verbose = !for_preview;
 	params->for_preview = for_preview;
 
@@ -1304,7 +1420,6 @@ static int curves_process_with_worker(gboolean for_preview, gboolean for_roi) {
 		return 1;
 	}
 
-	// Set the fit based on whether ROI is active
 	args->fit = params->fit;
 	args->op = &op_desc_curves;   // supplies image_hook, log_hook, description, mem_ratio
 	/* Undo is handled by curve_apply_idle with the pre-tool image so that
@@ -1314,8 +1429,11 @@ static int curves_process_with_worker(gboolean for_preview, gboolean for_roi) {
 	args->verbose = !for_preview;
 	args->user = params;
 	args->max_threads = com.max_thread;
+	/* Blend through the processing mask like the other stretches
+	 * (saturation, asinh, MTF/GHS) — curves silently ignored an active
+	 * mask while its history record claimed one was in effect. */
+	args->mask_aware = TRUE;
 	args->for_preview = for_preview;
-	args->for_roi = for_roi;
 
 	if (!start_in_new_thread(generic_image_worker, args)) {
 		free_generic_img_args(args);
@@ -1351,14 +1469,26 @@ gboolean curve_apply_idle(gpointer p) {
 
 		/* One undo entry for the whole operation (stages + final curves),
 		 * restoring the image saved when the tool was opened or last
-		 * applied.  Skipped for ROI runs, which never saved undo. */
-		if (!gui.roi.active && original_fit_copy) {
+		 * applied.
+		 *
+		 * The worker ran with skip_generic_undo, so it captured no NDE
+		 * record either: this is the commit point for the preview-off path,
+		 * mirroring the preview-on branch of on_curves_apply_button_clicked.
+		 * Capture before the save (worker order) and tag the entry.
+		 *
+		 * This used to be skipped when a ROI was active, because the apply
+		 * was then ROI-scoped and saved no undo.  Apply is full-image now
+		 * whether or not a rectangle is drawn, so the commit must happen
+		 * either way — gating it on gui.roi.active would leave a full-image
+		 * apply uncommitted merely because the user had a ROI on screen. */
+		if (original_fit_copy) {
 			gchar *summary = curves_log_hook(args->user, SUMMARY);
-			fits undo_fit = { 0 };
-			memcpy(&undo_fit, original_fit_copy, sizeof(fits));
-			undo_fit.icc_profile = original_icc;
-			undo_fit.color_managed = original_icc != NULL;
-			undo_save_state(&undo_fit, "%s", summary);
+			gint64 first_rid = 0, last_rid = 0;
+			curves_capture_records(original_fit_copy, gfit, args->user,
+					&first_rid, &last_rid);
+			if (!undo_save_state_with_icc(original_fit_copy, original_icc,
+					"%s", summary))
+				undo_tag_top_nde_record_range(first_rid, last_rid);
 			g_free(summary);
 		}
 
@@ -1408,7 +1538,61 @@ void _update_entry_text() {
 	g_free(buffer);
 }
 
+/* Load the amended record's parameters into the dialog's editor state
+ * through the op's own deserializer.  Adopts the record's per-channel point
+ * lists into the live gui_channels[] (the same state the apply path reads),
+ * and sets the algorithm and interpolation combo. */
+static void curves_prefill_from_amend(void) {
+	struct curve_params *p = op_desc_curves.deserialize(
+			nde_amend_preview_params(), nde_amend_preview_op_version());
+	if (!p)
+		return;
+
+	for (int c = 0; c < CHAN_COUNT; c++) {
+		/* Steal the deserialized list (a fresh g_new'd point list) so its
+		 * lifetime becomes ours, then NULL it so free_curve_params() below
+		 * leaves it alone.  A channel the record left at identity comes back
+		 * with no points: reset it rather than adopting an empty list. */
+		g_list_free_full(gui_channels[c].points, g_free);
+		gui_channels[c].points = p->channels[c].points;
+		p->channels[c].points = NULL;
+		gui_channels[c].range_enabled = p->channels[c].range_enabled;
+		gui_channels[c].lum_min = p->channels[c].lum_min;
+		gui_channels[c].lum_max = p->channels[c].lum_max;
+		gui_channels[c].feather = p->channels[c].feather;
+		gui_show_mask[c] = FALSE;   /* preview-only, never recorded */
+		if (!gui_channels[c].points)
+			init_single_channel_config(c);
+		else
+			gui_channels[c].points = g_list_sort(gui_channels[c].points,
+					(GCompareFunc) compare_points);
+	}
+
+	algorithm = p->algorithm;
+	gtk_drop_down_set_selected(GTK_DROP_DOWN(curves_interpolation_combo), algorithm);
+	free_curve_params(p);
+
+	/* Open on a channel the record actually curved, so the editor shows the
+	 * recorded curve rather than an identity diagonal.  The record does not
+	 * carry the channel the dialog was last on — that is view state, not a
+	 * parameter of the operation. */
+	enum curve_channel show = current_channel;
+	if (channel_is_identity(&gui_channels[show])) {
+		for (int c = 0; c < CHAN_COUNT; c++) {
+			if (!channel_is_identity(&gui_channels[c])) {
+				show = c;
+				break;
+			}
+		}
+	}
+	switch_channel_view(show);
+	update_display_histogram_from_curve();
+	_update_entry_text();
+}
+
 void update_gfit_curves_histogram_if_needed() {
+	/* Outside the mutex: the snapshot reads gfit, not the histograms. */
+	refresh_stats_fit();
 	/* Hold histogram_mutex across the invalidate+recompute pair so no other
 	 * thread observes a partially-nullified layers_hist[]. */
 	g_mutex_lock(&com.histogram_mutex);
@@ -1432,6 +1616,11 @@ void update_gfit_curves_histogram_if_needed() {
 void curves_reset_after_undo() {
 	// curves_dialog is NULL until the dialog has been opened once
 	if (!curves_dialog || !gtk_widget_get_visible(curves_dialog))
+		return;
+	/* In amend mode the editor holds the record's curves, and gfit holds the
+	 * synthetic pre-record state the amend preview installed — neither is
+	 * something an undo of an unrelated earlier operation should reset. */
+	if (curves_amend_mode)
 		return;
 
 	fit = gfit;
@@ -1460,8 +1649,7 @@ void curves_reset_after_undo() {
 }
 
 void curves_histogram_change_between_roi_and_image() {
-	fit = gui.roi.active ? &gui.roi.fit : gfit;
-	gui.roi.operation_supports_roi = TRUE;
+	fit = roi_stats_source(&roi_stats_cache);
 	curves_update_image();
 }
 
@@ -1566,6 +1754,9 @@ void on_curves_display_toggle(GtkToggleButton *togglebutton, gpointer user_data)
 void on_curves_window_show(GtkWidget *object, gpointer user_data) {
 	fit = gfit;
 	closing = FALSE;
+	curves_dialog_init_statics();
+	nde_amend_note_update(curves_amend_note, curves_amend_mode,
+	                      &op_desc_curves);
 	pipette_value = -1.0f;
 	curves_startup();
 	_initialize_clip_text();
@@ -1583,9 +1774,41 @@ void on_curves_window_show(GtkWidget *object, gpointer user_data) {
 	gtk_widget_set_sensitive(GTK_WIDGET(curves_chan_l_radio), is_rgb);
 	gtk_widget_set_sensitive(GTK_WIDGET(curves_chan_c_radio), is_rgb);
 	gtk_widget_set_sensitive(GTK_WIDGET(curves_chan_s_radio), is_rgb);
+
+	if (curves_amend_mode) {
+		/* The ROI stays armed as curves_startup() left it: the backup it took
+		 * IS the pre-record state, which is what a region preview crops from,
+		 * and the worker replays the record's successors inside the rectangle
+		 * (nde_replay.h). */
+
+		/* Load the record's curves into the editor, then one preview tick so
+		 * the dialog opens showing the record applied with its points. */
+		curves_prefill_from_amend();
+		gtk_widget_queue_draw(curves_drawingarea);
+		curves_update_image();
+	}
+}
+
+/* Leave amend mode: tear down the histogram/backup state without touching
+ * the pixels (preview_end restores the true pixels wholesale), then run the
+ * amend (apply == TRUE with @blob) or discard it (apply == FALSE, blob NULL).
+ * Returns TRUE when it handled the amend case. */
+static gboolean curves_amend_exit(gboolean apply, gchar *blob) {
+	if (!curves_amend_mode)
+		return FALSE;
+	closing = TRUE;
+	cancel_pending_update();
+	cancel_and_wait_for_preview();
+	curves_close(FALSE, FALSE);   /* restores display histograms, drops backup; no ICC revert */
+	nde_amend_preview_end(apply, blob);
+	curves_amend_mode = FALSE;
+	siril_close_dialog("curves_dialog");
+	return TRUE;
 }
 
 void on_curves_close_button_clicked(GtkButton *button, gpointer user_data) {
+	if (curves_amend_exit(FALSE, NULL))
+		return;
 	closing = TRUE;
 	set_cursor_waiting(TRUE);
 	curves_close(TRUE, TRUE);
@@ -1595,6 +1818,14 @@ void on_curves_close_button_clicked(GtkButton *button, gpointer user_data) {
 
 void on_curves_reset_button_clicked(GtkButton *button, gpointer user_data) {
 	set_cursor_waiting(TRUE);
+	if (curves_amend_mode) {
+		/* Reset means "back to the record's recorded curves" here. */
+		curves_prefill_from_amend();
+		gtk_widget_queue_draw(curves_drawingarea);
+		curves_update_image();
+		set_cursor_waiting(FALSE);
+		return;
+	}
 	init_all_curves();
 	update_range_ui_from_state();
 	_initialize_clip_text();
@@ -1620,6 +1851,20 @@ void on_curves_reset_channel_button_clicked(GtkButton *button, gpointer user_dat
 
 void on_curves_apply_button_clicked(GtkButton *button, gpointer user_data) {
 	if (!check_ok_if_cfa()) return;
+
+	if (curves_amend_mode) {
+		/* Serialize the current editor state through the SAME params struct
+		 * and serializer the normal apply uses, then route it through the
+		 * amend path.  Staging is disabled in amend mode, so what the editor
+		 * holds IS the whole replacement record. */
+		struct curve_params *applied = build_curve_params_from_gui();
+		if (!applied) { PRINT_ALLOC_ERR; return; }
+		gchar *blob = op_desc_curves.serialize(applied);
+		free_curve_params(applied);
+		curves_amend_exit(TRUE, blob);
+		g_free(blob);
+		return;
+	}
 
 	gboolean seq_mode = siril_toggle_get_active(GTK_WIDGET(curves_sequence_check)) && sequence_is_loaded();
 	/* Nothing to commit: no active curve and (for single image) no pending
@@ -1671,19 +1916,28 @@ void on_curves_apply_button_clicked(GtkButton *button, gpointer user_data) {
 			// incrementally by the preview pipeline.
 			struct curve_params *undo_params = build_curve_params_from_gui();
 			gchar *summary = curves_log_hook(undo_params, SUMMARY);
-			fits undo_fit = { 0 };
 			/* Restore point: the image as it was when the tool was opened
 			 * (or last fully applied) so that all stages plus the final
 			 * curves revert as ONE undo entry; the preview backup only
-			 * holds the last stage. */
-			memcpy(&undo_fit, original_fit_copy ? original_fit_copy : get_preview_gfit_backup(), sizeof(fits));
-			undo_fit.icc_profile = original_icc;
-			undo_fit.color_managed = original_icc != NULL;
-			undo_save_state(&undo_fit, "%s", summary);
+			 * holds the last stage.  That same image is the NDE baseline
+			 * the record chain replays from. */
+			fits *pre = original_fit_copy ? original_fit_copy : get_preview_gfit_backup();
+			/* This preview-on / non-ROI branch is one of the two commit
+			 * points: the curve was applied incrementally by the preview
+			 * pipeline, so no generic_image_worker run (which would capture)
+			 * fires here.  The other is curve_apply_idle, for the
+			 * preview-off / ROI runs — the worker itself never captures,
+			 * because curves_process_with_worker sets skip_generic_undo.
+			 * Capture before the save (worker order) and tag the entry. */
+			gint64 first_rid = 0, last_rid = 0;
+			curves_capture_records(pre, gfit, undo_params, &first_rid, &last_rid);
+			/* One entry captures pre-curve pixels + pre-curve ICC
+			 * profile so a single Ctrl-Z reverts the whole commit. */
+			if (!undo_save_state_with_icc(pre, original_icc, "%s", summary))
+				undo_tag_top_nde_record_range(first_rid, last_rid);
 			g_free(summary);
 			free_curve_params(undo_params);
 
-			populate_roi();
 			clear_backup();
 			clear_display_histogram();
 			single_image_stretch_applied = TRUE;
@@ -1697,10 +1951,12 @@ void on_curves_apply_button_clicked(GtkButton *button, gpointer user_data) {
 			return;
 		}
 
-		// Preview not active or ROI active: apply the curve now, defer reinit to curve_apply_idle
+		/* Preview not active, or it only covered the ROI: apply the curve now,
+		 * defer reinit to curve_apply_idle.  A ROI is a preview scope, so the
+		 * apply is full-image regardless — the worker only region-scopes a run
+		 * whose for_preview is set, which this one's is not. */
 		copy_backup_to_gfit();
-		populate_roi();
-		curves_process_with_worker(FALSE, gui.roi.active);
+		curves_process_with_worker(FALSE);
 		single_image_stretch_applied = TRUE;
 		set_cursor("default");
 	}
@@ -1746,6 +2002,8 @@ void apply_curve_to_sequence(struct curve_data *curve_args) {
 }
 
 void apply_curves_cancel() {
+	if (curves_amend_exit(FALSE, NULL))
+		return;
 	set_cursor_waiting(TRUE);
 	curves_close(TRUE, TRUE);
 	set_cursor_waiting(FALSE);
@@ -1797,7 +2055,7 @@ void toggle_curves_window_visibility() {
 		if (single_image_is_loaded()) {
 			if (original_icc) {
 				cmsCloseProfile(original_icc);
-				original_icc = copyICCProfile(gfit->icc_profile);
+				original_icc = copyICCProfile(current_icc_profile());
 			}
 			icc_auto_assign_or_convert(gfit, ICC_ASSIGN_ON_STRETCH);
 		} else {
@@ -2037,8 +2295,28 @@ void on_curves_log_check_toggled(GtkCheckButton *button, gpointer user_data) {
 	gtk_widget_queue_draw(curves_drawingarea);
 }
 
+/* ---- amend-mode entry (nde_editors registry) --------------------------- */
+
+static void curves_amend_ready(gboolean ok, gpointer user) {
+	(void)user;
+	if (!ok)
+		return;   /* the core logged the reason; nothing was changed */
+	curves_amend_mode = TRUE;
+	siril_open_dialog("curves_dialog");
+}
+
+gboolean curves_open_amend(gint64 record_id) {
+	/* The dialog opens from the ready callback, once the pre-record state
+	 * has been synthesized and installed. */
+	nde_amend_preview_start(record_id, curves_amend_ready, NULL);
+	return TRUE;
+}
+
 void on_curves_apply_stage_clicked(GtkButton *button, gpointer user_data) {
 	if (!check_ok_if_cfa()) return;
+	/* Amend mode replaces exactly ONE history record, so there is nothing a
+	 * second stage could be recorded as; the button is insensitive there. */
+	if (curves_amend_mode) return;
 	// Nothing to freeze if every channel is still the identity curve
 	if (!any_curve_active()) return;
 

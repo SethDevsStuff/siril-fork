@@ -4,6 +4,8 @@
 
 #include "core/siril.h"	// for sliders_mode
 
+struct op_descriptor;
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -14,9 +16,28 @@ void handle_owner_change(GdkClipboard *clipboard, gpointer data);
 void on_press_seq_field();
 gboolean launch_clipboard_survey(gpointer user_data);
 
-// Region of Interest processing
+/* Region of Interest processing.  The model — what an ROI is, what it is not,
+ * who decides whether a run is region-scoped — is documented above roi_t in
+ * core/siril.h.  The short version: it is a preview scope and a rectangle;
+ * generic_image_worker owns everything else. */
 typedef void (*ROICallback)();
-int populate_roi();
+/**
+ * roi_stats_source:
+ * @cache: caller-owned fits used as scratch for the region snapshot.  Zeroed
+ *         on first use, reused thereafter, cleared by the caller on close.
+ *
+ * The image a dialog should compute its DISPLAYED statistics from: @gfit, or —
+ * when a ROI is active — a snapshot of just that region of the active layer.
+ *
+ * Statistics are a view of the region, not of the preview buffer that happens
+ * to hold it, so this hands back a snapshot rather than an alias.  That makes
+ * it the CALLER's job to re-take it immediately before reading pixels: a
+ * preview writes its result into gfit, so a snapshot held across a preview
+ * tick shows the previous one.  Returns gfit unchanged when no ROI is active,
+ * and also whenever the region cannot be taken — whole-image statistics are a
+ * better failure than none.
+ */
+fits *roi_stats_source(fits *cache);
 gpointer on_set_roi();
 gpointer on_clear_roi();
 void add_roi_callback(ROICallback func);
@@ -26,7 +47,11 @@ void update_roi_config();
 gboolean is_gui_ready();
 void lock_roi_mutex();
 void unlock_roi_mutex();
-void roi_supported(gboolean state);
+/* Declare the operation the currently open dialog will run, so the ROI
+ * machinery can answer "can this be previewed on a rectangle?" from the op
+ * descriptor rather than from a hand-maintained boolean.  NULL to withhold
+ * (dialog closing, amend mode, apply-to-sequence). */
+void roi_declare_op(const struct op_descriptor *op);
 void initialize_all_GUI(gchar *files);
 /* Registers any GApplication-level actions that exist only in this
  * toolkit's build of the GUI tree.  Called once from siril_app_startup
@@ -82,6 +107,8 @@ void set_output_filename_to_sequence_name();
 gboolean close_tab(gpointer user_data);
 void activate_tab(int vport);
 gboolean init_right_tab(gpointer user_data);
+/* Re-apply the viewport set when a FLIS composite's chromaticity changes. */
+gboolean sync_colour_vports(gpointer user_data);
 
 void update_prepro_interface(gboolean allow_debayer);
 

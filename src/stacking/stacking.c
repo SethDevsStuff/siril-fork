@@ -26,12 +26,14 @@
 #include "core/arithm.h"
 #include "core/gui_iface.h"
 #include "core/icc_profile.h"
+#include "core/nde/nde_history.h"
 #include "core/OS_utils.h"
 #include "core/proto.h"
 #include "core/siril.h"
 #include "core/siril_date.h"
 #include "core/siril_log.h"
 #include "io/image_format_fits.h"
+#include "io/image_format_flis.h"
 #include "io/path_parse.h"
 #include "io/single_image.h"
 #include "stacking/stacking.h"
@@ -105,6 +107,23 @@ void main_stack(struct stacking_args *args) {
 gpointer stack_function_handler(gpointer p) {
 	struct stacking_args *args = (struct stacking_args *)p;
 
+	/* §5.8: stacking writes its result into gfit, which is the active
+	 * layer's fit for a FLIS.  Letting a sequence stack overwrite an
+	 * active layer would silently corrupt the FLIS document.  Refuse
+	 * cleanly — the user should close or flatten the FLIS first. */
+	if (is_current_image_flis()) {
+		siril_log_error(_("Stacking cannot run while a FLIS layered image is "
+		                  "loaded.  Flatten the image or close it first; the "
+		                  "stack result would otherwise overwrite the active "
+		                  "layer.\n"));
+		args->retval = -1;
+		/* Route through the normal completion idle so the processing
+		 * thread is released, busy state cleared, and args freed —
+		 * an early return here would leak all of that. */
+		siril_add_idle(end_stacking, args);
+		return GINT_TO_POINTER(-1);
+	}
+
 	main_stack(args);
 
 	/* 4. Save result, write gfit, and notify display pipeline.
@@ -113,6 +132,11 @@ gpointer stack_function_handler(gpointer p) {
 	 * tasks.  Use offsetof(fits, rwlock) in the memcpy to avoid overwriting
 	 * the lock itself. */
 	if (args->retval == ST_OK) {
+		/* Quiesce the lazy-tile materialise pool before the writer lock:
+		 * GRWLock has no writer preference, so with a large image on
+		 * display the pool's back-to-back reader-locked tile fills starve
+		 * this writer indefinitely (counting suppression, gui_iface_impl). */
+		gui_iface.set_suppress_redraws(TRUE);
 		g_rw_lock_writer_lock(&gfit->rwlock);
 		clearfits(gfit);
 		memcpy(gfit, &args->result, offsetof(fits, rwlock));
@@ -124,15 +148,34 @@ gpointer stack_function_handler(gpointer p) {
 		if (args->upscale_at_stacking)
 			com.seq.current = SCALED_IMAGE;
 		else com.seq.current = RESULT_IMAGE;
-		if (!com.script)
-			icc_auto_assign(gfit, ICC_ASSIGN_ON_STACK);
 		/* Warning: the previous com.uniq is not freed, but calling
 		 * close_single_image() will close everything before reopening it,
 		 * which is quite slow */
 		com.uniq = calloc(1, sizeof(single));
 		com.uniq->comment = strdup(_("Stacking result image"));
-		com.uniq->nb_layers = gfit->naxes[2];
+		com.uniq->chans = gfit->naxes[2];
 		com.uniq->fit = gfit;
+		/* Profile state lives on com.uniq, so the auto-assign must run
+		 * after the fresh single is installed — before it, the call would
+		 * early-return (no com.uniq) or write onto the stale one, and the
+		 * stacked result would be saved without an embedded profile. */
+		if (!com.script)
+			icc_auto_assign(gfit, ICC_ASSIGN_ON_STACK);
+		/* Where this image came from, as the first step of its history.  A
+		 * stack result is an origin like any other: these pixels were not
+		 * derived from anything the history can name, so what the history can
+		 * say is how many frames went into them and from which sequence.
+		 * After the fresh com.uniq, which is where the history lives. */
+		{
+			gchar *sum = g_strdup_printf(
+					ngettext("Stacked %d image", "Stacked %d images",
+					         args->nb_images_to_stack),
+					args->nb_images_to_stack);
+			nde_capture_image_origin("stack",
+			                         args->seq && args->seq->seqname ?
+			                                 args->seq->seqname : "", sum);
+			g_free(sum);
+		}
 		/* Giving summary if average rejection stacking */
 		_show_summary(args);
 
@@ -210,10 +253,13 @@ gpointer stack_function_handler(gpointer p) {
 			}
 		}
 		g_rw_lock_writer_unlock(&gfit->rwlock);
+		gui_iface.set_suppress_redraws(FALSE);
 		/* notify_gfit_data_modified must run with the writer lock released:
-		 * it reaches copy_roi_into_gfit() which itself acquires the writer
-		 * lock, triggering pthread EDEADLK on glibc and silent self-deadlock
-		 * elsewhere.  Defer to here, immediately after unlock, so the rest
+		 * it reaches the display remap, which takes gfit's rwlock as a
+		 * reader, and re-entering the lock from the thread already holding
+		 * it as a writer triggers pthread EDEADLK on glibc and silent
+		 * self-deadlock elsewhere.  Defer to here, immediately after
+		 * unlock, so the rest
 		 * of the cleanup pipeline (bgnoise, end_stacking idle) sees the
 		 * histogram/stats invalidations as expected. */
 		notify_gfit_data_modified();

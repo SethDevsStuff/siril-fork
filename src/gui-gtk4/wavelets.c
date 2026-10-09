@@ -333,6 +333,10 @@ static void reset_scale_w() {
  * adjusted strength; every other layer is held at the neutral 1.0 so the
  * preview isolates the previewed layers. Denoising/VST ride in wrecons_data. */
 static int update_wavelets() {
+	/* No live decomposition — the tool was invalidated (dialog hidden or the
+	 * active FLIS layer changed) after this update was scheduled. */
+	if (nb_computed_layers == 0)
+		return 0;
 	struct wrecons_data *wrecons_args = calloc(1, sizeof(struct wrecons_data));
 	if (!wrecons_args) {
 		PRINT_ALLOC_ERR;
@@ -345,16 +349,12 @@ static int update_wavelets() {
 	sync_denoise_params();
 	wrecons_args->denoise = wavelet_denoise;
 
-	/* Preview only the region of interest when one is set: reconstruct into the
-	 * ROI fit and let the framework composite it back. */
-	gboolean roi = gui.roi.active;
-	if (roi) {
-		wrecons_args->for_roi = TRUE;
-		wrecons_args->roi_x = gui.roi.selection.x;
-		wrecons_args->roi_y = gui.roi.selection.y;
-		wrecons_args->full_rx = gfit->rx;
-		wrecons_args->full_ry = gfit->ry;
-	}
+	/* The held transform covers the whole image, so a region preview still
+	 * reconstructs from full-image geometry and windows the result out.
+	 * Where that window is comes from the worker at run time (it owns the
+	 * region); only the full geometry has to be recorded here. */
+	wrecons_args->full_rx = gfit->rx;
+	wrecons_args->full_ry = gfit->ry;
 
 	struct generic_img_args *args = calloc(1, sizeof(struct generic_img_args));
 	if (!args) {
@@ -362,14 +362,13 @@ static int update_wavelets() {
 		free_wrecons_data(wrecons_args);
 		return 1;
 	}
-	args->fit = roi ? &gui.roi.fit : gfit;
+	args->fit = gfit;
 	args->op = &op_desc_wrecons;
 	args->description = _("Wavelets preview");  // override: variant label
 	args->verbose = FALSE;
 	args->user = wrecons_args;
 	args->max_threads = com.max_thread;
 	args->for_preview = TRUE;
-	args->for_roi = roi;
 	if (!start_in_new_thread(generic_image_worker, args))
 		free_generic_img_args(args);
 	return 0;
@@ -409,7 +408,6 @@ static void update_sigma_readout(void) {
 
 /* Re-run the preview when the ROI is created, moved or cleared. */
 static void wavelet_roi_changed(void) {
-	gui.roi.operation_supports_roi = TRUE;
 	if (gtk_widget_get_sensitive(wavelets_frame) != TRUE)
 		return; /* nothing computed yet */
 	update_image *param = malloc(sizeof(update_image));
@@ -424,7 +422,7 @@ static void wavelets_startup() {
 	}
 	copy_gfit_to_backup();
 	add_roi_callback(wavelet_roi_changed);
-	roi_supported(TRUE);
+	roi_declare_op(&op_desc_wrecons);
 }
 
 /* Idle function: called after generic_image_worker finishes the wrecons apply */
@@ -467,6 +465,34 @@ void on_wavelets_dialog_show(GtkWidget *widget, gpointer user_data) {
 	request_window_natural_size(widget, FALSE);
 }
 
+/* Active-layer reconciler entry point (gui_iface_impl.c): the computed
+ * decomposition — the transform held in memory AND the .wave files — describes
+ * the pixels of the layer gfit no longer points at.  Geometry guards cannot
+ * catch a same-size layer, which would silently get the OLD layer's
+ * reconstruction previewed (and on Apply, committed) into it.  So the whole
+ * tool state goes stale on a switch: mirror the decomposition teardown of
+ * on_wavelets_dialog_hide but keep the dialog open — the user re-runs the
+ * transform on the new layer.  The preview backup needs no handling here: the
+ * switch path already reverted the outgoing layer and re-armed the incoming
+ * one. */
+void wavelets_active_layer_changed(void) {
+	/* Drop any held transform even if the dialog never opened this session:
+	 * cheap, and keeps the reconciler's contract simple.  May briefly block
+	 * on an in-flight reconstruction (whose result the swap-point identity
+	 * check then discards). */
+	wavelet_session_release();
+	if (!wavelets_frame || nb_computed_layers == 0)
+		return;	/* dialog never built, or nothing computed — nothing stale */
+	cancel_pending_update();
+	gtk_widget_set_sensitive(wavelets_frame, FALSE);
+	gtk_widget_set_sensitive(wavelets_reset_btn, FALSE);
+	gtk_widget_set_sensitive(denoise_frame, FALSE);
+	nb_computed_layers = 0;
+	refresh_layer_visibility();
+	siril_log_message(_("Active layer changed: the wavelet decomposition no longer "
+			"matches the image, please run the wavelet transform again.\n"));
+}
+
 void on_wavelets_dialog_hide(GtkWidget *widget, gpointer user_data) {
 	gtk_widget_set_sensitive(wavelets_frame, FALSE);
 	gtk_widget_set_sensitive(wavelets_reset_btn, FALSE);
@@ -476,7 +502,7 @@ void on_wavelets_dialog_hide(GtkWidget *widget, gpointer user_data) {
 	nb_computed_layers = 0;
 	if (wavelets_plans_spin)
 		refresh_layer_visibility();
-	roi_supported(FALSE);
+	roi_declare_op(NULL);
 	remove_roi_callback(wavelet_roi_changed);
 	clear_backup();
 	/* the held transform is only for this window's repeated reconstructions */
@@ -517,7 +543,7 @@ static void apply_wavelets_to_current_sequence(void) {
 	/* stop any live preview/ROI compositing and restore the loaded frame first */
 	cancel_pending_update();
 	cancel_and_wait_for_preview();
-	roi_supported(FALSE);
+	roi_declare_op(NULL);
 	remove_roi_callback(wavelet_roi_changed);
 	if (is_preview_active())
 		copy_backup_to_gfit();
@@ -568,7 +594,7 @@ void on_button_ok_w_clicked(GtkButton *button, gpointer user_data) {
 	/* Apply always commits the full image. Stop ROI compositing now so the
 	 * worker's notify_gfit_data_modified() does not paste the (restored,
 	 * original) ROI back over the freshly reconstructed result. */
-	roi_supported(FALSE);
+	roi_declare_op(NULL);
 	remove_roi_callback(wavelet_roi_changed);
 	/* The live preview may have been showing an isolated reconstruction (only
 	 * some layers at their adjusted strength). Whatever was previewed, the

@@ -272,6 +272,9 @@ gpointer apply_pixel_math_operation(gpointer p) {
 	 * overwrite gfit->rwlock while it is held. */
 	gboolean rwlocked = FALSE;
 	if (!com.headless) {
+		/* Quiesce the lazy-tile materialise pool before gfit's writer
+		 * lock (writer-starvation protocol, gui_iface_impl.c). */
+		gui_iface.set_suppress_redraws(TRUE);
 		g_rw_lock_writer_lock(&gfit->rwlock);
 		rwlocked = TRUE;
 	}
@@ -484,7 +487,7 @@ failure:
 			clearfits(gfit);
 			memcpy(gfit, args->fit, sizeof(fits));
 			com.seq.current = UNRELATED_IMAGE;
-			create_uniq_from_gfit(strdup(_("Pixel Math result")), FALSE);
+			create_uniq_from_gfit(strdup(_("Pixel Math result")), FALSE, "generated");
 		}
 		else clearfits(args->fit);
 		free(args->fit);
@@ -500,12 +503,14 @@ failure:
 			memcpy(gfit, args->fit, offsetof(fits, rwlock));
 			icc_auto_assign(gfit, ICC_ASSIGN_ON_COMPOSITION);
 			com.seq.current = UNRELATED_IMAGE;
-			create_uniq_from_gfit(strdup(_("Pixel Math result")), FALSE);
+			create_uniq_from_gfit(strdup(_("Pixel Math result")), FALSE, "generated");
 		} else {
 			clearfits(args->fit);
 		}
-		if (rwlocked)
+		if (rwlocked) {
 			g_rw_lock_writer_unlock(&gfit->rwlock);
+			gui_iface.set_suppress_redraws(FALSE);
+		}
 		gui_iface.execute_idle_sync(end_pixel_math_operation, args);
 	}
 	return GINT_TO_POINTER((gint)failed);

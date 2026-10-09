@@ -208,6 +208,7 @@ gboolean show_or_hide_mask_tab_idle(gpointer p) { (void)p; return FALSE; }
 /* Window / tab / dialog control */
 void control_window_switch_to_tab(int tab) { (void)tab; }
 gboolean close_tab(gpointer user_data) { (void)user_data; return FALSE; }
+gboolean sync_colour_vports(gpointer user_data) { (void)user_data; return FALSE; }
 int number_of_dialogs(void) { return 0; }
 
 /* Sliders / precision / debayer controls */
@@ -222,8 +223,6 @@ void set_GUI_CAMERA(void) {}
 
 /* ROI */
 void on_clear_roi(void) {}
-int populate_roi(void) { return 0; }
-void copy_roi_into_gfit(void) {}
 void delete_selected_area(void) {}
 void lock_roi_mutex(void) {}
 void unlock_roi_mutex(void) {}
@@ -233,6 +232,7 @@ gboolean is_preview_active(void) { return FALSE; }
 void copy_gfit_to_backup(void) {}
 int copy_backup_to_gfit(void) { return 0; }
 fits *get_preview_gfit_backup(void) { return NULL; }
+fits *get_preop_gfit(void) { return NULL; }
 
 /* Script widgets */
 gboolean script_widgets_idle(gpointer user_data) { (void)user_data; return FALSE; }

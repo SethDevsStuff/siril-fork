@@ -126,6 +126,14 @@ typedef enum {
  * always valid function pointers, so no NULL guard is needed.
  */
 typedef struct {
+	/* TRUE once siril_register_gui_iface() has swapped the stubs out, i.e.
+	 * there is a real display: a main loop running idles, and a tile pool
+	 * that may be reading image buffers off-thread.  Stays FALSE in the CLI
+	 * and in unit tests, which never register.  Code that has to defer work
+	 * to the main loop tests this rather than com.headless, which only says
+	 * which binary is running (see flis_retire_fits). */
+	gboolean gui_registered;
+
 	/* A – Progress / status ------------------------------------------------ */
 	/* fraction: PROGRESS_* constant or [0.0, 1.0]; msg may be NULL */
 	void     (*set_progress)(double fraction, const char *msg);
@@ -233,10 +241,14 @@ typedef struct {
 	 * already-suppressed one must save this and restore it rather than force
 	 * the flag off — see free_image_data(). */
 	gboolean (*get_suppress_redraws)(void);
-	/* Repopulate the ROI display from current gfit data (call while holding
-	 * the gfit read lock). */
-	void     (*populate_roi)(void);
-
+	/* Block until the display's tile-materialisation pool is idle.  Call only
+	 * with redraws already suppressed, and keep them suppressed for as long as
+	 * the pool must stay idle — the flag is what stops new workers starting.
+	 * Needed before freeing or repointing the fits gfit refers to, since a
+	 * worker holds a reader lock on that struct across its fill; taking the
+	 * writer lock cannot cover that, as the lock lives inside the memory being
+	 * freed.  Never call while holding gfit's writer lock. */
+	void     (*drain_tile_workers)(void);
 	/* D additions – Histogram / image modification state ------------------ */
 	/* Mark the histogram as stale (call while holding at least a read lock). */
 	void     (*invalidate_histogram)(void);
@@ -244,8 +256,64 @@ typedef struct {
 	void     (*update_histogram)(void);
 	/* Reset the curves tool state after an undo/redo (no-op in headless mode). */
 	void     (*curves_reset_after_undo)(void);
-	/* Run the mask redraw now.  remap_tints as in queue_redraw_mask. */
+	/* Queue an idle mask redraw (may also trigger a full image redraw).
+	 * remap_tints: TRUE when the mask data changed and cached tints are
+	 * stale and must be recomputed. */
 	void     (*redraw_mask_idle)(gboolean remap_tints);
+	/* FLIS composite invalidation hook (legacy "drop everything" form).
+	 * Equivalent to flis_display_invalidate(FLIS_INV_ALL, 0); kept as a
+	 * convenience for call sites that don't know which layer or aspect
+	 * changed.  Prefer flis_display_invalidate with the narrowest flag
+	 * where possible. */
+	void     (*flis_invalidate_composite)(void);
+	/* Stage 3.4 — narrow-flag display-cache invalidation chokepoint.
+	 * @flags: one or more FLIS_INV_* bits (image_format_flis.h).
+	 * @item_id: layer id (required for FLIS_INV_LAYER_PIXELS /
+	 *          FLIS_INV_LAYER_PROPS; ignored otherwise).
+	 * No-op in headless / GTK3 builds. */
+	void     (*flis_display_invalidate)(int flags, int item_id);
+	/* Build the FLIS composite if stale and return a borrowed pointer to
+	 * it, or NULL when there is nothing to composite (non-FLIS image, or
+	 * the build failed).  Pass the result to whatever must measure or
+	 * render the multi-layer image; do not assign it to gfit. */
+	void    *(*flis_get_composite)(void);
+	/* Release the cached FLIS display composite.  Called when an image
+	 * is closed (free_image_data) so the per-image composite memory is
+	 * released promptly rather than waiting for the next FLIS open.
+	 * No-op when no composite is cached. */
+	void     (*flis_composite_free)(void);
+	/* Refresh the FLIS layers panel (rebuild the list, sync property
+	 * widgets to current state).  No-op when the panel hasn't been
+	 * created yet — the real implementation lands in stage 4. */
+	void     (*flis_gui_update)(void);
+	/* Fired by uniq_set_active_layer after EVERY active-layer retarget
+	 * (user switch, load, worker hooks).  The implementation must be
+	 * fully asynchronous (queue an idle, no locks) — the caller may hold
+	 * the FLIS stack writer lock.  The idle reconciles all GUI state
+	 * that is keyed to the active layer: preview backup ownership, the
+	 * ROI pixel cache, mask-tab visibility, panel highlight, overlays. */
+	void     (*on_active_layer_changed)(void);
+
+	/* TRUE when the FLIS layers panel's selection is a layer GROUP row.
+	 * Generic image/mask workers refuse to run in that state: the
+	 * operation would silently apply to the active layer only, which is
+	 * misleading when the user intends it to affect the whole group.
+	 * Headless stub returns FALSE (no panel). */
+	gboolean (*flis_group_is_selected)(void);
+	/* TRUE when the layers panel has MORE THAN ONE row selected — GUI
+	 * image ops refuse then, like the group-selected guard above. */
+	gboolean (*flis_multi_is_selected)(void);
+	/* Idempotent show: present the FLIS layers panel iff a FLIS is
+	 * currently loaded.  No-op for plain FITS / sequences / no image,
+	 * no-op when the panel is already visible.  Called from
+	 * open_single_image_from_gfit so opening a FLIS automatically
+	 * reveals the panel without stealing focus during plain-FITS work. */
+	void     (*flis_gui_present_if_flis)(void);
+	/* The NDE provenance log changed (append / undo / redo / attach).
+	 * Called from any thread, never with the nde leaf mutex held; the
+	 * implementation must only schedule a coalesced idle that refreshes
+	 * the History section's main-thread mirror (sketch §6a/§16). */
+	void     (*nde_history_changed)(void);
 
 	/* F additions – Application lifecycle -------------------------------- */
 	/* Quit the application's main event loop. */
@@ -303,15 +371,14 @@ typedef struct {
 	/* Returns TRUE if the current operation has set up an ROI preview patch
 	 * (gui.roi.operation_supports_roi).  Always FALSE in headless mode. */
 	gboolean (*roi_operation_supports)(void);
-	/* Return a pointer to the ROI fits buffer (gui.roi.fit) cast to gpointer.
-	 * Returns NULL in headless/CLI mode.  Callers cast back to fits*. */
-	gpointer (*get_roi_fit)(void);
 	/* Copy the current ROI selection rectangle into *rect. */
 	void     (*get_roi_selection)(rectangle *rect);
 	/* Clear any active ROI selection. */
 	void     (*clear_roi)(void);
-	/* Set *rect as the new ROI selection and notify the GUI. */
-	void     (*restore_roi)(const rectangle *rect);
+	/* The ROI selection translated and clipped to the ACTIVE LAYER, i.e. the
+	 * region of gfit a region preview covers.  FALSE (leaving *rect
+	 * untouched) when no ROI is active or it misses the layer entirely. */
+	gboolean (*roi_active_layer_rect)(rectangle *rect);
 	/* Reset (delete) the ICC proofing display transform under its lock. */
 	void     (*reset_display_transform)(void);
 
@@ -466,6 +533,16 @@ typedef struct {
 	int      (*copy_backup_to_gfit)(void);
 	/* Return the internal preview backup fits buffer cast to gpointer. */
 	gpointer (*get_preview_gfit_backup)(void);
+	/* Report what this job changed in gfit relative to a live preview backup,
+	 * so the next preview restore can be scoped to it.  @region is the
+	 * rectangle a region preview wrote; NULL means "assume the whole image",
+	 * which is always the safe answer. */
+	void     (*preview_note_gfit_change)(const rectangle *region);
+	/* The PRE-OPERATION pixels of the displayed image: the preview backup when
+	 * one is live and belongs to the current gfit, gfit itself otherwise.
+	 * Unlike get_preview_gfit_backup() this never hands back another layer's
+	 * backup after a FLIS active-layer switch. */
+	gpointer (*get_preop_gfit)(void);
 
 	/* ── Registration / sequence state ─────────────────────────────────────── */
 	/* Update the registration panel's status indicators. */
@@ -562,6 +639,10 @@ typedef struct {
 	void     (*close_tab)(void);
 	/* (Re-)initialise the right-hand image tab (call as idle; arg unused). */
 	void     (*init_right_tab)(void);
+	/* Re-apply the R/G/B/RGB viewport set when a FLIS composite's
+	 * chromaticity has changed under it (a mono layer gaining a tint).
+	 * No-op unless the answer actually moved. */
+	void     (*sync_colour_vports)(void);
 	/* Set the display mode combo to the image's own colour space. */
 	void     (*initialize_display_mode)(void);
 	/* Update the window title / filename label to show the current image. */
@@ -592,8 +673,6 @@ typedef struct {
 	void     (*update_sequence_overlay_async)(void);
 	/* Ensure the sequence-list dialog is closed before modifying seq data. */
 	void     (*ensure_seqlist_dialog_closed)(void);
-	/* Copy the active ROI pixels back into gfit. */
-	void     (*copy_roi_into_gfit)(void);
 	/* Acquire the ROI mutex (prevents ROI callbacks during processing). */
 	void     (*lock_roi_mutex)(void);
 	/* Release the ROI mutex. */

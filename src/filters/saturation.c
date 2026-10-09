@@ -4,12 +4,41 @@
 
 #include "algos/colors.h"
 #include "algos/statistics.h"
+#include "core/nde/nde_history.h"
 #include "core/op_descriptors.h"
 #include "core/processing.h"
 #include "core/proto.h"
 #include "core/siril.h"
 #include "core/siril_log.h"
 #include "filters/saturation.h"
+
+static gchar *satu_serialize(gconstpointer user) {
+	const saturation_params *p = user;
+	GString *kv = nde_kv_start();
+	nde_kv_add_double(kv, "coeff", p->coeff);
+	nde_kv_add_double(kv, "background_factor", p->background_factor);
+	nde_kv_add_double(kv, "h_min", p->h_min);
+	nde_kv_add_double(kv, "h_max", p->h_max);
+	return nde_kv_end(kv);
+}
+
+static gpointer satu_deserialize(const gchar *blob, int version) {
+	if (version > 1)
+		return NULL;
+	GHashTable *kv = nde_kv_parse(blob);
+	saturation_params *p = calloc(1, sizeof(*p));
+	p->free = free;
+	gboolean ok = nde_kv_get_double(kv, "coeff", &p->coeff)
+	           && nde_kv_get_double(kv, "background_factor", &p->background_factor)
+	           && nde_kv_get_double(kv, "h_min", &p->h_min)
+	           && nde_kv_get_double(kv, "h_max", &p->h_max);
+	g_hash_table_unref(kv);
+	if (!ok) {
+		free(p);
+		return NULL;
+	}
+	return p;
+}
 
 /* Op descriptor — single source of truth for this operation (op_descriptor.h) */
 const op_descriptor op_desc_saturation = {
@@ -18,7 +47,8 @@ const op_descriptor op_desc_saturation = {
 	.log_hook = satu_log_hook,
 	.description = N_("Saturation"),
 	.mem_ratio = 1.0f,
-	.flags = OP_MASK_CAPABLE,
+	.flags = OP_MASK_CAPABLE | OP_ROI_CAPABLE | OP_REQ_RGB,
+	.serialize = satu_serialize, .deserialize = satu_deserialize,
 };
 
 /* Helper to map hue types to degree ranges */

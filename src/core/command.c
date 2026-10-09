@@ -56,6 +56,7 @@
 #include "core/siril_update.h"
 #include "core/undo.h"
 #include "drizzle/cdrizzleutil.h"
+#include "filters/synthstar.h"
 #include "io/annotation_catalogues.h"
 #include "io/Astro-TIFF.h"
 #include "io/conversion.h"
@@ -96,6 +97,9 @@
 #include "core/command.h"
 #include "core/command_line_processor.h"
 #include "core/command_list.h"
+#include "core/nde/nde_checkpoint.h"
+#include "core/nde/nde_history.h"
+#include "core/nde/nde_replay.h"
 #include "filters/asinh.h"
 #include "filters/banding.h"
 #include "filters/clahe.h"
@@ -115,8 +119,10 @@
 #include "filters/wavelets.h"
 #include "io/healpix/healpix_cat.h"
 #include "io/healpix/healpix_image.h"
+#include "io/image_format_flis.h"
 #include "livestacking/livestacking.h"
 #include "pixelMath/pixel_math_runner.h"
+#include "registration/flis_register.h"
 #include "registration/mpp.h"
 #include "registration/mpp/mpp_ap.h"
 #include "registration/mpp/mpp_config.h"
@@ -129,6 +135,31 @@
 /* The op_descriptors for command.c's ops are declared in core/op_descriptors.h
  * (included above) and defined at the end of this file, after their static
  * hook functions. */
+
+/* Shared NDE serializer for paramless ops (stretch.log, arith.neg,
+ * color.grey_flat, cfa.fix_xtrans): the hook takes no user parameters and is a
+ * pure function of the input pixels.  serialize emits an empty blob; the
+ * generic paramless deserializer returns a minimal destructor-first heap struct
+ * so replay has a valid (freeable) user pointer, even though the hook ignores
+ * it.  Any blob (including "") is accepted; only a newer format version fails,
+ * which is the version-gated wrapper's job. */
+struct paramless_data { destructor destroy_fn; };
+
+static gchar *paramless_serialize(gconstpointer user) {
+	(void)user;
+	GString *kv = nde_kv_start();
+	return nde_kv_end(kv);   /* "" */
+}
+
+static gpointer paramless_deserialize_v1(const gchar *blob, int version) {
+	if (version > 1)
+		return NULL;
+	(void)blob;   /* no keys required — any blob (incl. "") is accepted */
+	struct paramless_data *d = calloc(1, sizeof(*d));
+	if (d)
+		d->destroy_fn = free;
+	return d;
+}
 
 #define PRINT_DEPRECATED_WARNING(__new_function__) siril_log_error(_("This command is deprecated: %s should be used instead.\n"), __new_function__)
 #define PRINT_DEPRECATED_OPTION_WARNING(__option__, __new_function__) siril_log_error(_("The %s option is deprecated: %s should be used instead.\n"), __option__, __new_function__)
@@ -360,7 +391,6 @@ int process_satu(int nb) {
 	args->mask_aware = mask_aware;
 	args->max_threads = com.max_thread;
 	args->for_preview = FALSE;
-	args->for_roi = FALSE;
 
 	/* Run synchronously */
 	gui_iface.set_busy(TRUE);
@@ -369,7 +399,11 @@ int process_satu(int nb) {
 		return CMD_GENERIC_ERROR;
 	}
 
-	int retval = args->retval;
+	/* Read the result from the worker's cached return value, not from args:
+	 * generic_image_worker frees args via a synchronous completion idle before
+	 * start_in_new_thread returns (see the note in process_asinh), so
+	 * args->retval would be a use-after-free. */
+	int retval = GPOINTER_TO_INT(waiting_for_thread());
 
 	if (retval != 0) {
 		siril_log_error(_("Saturation enhancement failed\n"));
@@ -386,6 +420,8 @@ int process_satu(int nb) {
 }
 
 int process_save(int nb){
+	if (nde_edit_at_refuses_op(_("Saving")))
+		return CMD_GENERIC_ERROR;
 	gchar *filename = g_strdup(word[1]);
 	int status, retval;
 
@@ -408,22 +444,46 @@ int process_save(int nb){
 		retval = CMD_GENERIC_ERROR;
 	} else {
 		gui_iface.set_busy(TRUE);
-		retval = savefits(savename, gfit) ? CMD_GENERIC_ERROR : CMD_OK;
+		/* Data-driven save dispatch (matches the GUI save / save-as paths):
+		 * format follows the loaded image's state, not the filename
+		 * extension.  Headless / scripted runs cannot show the multi-layer
+		 * flatten-vs-preserve dialog, so the safe default is always to
+		 * preserve layers — a script that wants to flatten should invoke
+		 * `flis_flatten` first. */
+		if (is_current_image_flis()) {
+			/* Append the .flis extension when none was given, mirroring
+			 * the plain-FITS branch below — `save result` should
+			 * produce result.flis, not an extensionless file. */
+			gchar *flis_name = g_str_has_suffix(savename, ".flis")
+				? g_strdup(savename)
+				: g_strdup_printf("%s.flis", savename);
+			retval = save_flis(flis_name) ? CMD_GENERIC_ERROR : CMD_OK;
+			if (retval == CMD_OK && com.uniq) {
+				free(com.uniq->filename);
+				com.uniq->filename = strdup(flis_name);
+				com.uniq->fileexist = TRUE;
+			}
+			g_free(flis_name);
+		} else {
+			retval = savefits(savename, gfit) ? CMD_GENERIC_ERROR : CMD_OK;
+			if (com.uniq && retval == CMD_OK) {
+				if (!g_str_has_suffix(savename, com.pref.ext)) {
+					gchar* tempfilename = g_strdup_printf("%s%s", savename, com.pref.ext);
+					free(com.uniq->filename);
+					com.uniq->filename = strdup(tempfilename);
+					g_free(tempfilename);
+				} else {
+					free(com.uniq->filename);
+					com.uniq->filename = strdup(savename);
+				}
+				com.uniq->fileexist = TRUE;
+			}
+		}
 		gui_iface.set_busy(FALSE);
 	}
-	if (com.uniq) {
-		if (!g_str_has_suffix(savename, com.pref.ext)) {
-			gchar* tempfilename = g_strdup_printf("%s%s", savename, com.pref.ext);
-			com.uniq->filename = strdup(tempfilename);
-			g_free(tempfilename);
-		} else {
-			com.uniq->filename = strdup(savename);
-		}
-		com.uniq->fileexist = TRUE;
-		if (!com.headless) {
-			gui_iface.display_filename();
-			gui_iface.adjust_sellabel();
-		}
+	if (com.uniq && !com.headless) {
+		gui_iface.display_filename();
+		gui_iface.adjust_sellabel();
 	}
 	gui_iface.on_precision_changed();
 
@@ -453,6 +513,7 @@ int process_synthstar(int nb) {
 	struct generic_img_args *args = calloc(1, sizeof(struct generic_img_args));
 	args->fit = gfit;
 	args->op = &op_desc_synthstar;
+	args->user = new_synthstar_data();  /* stashes the effective star list for NDE replay */
 	args->verbose = TRUE;
 	args->command = TRUE;
 	args->command_updates_gfit = TRUE;
@@ -468,6 +529,7 @@ int process_unclip(int nb) {
 	struct generic_img_args *args = calloc(1, sizeof(struct generic_img_args));
 	args->fit = gfit;
 	args->op = &op_desc_unclip;
+	args->user = new_synthstar_data();  /* records the detection conf for NDE replay */
 	args->verbose = TRUE;
 	args->command = TRUE;
 	args->command_updates_gfit = TRUE;
@@ -615,6 +677,50 @@ int denoise_image_hook(struct generic_img_args *args, fits *fit, int nb_threads)
 	return retval;
 }
 
+/* NDE serializers for filters.denoise.  The hook reads modulation, sos, da3d,
+ * rho, do_anscombe, do_cosme and suppress_artefacts; fit and previewing are
+ * runtime context and are skipped. */
+static gchar *denoise_serialize(gconstpointer user) {
+	const struct denoise_args *d = user;
+	GString *kv = nde_kv_start();
+	nde_kv_add_float(kv, "modulation", d->modulation);
+	nde_kv_add_int(kv, "sos", d->sos);
+	nde_kv_add_int(kv, "da3d", d->da3d);
+	nde_kv_add_float(kv, "rho", d->rho);
+	nde_kv_add_bool(kv, "do_anscombe", d->do_anscombe);
+	nde_kv_add_bool(kv, "do_cosme", d->do_cosme);
+	nde_kv_add_bool(kv, "suppress_artefacts", d->suppress_artefacts);
+	return nde_kv_end(kv);
+}
+
+static gpointer denoise_deserialize(const gchar *blob, int version) {
+	if (version > op_desc_denoise.version)
+		return NULL;
+	GHashTable *kv = nde_kv_parse(blob);
+	float modulation, rho;
+	gint64 sos, da3d;
+	gboolean do_anscombe, do_cosme, suppress_artefacts;
+	NDE_KV_REQUIRE(kv, nde_kv_get_float(kv, "modulation", &modulation) &&
+	                   nde_kv_get_int(kv, "sos", &sos) &&
+	                   nde_kv_get_int(kv, "da3d", &da3d) &&
+	                   nde_kv_get_float(kv, "rho", &rho) &&
+	                   nde_kv_get_bool(kv, "do_anscombe", &do_anscombe) &&
+	                   nde_kv_get_bool(kv, "do_cosme", &do_cosme) &&
+	                   nde_kv_get_bool(kv, "suppress_artefacts", &suppress_artefacts));
+	struct denoise_args *d = new_denoise_args();
+	if (d) {
+		d->modulation = modulation;
+		d->sos = (unsigned int)sos;
+		d->da3d = (int)da3d;
+		d->rho = rho;
+		d->do_anscombe = do_anscombe;
+		d->do_cosme = do_cosme;
+		d->suppress_artefacts = suppress_artefacts;
+	}
+	g_hash_table_unref(kv);
+	return d;
+}
+
 /*****************************************************************************
  *      C O M M A N D   P R O C E S S I N G                                 *
  ****************************************************************************/
@@ -738,7 +844,6 @@ int process_denoise(int nb) {
 	args->user = params;
 	args->max_threads = com.max_thread;
 	args->for_preview = FALSE;
-	args->for_roi = FALSE;
 	args->mask_aware = mask_aware;
 	args->command_updates_gfit = TRUE;
 	args->command = TRUE;
@@ -949,13 +1054,20 @@ static gpointer rebayer_cmd_worker(gpointer p) {
 		return GINT_TO_POINTER(1);
 	}
 	siril_log_message("Bayer pattern produced: 1 layer, %dx%d pixels\n", out->rx, out->ry);
-	/* close_single_image() must stay OUTSIDE the writer lock: it takes that
-	 * same non-recursive lock itself, inside free_image_data(), to clear gfit.
+	/* Quiesce the lazy-tile materialise pool before gfit's writer lock
+	 * (writer-starvation protocol, gui_iface_impl.c).
+	 *
+	 * close_single_image() must stay OUTSIDE that lock: it takes the same
+	 * non-recursive lock itself, inside free_image_data(), to clear gfit.
 	 * Closing from within the locked region makes GLib refuse the nested
 	 * acquisition — "Failed to get RW lock: Resource deadlock avoided" on
 	 * glibc, a hard hang where the platform has no such check — after which
-	 * the unlock paired with it releases the lock taken HERE, leaving the copy
-	 * below running unguarded and the final unlock with nothing to release. */
+	 * the unlock paired with it releases the lock taken HERE, leaving the
+	 * swap below running unguarded and the final unlock with nothing to
+	 * release.  The close also replaces the struct the lock lives in when a
+	 * FLIS document is open, so the lock has to be taken afterwards, on the
+	 * gfit the copy actually goes into. */
+	gui_iface.set_suppress_redraws(TRUE);
 	close_single_image();
 	g_rw_lock_writer_lock(&gfit->rwlock);
 	copyfits(out, gfit, CP_ALLOC | CP_COPYA | CP_FORMAT, -1);
@@ -965,11 +1077,12 @@ static gpointer rebayer_cmd_worker(gpointer p) {
 	free_wcs(gfit);
 	update_fits_header(gfit);
 	g_rw_lock_writer_unlock(&gfit->rwlock);
+	gui_iface.set_suppress_redraws(FALSE);
 	clearfits(out);
 	free(out);
 	clear_stars_list(TRUE);
 	com.seq.current = UNRELATED_IMAGE;
-	if (!create_uniq_from_gfit(strdup(_("Unsaved Bayer pattern merge")), FALSE))
+	if (!create_uniq_from_gfit(strdup(_("Unsaved Bayer pattern merge")), FALSE, "generated"))
 		com.uniq->comment = strdup(_("Bayer pattern merge"));
 	if (!com.script) {
 		gui_iface.on_image_loaded();
@@ -1041,6 +1154,50 @@ static void free_imoper_data(void *data) {
 		return;
 	free(imoper->filename);
 	free(imoper);
+}
+
+/* NDE serializers (phase 4.5 Convention 1 — file operands).  imoper_image_hook
+ * loads the operand from data->filename itself, so the serializer just PINS
+ * that path (hash+size computed from the file at capture) and replay_pre only
+ * VERIFIES it — no filesystem load here.  oper/force_to_float are POD. */
+static gchar *imoper_serialize(gconstpointer user) {
+	const struct imoper_data *d = user;
+	GString *kv = nde_kv_start();
+	/* on-disk value: enum order is frozen by the NDE format — do not reorder */
+	nde_kv_add_int(kv, "oper", d->oper);
+	nde_kv_add_bool(kv, "force_to_float", d->force_to_float);
+	nde_kv_add_operand(kv, d->filename);
+	return nde_kv_end(kv);
+}
+
+static gpointer imoper_deserialize(const gchar *blob, int version) {
+	if (version > op_desc_imoper.version)
+		return NULL;
+	GHashTable *kv = nde_kv_parse(blob);
+	gint64 oper;
+	gboolean force_to_float;
+	const char *path = nde_kv_get_str(kv, "operand_path");
+	/* records captured before phase 4.5 lack the operand keys → not
+	 * replayable (they stay honestly Tier B-flagged at capture time). */
+	NDE_KV_REQUIRE(kv, nde_kv_get_int(kv, "oper", &oper) &&
+	                   nde_kv_get_bool(kv, "force_to_float", &force_to_float) &&
+	                   path && *path);
+	struct imoper_data *d = calloc(1, sizeof(*d));
+	if (d) {
+		d->destructor = free_imoper_data;
+		d->oper = (image_operator)oper;
+		d->force_to_float = force_to_float;
+		d->filename = strdup(path);
+	}
+	g_hash_table_unref(kv);
+	return d;
+}
+
+/* replay_pre: verify the pinned operand file (existence/size/sha); the hook
+ * itself reads data->filename, so nothing is loaded here. */
+static int imoper_replay_pre(gpointer user, GHashTable *kv, fits *target) {
+	(void)user; (void)target;
+	return nde_operand_get(kv) ? 0 : 1;
 }
 
 // Image processing hook for imoper
@@ -1183,7 +1340,6 @@ int process_imoper(int nb) {
 	args->max_threads = 1;  // imoper likely doesn't need multi-threading
 	args->for_preview = FALSE;
 	args->mask_aware = mask_aware;
-	args->for_roi = FALSE;
 
 	/* Start the worker thread */
 	start_in_new_thread(generic_image_worker, args);
@@ -1194,6 +1350,8 @@ int process_imoper(int nb) {
 struct addmax_data {
 	void (*destructor)(void *);
 	fits *operand_fit;
+	char *operand_path;      /* pinned operand path (phase 4.5 Convention 1) */
+	gboolean force_to_float; /* readfits force_float used at construction */
 };
 
 static void addmax_destructor(void *p) {
@@ -1202,6 +1360,7 @@ static void addmax_destructor(void *p) {
 		clearfits(data->operand_fit);
 		free(data->operand_fit);
 	}
+	free(data->operand_path);
 	free(data);
 }
 
@@ -1213,6 +1372,51 @@ static int addmax_image_hook(struct generic_img_args *args, fits *fit, int threa
 
 static gchar *addmax_log_hook(gpointer p, log_hook_detail detail) {
 	return g_strdup_printf(_("Add max operation"));
+}
+
+/* NDE serializers (phase 4.5 Convention 1).  The hook consumes a pre-loaded
+ * operand_fit; the params struct pins the source path (+hash/size) and
+ * replay_pre readfits() it into operand_fit (freed by addmax_destructor). */
+static gchar *addmax_serialize(gconstpointer user) {
+	const struct addmax_data *d = user;
+	GString *kv = nde_kv_start();
+	nde_kv_add_bool(kv, "force_to_float", d->force_to_float);
+	nde_kv_add_operand(kv, d->operand_path);
+	return nde_kv_end(kv);
+}
+
+static gpointer addmax_deserialize(const gchar *blob, int version) {
+	if (version > op_desc_addmax.version)
+		return NULL;
+	GHashTable *kv = nde_kv_parse(blob);
+	gboolean force_to_float;
+	const char *path = nde_kv_get_str(kv, "operand_path");
+	NDE_KV_REQUIRE(kv, nde_kv_get_bool(kv, "force_to_float", &force_to_float) && path && *path);
+	struct addmax_data *d = calloc(1, sizeof(*d));
+	if (d) {
+		d->destructor = addmax_destructor;
+		d->force_to_float = force_to_float;
+		d->operand_path = strdup(path);
+	}
+	g_hash_table_unref(kv);
+	return d;
+}
+
+static int addmax_replay_pre(gpointer user, GHashTable *kv, fits *target) {
+	(void)target;
+	struct addmax_data *d = user;
+	const char *path = nde_operand_get(kv);
+	if (!path)
+		return 1;
+	fits *operand_fit = calloc(1, sizeof(fits));
+	if (!operand_fit)
+		return 1;
+	if (readfits(path, operand_fit, NULL, d->force_to_float)) {
+		free(operand_fit);
+		return 1;
+	}
+	d->operand_fit = operand_fit;   /* freed by addmax_destructor */
+	return 0;
 }
 
 int process_addmax(int nb) {
@@ -1248,7 +1452,8 @@ int process_addmax(int nb) {
 		return CMD_ALLOC_ERROR;
 	}
 
-	if (readfits(filename, operand_fit, NULL, gfit->type == DATA_FLOAT)) {
+	gboolean force_to_float = (gfit->type == DATA_FLOAT);
+	if (readfits(filename, operand_fit, NULL, force_to_float)) {
 		free(operand_fit);
 		return CMD_INVALID_IMAGE;
 	}
@@ -1263,6 +1468,9 @@ int process_addmax(int nb) {
 	}
 	data->destructor = addmax_destructor;
 	data->operand_fit = operand_fit;
+	/* pin the operand for NDE replay (phase 4.5 Convention 1) */
+	data->operand_path = strdup(filename);
+	data->force_to_float = force_to_float;
 
 	/* Allocate and initialize generic_img_args */
 	struct generic_img_args *args = calloc(1, sizeof(struct generic_img_args));
@@ -1282,7 +1490,6 @@ int process_addmax(int nb) {
 	args->mask_aware = mask_aware;
 	args->max_threads = 1;
 	args->for_preview = FALSE;
-	args->for_roi = FALSE;
 
 	if (!start_in_new_thread(generic_image_worker, args)) {
 		free_generic_img_args(args);
@@ -1296,6 +1503,8 @@ struct fdiv_data {
 	void (*destructor)(void *);
 	fits *operand_fit;
 	float norm;
+	char *operand_path;      /* pinned operand path (phase 4.5 Convention 1) */
+	gboolean force_to_float; /* readfits force_float used at construction */
 };
 
 static void fdiv_destructor(void *p) {
@@ -1304,6 +1513,7 @@ static void fdiv_destructor(void *p) {
 		clearfits(data->operand_fit);
 		free(data->operand_fit);
 	}
+	free(data->operand_path);
 	free(data);
 }
 
@@ -1316,6 +1526,56 @@ static int fdiv_image_hook(struct generic_img_args *args, fits *fit, int threads
 static gchar *fdiv_log_hook(gpointer p, log_hook_detail detail) {
 	struct fdiv_data *args = (struct fdiv_data*) p;
 	return g_strdup_printf(_("Image division with normalization: %.6f"), args->norm);
+}
+
+/* NDE serializers (phase 4.5 Convention 1).  norm is POD; the operand is
+ * pinned by path and readfits()-loaded by replay_pre into operand_fit (freed
+ * by fdiv_destructor). */
+static gchar *fdiv_serialize(gconstpointer user) {
+	const struct fdiv_data *d = user;
+	GString *kv = nde_kv_start();
+	nde_kv_add_float(kv, "norm", d->norm);
+	nde_kv_add_bool(kv, "force_to_float", d->force_to_float);
+	nde_kv_add_operand(kv, d->operand_path);
+	return nde_kv_end(kv);
+}
+
+static gpointer fdiv_deserialize(const gchar *blob, int version) {
+	if (version > op_desc_fdiv.version)
+		return NULL;
+	GHashTable *kv = nde_kv_parse(blob);
+	float norm;
+	gboolean force_to_float;
+	const char *path = nde_kv_get_str(kv, "operand_path");
+	NDE_KV_REQUIRE(kv, nde_kv_get_float(kv, "norm", &norm) &&
+	                   nde_kv_get_bool(kv, "force_to_float", &force_to_float) &&
+	                   path && *path);
+	struct fdiv_data *d = calloc(1, sizeof(*d));
+	if (d) {
+		d->destructor = fdiv_destructor;
+		d->norm = norm;
+		d->force_to_float = force_to_float;
+		d->operand_path = strdup(path);
+	}
+	g_hash_table_unref(kv);
+	return d;
+}
+
+static int fdiv_replay_pre(gpointer user, GHashTable *kv, fits *target) {
+	(void)target;
+	struct fdiv_data *d = user;
+	const char *path = nde_operand_get(kv);
+	if (!path)
+		return 1;
+	fits *operand_fit = calloc(1, sizeof(fits));
+	if (!operand_fit)
+		return 1;
+	if (readfits(path, operand_fit, NULL, d->force_to_float)) {
+		free(operand_fit);
+		return 1;
+	}
+	d->operand_fit = operand_fit;   /* freed by fdiv_destructor */
+	return 0;
 }
 
 int process_fdiv(int nb) {
@@ -1362,7 +1622,8 @@ int process_fdiv(int nb) {
 		return CMD_ALLOC_ERROR;
 	}
 
-	if (readfits(filename, operand_fit, NULL, !com.pref.force_16bit)) {
+	gboolean force_to_float = !com.pref.force_16bit;
+	if (readfits(filename, operand_fit, NULL, force_to_float)) {
 		free(operand_fit);
 		return CMD_INVALID_IMAGE;
 	}
@@ -1378,6 +1639,9 @@ int process_fdiv(int nb) {
 	data->destructor = fdiv_destructor;
 	data->operand_fit = operand_fit;
 	data->norm = norm;
+	/* pin the operand for NDE replay (phase 4.5 Convention 1) */
+	data->operand_path = strdup(filename);
+	data->force_to_float = force_to_float;
 
 	/* Allocate and initialize generic_img_args */
 	struct generic_img_args *args = calloc(1, sizeof(struct generic_img_args));
@@ -1396,7 +1660,6 @@ int process_fdiv(int nb) {
 	args->mask_aware = mask_aware;
 	args->max_threads = 1;
 	args->for_preview = FALSE;
-	args->for_roi = FALSE;
 
 	if (!start_in_new_thread(generic_image_worker, args)) {
 		free_generic_img_args(args);
@@ -1435,6 +1698,32 @@ static int fmul_image_hook(struct generic_img_args *args, fits *fit, int threads
 static gchar *fmul_log_hook(gpointer p, log_hook_detail detail) {
 	struct fmul_data *args = (struct fmul_data*) p;
 	return g_strdup_printf(_("Scalar multiplication: factor %.6f"), args->coeff);
+}
+
+/* NDE serializers for arith.fmul.  The hook's pixel math is soper(fit, coeff,
+ * OPER_MUL): only coeff affects output pixels.  from8b is a runtime-derived
+ * flag (the source image was 8-bit) that only triggers slider/stats UI
+ * refresh, not pixel values, so it is not serialized. */
+static gchar *fmul_serialize(gconstpointer user) {
+	const struct fmul_data *d = user;
+	GString *kv = nde_kv_start();
+	nde_kv_add_float(kv, "coeff", d->coeff);
+	return nde_kv_end(kv);
+}
+
+static gpointer fmul_deserialize(const gchar *blob, int version) {
+	if (version > op_desc_fmul.version)
+		return NULL;
+	GHashTable *kv = nde_kv_parse(blob);
+	float coeff;
+	NDE_KV_REQUIRE(kv, nde_kv_get_float(kv, "coeff", &coeff));
+	struct fmul_data *d = calloc(1, sizeof(*d));
+	if (d) {
+		d->destructor = free;
+		d->coeff = coeff;
+	}
+	g_hash_table_unref(kv);
+	return d;
 }
 
 // Main command function for fmul
@@ -1479,7 +1768,6 @@ int process_fmul(int nb) {
 	args->mask_aware = mask_aware;
 	args->max_threads = 1;  // soper doesn't need multi-threading
 	args->for_preview = FALSE;
-	args->for_roi = FALSE;
 
 	// Start the worker thread
 	if (!start_in_new_thread(generic_image_worker, args)) {
@@ -1514,6 +1802,31 @@ static int gauss_image_hook(struct generic_img_args *args, fits *fit, int thread
 static gchar *gauss_log_hook(gpointer p, log_hook_detail detail) {
 	struct gauss_data *data = (struct gauss_data*) p;
 	return g_strdup_printf(_("Gaussian blur: sigma = %f"), data->sigma);
+}
+
+/* NDE serializers for filters.gauss.  The hook reads only sigma
+ * (unsharp(fit, sigma, 0.0, TRUE)); the mask/from8b context is not part of
+ * this struct. */
+static gchar *gauss_serialize(gconstpointer user) {
+	const struct gauss_data *d = user;
+	GString *kv = nde_kv_start();
+	nde_kv_add_double(kv, "sigma", d->sigma);
+	return nde_kv_end(kv);
+}
+
+static gpointer gauss_deserialize(const gchar *blob, int version) {
+	if (version > op_desc_gauss.version)
+		return NULL;
+	GHashTable *kv = nde_kv_parse(blob);
+	double sigma;
+	NDE_KV_REQUIRE(kv, nde_kv_get_double(kv, "sigma", &sigma));
+	struct gauss_data *d = calloc(1, sizeof(*d));
+	if (d) {
+		d->destructor = free;
+		d->sigma = sigma;
+	}
+	g_hash_table_unref(kv);
+	return d;
 }
 
 // Main command function for gauss
@@ -1558,7 +1871,6 @@ int process_gauss(int nb) {
 	args->mask_aware = mask_aware;
 	args->max_threads = com.max_thread;  // Gaussian blur can benefit from multi-threading
 	args->for_preview = FALSE;
-	args->for_roi = FALSE;
 
 	// Start the worker thread
 	if (!start_in_new_thread(generic_image_worker, args)) {
@@ -1634,7 +1946,6 @@ int process_entropy(int nb) {
 	args->user = data;
 	args->max_threads = 1;
 	args->for_preview = FALSE;
-	args->for_roi = FALSE;
 
 	if (!start_in_new_thread(generic_image_worker, args)) {
 		free_generic_img_args(args);
@@ -1706,7 +2017,8 @@ int process_unpurple(int nb) {
 			return CMD_GENERIC_ERROR;
 		}
 
-		if (generate_binary_starmask(gfit, &params->starmask, thresh)) {
+		if (generate_binary_starmask(gfit, &params->starmask, thresh,
+				&params->stars_blob, &params->star_auto, &params->star_conf, NULL)) {
 			free_unpurple_args(params);
 			return CMD_GENERIC_ERROR;
 		}
@@ -1730,7 +2042,6 @@ int process_unpurple(int nb) {
 	args->user = params;
 	args->max_threads = com.max_thread;
 	args->for_preview = FALSE;
-	args->for_roi = FALSE;
 	args->mask_aware = mask_aware;
 	args->command = TRUE;
 	args->command_updates_gfit = TRUE;
@@ -1834,6 +2145,7 @@ int process_epf(int nb) {
 		 g_free(filename);
 		 return CMD_ARG_ERROR;
 	}
+	gchar *guide_path = NULL;   /* pinned guide path for NDE replay (Convention 1) */
 	if (filename != NULL)
 		filter = EP_GUIDED; // passing guideimage name is enough to set to guided
 	if (filter == EP_GUIDED) {
@@ -1846,7 +2158,8 @@ int process_epf(int nb) {
 				g_free(filename);
 				return CMD_ARG_ERROR;
 			}
-			g_free(filename);
+			guide_path = filename;   /* take ownership; freed below */
+			filename = NULL;
 			guide_needs_freeing = TRUE;
 		} else {
 			guidefit = gfit;
@@ -1857,6 +2170,7 @@ int process_epf(int nb) {
 				clearfits(guidefit);
 				free(guidefit);
 			}
+			g_free(guide_path);
 			return CMD_ARG_ERROR;
 		}
 	}
@@ -1873,6 +2187,7 @@ int process_epf(int nb) {
 			clearfits(guidefit);
 			free(guidefit);
 		}
+		g_free(guide_path);
 		return CMD_GENERIC_ERROR;
 	}
 
@@ -1886,6 +2201,9 @@ int process_epf(int nb) {
 	params->filter = filter;
 	params->verbose = TRUE;
 	params->applying = TRUE;
+	/* pin a separate guide image for NDE replay (phase 4.5 Convention 1);
+	 * self-guide (guidefit == gfit) needs no path.  Takes ownership. */
+	params->guide_path = guide_path;   /* NULL for self/non-guided */
 
 	// Allocate worker args
 	struct generic_img_args *args = calloc(1, sizeof(struct generic_img_args));
@@ -1905,7 +2223,6 @@ int process_epf(int nb) {
 	args->mask_aware = mask_aware;
 	args->max_threads = com.max_thread;
 	args->for_preview = FALSE;
-	args->for_roi = FALSE;
 
 	char log[90];
 	if (filter == EP_BILATERAL) {
@@ -2143,13 +2460,18 @@ int process_makepsf(int nb) {
 
 			args->fit = gfit;
 			args->op = &op_desc_psf_estimate;
+			/* Measurement-only: the estimator fills com.kernel and leaves the
+			 * pixels alone, so an undo state would be meaningless — and without
+			 * this the swap path captures an opaque NDE record, planting a
+			 * permanent replay barrier for an op that changed nothing.  The GUI
+			 * Estimate button has always guarded itself (newdeconv.c). */
+			args->skip_generic_undo = TRUE;
 			args->idle_function = NULL;
 			args->description = _("PSF Estimation (Blind)");
 			args->verbose = TRUE;
 			args->user = data; // Dynamic estk_data managed by generic worker
 			args->max_threads = com.max_thread;
 			args->for_preview = FALSE;
-			args->for_roi = FALSE;
 
 			if (!start_in_new_thread(generic_image_worker, args)) {
 				// Free both args and data on thread start failure
@@ -2222,13 +2544,18 @@ int process_makepsf(int nb) {
 
 			args->fit = gfit;
 			args->op = &op_desc_psf_estimate;
+			/* Measurement-only: the estimator fills com.kernel and leaves the
+			 * pixels alone, so an undo state would be meaningless — and without
+			 * this the swap path captures an opaque NDE record, planting a
+			 * permanent replay barrier for an op that changed nothing.  The GUI
+			 * Estimate button has always guarded itself (newdeconv.c). */
+			args->skip_generic_undo = TRUE;
 			args->idle_function = NULL;
 			args->description = _("PSF Estimation (Stars)");
 			args->verbose = TRUE;
 			args->user = data; // Dynamic estk_data managed by generic worker
 			args->max_threads = com.max_thread;
 			args->for_preview = FALSE;
-			args->for_roi = FALSE;
 
 			if (!start_in_new_thread(generic_image_worker, args)) {
 				// Free both args and data on thread start failure
@@ -2392,13 +2719,18 @@ int process_makepsf(int nb) {
 
 			args->fit = gfit;
 			args->op = &op_desc_psf_estimate;
+			/* Measurement-only: the estimator fills com.kernel and leaves the
+			 * pixels alone, so an undo state would be meaningless — and without
+			 * this the swap path captures an opaque NDE record, planting a
+			 * permanent replay barrier for an op that changed nothing.  The GUI
+			 * Estimate button has always guarded itself (newdeconv.c). */
+			args->skip_generic_undo = TRUE;
 			args->idle_function = NULL;
 			args->description = _("PSF Estimation (Manual)");
 			args->verbose = TRUE;
 			args->user = data; // Dynamic estk_data managed by generic worker
 			args->max_threads = com.max_thread;
 			args->for_preview = FALSE;
-			args->for_roi = FALSE;
 
 			if (!start_in_new_thread(generic_image_worker, args)) {
 				// Free both args and data on thread start failure
@@ -2597,7 +2929,6 @@ int process_deconvolve(int nb, nonblind_t type) {
 		args->mask_aware = data->mask_aware;
 		args->max_threads = com.max_thread;
 		args->for_preview = FALSE;
-		args->for_roi = FALSE;
 
 		if (!start_in_new_thread(generic_image_worker, args)) {
 			// Free both args and data on thread start failure
@@ -2685,6 +3016,32 @@ static gchar *unsharp_log_hook(gpointer p, log_hook_detail detail) {
 	return g_strdup_printf(_("Unsharp mask: sigma=%f, amount=%f"), data->sigma, data->multi);
 }
 
+/* NDE serializers for filters.unsharp.  The hook reads sigma and multi. */
+static gchar *unsharp_serialize(gconstpointer user) {
+	const struct unsharp_data *d = user;
+	GString *kv = nde_kv_start();
+	nde_kv_add_double(kv, "sigma", d->sigma);
+	nde_kv_add_double(kv, "multi", d->multi);
+	return nde_kv_end(kv);
+}
+
+static gpointer unsharp_deserialize(const gchar *blob, int version) {
+	if (version > op_desc_unsharp.version)
+		return NULL;
+	GHashTable *kv = nde_kv_parse(blob);
+	double sigma, multi;
+	NDE_KV_REQUIRE(kv, nde_kv_get_double(kv, "sigma", &sigma) &&
+	                   nde_kv_get_double(kv, "multi", &multi));
+	struct unsharp_data *d = calloc(1, sizeof(*d));
+	if (d) {
+		d->destructor = free;
+		d->sigma = sigma;
+		d->multi = multi;
+	}
+	g_hash_table_unref(kv);
+	return d;
+}
+
 // Main command function for unsharp
 int process_unsharp(int nb) {
 	gchar *end;
@@ -2731,7 +3088,6 @@ int process_unsharp(int nb) {
 	args->mask_aware = mask_aware;
 	args->max_threads = com.max_thread;
 	args->for_preview = FALSE;
-	args->for_roi = FALSE;
 
 	// Start the worker thread
 	if (!start_in_new_thread(generic_image_worker, args)) {
@@ -3639,7 +3995,6 @@ int process_mtf(int nb) {
 	args->mask_aware = mask_aware;
 	args->max_threads = com.max_thread;
 	args->for_preview = FALSE;
-	args->for_roi = FALSE;
 
 	// Run worker synchronously - cleanup happens via destructor
 	gpointer result = generic_image_worker(args);
@@ -3713,7 +4068,6 @@ int process_ghs(int nb, int stretchtype) {
 	args->mask_aware = mask_aware;
 	args->max_threads = com.max_thread;
 	args->for_preview = FALSE;
-	args->for_roi = FALSE;
 
 	// Run worker synchronously - cleanup happens via destructor
 	gpointer result = generic_image_worker(args);
@@ -3747,9 +4101,6 @@ int process_ghs(int nb, int stretchtype) {
 			break;
 	}
 	gfit->history = g_slist_append(gfit->history, g_strdup(log));
-
-	if (gui_iface.roi_is_active())
-		gui_iface.populate_roi();
 
 	return CMD_OK;
 }
@@ -3798,6 +4149,45 @@ static gchar *autoghs_unlinked_log_hook(gpointer p, log_hook_detail detail) {
 	struct autoghs_unlinked_data *data = (struct autoghs_unlinked_data *)p;
 	return g_strdup_printf("AutoGHS (k.sigma: %.2f, amount: %.2f, local: %.1f [%.2f, %.2f])",
 			data->shadows_clipping, data->amount, data->b, data->lp, data->hp);
+}
+
+/* NDE serializers (flis-nde-sketch.md §11-§12).  autoghs_unlinked_hook reads
+ * shadows_clipping, amount, b, hp, lp, clip_mode; SP is derived per-channel
+ * from image statistics at replay time, not stored.  The struct uses
+ * destroy_fn = free (POD, no owned pointers). */
+static gchar *autoghs_unlinked_serialize(gconstpointer user) {
+	const struct autoghs_unlinked_data *d = user;
+	GString *kv = nde_kv_start();
+	nde_kv_add_float(kv, "shadows_clipping", d->shadows_clipping);
+	nde_kv_add_float(kv, "amount", d->amount);
+	nde_kv_add_float(kv, "b", d->b);
+	nde_kv_add_float(kv, "hp", d->hp);
+	nde_kv_add_float(kv, "lp", d->lp);
+	/* on-disk value: enum order is frozen by the NDE format — do not reorder */
+	nde_kv_add_int(kv, "clip_mode", d->clip_mode);
+	return nde_kv_end(kv);
+}
+
+static gpointer autoghs_unlinked_deserialize(const gchar *blob, int version) {
+	if (version > op_desc_autoghs_unlinked.version)
+		return NULL;
+	GHashTable *kv = nde_kv_parse(blob);
+	struct autoghs_unlinked_data tmp = { 0 };
+	gint64 clip_mode;
+	NDE_KV_REQUIRE(kv, nde_kv_get_float(kv, "shadows_clipping", &tmp.shadows_clipping) &&
+	                   nde_kv_get_float(kv, "amount", &tmp.amount) &&
+	                   nde_kv_get_float(kv, "b", &tmp.b) &&
+	                   nde_kv_get_float(kv, "hp", &tmp.hp) &&
+	                   nde_kv_get_float(kv, "lp", &tmp.lp) &&
+	                   nde_kv_get_int(kv, "clip_mode", &clip_mode));
+	struct autoghs_unlinked_data *d = calloc(1, sizeof(*d));
+	if (d) {
+		*d = tmp;
+		d->clip_mode = (clip_mode_t)clip_mode;
+		d->destroy_fn = free;
+	}
+	g_hash_table_unref(kv);
+	return d;
 }
 
 int process_autoghs(int nb) {
@@ -4072,7 +4462,6 @@ int process_autostretch(int nb) {
 	args->mask_aware = mask_aware;
 	args->max_threads = com.max_thread;
 	args->for_preview = FALSE;
-	args->for_roi = FALSE;
 
 	/* Run worker synchronously - cleanup happens via destructor */
 	gpointer result = generic_image_worker(args);
@@ -4152,6 +4541,9 @@ static int log_image_hook(struct generic_img_args *args, fits *fit, int threads)
 	return loglut(fit);
 }
 
+/* stretch.log is paramless (args->user is NULL, the hook calls loglut(fit)
+ * unconditionally); it uses the shared paramless serializer pair. */
+
 int process_log(int nb){
 	struct generic_img_args *args = calloc(1, sizeof(struct generic_img_args));
 	if (!args) {
@@ -4189,7 +4581,7 @@ int process_linear_match(int nb) {
 	if (readfits(word[1], &ref, NULL, gfit->type == DATA_FLOAT))
 		return CMD_INVALID_IMAGE;
 
-	struct linear_match_data *data = new_linear_match_data(&ref, low, high);
+	struct linear_match_data *data = new_linear_match_data(&ref, low, high, word[1]);
 	if (!data) {
 		clearfits(&ref);
 		return CMD_ALLOC_ERROR;
@@ -4295,7 +4687,6 @@ int process_asinh(int nb) {
 	args->max_threads = com.max_thread;
 	args->mask_aware = use_mask;
 	args->for_preview = FALSE;
-	args->for_roi = FALSE;
 
 	// Run synchronously by calling the worker directly
 	if (!start_in_new_thread(generic_image_worker, args)) {
@@ -4303,8 +4694,14 @@ int process_asinh(int nb) {
 		return CMD_GENERIC_ERROR;
 	}
 
-	// Check return value
-	int retval = args->retval;
+	/* Read the return value from the worker's cached result, NOT from args:
+	 * for a command in GUI mode generic_image_worker disposes of args through a
+	 * synchronous completion idle (execute_idle_sync → free_generic_img_args)
+	 * before start_in_new_thread returns, so args->retval here is a
+	 * use-after-free.  It is benign headless (the freed value stays 0) but the
+	 * live GUI main loop can reuse the block, yielding a spurious non-zero and
+	 * a false "failed" (seen intermittently from python scripts). */
+	int retval = GPOINTER_TO_INT(waiting_for_thread());
 
 	// Resources are freed at the end of the generic image worker
 
@@ -4364,7 +4761,6 @@ int process_clahe(int nb) {
 	args->mask_aware = word[3] && g_strcmp0(word[3], "-mask") == 0; // handle the -mask flag to set mask_aware state
 	args->max_threads = com.max_thread;
 	args->for_preview = FALSE;
-	args->for_roi = FALSE;
 
 	if (!start_in_new_thread(generic_image_worker, args)) {
 		free(params);
@@ -6884,7 +7280,6 @@ int process_bg(int nb) {
 	args->user = data;
 	args->max_threads = 1;
 	args->for_preview = FALSE;
-	args->for_roi = FALSE;
 
 	if (!start_in_new_thread(generic_image_worker, args)) {
 		free_generic_img_args(args);
@@ -6938,7 +7333,6 @@ int process_bgnoise(int nb) {
 	args->user = noise_args;
 	args->max_threads = com.max_thread;
 	args->for_preview = FALSE;
-	args->for_roi = FALSE;
 
 	if (!start_in_new_thread(generic_image_worker, args)) {
 		free_generic_img_args(args);
@@ -7112,6 +7506,36 @@ static gchar *thresh_log_hook(gpointer p, log_hook_detail detail) {
 	return g_strdup_printf(_("Threshold: lo = %d, hi = %d"), args->lo, args->hi);
 }
 
+/* NDE serializers for arith.thresh.  The hook reads type, lo, hi. */
+static gchar *thresh_serialize(gconstpointer user) {
+	const struct thresh_data *d = user;
+	GString *kv = nde_kv_start();
+	/* on-disk value: enum order is frozen by the NDE format — do not reorder */
+	nde_kv_add_int(kv, "type", d->type);
+	nde_kv_add_int(kv, "lo", d->lo);
+	nde_kv_add_int(kv, "hi", d->hi);
+	return nde_kv_end(kv);
+}
+
+static gpointer thresh_deserialize(const gchar *blob, int version) {
+	if (version > op_desc_thresh.version)
+		return NULL;
+	GHashTable *kv = nde_kv_parse(blob);
+	gint64 type, lo, hi;
+	NDE_KV_REQUIRE(kv, nde_kv_get_int(kv, "type", &type) &&
+	                   nde_kv_get_int(kv, "lo", &lo) &&
+	                   nde_kv_get_int(kv, "hi", &hi));
+	struct thresh_data *d = calloc(1, sizeof(*d));
+	if (d) {
+		d->destructor = free;
+		d->type = (thresh_type)type;
+		d->lo = (int)lo;
+		d->hi = (int)hi;
+	}
+	g_hash_table_unref(kv);
+	return d;
+}
+
 // Unified threshold processing function
 int process_thresh(int nb) {
 	gboolean mask_aware = FALSE;
@@ -7217,7 +7641,6 @@ int process_thresh(int nb) {
 	args->mask_aware = mask_aware;
 	args->max_threads = com.max_thread;
 	args->for_preview = FALSE;
-	args->for_roi = FALSE;
 
 	/* Start the worker thread */
 	if (!start_in_new_thread(generic_image_worker, args)) {
@@ -7274,7 +7697,6 @@ int process_neg(int nb) {
 	// No log_hook required here as the basic description is enough
 	args->max_threads = com.max_thread;
 	args->for_preview = FALSE;
-	args->for_roi = FALSE;
 
 	// Start the worker thread
 	if (!start_in_new_thread(generic_image_worker, args)) {
@@ -7299,6 +7721,29 @@ static int nozero_image_hook(struct generic_img_args *args, fits *fit, int threa
 static gchar *nozero_log_hook(gpointer p, log_hook_detail detail) {
 	struct nozero_data *args = (struct nozero_data*) p;
 	return g_strdup_printf(_("Replace zeros with %d"), args->level);
+}
+
+/* NDE serializers for arith.nozero.  The hook reads level (a WORD). */
+static gchar *nozero_serialize(gconstpointer user) {
+	const struct nozero_data *d = user;
+	GString *kv = nde_kv_start();
+	nde_kv_add_int(kv, "level", d->level);
+	return nde_kv_end(kv);
+}
+
+static gpointer nozero_deserialize(const gchar *blob, int version) {
+	if (version > op_desc_nozero.version)
+		return NULL;
+	GHashTable *kv = nde_kv_parse(blob);
+	gint64 level;
+	NDE_KV_REQUIRE(kv, nde_kv_get_int(kv, "level", &level));
+	struct nozero_data *d = calloc(1, sizeof(*d));
+	if (d) {
+		d->destructor = free;
+		d->level = (WORD)level;
+	}
+	g_hash_table_unref(kv);
+	return d;
 }
 
 int process_nozero(int nb) {
@@ -7335,7 +7780,6 @@ int process_nozero(int nb) {
 	args->user = data;
 	args->max_threads = 1;
 	args->for_preview = FALSE;
-	args->for_roi = FALSE;
 
 	if (!start_in_new_thread(generic_image_worker, args)) {
 		free_generic_img_args(args);
@@ -7368,6 +7812,35 @@ static gchar *ddp_log_hook(gpointer p, log_hook_detail detail) {
 		return g_strdup_printf(_("DDP: level %.3f, coeff %.3f, Sigma %.3f"), args->level, args->coeff, args->sigma);
 	}
 	return g_strdup_printf(_("Digital Development Processing: level %.3f, coeff %.3f, Sigma %.3f"), args->level, args->coeff, args->sigma);
+}
+
+/* NDE serializers for filters.ddp.  The hook reads level, coeff, sigma. */
+static gchar *ddp_serialize(gconstpointer user) {
+	const struct ddp_data *d = user;
+	GString *kv = nde_kv_start();
+	nde_kv_add_float(kv, "level", d->level);
+	nde_kv_add_float(kv, "coeff", d->coeff);
+	nde_kv_add_float(kv, "sigma", d->sigma);
+	return nde_kv_end(kv);
+}
+
+static gpointer ddp_deserialize(const gchar *blob, int version) {
+	if (version > op_desc_ddp.version)
+		return NULL;
+	GHashTable *kv = nde_kv_parse(blob);
+	float level, coeff, sigma;
+	NDE_KV_REQUIRE(kv, nde_kv_get_float(kv, "level", &level) &&
+	                   nde_kv_get_float(kv, "coeff", &coeff) &&
+	                   nde_kv_get_float(kv, "sigma", &sigma));
+	struct ddp_data *d = calloc(1, sizeof(*d));
+	if (d) {
+		d->destructor = free;
+		d->level = level;
+		d->coeff = coeff;
+		d->sigma = sigma;
+	}
+	g_hash_table_unref(kv);
+	return d;
 }
 
 // Main command function
@@ -7444,7 +7917,6 @@ int process_ddp(int nb) {
 	args->mask_aware = mask_aware;
 	args->max_threads = com.max_thread;
 	args->for_preview = FALSE;
-	args->for_roi = FALSE;
 
 	/* Start the worker thread */
 	if (!start_in_new_thread(generic_image_worker, args)) {
@@ -7489,7 +7961,7 @@ int process_new(int nb){
 	memset(gfit->fdata, 0, width * height * layers * sizeof(float));
 
 	com.seq.current = UNRELATED_IMAGE;
-	create_uniq_from_gfit(filename, FALSE);
+	create_uniq_from_gfit(filename, FALSE, "generated");
 	if (!com.headless)
 		gui_iface.on_image_loaded();
 	return CMD_OK;
@@ -7531,6 +8003,40 @@ static int ffill_image_hook(struct generic_img_args *args, fits *fit, int thread
 static gchar *ffill_log_hook(gpointer p, log_hook_detail detail) {
 	struct ffill_data *args = (struct ffill_data*) p;
 	return g_strdup_printf(_("Fill mirrored region with level %d"), args->level);
+}
+
+/* NDE serializers for arith.ffill.  The hook reads level and the area
+ * rectangle (the mirrored region is derived from area at replay time). */
+static gchar *ffill_serialize(gconstpointer user) {
+	const struct ffill_data *d = user;
+	GString *kv = nde_kv_start();
+	nde_kv_add_int(kv, "level", d->level);
+	nde_kv_add_int(kv, "x", d->area.x);
+	nde_kv_add_int(kv, "y", d->area.y);
+	nde_kv_add_int(kv, "w", d->area.w);
+	nde_kv_add_int(kv, "h", d->area.h);
+	return nde_kv_end(kv);
+}
+
+static gpointer ffill_deserialize(const gchar *blob, int version) {
+	if (version > op_desc_ffill.version)
+		return NULL;
+	GHashTable *kv = nde_kv_parse(blob);
+	gint64 level, x, y, w, h;
+	NDE_KV_REQUIRE(kv, nde_kv_get_int(kv, "level", &level) &&
+	                   nde_kv_get_int(kv, "x", &x) &&
+	                   nde_kv_get_int(kv, "y", &y) &&
+	                   nde_kv_get_int(kv, "w", &w) &&
+	                   nde_kv_get_int(kv, "h", &h));
+	struct ffill_data *d = calloc(1, sizeof(*d));
+	if (d) {
+		d->destructor = free;
+		d->level = (int)level;
+		d->area.x = (int)x; d->area.y = (int)y;
+		d->area.w = (int)w; d->area.h = (int)h;
+	}
+	g_hash_table_unref(kv);
+	return d;
 }
 
 int process_ffill(int nb) {
@@ -7620,7 +8126,6 @@ int process_ffill(int nb) {
 	args->mask_aware = mask_aware;
 	args->max_threads = 1;
 	args->for_preview = FALSE;
-	args->for_roi = FALSE;
 
 	if (!start_in_new_thread(generic_image_worker, args)) {
 		free_generic_img_args(args);
@@ -7695,6 +8200,15 @@ int process_findstar(int nb) {
 	}
 
 	struct starfinder_data *args = calloc(1, sizeof(struct starfinder_data));
+	/* Clamp out-of-range vports to a real channel: for FLIS the active
+	 * layer can be mono even though the GUI displays the RGB composite,
+	 * and for plain RGB images the RGB vport (3) has no channel of its
+	 * own — master passed it straight into statistics(), an
+	 * out-of-bounds pdata access.  Pick the same channel the scripted
+	 * path uses (green for multi-channel, red for mono) so GUI and
+	 * script results agree. */
+	if (layer >= (int)gfit->naxes[2])
+		layer = (gfit->naxes[2] > 1) ? GLAYER : RLAYER;
 	args->layer = layer;
 	args->im.fit = gfit;
 	if (sequence_is_loaded() && com.seq.current >= 0) {
@@ -7958,7 +8472,6 @@ int process_cosme(int nb) {
 	args->user = params;
 	args->max_threads = com.max_thread;
 	args->for_preview = FALSE;
-	args->for_roi = FALSE;
 	args->command = TRUE;
 	args->command_updates_gfit = TRUE;
 
@@ -8091,7 +8604,6 @@ int process_fmedian(int nb) {
 	args->mask_aware = mask_aware;
 	args->max_threads = com.max_thread;
 	args->for_preview = FALSE;
-	args->for_roi = FALSE;
 
 	image_cfa_warning_check();
 
@@ -8159,7 +8671,6 @@ int process_cdg(int nb) {
 	args->user = data;
 	args->max_threads = 1;
 	args->for_preview = FALSE;
-	args->for_roi = FALSE;
 
 	if (!start_in_new_thread(generic_image_worker, args)) {
 		free_generic_img_args(args);
@@ -8204,6 +8715,40 @@ static int fill_image_hook(struct generic_img_args *args, fits *fit, int threads
 static gchar *fill_log_hook(gpointer p, log_hook_detail detail) {
 	struct fill_data *args = (struct fill_data*) p;
 	return g_strdup_printf(_("Fill region with level %d"), args->level);
+}
+
+/* NDE serializers for arith.fill.  The hook reads level and the area
+ * rectangle. */
+static gchar *fill_serialize(gconstpointer user) {
+	const struct fill_data *d = user;
+	GString *kv = nde_kv_start();
+	nde_kv_add_int(kv, "level", d->level);
+	nde_kv_add_int(kv, "x", d->area.x);
+	nde_kv_add_int(kv, "y", d->area.y);
+	nde_kv_add_int(kv, "w", d->area.w);
+	nde_kv_add_int(kv, "h", d->area.h);
+	return nde_kv_end(kv);
+}
+
+static gpointer fill_deserialize(const gchar *blob, int version) {
+	if (version > op_desc_fill.version)
+		return NULL;
+	GHashTable *kv = nde_kv_parse(blob);
+	gint64 level, x, y, w, h;
+	NDE_KV_REQUIRE(kv, nde_kv_get_int(kv, "level", &level) &&
+	                   nde_kv_get_int(kv, "x", &x) &&
+	                   nde_kv_get_int(kv, "y", &y) &&
+	                   nde_kv_get_int(kv, "w", &w) &&
+	                   nde_kv_get_int(kv, "h", &h));
+	struct fill_data *d = calloc(1, sizeof(*d));
+	if (d) {
+		d->destructor = free;
+		d->level = (int)level;
+		d->area.x = (int)x; d->area.y = (int)y;
+		d->area.w = (int)w; d->area.h = (int)h;
+	}
+	g_hash_table_unref(kv);
+	return d;
 }
 
 int process_fill(int nb) {
@@ -8290,7 +8835,6 @@ int process_fill(int nb) {
 	args->mask_aware = mask_aware;
 	args->max_threads = 1;
 	args->for_preview = FALSE;
-	args->for_roi = FALSE;
 
 	if (!start_in_new_thread(generic_image_worker, args)) {
 		free_generic_img_args(args);
@@ -8314,6 +8858,29 @@ static int offset_image_hook(struct generic_img_args *args, fits *fit, int threa
 static gchar *offset_log_hook(gpointer p, log_hook_detail detail) {
 	struct offset_data *args = (struct offset_data*) p;
 	return g_strdup_printf(_("Offset: %.0f"), args->level);
+}
+
+/* NDE serializers for arith.offset.  The hook reads level (a float). */
+static gchar *offset_serialize(gconstpointer user) {
+	const struct offset_data *d = user;
+	GString *kv = nde_kv_start();
+	nde_kv_add_float(kv, "level", d->level);
+	return nde_kv_end(kv);
+}
+
+static gpointer offset_deserialize(const gchar *blob, int version) {
+	if (version > op_desc_offset.version)
+		return NULL;
+	GHashTable *kv = nde_kv_parse(blob);
+	float level;
+	NDE_KV_REQUIRE(kv, nde_kv_get_float(kv, "level", &level));
+	struct offset_data *d = calloc(1, sizeof(*d));
+	if (d) {
+		d->destructor = free;
+		d->level = level;
+	}
+	g_hash_table_unref(kv);
+	return d;
 }
 
 int process_offset(int nb) {
@@ -8377,7 +8944,6 @@ int process_offset(int nb) {
 	args->mask_aware = mask_aware;
 	args->max_threads = 1;
 	args->for_preview = FALSE;
-	args->for_roi = FALSE;
 
 	if (!start_in_new_thread(generic_image_worker, args)) {
 		free_generic_img_args(args);
@@ -8471,7 +9037,6 @@ int process_scnr(int nb) {
 	args->user = params;
 	args->max_threads = com.max_thread;
 	args->for_preview = FALSE;
-	args->for_roi = FALSE;
 	args->mask_aware = mask_aware;
 	args->command = TRUE;
 	args->command_updates_gfit = TRUE;
@@ -8570,7 +9135,6 @@ int process_fixbanding(int nb) {
 	args->user = params;
 	args->max_threads = com.max_thread;
 	args->for_preview = FALSE;
-	args->for_roi = FALSE;
 
 	if (!start_in_new_thread(generic_image_worker, args)) {
 		free_banding_data(params);
@@ -12797,8 +13361,12 @@ int process_rgbalign(int nb) {
 	if (!rgb_align_prerequisites_met(method))
 		return CMD_ARG_ERROR;
 
-	undo_save_state(gfit, _("RGB alignment (%s)"), rgb_align_method_name(method));
-	if (rgb_align(method))
+	gchar *summary = g_strdup_printf(_("RGB alignment (%s)"), rgb_align_method_name(method));
+	int undo_err = undo_save_state(gfit, "%s", summary);
+	/* records NDE provenance for the direct-apply path, like the menu entries */
+	int retval = rgb_align_and_capture(method, undo_err, summary);
+	g_free(summary);
+	if (retval)
 		return CMD_GENERIC_ERROR;
 	return CMD_OK;
 }
@@ -14087,6 +14655,10 @@ int process_catsearch(int nb) {
 	args->op = &op_desc_catsearch;
 	args->verbose = TRUE;
 	args->command = TRUE;
+	/* Measurement-only: the hook writes an annotation catalogue, never the
+	 * pixels.  See the makepsf sites — without this the swap path captures an
+	 * opaque record and freezes the chain around a search. */
+	args->skip_generic_undo = TRUE;
 	args->user = query_args;
 
 	if (!start_in_new_thread(generic_image_worker, args)) {
@@ -14608,19 +15180,23 @@ int process_seq_profile(int nb) {
 int process_icc_assign(int nb) {
 	gui_iface.clear_roi();
 	char *arg = word[1];
+	/* The profile describes the current image: for a FLIS that is the
+	 * always-RGB composite, not the (possibly mono) active layer. */
+	gboolean mono = (is_current_image_flis()
+	                 ? flis_composite_naxes2() : (guint)gfit->naxes[2]) == 1;
 	cmsHPROFILE profile = NULL;
 	if (!g_ascii_strncasecmp(arg, "srgblinear", 10)) {
-		profile = gfit->naxes[2] == 1 ? gray_linear() : srgb_linear();
+		profile = mono ? gray_linear() : srgb_linear();
 	} else if (!g_ascii_strncasecmp(arg, "srgb", 4)) {
-		profile = gfit->naxes[2] == 1 ? gray_srgbtrc() : srgb_trc();
+		profile = mono ? gray_srgbtrc() : srgb_trc();
 	} else if (!g_ascii_strncasecmp(arg, "rec2020linear", 13)) {
-		profile = gfit->naxes[2] == 1 ? gray_linear() : rec2020_linear();
+		profile = mono ? gray_linear() : rec2020_linear();
 	} else if (!g_ascii_strncasecmp(arg, "rec2020", 7)) {
-		profile = gfit->naxes[2] == 1 ? gray_rec709trc() : rec2020_trc();
+		profile = mono ? gray_rec709trc() : rec2020_trc();
 	} else if (!g_ascii_strncasecmp(arg, "linear", 6)) {
-		profile = gfit->naxes[2] == 1 ? gray_linear() : siril_color_profile_linear_from_color_profile(com.icc.working_standard);
+		profile = mono ? gray_linear() : siril_color_profile_linear_from_color_profile(com.icc.working_standard);
 	} else if (!g_ascii_strncasecmp(arg, "working", 7)) {
-		profile = copyICCProfile(gfit->naxes[2] == 1 ? com.icc.mono_standard : com.icc.working_standard);
+		profile = copyICCProfile(mono ? com.icc.mono_standard : com.icc.working_standard);
 	} else if (g_file_test(arg, G_FILE_TEST_EXISTS) && g_file_test(arg, G_FILE_TEST_IS_REGULAR)) {
 		profile = cmsOpenProfileFromFile(arg, "r");
 	}
@@ -14629,20 +15205,14 @@ int process_icc_assign(int nb) {
 		return CMD_GENERIC_ERROR;
 	}
 
-	struct icc_data *icc_args = calloc(1, sizeof(struct icc_data));
-	icc_args->destroy_fn = free_icc_data;
-	icc_args->profile = profile;  /* hook owns it via icc_args */
-
-	struct generic_img_args *args = calloc(1, sizeof(struct generic_img_args));
-	args->fit = gfit;
-	args->op = &op_desc_icc_assign;
-	args->verbose = TRUE;
+	/* Assign is a pure com.uniq state change: no pixel work, so no
+	 * generic_image_worker (see icc_state_worker). */
+	struct icc_state_args *args = calloc(1, sizeof(struct icc_state_args));
+	args->destroy_fn = free_icc_state_args;
+	args->profile = profile;  /* worker owns it */
 	args->command = TRUE;
-	args->command_updates_gfit = TRUE;
-	args->skip_generic_undo = TRUE;  /* siril_colorspace_transform already writes FITS history */
-	args->user = icc_args;
-	if (!start_in_new_thread(generic_image_worker, args)) {
-		free_generic_img_args(args);
+	if (!start_in_new_thread(icc_state_worker, args)) {
+		free_icc_state_args(args);
 		return CMD_GENERIC_ERROR;
 	}
 	return CMD_OK;
@@ -14651,7 +15221,7 @@ int process_icc_assign(int nb) {
 int process_icc_convert_to(int nb) {
 	gui_iface.clear_roi();
 	char *arg = word[1];
-	if (!gfit->icc_profile) {
+	if (!current_icc_profile()) {
 		siril_log_error(_("Image has no color profile assigned to convert from. Assign a profile first.\n"));
 		return CMD_GENERIC_ERROR;
 	}
@@ -14670,28 +15240,41 @@ int process_icc_convert_to(int nb) {
 			return CMD_GENERIC_ERROR;
 		}
 	}
+	/* NDE (Convention 4): resolve the profile via the shared source→profile
+	 * helper and stash how it was obtained (builtin token, file path, or an
+	 * embedded blob for the settings-dependent "working" profile) so the
+	 * conversion can be replayed. */
 	cmsHPROFILE profile = NULL;
-	if (!g_ascii_strncasecmp(arg, "srgblinear", 10)) {
-		profile = srgb_linear();
-	} else if (!g_ascii_strncasecmp(arg, "srgb", 4)) {
-		profile = srgb_trc();
-	} else if (!g_ascii_strncasecmp(arg, "rec2020linear", 13)) {
-		profile = rec2020_linear();
-	} else if (!g_ascii_strncasecmp(arg, "rec2020", 7)) {
-		profile = rec2020_trc();
-	} else if (!g_ascii_strncasecmp(arg, "graysrgb", 8)) {
-		profile = gray_srgbtrc();
-	} else if (!g_ascii_strncasecmp(arg, "grayrec2020", 11)) {
-		profile = gray_rec709trc();
-	} else if (!g_ascii_strncasecmp(arg, "graylinear", 10)) {
-		profile = gray_linear();
-	} else if (!g_ascii_strncasecmp(arg, "working", 7)) {
-		profile = copyICCProfile(gfit->naxes[2] == 1 ? com.icc.mono_standard : com.icc.working_standard);
-	} else if (g_file_test(arg, G_FILE_TEST_EXISTS) && g_file_test(arg, G_FILE_TEST_IS_REGULAR)) {
+	gchar *profile_source = NULL;
+	static const char *icc_tokens[][2] = {
+		/* longest-prefix first so "srgblinear" wins over "srgb", etc. */
+		{ "srgblinear", "srgblinear" }, { "srgb", "srgb" },
+		{ "rec2020linear", "rec2020linear" }, { "rec2020", "rec2020" },
+		{ "graysrgb", "graysrgb" }, { "grayrec2020", "grayrec2020" },
+		{ "graylinear", "graylinear" },
+	};
+	for (size_t i = 0; i < G_N_ELEMENTS(icc_tokens); i++) {
+		if (!g_ascii_strncasecmp(arg, icc_tokens[i][0], strlen(icc_tokens[i][0]))) {
+			profile_source = icc_source_for_builtin(icc_tokens[i][1]);
+			profile = icc_profile_from_source(profile_source, NULL);
+			break;
+		}
+	}
+	if (!profile && !g_ascii_strncasecmp(arg, "working", 7)) {
+		/* Composite-aware: a FLIS document is always RGB.  "working" floats
+		 * with user settings, so embed the actual profile as a blob. */
+		gboolean mono = (is_current_image_flis()
+		                 ? flis_composite_naxes2() : (guint)gfit->naxes[2]) == 1;
+		profile = copyICCProfile(mono ? com.icc.mono_standard : com.icc.working_standard);
+		profile_source = icc_source_blob_from_profile(profile);
+	}
+	if (!profile && g_file_test(arg, G_FILE_TEST_EXISTS) && g_file_test(arg, G_FILE_TEST_IS_REGULAR)) {
 		profile = cmsOpenProfileFromFile(arg, "r");
+		profile_source = g_strconcat("file:", arg, NULL);
 	}
 	if (!profile) {
 		siril_log_error(_("Error opening ICC profile.\n"));
+		g_free(profile_source);
 		return CMD_GENERIC_ERROR;
 	}
 
@@ -14699,6 +15282,23 @@ int process_icc_convert_to(int nb) {
 	icc_args->destroy_fn = free_icc_data;
 	icc_args->profile = profile;
 	icc_args->intent = intent;
+	icc_args->profile_source = profile_source;
+
+	if (is_current_image_flis()) {
+		/* Converting a FLIS rewrites every layer's pixels — a layer-stack
+		 * mutation, so it goes through generic_layer_worker (stack writer
+		 * lock + multi-layer undo). */
+		struct generic_layer_args *largs = calloc(1, sizeof(struct generic_layer_args));
+		largs->op = &op_desc_icc_convert;   /* fills layer_hook/log_hook/description */
+		largs->user = icc_args;
+		largs->verbose = TRUE;
+		largs->command = TRUE;
+		if (!start_in_new_thread(generic_layer_worker, largs)) {
+			free_generic_layer_args(largs);
+			return CMD_GENERIC_ERROR;
+		}
+		return CMD_OK;
+	}
 
 	struct generic_img_args *args = calloc(1, sizeof(struct generic_img_args));
 	args->fit = gfit;
@@ -14706,7 +15306,7 @@ int process_icc_convert_to(int nb) {
 	args->verbose = TRUE;
 	args->command = TRUE;
 	args->command_updates_gfit = TRUE;
-	args->skip_generic_undo = TRUE;  /* siril_colorspace_transform already writes FITS history */
+	args->skip_generic_undo = TRUE;  /* the hook saves a combined pixels+ICC entry */
 	args->user = icc_args;
 	if (!start_in_new_thread(generic_image_worker, args)) {
 		free_generic_img_args(args);
@@ -14717,19 +15317,18 @@ int process_icc_convert_to(int nb) {
 
 int process_icc_remove(int nb) {
 	gui_iface.clear_roi();
-	struct generic_img_args *args = calloc(1, sizeof(struct generic_img_args));
+	/* Remove is a pure com.uniq state change: no pixel work, so no
+	 * generic_image_worker (see icc_state_worker). */
+	struct icc_state_args *args = calloc(1, sizeof(struct icc_state_args));
 	if (!args) {
 		PRINT_ALLOC_ERR;
 		return CMD_ALLOC_ERROR;
 	}
-	args->fit = gfit;
-	args->op = &op_desc_icc_remove;
-	args->verbose = TRUE;
+	args->destroy_fn = free_icc_state_args;
+	args->profile = NULL;   /* NULL = remove */
 	args->command = TRUE;
-	args->command_updates_gfit = TRUE;
-	args->skip_generic_undo = TRUE;  /* siril_colorspace_transform already writes FITS history */
-	if (!start_in_new_thread(generic_image_worker, args)) {
-		free_generic_img_args(args);
+	if (!start_in_new_thread(icc_state_worker, args)) {
+		free_icc_state_args(args);
 		return CMD_GENERIC_ERROR;
 	}
 	return CMD_OK;
@@ -14923,6 +15522,32 @@ static gchar *limit_log_hook(gpointer p, log_hook_detail detail) {
 		default:                         method_str = _("unknown"); break;
 	}
 	return g_strdup_printf(_("Limit pixels (%s)"), method_str);
+}
+
+/* NDE serializers for arith.limit.  The hook reads method (an
+ * OverrangeResponse enum); the actual clip range is measured from the image at
+ * apply time. */
+static gchar *limit_serialize(gconstpointer user) {
+	const struct limit_data *d = user;
+	GString *kv = nde_kv_start();
+	/* on-disk value: enum order is frozen by the NDE format — do not reorder */
+	nde_kv_add_int(kv, "method", d->method);
+	return nde_kv_end(kv);
+}
+
+static gpointer limit_deserialize(const gchar *blob, int version) {
+	if (version > op_desc_limit.version)
+		return NULL;
+	GHashTable *kv = nde_kv_parse(blob);
+	gint64 method;
+	NDE_KV_REQUIRE(kv, nde_kv_get_int(kv, "method", &method));
+	struct limit_data *d = calloc(1, sizeof(*d));
+	if (d) {
+		d->destroy_fn = free;
+		d->method = (OverrangeResponse)method;
+	}
+	g_hash_table_unref(kv);
+	return d;
 }
 
 int process_limit(int nb) {
@@ -15533,7 +16158,7 @@ typedef struct _pyscript_data {
 
 gpointer execute_python_script_wrapper(gpointer user_data) {
 	pyscript_data *data = (pyscript_data*) user_data;
-	execute_python_script(data->script_name, TRUE, TRUE, data->argv_script, FALSE, data->from_cli, FALSE);
+	execute_python_script(data->script_name, TRUE, TRUE, data->argv_script, FALSE, data->from_cli, FALSE, FALSE);
 	// execute_python_script() frees data->script_name
 	g_strfreev(data->argv_script);
 	free(data);
@@ -15933,16 +16558,41 @@ int process_catmag_mono(int nb) {
 }
 
 // Process functions refactored
+
+/* Forward decl of the §C.1 layer-arg parser (defined further down in the
+ * flis_* command block).  Lets the mask_from_* commands share the same
+ * <id|"name"> resolution as the rest of the FLIS surface. */
+static flis_layer_t *resolve_layer_arg(const char *arg);
+
+/* Parse the value of a -layermask=<id|"name"> option.  Returns the
+ * resolved layer's stable item_id, or 0 on failure (logging the cause).
+ * Used by every mask_from_* command to honour the §5.2 routing contract:
+ * when present, the mask is stored on the named layer's lmask instead
+ * of gfit's processing mask. */
+static gint parse_layermask_value(const char *arg) {
+	if (!is_current_image_flis()) {
+		siril_log_error(_("-layermask= requires a FLIS image to be loaded\n"));
+		return 0;
+	}
+	flis_layer_t *lay = resolve_layer_arg(arg);
+	return lay ? lay->item_id : 0;
+}
+
 int process_mask_from_stars(int nb) {
 	int argidx = 1;
 	float r = 0.f, feather = 0.f;
 	gboolean invert = FALSE;
 	int bitdepth = com.pref.default_mask_bitpix;
+	gint target_layer_id = 0;
 	char *end;
 
 	while (argidx < nb) {
 		if (g_str_has_prefix(word[argidx], "-invert")) {
 			invert = TRUE;
+		}
+		else if (g_str_has_prefix(word[argidx], "-layermask=")) {
+			target_layer_id = parse_layermask_value(word[argidx] + 11);
+			if (!target_layer_id) return CMD_ARG_ERROR;
 		}
 		else if (g_str_has_prefix(word[argidx], "-r=")) {
 			char *arg = word[argidx] + 3;
@@ -15987,6 +16637,7 @@ int process_mask_from_stars(int nb) {
 	args->mask_creation = TRUE;
 	args->user = data;
 	args->max_threads = com.max_thread;
+	args->target_layer_id = target_layer_id;
 
 	start_in_new_thread(generic_mask_worker, args);
 	return CMD_OK;
@@ -15999,6 +16650,7 @@ int process_mask_from_channel(int nb) {
 	gboolean invert = FALSE;
 	int bitdepth = com.pref.default_mask_bitpix;
 	gchar *filename = NULL;
+	gint target_layer_id = 0;
 	char *end;
 
 	while (argidx < nb) {
@@ -16007,6 +16659,10 @@ int process_mask_from_channel(int nb) {
 		}
 		else if (g_str_has_prefix(word[argidx], "-invert")) {
 			invert = TRUE;
+		}
+		else if (g_str_has_prefix(word[argidx], "-layermask=")) {
+			target_layer_id = parse_layermask_value(word[argidx] + 11);
+			if (!target_layer_id) return CMD_ARG_ERROR;
 		}
 		else if (g_str_has_prefix(word[argidx], "-channel=")) {
 			char *arg = word[argidx] + 9;
@@ -16041,7 +16697,9 @@ int process_mask_from_channel(int nb) {
 	data->autostretch = autostretch;
 	data->invert = invert;
 	data->bitpix = (uint8_t)bitdepth;
-	data->filename = filename;
+	/* `filename` borrows from the command-word array; the struct owns a copy. */
+	data->filename = g_strdup(filename);
+	data->destroy_fn = mask_from_channel_data_free;
 
 	struct generic_mask_args *args = calloc(1, sizeof(struct generic_mask_args));
 	args->fit =  gfit;
@@ -16052,6 +16710,7 @@ int process_mask_from_channel(int nb) {
 	args->mask_creation = TRUE;
 	args->user = data;
 	args->max_threads = com.max_thread;
+	args->target_layer_id = target_layer_id;
 
 	start_in_new_thread(generic_mask_worker, args);
 	return CMD_OK;
@@ -16066,6 +16725,7 @@ int process_mask_from_lum(int nb) {
 	gboolean use_even = FALSE;
 	int bitdepth = com.pref.default_mask_bitpix;
 	gchar *filename = NULL;
+	gint target_layer_id = 0;
 	char *end;
 
 	while (argidx < nb) {
@@ -16074,6 +16734,10 @@ int process_mask_from_lum(int nb) {
 		}
 		else if (g_str_has_prefix(word[argidx], "-invert")) {
 			invert = TRUE;
+		}
+		else if (g_str_has_prefix(word[argidx], "-layermask=")) {
+			target_layer_id = parse_layermask_value(word[argidx] + 11);
+			if (!target_layer_id) return CMD_ARG_ERROR;
 		}
 		else if (g_str_has_prefix(word[argidx], "-human")) {
 			use_human = TRUE;
@@ -16161,7 +16825,9 @@ int process_mask_from_lum(int nb) {
 	data->use_human = use_human;
 	data->use_even = use_even;
 	data->bitpix = (uint8_t)bitdepth;
-	data->filename = filename;
+	/* `filename` borrows from the command-word array; the struct owns a copy. */
+	data->filename = g_strdup(filename);
+	data->destroy_fn = mask_from_lum_data_free;
 
 	struct generic_mask_args *args = calloc(1, sizeof(struct generic_mask_args));
 	args->fit =  gfit;
@@ -16172,6 +16838,7 @@ int process_mask_from_lum(int nb) {
 	args->mask_creation = TRUE;
 	args->user = data;
 	args->max_threads = com.max_thread;
+	args->target_layer_id = target_layer_id;
 
 	start_in_new_thread(generic_mask_worker, args);
 	return CMD_OK;
@@ -16503,11 +17170,16 @@ int process_mask_from_color(int nb) {
 	int feather_radius = 0;
 	gboolean invert = FALSE;
 	int bitdepth = com.pref.default_mask_bitpix;
+	gint target_layer_id = 0;
 	char *end;
 
 	while (argidx < nb) {
 		if (g_str_has_prefix(word[argidx], "-invert")) {
 			invert = TRUE;
+		}
+		else if (g_str_has_prefix(word[argidx], "-layermask=")) {
+			target_layer_id = parse_layermask_value(word[argidx] + 11);
+			if (!target_layer_id) return CMD_ARG_ERROR;
 		}
 		else if (g_str_has_prefix(word[argidx], "-cr=")) {
 			char *arg = word[argidx] + 4;
@@ -16612,8 +17284,1536 @@ int process_mask_from_color(int nb) {
 	args->mask_creation = TRUE;
 	args->user = data;
 	args->max_threads = com.max_thread;
+	args->target_layer_id = target_layer_id;
 
 	start_in_new_thread(generic_mask_worker, args);
+	return CMD_OK;
+}
+
+/* ===========================================================================
+ * FLIS introspection commands (stage 1.6)
+ * ===========================================================================
+ *
+ * Five read-only commands that expose FLIS state to scripts and to the
+ * command console.  Together they form the headless test harness for
+ * stage 1: a .ssf script can open a FLIS, dump its structure to CSV, run
+ * an operation, and diff the post-state CSV against a golden file.  The
+ * commands run from the command thread, take no locks beyond reading
+ * com.uniq, and never mutate state.
+ *
+ *   flis_info               Canvas dimensions, layer/group count, ICC presence.
+ *   flis_layer_list         Tabular dump of every layer.  -format=text|csv.
+ *   flis_group_list         Tabular dump of every group.  -format=text|csv.
+ *   flis_layer_info <id|"name">   Verbose dump of one layer.
+ *   flis_group_info <gid|"name">  Verbose dump of one group.
+ *
+ * The REQ_CMD_FLIS_IMAGE prerequisite is set on all five; the parser
+ * refuses each with a uniform "command requires a FLIS layered image"
+ * message when no FLIS is loaded.
+ */
+
+/* Map a flis_blend_mode_t to its spec-compliant name (Section 5). */
+static const char *flis_blend_mode_name(flis_blend_mode_t m) {
+	switch (m) {
+		case FLIS_BLEND_NORMAL:       return "NORMAL";
+		case FLIS_BLEND_MULTIPLY:     return "MULTIPLY";
+		case FLIS_BLEND_SCREEN:       return "SCREEN";
+		case FLIS_BLEND_OVERLAY:      return "OVERLAY";
+		case FLIS_BLEND_SOFT_LIGHT:   return "SOFT_LIGHT";
+		case FLIS_BLEND_HARD_LIGHT:   return "HARD_LIGHT";
+		case FLIS_BLEND_COLOR_DODGE:  return "COLOR_DODGE";
+		case FLIS_BLEND_COLOR_BURN:   return "COLOR_BURN";
+		case FLIS_BLEND_DARKEN:       return "DARKEN";
+		case FLIS_BLEND_LIGHTEN:      return "LIGHTEN";
+		case FLIS_BLEND_DIFFERENCE:   return "DIFFERENCE";
+		case FLIS_BLEND_EXCLUSION:    return "EXCLUSION";
+		case FLIS_BLEND_HUE:          return "HUE";
+		case FLIS_BLEND_SATURATION:   return "SATURATION";
+		case FLIS_BLEND_COLOR:        return "COLOR";
+		case FLIS_BLEND_LUMINOSITY:   return "LUMINOSITY";
+		case FLIS_BLEND_CHROMA:       return "LRGB_COLOR";
+		case FLIS_BLEND_PASS_THROUGH: return "PASS_THROUGH";
+	}
+	return "?";
+}
+
+/* Reverse of flis_blend_mode_name — case-insensitive lookup.  Returns
+ * the matched mode or 0 (= invalid) on miss; caller checks. */
+static flis_blend_mode_t flis_blend_mode_from_name(const char *s) {
+	if (!s) return 0;
+	if (!g_ascii_strcasecmp(s, "NORMAL"))       return FLIS_BLEND_NORMAL;
+	if (!g_ascii_strcasecmp(s, "MULTIPLY"))     return FLIS_BLEND_MULTIPLY;
+	if (!g_ascii_strcasecmp(s, "SCREEN"))       return FLIS_BLEND_SCREEN;
+	if (!g_ascii_strcasecmp(s, "OVERLAY"))      return FLIS_BLEND_OVERLAY;
+	if (!g_ascii_strcasecmp(s, "SOFT_LIGHT"))   return FLIS_BLEND_SOFT_LIGHT;
+	if (!g_ascii_strcasecmp(s, "HARD_LIGHT"))   return FLIS_BLEND_HARD_LIGHT;
+	if (!g_ascii_strcasecmp(s, "COLOR_DODGE"))  return FLIS_BLEND_COLOR_DODGE;
+	if (!g_ascii_strcasecmp(s, "COLOR_BURN"))   return FLIS_BLEND_COLOR_BURN;
+	if (!g_ascii_strcasecmp(s, "DARKEN"))       return FLIS_BLEND_DARKEN;
+	if (!g_ascii_strcasecmp(s, "LIGHTEN"))      return FLIS_BLEND_LIGHTEN;
+	if (!g_ascii_strcasecmp(s, "DIFFERENCE"))   return FLIS_BLEND_DIFFERENCE;
+	if (!g_ascii_strcasecmp(s, "EXCLUSION"))    return FLIS_BLEND_EXCLUSION;
+	if (!g_ascii_strcasecmp(s, "HUE"))          return FLIS_BLEND_HUE;
+	if (!g_ascii_strcasecmp(s, "SATURATION"))   return FLIS_BLEND_SATURATION;
+	if (!g_ascii_strcasecmp(s, "COLOR"))        return FLIS_BLEND_COLOR;
+	if (!g_ascii_strcasecmp(s, "LUMINOSITY"))   return FLIS_BLEND_LUMINOSITY;
+	if (!g_ascii_strcasecmp(s, "LRGB_COLOR"))   return FLIS_BLEND_CHROMA;
+	if (!g_ascii_strcasecmp(s, "CHROMA"))       return FLIS_BLEND_CHROMA;
+	if (!g_ascii_strcasecmp(s, "PASS_THROUGH")) return FLIS_BLEND_PASS_THROUGH;
+	return 0;
+}
+
+/* Parse on / off / true / false / 1 / 0 → gboolean; returns -1 on
+ * invalid input. */
+static int parse_bool_arg(const char *s) {
+	if (!s) return -1;
+	if (!g_ascii_strcasecmp(s, "on")  || !g_ascii_strcasecmp(s, "true")  || !strcmp(s, "1")) return 1;
+	if (!g_ascii_strcasecmp(s, "off") || !g_ascii_strcasecmp(s, "false") || !strcmp(s, "0")) return 0;
+	return -1;
+}
+
+/* Resolve an argument that is either a positive integer (item_id) or a
+ * layer name in double quotes, e.g. `flis_layer_info 3` or
+ * `flis_layer_info "Ha Narrowband"`.  Returns the layer or NULL with an
+ * error logged. */
+/* An identifier is either a bare item id or a name, and the name may arrive
+ * quoted or not depending which parser path it came down.  Shared by the layer
+ * and group resolvers and by the one that accepts either. */
+static gboolean flis_ident_all_digits(const char *arg) {
+	if (!arg || !*arg) return FALSE;
+	for (const char *p = arg; *p; p++) if (!g_ascii_isdigit(*p)) return FALSE;
+	return TRUE;
+}
+
+static gchar *flis_ident_unquote(const char *arg) {
+	gchar *trimmed = g_strdup(arg);
+	size_t len = strlen(trimmed);
+	if (len >= 2 && trimmed[0] == '"' && trimmed[len-1] == '"') {
+		trimmed[len-1] = '\0';
+		memmove(trimmed, trimmed + 1, len - 1);
+	}
+	return trimmed;
+}
+
+static flis_group_t *flis_group_get_by_name(const char *name) {
+	for (GSList *l = com.uniq ? com.uniq->groups : NULL; l; l = l->next) {
+		flis_group_t *cand = (flis_group_t *)l->data;
+		if (cand && cand->name && !strcmp(cand->name, name))
+			return cand;
+	}
+	return NULL;
+}
+
+static flis_layer_t *resolve_layer_arg(const char *arg) {
+	if (!arg || !*arg) {
+		siril_log_error(_("flis: layer identifier required\n"));
+		return NULL;
+	}
+	/* Integer form: digits only */
+	if (flis_ident_all_digits(arg)) {
+		gint64 id64 = g_ascii_strtoll(arg, NULL, 10);
+		if (id64 <= 0 || id64 > G_MAXINT) {
+			siril_log_error(_("flis: layer id '%s' out of range\n"), arg);
+			return NULL;
+		}
+		gint id = (gint)id64;
+		flis_layer_t *l = flis_layer_get_by_id(id);
+		if (!l) siril_log_error(_("flis: no layer with id %d\n"), id);
+		return l;
+	}
+	/* Name form: strip surrounding quotes if present (the command parser
+	 * may or may not have done this for us depending on path). */
+	gchar *trimmed = flis_ident_unquote(arg);
+	flis_layer_t *l = flis_layer_get_by_name(trimmed);
+	if (!l) siril_log_error(_("flis: no layer named \"%s\"\n"), trimmed);
+	g_free(trimmed);
+	return l;
+}
+
+static flis_group_t *resolve_group_arg(const char *arg) {
+	if (!arg || !*arg) {
+		siril_log_error(_("flis: group identifier required\n"));
+		return NULL;
+	}
+	if (flis_ident_all_digits(arg)) {
+		gint id = atoi(arg);
+		flis_group_t *g = flis_group_get_by_id(id);
+		if (!g) siril_log_error(_("flis: no group with id %d\n"), id);
+		return g;
+	}
+	gchar *trimmed = flis_ident_unquote(arg);
+	flis_group_t *g = flis_group_get_by_name(trimmed);
+	if (!g) siril_log_error(_("flis: no group named \"%s\"\n"), trimmed);
+	g_free(trimmed);
+	return g;
+}
+
+/* Resolve an identifier that may name EITHER a layer or a group.  The panel's
+ * Blend dropdown serves both, and an LRGB stack wants Chroma on the group
+ * holding R, G and B rather than on any one of them, so the command that
+ * mirrors that dropdown has to accept both too.  Item ids are unique across
+ * layers and groups, so an integer is unambiguous; a bare name is looked for
+ * among layers first, which is the older meaning of the argument.  Exactly one
+ * of @lay / @grp is set on success. */
+static gboolean resolve_layer_or_group_arg(const char *arg, const char *cmdname,
+                                           flis_layer_t **lay,
+                                           flis_group_t **grp) {
+	*lay = NULL;
+	*grp = NULL;
+	if (!arg || !*arg) {
+		siril_log_error(_("%s: layer or group identifier required\n"), cmdname);
+		return FALSE;
+	}
+	if (flis_ident_all_digits(arg)) {
+		gint64 id64 = g_ascii_strtoll(arg, NULL, 10);
+		if (id64 > 0 && id64 <= G_MAXINT) {
+			*lay = flis_layer_get_by_id((gint)id64);
+			if (!*lay) *grp = flis_group_get_by_id((gint)id64);
+		}
+		if (!*lay && !*grp)
+			siril_log_error(_("%s: no layer or group with id %s\n"), cmdname, arg);
+		return (*lay || *grp);
+	}
+	gchar *name = flis_ident_unquote(arg);
+	*lay = flis_layer_get_by_name(name);
+	if (!*lay)
+		*grp = flis_group_get_by_name(name);
+	if (!*lay && !*grp)
+		siril_log_error(_("%s: no layer or group named \"%s\"\n"), cmdname, name);
+	g_free(name);
+	return (*lay || *grp);
+}
+
+/* Parse -format=text|csv option from word[1..nb-1]; default text. */
+static int parse_format_arg(int nb) {
+	for (int i = 1; i < nb; i++) {
+		if (!word[i]) continue;
+		if (!g_str_has_prefix(word[i], "-format=")) continue;
+		const char *v = word[i] + 8;
+		if (!g_ascii_strcasecmp(v, "csv"))  return 1;
+		if (!g_ascii_strcasecmp(v, "text")) return 0;
+		/* word[0] is the invoking command (flis_layer_list or
+		 * flis_group_list) — don't hard-code one of them. */
+		siril_log_error(_("%s: -format= must be text or csv\n"), word[0]);
+		return -1;
+	}
+	return 0;
+}
+
+int process_flis_info(int nb) {
+	(void)nb;
+	guint nl = flis_layer_count();
+	guint ng = flis_group_count();
+	guint cw = flis_canvas_rx();
+	guint ch = flis_canvas_ry();
+	flis_layer_t *base = NULL;
+	gboolean icc = FALSE;
+	if (com.uniq->layers) {
+		base = (flis_layer_t *)com.uniq->layers->data;
+		if (base && base->fit && fit_get_icc_profile(base->fit)) icc = TRUE;
+	}
+	siril_log_info(_("FLIS image: canvas %ux%u, layers=%u, groups=%u, ICC=%s\n"),
+	               cw, ch, nl, ng, icc ? "yes" : "no");
+	if (com.uniq->filename)
+		siril_log_info(_("  source: %s\n"), com.uniq->filename);
+	return CMD_OK;
+}
+
+int process_flis_layer_list(int nb) {
+	int fmt = parse_format_arg(nb);
+	if (fmt < 0) return CMD_ARG_ERROR;
+	gboolean csv = (fmt == 1);
+
+	if (csv) {
+		siril_log_message("id,order,name,model,blend,opacity,visible,locked,has_tint,tint_r,tint_g,tint_b,has_lmask,lmask_active,group_id,pos_x,pos_y\n");
+	} else {
+		siril_log_info(_("%4s %5s %-24s %4s %-12s %5s %3s %3s %4s %4s %3s\n"),
+		               "id", "order", "name", "mdl", "blend", "opac", "vis", "lck",
+		               "tint", "lmsk", "grp");
+	}
+	for (GSList *l = com.uniq->layers; l; l = l->next) {
+		flis_layer_t *lay = (flis_layer_t *)l->data;
+		if (!lay) continue;
+		const char *mdl = (lay->fit && lay->fit->naxes[2] == 3) ? "RGB" : "MONO";
+		const char *blend = flis_blend_mode_name(lay->blend_mode);
+		if (csv) {
+			siril_log_message("%d,%d,\"%s\",%s,%s,%.4f,%d,%d,%d,%.4f,%.4f,%.4f,%d,%d,%d,%d,%d\n",
+			                  lay->item_id, lay->layer_order,
+			                  lay->layer_name ? lay->layer_name : "",
+			                  mdl, blend, (double)lay->opacity,
+			                  lay->visible ? 1 : 0, lay->locked ? 1 : 0,
+			                  lay->has_tint ? 1 : 0,
+			                  lay->layer_tint.r, lay->layer_tint.g, lay->layer_tint.b,
+			                  lay->lmask ? 1 : 0, lay->lmask_active ? 1 : 0,
+			                  lay->group_id, lay->position_x, lay->position_y);
+		} else {
+			siril_log_info(_("%4d %5d %-24.24s %4s %-12s %5.2f %3s %3s %4s %4s %3d\n"),
+			               lay->item_id, lay->layer_order,
+			               lay->layer_name ? lay->layer_name : "",
+			               mdl, blend, (double)lay->opacity,
+			               lay->visible ? "yes" : "no",
+			               lay->locked ? "yes" : "no",
+			               lay->has_tint ? "yes" : "no",
+			               lay->lmask ? (lay->lmask_active ? "on" : "off") : "no",
+			               lay->group_id);
+		}
+	}
+	return CMD_OK;
+}
+
+int process_flis_group_list(int nb) {
+	int fmt = parse_format_arg(nb);
+	if (fmt < 0) return CMD_ARG_ERROR;
+	gboolean csv = (fmt == 1);
+
+	if (csv) {
+		siril_log_message("id,name,visible,opacity,blend,members,collapsed\n");
+	} else {
+		siril_log_info(_("%4s %-24s %3s %5s %-12s %7s %3s\n"),
+		               "id", "name", "vis", "opac", "blend", "members", "col");
+	}
+	for (GSList *l = com.uniq->groups; l; l = l->next) {
+		flis_group_t *grp = (flis_group_t *)l->data;
+		if (!grp) continue;
+		guint members = 0;
+		for (GSList *m = com.uniq->layers; m; m = m->next) {
+			flis_layer_t *lay = (flis_layer_t *)m->data;
+			if (lay && lay->group_id == grp->item_id) members++;
+		}
+		const char *blend = flis_blend_mode_name(grp->blend_mode);
+		if (csv) {
+			siril_log_message("%d,\"%s\",%d,%.4f,%s,%u,%d\n",
+			                  grp->item_id, grp->name ? grp->name : "",
+			                  grp->visible ? 1 : 0, (double)grp->opacity, blend,
+			                  members, grp->collapsed ? 1 : 0);
+		} else {
+			siril_log_info(_("%4d %-24.24s %3s %5.2f %-12s %7u %3s\n"),
+			               grp->item_id, grp->name ? grp->name : "",
+			               grp->visible ? "yes" : "no", (double)grp->opacity, blend,
+			               members, grp->collapsed ? "yes" : "no");
+		}
+	}
+	return CMD_OK;
+}
+
+/* flis_history [-format=text|csv] — print the nondestructive edit history of
+ * the loaded image (sketch §17).  SINGLE_IMAGE-gated, not FLIS_IMAGE: a plain
+ * image's in-memory log is inspectable too (it persists only if saved as
+ * .flis). */
+int process_flis_history(int nb) {
+	int fmt = parse_format_arg(nb);
+	if (fmt < 0) return CMD_ARG_ERROR;
+	gboolean csv = (fmt == 1);
+
+	gint64 next_id = 0;
+	GPtrArray *snap = nde_history_snapshot(&next_id);
+	if (!snap || snap->len == 0) {
+		if (snap) g_ptr_array_unref(snap);
+		siril_log_info(_("No edit history recorded for this image\n"));
+		return CMD_OK;
+	}
+
+	/* Stale banner first, matching the load-time warning wording. */
+	if (nde_history_is_stale())
+		siril_log_warning(_("FLIS: layer pixels were modified outside the recorded history\n"));
+
+	if (csv)
+		siril_log_message("record_id,tier,op_id,op_version,scope,target,summary,params,inputs\n");
+
+	for (guint i = 0; i < snap->len; i++) {
+		nde_record *r = g_ptr_array_index(snap, i);
+		const char *tier = (r->tier == NDE_TIER_A) ? "A" : "B";
+		/* Target label: the item id whenever there is one — geometry
+		 * records carry CANVAS scope but do target a layer, and calling
+		 * that "canvas" hid which layer they belong to.  Matches the
+		 * History panel's hist_target_label. */
+		char target_buf[32];
+		const char *target;
+		if (r->target_item_id >= 0) {
+			g_snprintf(target_buf, sizeof(target_buf), "%d", r->target_item_id);
+			target = target_buf;
+		} else if (r->scope == NDE_SCOPE_CANVAS)
+			target = "canvas";
+		else if (r->scope == NDE_SCOPE_DOCUMENT)
+			target = "document";
+		else
+			target = "-1";
+		if (csv) {
+			gchar *pins = nde_pins_to_string(r->inputs);
+			siril_log_message("%" G_GINT64_FORMAT ",%s,%s,%d,%d,%s,\"%s\",\"%s\",\"%s\"\n",
+			                  r->record_id, tier, r->op_id ? r->op_id : "",
+			                  r->op_version, r->scope, target,
+			                  r->summary ? r->summary : "",
+			                  r->params ? r->params : "",
+			                  pins ? pins : "");
+			g_free(pins);
+		} else {
+			siril_log_info(_("#%" G_GINT64_FORMAT " [%s] %s v%d target=%s  %s\n"),
+			               r->record_id, tier, r->op_id ? r->op_id : "",
+			               r->op_version, target, r->summary ? r->summary : "");
+			if (r->params)
+				siril_log_info(_("    params: %s\n"), r->params);
+			/* Input edges beyond the implicit image the chain supplies. */
+			gchar *pins = nde_pins_to_string(r->inputs);
+			if (pins)
+				siril_log_info(_("    inputs: %s\n"), pins);
+			g_free(pins);
+		}
+	}
+	g_ptr_array_unref(snap);
+	return CMD_OK;
+}
+
+int process_flis_replay_check(int nb) {
+	(void)nb;
+	/* Conductor-hosted since nde-phase5 (nde_replay.c): the check replays
+	 * under SLOT_REPLAY like every other replay path, which Tier-C script
+	 * re-runs require.  The reservation refusal is logged there. */
+	gint item_id = nde_checkpoint_active_item_id();
+	if (!nde_replay_check_start(item_id))
+		return CMD_GENERIC_ERROR;
+	return CMD_OK;
+}
+
+/* Parse a decimal record id from an argument, rejecting garbage (trailing
+ * junk, empty, non-numeric).  Records are identified by their record_id
+ * (a positive integer as printed by flis_history). */
+static gboolean parse_record_id_arg(const char *arg, gint64 *out) {
+	if (!arg || !*arg) return FALSE;
+	char *end = NULL;
+	gint64 v = g_ascii_strtoll(arg, &end, 10);
+	if (end == arg || !end || *end != '\0')
+		return FALSE;
+	*out = v;
+	return TRUE;
+}
+
+/* flis_amend / flis_hist_delete (nde-phase2-3-plan.md P3.C): thin parsers
+ * that funnel into the amend/delete commit machinery in nde_replay.c.  No
+ * logic beyond argument parsing and the python-reservation guard; the
+ * _start wrappers spawn the job and own the whole replay+swap+commit. */
+int process_flis_amend(int nb) {
+	if (nb < 3) {
+		siril_log_error(_("Usage: flis_amend <record_id> <params>\n"));
+		return CMD_WRONG_N_ARG;
+	}
+	gint64 record_id;
+	if (!parse_record_id_arg(word[1], &record_id)) {
+		siril_log_error(_("Invalid record id: '%s'\n"), word[1]);
+		return CMD_ARG_ERROR;
+	}
+	if (processing_is_reserved_for_python()) {
+		siril_log_error(_("The processing thread is reserved by a Python script; try again later\n"));
+		return CMD_GENERIC_ERROR;
+	}
+	if (!nde_amend_start(record_id, word[2]))
+		return CMD_GENERIC_ERROR;
+	return CMD_OK;
+}
+
+int process_flis_editat(int nb) {
+	if (nb < 2) {
+		siril_log_error(_("Usage: flis_editat <record_id>|done|cancel\n"));
+		return CMD_WRONG_N_ARG;
+	}
+	if (processing_is_reserved_for_python()) {
+		siril_log_error(_("The processing thread is reserved by a Python script; try again later\n"));
+		return CMD_GENERIC_ERROR;
+	}
+	gboolean done = !g_ascii_strcasecmp(word[1], "done");
+	if (done || !g_ascii_strcasecmp(word[1], "cancel")) {
+		if (!nde_edit_at_active()) {
+			siril_log_error(_("No insertion point is open\n"));
+			return CMD_GENERIC_ERROR;
+		}
+		if (!nde_edit_at_end(done))
+			return CMD_GENERIC_ERROR;
+		return CMD_OK;
+	}
+	gint64 record_id;
+	if (!parse_record_id_arg(word[1], &record_id)) {
+		siril_log_error(_("Invalid record id: '%s'\n"), word[1]);
+		return CMD_ARG_ERROR;
+	}
+	if (!nde_edit_at_start(record_id, NULL, NULL))
+		return CMD_GENERIC_ERROR;
+	/* The conductor only joins the begin worker in synchronous contexts
+	 * (com.script || com.python_command); there the insertion point is already
+	 * open by the time we get here, so nde_edit_at_active() reports the real
+	 * outcome and the begin logs its own reason on failure. Typed into the GUI
+	 * console both flags are FALSE: the worker runs detached and completes later
+	 * via the idle handler, so an inactive state here is merely "not yet", not a
+	 * failure. */
+	if ((com.script || com.python_command) && !nde_edit_at_active())
+		return CMD_GENERIC_ERROR;
+	if (!com.script && !com.python_command && !nde_edit_at_active()) {
+		siril_log_message(_("Opening insertion point before step %" G_GINT64_FORMAT ": the display "
+		                    "will change to the pre-step state; then run operations and "
+		                    "'flis_editat done' to keep them or 'flis_editat cancel' to discard\n"),
+		                  record_id);
+		return CMD_OK;
+	}
+	siril_log_message(_("Inserting before step %" G_GINT64_FORMAT ": run operations, then "
+	                    "'flis_editat done' to keep them or 'flis_editat cancel' to discard\n"),
+	                  record_id);
+	return CMD_OK;
+}
+
+int process_flis_hist_move(int nb) {
+	if (nb < 3) {
+		siril_log_error(_("Usage: flis_hist_move <record_id> {-before=<id>|-after=<id>}\n"));
+		return CMD_WRONG_N_ARG;
+	}
+	gint64 record_id;
+	if (!parse_record_id_arg(word[1], &record_id)) {
+		siril_log_error(_("Invalid record id: '%s'\n"), word[1]);
+		return CMD_ARG_ERROR;
+	}
+	gint64 anchor_id = 0;
+	gboolean after = FALSE;
+	if (g_str_has_prefix(word[2], "-before=")) {
+		if (!parse_record_id_arg(word[2] + 8, &anchor_id)) {
+			siril_log_error(_("Invalid record id: '%s'\n"), word[2] + 8);
+			return CMD_ARG_ERROR;
+		}
+	} else if (g_str_has_prefix(word[2], "-after=")) {
+		after = TRUE;
+		if (!parse_record_id_arg(word[2] + 7, &anchor_id)) {
+			siril_log_error(_("Invalid record id: '%s'\n"), word[2] + 7);
+			return CMD_ARG_ERROR;
+		}
+	} else {
+		siril_log_error(_("Usage: flis_hist_move <record_id> {-before=<id>|-after=<id>}\n"));
+		return CMD_ARG_ERROR;
+	}
+	if (processing_is_reserved_for_python()) {
+		siril_log_error(_("The processing thread is reserved by a Python script; try again later\n"));
+		return CMD_GENERIC_ERROR;
+	}
+	if (!nde_reorder_start(record_id, anchor_id, after))
+		return CMD_GENERIC_ERROR;
+	return CMD_OK;
+}
+
+int process_flis_hist_delete(int nb) {
+	if (nb < 2) {
+		siril_log_error(_("Usage: flis_hist_delete <record_id>\n"));
+		return CMD_WRONG_N_ARG;
+	}
+	gint64 record_id;
+	if (!parse_record_id_arg(word[1], &record_id)) {
+		siril_log_error(_("Invalid record id: '%s'\n"), word[1]);
+		return CMD_ARG_ERROR;
+	}
+	if (processing_is_reserved_for_python()) {
+		siril_log_error(_("The processing thread is reserved by a Python script; try again later\n"));
+		return CMD_GENERIC_ERROR;
+	}
+	if (!nde_delete_start(record_id))
+		return CMD_GENERIC_ERROR;
+	return CMD_OK;
+}
+
+int process_flis_layer_info(int nb) {
+	if (nb < 2) {
+		siril_log_error(_("Usage: flis_layer_info <id|\"name\">\n"));
+		return CMD_WRONG_N_ARG;
+	}
+	flis_layer_t *lay = resolve_layer_arg(word[1]);
+	if (!lay) return CMD_ARG_ERROR;
+
+	siril_log_info(_("Layer id %d: \"%s\"\n"),
+	               lay->item_id, lay->layer_name ? lay->layer_name : "");
+	siril_log_info(_("  order       : %d\n"), lay->layer_order);
+	siril_log_info(_("  model       : %s\n"),
+	               (lay->fit && lay->fit->naxes[2] == 3) ? "RGB" : "MONO");
+	if (lay->fit)
+		siril_log_info(_("  size        : %lu x %lu\n"),
+		               (unsigned long)lay->fit->rx, (unsigned long)lay->fit->ry);
+	siril_log_info(_("  position    : (%d, %d)\n"), lay->position_x, lay->position_y);
+	siril_log_info(_("  blend mode  : %s\n"), flis_blend_mode_name(lay->blend_mode));
+	siril_log_info(_("  opacity     : %.4f\n"), (double)lay->opacity);
+	siril_log_info(_("  visible     : %s\n"), lay->visible ? "yes" : "no");
+	siril_log_info(_("  locked      : %s\n"), lay->locked  ? "yes" : "no");
+	if (lay->has_tint)
+		siril_log_info(_("  tint        : (%.3f, %.3f, %.3f)\n"),
+		               lay->layer_tint.r, lay->layer_tint.g, lay->layer_tint.b);
+	else
+		siril_log_info(_("  tint        : neutral\n"));
+	/* Masks are items in their own right, so report the ids the edit
+	 * history uses to name them (allocated on demand — printing one is a
+	 * legitimate first use). */
+	if (lay->lmask)
+		siril_log_info(_("  layer mask  : %s (item id %d)\n"),
+		               lay->lmask_active ? "active" : "inactive",
+		               flis_layer_lmask_id(lay));
+	else
+		siril_log_info(_("  layer mask  : none\n"));
+	if (lay->fit && lay->fit->mask && lay->fit->mask->data)
+		siril_log_info(_("  proc mask   : present (item id %d)\n"),
+		               flis_layer_pmask_id(lay));
+	else
+		siril_log_info(_("  proc mask   : none\n"));
+	siril_log_info(_("  group_id    : %d\n"), lay->group_id);
+	return CMD_OK;
+}
+
+/* Strip one leading and one trailing quote (single or double) from an
+ * -opt= value, in place (word[] points into the mutable command line).
+ * The tokenizer keeps the opening quote of a -opt="..." value embedded
+ * in the word and eats the closing one at end-of-word; values typed
+ * without spaces may still carry both. */
+static char *strip_optval_quotes(char *v) {
+	if (!v) return v;
+	if (*v == '"' || *v == '\'')
+		v++;
+	size_t vl = strlen(v);
+	if (vl > 0 && (v[vl - 1] == '"' || v[vl - 1] == '\''))
+		v[vl - 1] = '\0';
+	return v;
+}
+
+int process_flis_promote(int nb) {
+	const char *name = NULL;
+	for (int i = 1; i < nb; i++) {
+		if (!word[i]) continue;
+		if (g_str_has_prefix(word[i], "-name=")) {
+			name = strip_optval_quotes(word[i] + 6);
+		} else {
+			siril_log_error(_("flis_promote: unknown argument '%s'\n"), word[i]);
+			return CMD_ARG_ERROR;
+		}
+	}
+	if (is_current_image_flis()) {
+		siril_log_warning(_("flis_promote: image is already a FLIS — nothing to do\n"));
+		return CMD_OK;
+	}
+	if (flis_promote_from_gfit(name)) {
+		siril_log_error(_("flis_promote: failed to promote image to single-layer FLIS\n"));
+		return CMD_GENERIC_ERROR;
+	}
+	siril_log_message(_("flis_promote: image is now a single-layer FLIS (base: \"%s\")\n"),
+	                  name ? name : "Background");
+	return CMD_OK;
+}
+
+int process_flis_active_layer(int nb) {
+	/* No argument: report the currently active layer's id and name.
+	 * One argument: set the active layer to that id or name. */
+	if (nb < 2) {
+		flis_layer_t *active = flis_active_layer();
+		if (!active) {
+			siril_log_error(_("flis_active_layer: no FLIS loaded\n"));
+			return CMD_GENERIC_ERROR;
+		}
+		siril_log_message(_("Active layer: id=%d  name=\"%s\"\n"),
+		                  active->item_id,
+		                  active->layer_name ? active->layer_name : "");
+		return CMD_OK;
+	}
+
+	/* Resolve <id|"name"> using the same dispatch the introspection
+	 * commands use (positive integer → item_id, anything else → name). */
+	const char *arg = word[1];
+	flis_layer_t *target = NULL;
+	gboolean all_digits = (arg && *arg);
+	for (const char *p = arg; *p; p++) if (!g_ascii_isdigit(*p)) { all_digits = FALSE; break; }
+	if (all_digits) {
+		target = flis_layer_get_by_id(atoi(arg));
+		if (!target) {
+			siril_log_error(_("flis_active_layer: no layer with id %s\n"), arg);
+			return CMD_ARG_ERROR;
+		}
+	} else {
+		gchar *trimmed = g_strdup(arg);
+		size_t len = strlen(trimmed);
+		if (len >= 2 && trimmed[0] == '"' && trimmed[len-1] == '"') {
+			trimmed[len-1] = '\0';
+			memmove(trimmed, trimmed + 1, len - 1);
+		}
+		target = flis_layer_get_by_name(trimmed);
+		if (!target) {
+			siril_log_error(_("flis_active_layer: no layer named \"%s\"\n"), trimmed);
+			g_free(trimmed);
+			return CMD_ARG_ERROR;
+		}
+		g_free(trimmed);
+	}
+
+	gint idx = flis_layer_get_index(target);
+	if (idx < 0) {
+		siril_log_error(_("flis_active_layer: target layer not in stack\n"));
+		return CMD_GENERIC_ERROR;
+	}
+	flis_switch_active_layer_gui(idx);
+	siril_log_message(_("Active layer: id=%d  name=\"%s\"\n"),
+	                  target->item_id,
+	                  target->layer_name ? target->layer_name : "");
+	/* Switching the active layer changes which fits gfit points at, so
+	 * any downstream display refresh needs to be triggered.  The mask
+	 * tab visibility and right-tab activation are GUI-side concerns
+	 * but the script command is normally invoked from headless paths
+	 * where neither matters; no extra plumbing needed here. */
+	return CMD_OK;
+}
+
+/* flis_addlayer <file> [-name="X"] — load a FITS from disk and add it
+ * as a new layer on top of the current FLIS stack.  Mirrors the panel's
+ * Add Layer toolbar button: both build a flis_addlayer_args payload and
+ * submit through generic_layer_worker so undo, logging, HISTORY and
+ * invalidation are identical between paths (§4.3 parity). */
+int process_flis_addlayer(int nb) {
+	if (nb < 2) {
+		siril_log_error(_("Usage: flis_addlayer <file> [-name=\"X\"]\n"));
+		return CMD_WRONG_N_ARG;
+	}
+	const char *path = word[1];
+	const char *name = NULL;
+	for (int i = 2; i < nb; i++) {
+		if (!word[i]) continue;
+		if (g_str_has_prefix(word[i], "-name=")) {
+			name = strip_optval_quotes(word[i] + 6);
+		} else {
+			siril_log_error(_("flis_addlayer: unknown argument '%s'\n"), word[i]);
+			return CMD_ARG_ERROR;
+		}
+	}
+
+	struct flis_addlayer_args *payload = calloc(1, sizeof(*payload));
+	if (!payload) return CMD_ALLOC_ERROR;
+	payload->destroy_fn = flis_addlayer_args_free;
+	payload->filename   = g_strdup(path);
+	payload->name       = name ? g_strdup(name) : NULL;
+
+	struct generic_layer_args *args = calloc(1, sizeof(*args));
+	if (!args) { flis_addlayer_args_free(payload); return CMD_ALLOC_ERROR; }
+	args->layer_hook         = flis_addlayer_hook;
+	args->user               = payload;
+	args->description        = g_strdup("flis_addlayer");
+	args->command            = TRUE;     /* script blocks until done */
+	args->invalidate_flags   = FLIS_INV_ALL;
+	args->invalidate_item_id = 0;        /* hook fills in the new layer's id */
+
+	if (!start_in_new_thread(generic_layer_worker, args)) {
+		free_generic_layer_args(args);
+		return CMD_GENERIC_ERROR;
+	}
+	/* CMD_NOTIFY_GFIT_MODIFIED makes the script processor wait for the
+	 * worker to finish before running the next command. */
+	return CMD_OK | CMD_NOTIFY_GFIT_MODIFIED;
+}
+
+/* flis_setmask <id|"name"> <file> [-bitpix=8|32] — load a mono FITS and
+ * attach it as the named layer's mask.  Mirrors the panel's mask Add…
+ * button via shared flis_setmask_hook. */
+int process_flis_setmask(int nb) {
+	if (nb < 3) {
+		siril_log_error(_("Usage: flis_setmask <id|\"name\"> <file> [-bitpix=8|32]\n"));
+		return CMD_WRONG_N_ARG;
+	}
+	flis_layer_t *target = resolve_layer_arg(word[1]);
+	if (!target) return CMD_ARG_ERROR;
+	const char *path = word[2];
+	int bitpix = 0;
+	for (int i = 3; i < nb; i++) {
+		if (!word[i]) continue;
+		if (g_str_has_prefix(word[i], "-bitpix=")) {
+			bitpix = atoi(word[i] + 8);
+			if (bitpix != 8 && bitpix != 32) {
+				siril_log_error(_("flis_setmask: -bitpix must be 8 or 32\n"));
+				return CMD_ARG_ERROR;
+			}
+		} else {
+			siril_log_error(_("flis_setmask: unknown argument '%s'\n"), word[i]);
+			return CMD_ARG_ERROR;
+		}
+	}
+
+	struct flis_setmask_args *payload = calloc(1, sizeof(*payload));
+	if (!payload) return CMD_ALLOC_ERROR;
+	payload->destroy_fn = flis_setmask_args_free;
+	payload->filename   = g_strdup(path);
+	payload->bitpix     = bitpix;
+
+	struct generic_layer_args *args = calloc(1, sizeof(*args));
+	if (!args) { flis_setmask_args_free(payload); return CMD_ALLOC_ERROR; }
+	args->layer_hook         = flis_setmask_hook;
+	args->user               = payload;
+	args->description        = g_strdup("flis_setmask");
+	args->command            = TRUE;
+	args->updates_lmask      = TRUE;
+	args->invalidate_flags   = FLIS_INV_LAYER_PIXELS;  /* lmask is per-layer */
+	args->invalidate_item_id = target->item_id;
+
+	if (!start_in_new_thread(generic_layer_worker, args)) {
+		free_generic_layer_args(args);
+		return CMD_GENERIC_ERROR;
+	}
+	return CMD_OK | CMD_NOTIFY_GFIT_MODIFIED;
+}
+
+/* flis_clearmask <id|"name"> — strip the layer's mask.  Mirrors the
+ * panel's mask Remove… button. */
+int process_flis_clearmask(int nb) {
+	if (nb < 2) {
+		siril_log_error(_("Usage: flis_clearmask <id|\"name\">\n"));
+		return CMD_WRONG_N_ARG;
+	}
+	flis_layer_t *target = resolve_layer_arg(word[1]);
+	if (!target) return CMD_ARG_ERROR;
+
+	struct generic_layer_args *args = calloc(1, sizeof(*args));
+	if (!args) return CMD_ALLOC_ERROR;
+	args->layer_hook         = flis_clearmask_hook;
+	args->description        = g_strdup("flis_clearmask");
+	args->command            = TRUE;
+	args->updates_lmask      = TRUE;
+	args->invalidate_flags   = FLIS_INV_LAYER_PIXELS;
+	args->invalidate_item_id = target->item_id;
+
+	if (!start_in_new_thread(generic_layer_worker, args)) {
+		free_generic_layer_args(args);
+		return CMD_GENERIC_ERROR;
+	}
+	return CMD_OK | CMD_NOTIFY_GFIT_MODIFIED;
+}
+
+/* flis_flatten — composite all visible layers into a single base layer.
+ * Mirrors the panel's Flatten Image context item via the shared
+ * flis_flatten_hook.  This is the scripted counterpart the stacking /
+ * livestacking refusal messages direct users to. */
+int process_flis_flatten(int nb) {
+	(void)nb;
+	struct generic_layer_args *args = calloc(1, sizeof(*args));
+	if (!args) return CMD_ALLOC_ERROR;
+	args->layer_hook       = flis_flatten_hook;
+	args->description      = g_strdup("flis_flatten");
+	args->command          = TRUE;
+	args->invalidate_flags = FLIS_INV_ALL;
+
+	if (!start_in_new_thread(generic_layer_worker, args)) {
+		free_generic_layer_args(args);
+		return CMD_GENERIC_ERROR;
+	}
+	return CMD_OK | CMD_NOTIFY_GFIT_MODIFIED;
+}
+
+/* flis_addgroup [-name="X"] — create a new layer group. */
+int process_flis_addgroup(int nb) {
+	const char *name = NULL;
+	for (int i = 1; i < nb; i++) {
+		if (!word[i]) continue;
+		if (g_str_has_prefix(word[i], "-name=")) {
+			name = strip_optval_quotes(word[i] + 6);
+		} else {
+			siril_log_error(_("flis_addgroup: unknown argument '%s'\n"), word[i]);
+			return CMD_ARG_ERROR;
+		}
+	}
+	struct flis_addgroup_args *payload = calloc(1, sizeof(*payload));
+	if (!payload) return CMD_ALLOC_ERROR;
+	payload->destroy_fn = flis_addgroup_args_free;
+	payload->name       = (name && *name) ? g_strdup(name) : NULL;
+
+	struct generic_layer_args *args = calloc(1, sizeof(*args));
+	if (!args) { flis_addgroup_args_free(payload); return CMD_ALLOC_ERROR; }
+	args->layer_hook         = flis_addgroup_hook;
+	args->user               = payload;
+	args->description        = g_strdup("flis_addgroup");
+	args->command            = TRUE;
+	args->invalidate_flags   = FLIS_INV_STACK;  /* groups affect z-order display */
+	args->invalidate_item_id = 0;
+
+	if (!start_in_new_thread(generic_layer_worker, args)) {
+		free_generic_layer_args(args);
+		return CMD_GENERIC_ERROR;
+	}
+	return CMD_OK | CMD_NOTIFY_GFIT_MODIFIED;
+}
+
+/* flis_setgroup <layer-id|"name"> { <group-id|"name"> | -clear } */
+int process_flis_setgroup(int nb) {
+	if (nb < 3) {
+		siril_log_error(_("Usage: flis_setgroup <layer-id|\"name\"> "
+		                  "{ <group-id|\"name\"> | -clear }\n"));
+		return CMD_WRONG_N_ARG;
+	}
+	flis_layer_t *target = resolve_layer_arg(word[1]);
+	if (!target) return CMD_ARG_ERROR;
+
+	gint target_group = 0;
+	if (!g_strcmp0(word[2], "-clear")) {
+		target_group = 0;
+	} else {
+		flis_group_t *grp = resolve_group_arg(word[2]);
+		if (!grp) return CMD_ARG_ERROR;
+		target_group = grp->item_id;
+	}
+
+	struct flis_setgroup_args *payload = calloc(1, sizeof(*payload));
+	if (!payload) return CMD_ALLOC_ERROR;
+	payload->destroy_fn = flis_setgroup_args_free;
+	payload->group_id   = target_group;
+
+	struct generic_layer_args *args = calloc(1, sizeof(*args));
+	if (!args) { flis_setgroup_args_free(payload); return CMD_ALLOC_ERROR; }
+	args->layer_hook         = flis_setgroup_hook;
+	args->user               = payload;
+	args->description        = g_strdup("flis_setgroup");
+	args->command            = TRUE;
+	args->invalidate_flags   = FLIS_INV_STACK;
+	args->invalidate_item_id = target->item_id;
+
+	if (!start_in_new_thread(generic_layer_worker, args)) {
+		free_generic_layer_args(args);
+		return CMD_GENERIC_ERROR;
+	}
+	return CMD_OK | CMD_NOTIFY_GFIT_MODIFIED;
+}
+
+/* flis_setposition <id|"name"> <x> <y> — move a layer to canvas (x,y). */
+int process_flis_setposition(int nb) {
+	if (nb < 4) {
+		siril_log_error(_("Usage: flis_setposition <id|\"name\"> <x> <y>\n"));
+		return CMD_WRONG_N_ARG;
+	}
+	flis_layer_t *target = resolve_layer_arg(word[1]);
+	if (!target) return CMD_ARG_ERROR;
+	char *endx, *endy;
+	gint x = (gint)strtol(word[2], &endx, 10);
+	gint y = (gint)strtol(word[3], &endy, 10);
+	if (*endx || *endy) {
+		siril_log_error(_("flis_setposition: x and y must be integers\n"));
+		return CMD_ARG_ERROR;
+	}
+
+	struct flis_setposition_args *payload = calloc(1, sizeof(*payload));
+	if (!payload) return CMD_ALLOC_ERROR;
+	payload->destroy_fn = flis_setposition_args_free;
+	payload->x = x;
+	payload->y = y;
+
+	struct generic_layer_args *args = calloc(1, sizeof(*args));
+	if (!args) { flis_setposition_args_free(payload); return CMD_ALLOC_ERROR; }
+	args->layer_hook         = flis_setposition_hook;
+	args->user               = payload;
+	args->description        = g_strdup("flis_setposition");
+	args->command            = TRUE;
+	args->invalidate_flags   = FLIS_INV_STACK;
+	args->invalidate_item_id = target->item_id;
+
+	if (!start_in_new_thread(generic_layer_worker, args)) {
+		free_generic_layer_args(args);
+		return CMD_GENERIC_ERROR;
+	}
+	return CMD_OK | CMD_NOTIFY_GFIT_MODIFIED;
+}
+
+/* flis_exportlayer <id|"name"> <file> — write the named layer to file. */
+int process_flis_exportlayer(int nb) {
+	if (nb < 3) {
+		siril_log_error(_("Usage: flis_exportlayer <id|\"name\"> <file>\n"));
+		return CMD_WRONG_N_ARG;
+	}
+	flis_layer_t *target = resolve_layer_arg(word[1]);
+	if (!target) return CMD_ARG_ERROR;
+
+	struct flis_exportlayer_args *payload = calloc(1, sizeof(*payload));
+	if (!payload) return CMD_ALLOC_ERROR;
+	payload->destroy_fn = flis_exportlayer_args_free;
+	payload->filename   = g_strdup(word[2]);
+
+	struct generic_layer_args *args = calloc(1, sizeof(*args));
+	if (!args) { flis_exportlayer_args_free(payload); return CMD_ALLOC_ERROR; }
+	args->layer_hook         = flis_exportlayer_hook;
+	args->user               = payload;
+	args->description        = g_strdup("flis_exportlayer");
+	args->command            = TRUE;
+	args->read_only          = TRUE;
+	args->invalidate_item_id = target->item_id;
+
+	if (!start_in_new_thread(generic_layer_worker, args)) {
+		free_generic_layer_args(args);
+		return CMD_GENERIC_ERROR;
+	}
+	return CMD_OK | CMD_NOTIFY_GFIT_MODIFIED;
+}
+
+/* -----------------------------------------------------------------
+ * Layer property commands (§4.3 slice 8) — set name / blend mode /
+ * opacity / visibility / locked / tint.  Thin wrappers around the
+ * existing flis_layer_set_* primitives.  Following the pattern of
+ * flis_active_layer, they call the primitive directly (no worker)
+ * — these are fast property mutations and don't need the worker's
+ * thread management.  Display refresh is the caller's
+ * responsibility (the script processor flushes at end; interactive
+ * GUI users see the panel's own widget feedback).
+ * ----------------------------------------------------------------- */
+
+/* Shared tail for the flis_set* property commands: push a props-only undo
+ * entry (captured before the mutation; no-op when scripted) and refresh
+ * the composite / layers panel / display, so a property change is undoable
+ * and visible immediately — matching the panel's dispatch path. */
+static int flis_prop_cmd_finish(const flis_layer_t *target, int rc,
+                                const flis_layer_props_t *pre,
+                                const char *cmdname) {
+	if (rc)
+		return CMD_GENERIC_ERROR;
+	undo_save_flis_layer_props_snapshot(target->item_id, pre, cmdname);
+	notify_gfit_data_modified();
+	return CMD_OK;
+}
+
+int process_flis_setname(int nb) {
+	if (nb < 3) {
+		siril_log_error(_("Usage: flis_setname <id|\"name\"> \"<new name>\"\n"));
+		return CMD_WRONG_N_ARG;
+	}
+	flis_layer_t *target = resolve_layer_arg(word[1]);
+	if (!target) return CMD_ARG_ERROR;
+	/* Strip surrounding quotes on the new name if present. */
+	gchar *name = g_strdup(word[2]);
+	size_t len = strlen(name);
+	if (len >= 2 && name[0] == '"' && name[len-1] == '"') {
+		name[len-1] = '\0';
+		memmove(name, name + 1, len - 1);
+	}
+	flis_layer_props_t pre;
+	flis_layer_capture_props(target, &pre);
+	int rv = flis_layer_set_name(target, name);
+	g_free(name);
+	return flis_prop_cmd_finish(target, rv, &pre, "flis_setname");
+}
+
+int process_flis_setblend(int nb) {
+	if (nb < 3) {
+		siril_log_error(_("Usage: flis_setblend <layer-or-group-id|\"name\"> <mode>\n"));
+		return CMD_WRONG_N_ARG;
+	}
+	flis_layer_t *target = NULL;
+	flis_group_t *group = NULL;
+	if (!resolve_layer_or_group_arg(word[1], "flis_setblend", &target, &group))
+		return CMD_ARG_ERROR;
+	flis_blend_mode_t mode = flis_blend_mode_from_name(word[2]);
+	if (!mode) {
+		siril_log_error(_("flis_setblend: unknown blend mode '%s'\n"), word[2]);
+		return CMD_ARG_ERROR;
+	}
+	if (group) {
+		/* No group-props undo record type exists, and the panel captures no
+		 * provenance for group properties either (dispatch_op in flis_gui.c
+		 * excludes them deliberately).  Match that rather than invent a
+		 * second answer for the same operation. */
+		if (flis_group_set_blend_mode(group, mode))
+			return CMD_GENERIC_ERROR;
+		if (!com.script)
+			siril_log_message(_("Note: group property changes cannot be undone yet\n"));
+		notify_gfit_data_modified();
+		return CMD_OK;
+	}
+	if (mode == FLIS_BLEND_PASS_THROUGH) {
+		/* "Members composite directly at natural z-order" is a statement about
+		 * a group's contents; a layer has none. */
+		siril_log_error(_("flis_setblend: PASS_THROUGH applies to groups, not layers\n"));
+		return CMD_ARG_ERROR;
+	}
+	flis_layer_props_t pre;
+	flis_layer_capture_props(target, &pre);
+	int rc = flis_prop_cmd_finish(target,
+			flis_layer_set_blend_mode(target, mode), &pre, "flis_setblend");
+	if (rc == CMD_OK) {
+		/* NDE provenance (sketch §13.2).  Uncoupled: command undo is
+		 * headless-gated; coupling lives in the GUI dispatch path only. */
+		GString *kv = nde_kv_start();
+		nde_kv_add_int(kv, "blend", mode);
+		nde_capture_structural("layer.set_blend", NDE_SCOPE_LAYER,
+		                       target->item_id, nde_kv_end(kv), _("Set blend mode"));
+	}
+	return rc;
+}
+
+int process_flis_setopacity(int nb) {
+	if (nb < 3) {
+		siril_log_error(_("Usage: flis_setopacity <id|\"name\"> <0.0-1.0>\n"));
+		return CMD_WRONG_N_ARG;
+	}
+	flis_layer_t *target = resolve_layer_arg(word[1]);
+	if (!target) return CMD_ARG_ERROR;
+	char *end;
+	double v = g_ascii_strtod(word[2], &end);
+	if (*end || v < 0.0 || v > 1.0) {
+		siril_log_error(_("flis_setopacity: opacity must be a float in [0.0, 1.0]\n"));
+		return CMD_ARG_ERROR;
+	}
+	flis_layer_props_t pre;
+	flis_layer_capture_props(target, &pre);
+	int rc = flis_prop_cmd_finish(target,
+			flis_layer_set_opacity(target, (gfloat)v), &pre, "flis_setopacity");
+	if (rc == CMD_OK) {
+		GString *kv = nde_kv_start();
+		nde_kv_add_float(kv, "opacity", (gfloat)v);
+		nde_capture_structural("layer.set_opacity", NDE_SCOPE_LAYER,
+		                       target->item_id, nde_kv_end(kv), _("Set opacity"));
+	}
+	return rc;
+}
+
+int process_flis_setvisible(int nb) {
+	if (nb < 3) {
+		siril_log_error(_("Usage: flis_setvisible <id|\"name\"> <on|off>\n"));
+		return CMD_WRONG_N_ARG;
+	}
+	flis_layer_t *target = resolve_layer_arg(word[1]);
+	if (!target) return CMD_ARG_ERROR;
+	int b = parse_bool_arg(word[2]);
+	if (b < 0) {
+		siril_log_error(_("flis_setvisible: expected on/off/true/false/1/0\n"));
+		return CMD_ARG_ERROR;
+	}
+	flis_layer_props_t pre;
+	flis_layer_capture_props(target, &pre);
+	int rc = flis_prop_cmd_finish(target,
+			flis_layer_set_visible(target, b), &pre, "flis_setvisible");
+	if (rc == CMD_OK) {
+		GString *kv = nde_kv_start();
+		nde_kv_add_bool(kv, "visible", b);
+		nde_capture_structural("layer.set_visible", NDE_SCOPE_LAYER,
+		                       target->item_id, nde_kv_end(kv), _("Set visibility"));
+	}
+	return rc;
+}
+
+int process_flis_setlocked(int nb) {
+	if (nb < 3) {
+		siril_log_error(_("Usage: flis_setlocked <id|\"name\"> <on|off>\n"));
+		return CMD_WRONG_N_ARG;
+	}
+	flis_layer_t *target = resolve_layer_arg(word[1]);
+	if (!target) return CMD_ARG_ERROR;
+	int b = parse_bool_arg(word[2]);
+	if (b < 0) {
+		siril_log_error(_("flis_setlocked: expected on/off/true/false/1/0\n"));
+		return CMD_ARG_ERROR;
+	}
+	flis_layer_props_t pre;
+	flis_layer_capture_props(target, &pre);
+	return flis_prop_cmd_finish(target,
+			flis_layer_set_locked(target, b), &pre, "flis_setlocked");
+}
+
+int process_flis_settint(int nb) {
+	if (nb < 3) {
+		siril_log_error(_("Usage: flis_settint <id|\"name\"> { -clear | <r> <g> <b> }\n"));
+		return CMD_WRONG_N_ARG;
+	}
+	flis_layer_t *target = resolve_layer_arg(word[1]);
+	if (!target) return CMD_ARG_ERROR;
+	if (!g_strcmp0(word[2], "-clear")) {
+		/* Use the primitive so the locked-layer check, tint reset and
+		 * modified stamp all apply — mirrors flis_layer_set_tint below. */
+		flis_layer_props_t pre_clear;
+		flis_layer_capture_props(target, &pre_clear);
+		int rc_clear = flis_prop_cmd_finish(target,
+				flis_layer_clear_tint(target), &pre_clear, "flis_settint");
+		if (rc_clear == CMD_OK) {
+			/* NDE provenance — tint is a recorded compositing property. */
+			GString *kv = nde_kv_start();
+			nde_kv_add_bool(kv, "tinted", FALSE);
+			nde_capture_structural("layer.set_tint", NDE_SCOPE_LAYER,
+			                       target->item_id, nde_kv_end(kv), _("Clear tint"));
+		}
+		return rc_clear;
+	}
+	if (nb < 5) {
+		siril_log_error(_("flis_settint: need three colour components (r g b) or -clear\n"));
+		return CMD_WRONG_N_ARG;
+	}
+	char *er, *eg, *eb;
+	double r = g_ascii_strtod(word[2], &er);
+	double g = g_ascii_strtod(word[3], &eg);
+	double b = g_ascii_strtod(word[4], &eb);
+	if (*er || *eg || *eb ||
+	    r < 0.0 || r > 1.0 || g < 0.0 || g > 1.0 || b < 0.0 || b > 1.0) {
+		siril_log_error(_("flis_settint: r g b must each be floats in [0.0, 1.0]\n"));
+		return CMD_ARG_ERROR;
+	}
+	flis_layer_props_t pre;
+	flis_layer_capture_props(target, &pre);
+	int rc = flis_prop_cmd_finish(target,
+			flis_layer_set_tint(target, r, g, b), &pre, "flis_settint");
+	if (rc == CMD_OK) {
+		/* NDE provenance — tint is a recorded compositing property. */
+		GString *kv = nde_kv_start();
+		nde_kv_add_bool(kv, "tinted", TRUE);
+		nde_kv_add_double(kv, "r", r);
+		nde_kv_add_double(kv, "g", g);
+		nde_kv_add_double(kv, "b", b);
+		nde_capture_structural("layer.set_tint", NDE_SCOPE_LAYER,
+		                       target->item_id, nde_kv_end(kv), _("Set tint"));
+	}
+	return rc;
+}
+
+int process_flis_group_info(int nb) {
+	if (nb < 2) {
+		siril_log_error(_("Usage: flis_group_info <gid|\"name\">\n"));
+		return CMD_WRONG_N_ARG;
+	}
+	flis_group_t *grp = resolve_group_arg(word[1]);
+	if (!grp) return CMD_ARG_ERROR;
+
+	siril_log_info(_("Group id %d: \"%s\"\n"),
+	               grp->item_id, grp->name ? grp->name : "");
+	siril_log_info(_("  visible    : %s\n"), grp->visible ? "yes" : "no");
+	siril_log_info(_("  opacity    : %.4f\n"), (double)grp->opacity);
+	siril_log_info(_("  blend mode : %s\n"), flis_blend_mode_name(grp->blend_mode));
+	siril_log_info(_("  collapsed  : %s\n"), grp->collapsed ? "yes" : "no");
+
+	siril_log_info(_("  members    :\n"));
+	for (GSList *l = com.uniq->layers; l; l = l->next) {
+		flis_layer_t *lay = (flis_layer_t *)l->data;
+		if (lay && lay->group_id == grp->item_id)
+			siril_log_info(_("    [%d] \"%s\"\n"),
+			               lay->item_id, lay->layer_name ? lay->layer_name : "");
+	}
+	return CMD_OK;
+}
+
+/* Parse a comma-separated `<id|"name">` list into a freshly-allocated
+ * GSList of flis_layer_t* (no ownership transfer of the layers).  On any
+ * resolution failure logs and returns NULL.  Caller frees the GSList
+ * shell via g_slist_free (layer pointers are borrowed). */
+static GSList *parse_layer_subset(const char *csv) {
+	if (!csv || !*csv) {
+		siril_log_error(_("-subset= requires a comma-separated list of "
+				"layer ids or names\n"));
+		return NULL;
+	}
+	/* Known limitation: the split is a plain comma split, so quoted
+	 * layer names containing commas cannot be addressed here — use the
+	 * numeric id for such layers. */
+	GSList *out = NULL;
+	gchar **toks = g_strsplit(csv, ",", -1);
+	gboolean ok = TRUE;
+	for (gchar **t = toks; *t && ok; t++) {
+		gchar *trimmed = g_strstrip(*t);
+		if (!*trimmed) continue;
+		flis_layer_t *lay = resolve_layer_arg(trimmed);
+		if (!lay) { ok = FALSE; break; }
+		out = g_slist_append(out, lay);
+	}
+	g_strfreev(toks);
+	if (!ok) { g_slist_free(out); return NULL; }
+	return out;
+}
+
+int process_flis_layers_match(int nb) {
+	if (!is_current_image_flis()) {
+		siril_log_error(_("flis_layers_match: requires a FLIS image\n"));
+		return CMD_GENERIC_ERROR;
+	}
+
+	GSList *subset = NULL;
+	gboolean owned_subset = FALSE;
+	for (int i = 1; i < nb; i++) {
+		if (g_str_has_prefix(word[i], "-subset=")) {
+			if (owned_subset) g_slist_free(subset);  /* repeated option */
+			subset = parse_layer_subset(word[i] + 8);
+			if (!subset) return CMD_ARG_ERROR;
+			owned_subset = TRUE;
+		} else {
+			siril_log_error(_("flis_layers_match: unknown option '%s'\n"), word[i]);
+			if (owned_subset) g_slist_free(subset);
+			return CMD_ARG_ERROR;
+		}
+	}
+
+	/* M-F12: this command mutates layer pixels on the calling thread
+	 * (script / console), not through the layer worker — take the stack
+	 * writer lock over the undo snapshot (which reads layer pixels) and
+	 * the mutation together. */
+	flis_stack_writer_lock();
+	/* Snapshot every affected layer for one-step undo. */
+	GSList *snap_target = subset ? subset : com.uniq->layers;
+	if (undo_save_flis_multi_layer(snap_target, _("Layers match"))) {
+		siril_log_warning(_("flis_layers_match: could not save undo state\n"));
+	}
+
+	int ret = flis_background_neutralise_layers(subset);
+	flis_stack_writer_unlock();
+	if (owned_subset) g_slist_free(subset);
+
+	if (ret) {
+		siril_log_error(_("flis_layers_match failed\n"));
+		return CMD_GENERIC_ERROR;
+	}
+
+	gui_iface.flis_invalidate_composite();
+	gui_iface.flis_gui_update();
+	return CMD_OK;
+}
+
+/* Parse a -interp= argument string into an OpenCV interpolation constant.
+ * Returns -1 on unknown value (caller logs and aborts). */
+static int parse_interp_name(const char *s) {
+	if (!s) return -1;
+	if (!g_ascii_strcasecmp(s, "nearest")) return OPENCV_NEAREST;
+	if (!g_ascii_strcasecmp(s, "linear"))  return OPENCV_LINEAR;
+	if (!g_ascii_strcasecmp(s, "cubic"))   return OPENCV_CUBIC;
+	if (!g_ascii_strcasecmp(s, "area"))    return OPENCV_AREA;
+	if (!g_ascii_strcasecmp(s, "lanczos")) return OPENCV_LANCZOS4;
+	if (!g_ascii_strcasecmp(s, "lanczos4")) return OPENCV_LANCZOS4;
+	return -1;
+}
+
+static flis_reg_method_id parse_reg_method_name(const char *s) {
+	if (!s) return (flis_reg_method_id)-1;
+	if (!g_ascii_strcasecmp(s, "global")) return FLIS_REG_GLOBAL;
+	if (!g_ascii_strcasecmp(s, "2pass"))  return FLIS_REG_2PASS;
+	if (!g_ascii_strcasecmp(s, "dft"))    return FLIS_REG_DFT;
+	if (!g_ascii_strcasecmp(s, "kombat")) return FLIS_REG_KOMBAT;
+	return (flis_reg_method_id)-1;
+}
+
+int process_flis_register_layers(int nb) {
+	if (!is_current_image_flis()) {
+		siril_log_error(_("flis_register_layers: requires a FLIS image\n"));
+		return CMD_GENERIC_ERROR;
+	}
+
+	flis_layer_t *ref = NULL;
+	opencv_interpolation interp = OPENCV_LANCZOS4;
+	gboolean clamp = TRUE;
+	flis_reg_method_id method_id = FLIS_REG_GLOBAL;
+
+	for (int i = 1; i < nb; i++) {
+		if (g_str_has_prefix(word[i], "-ref=")) {
+			ref = resolve_layer_arg(word[i] + 5);
+			if (!ref) return CMD_ARG_ERROR;
+		} else if (g_str_has_prefix(word[i], "-method=")) {
+			flis_reg_method_id m = parse_reg_method_name(word[i] + 8);
+			if ((int)m < 0) {
+				siril_log_error(_("flis_register_layers: unknown -method= "
+				                  "value '%s' (expected one of: global, "
+				                  "2pass, dft, kombat)\n"), word[i] + 8);
+				return CMD_ARG_ERROR;
+			}
+			method_id = m;
+		} else if (g_str_has_prefix(word[i], "-interp=")) {
+			int v = parse_interp_name(word[i] + 8);
+			if (v < 0) {
+				siril_log_error(_("flis_register_layers: unknown -interp= value '%s'\n"),
+				                word[i] + 8);
+				return CMD_ARG_ERROR;
+			}
+			interp = (opencv_interpolation)v;
+		} else if (!strcmp(word[i], "-noclamp")) {
+			clamp = FALSE;
+		} else {
+			siril_log_error(_("flis_register_layers: unknown option '%s'\n"), word[i]);
+			return CMD_ARG_ERROR;
+		}
+	}
+
+	if (g_slist_length(com.uniq->layers) < 2) {
+		siril_log_error(_("flis_register_layers: need at least two layers\n"));
+		return CMD_GENERIC_ERROR;
+	}
+
+	/* Default reference: the currently active layer. */
+	if (!ref) ref = flis_active_layer();
+
+	selection_type sel_req;
+	transformation_type tx;
+	registration_function method = flis_register_resolve_method(method_id, &sel_req, &tx);
+	if (!method) {
+		siril_log_error(_("flis_register_layers: internal — unresolved method\n"));
+		return CMD_GENERIC_ERROR;
+	}
+
+	/* Snapshot every layer for one-step undo (pixels change). */
+	if (undo_save_flis_multi_layer(com.uniq->layers, _("Register layers"))) {
+		siril_log_warning(_("flis_register_layers: could not save undo state\n"));
+	}
+
+	/* M-F12: direct mutation on the calling thread — same exclusive
+	 * discipline as the panel path (whose hook runs under the layer
+	 * worker's stack writer lock). */
+	flis_stack_writer_lock();
+	int ret = flis_register_layers(ref, NULL, method, sel_req, tx, interp, clamp,
+	                               method_id);
+	flis_stack_writer_unlock();
+	if (ret) {
+		siril_log_error(_("flis_register_layers failed\n"));
+		return CMD_GENERIC_ERROR;
+	}
+
+	gui_iface.flis_invalidate_composite();
+	gui_iface.flis_gui_update();
+	return CMD_OK;
+}
+
+/* =====================================================================
+ * §7 canvas-scoped commands: act on the FLIS document's canvas
+ * (com.uniq->canvas_w/h) and shift every layer's position to track
+ * the change.  Layer pixel data is never touched.
+ *
+ * Each command snapshots every layer's props for one-step undo via
+ * undo_save_flis_multi_layer_props (positions change, pixels don't,
+ * so the props-only variant is sufficient).  The compound entry also
+ * captures com.uniq->canvas_w/h, so undo restores the canvas
+ * dimensions together with the layer positions.
+ * ===================================================================== */
+
+int process_flis_canvas_resize(int nb) {
+	if (!is_current_image_flis()) {
+		siril_log_error(_("flis_canvas_resize: requires a FLIS image\n"));
+		return CMD_GENERIC_ERROR;
+	}
+	gint w = 0, h = 0, dx = 0, dy = 0;
+	for (int i = 1; i < nb; i++) {
+		char *end;
+		if (g_str_has_prefix(word[i], "-w=")) {
+			w = (gint)g_ascii_strtoll(word[i] + 3, &end, 10);
+			if (end == word[i] + 3 || w <= 0 || w > (1 << 20)) {
+				siril_log_error(_("flis_canvas_resize: -w= must be a positive integer up to %d\n"), 1 << 20);
+				return CMD_ARG_ERROR;
+			}
+		} else if (g_str_has_prefix(word[i], "-h=")) {
+			h = (gint)g_ascii_strtoll(word[i] + 3, &end, 10);
+			if (end == word[i] + 3 || h <= 0 || h > (1 << 20)) {
+				siril_log_error(_("flis_canvas_resize: -h= must be a positive integer up to %d\n"), 1 << 20);
+				return CMD_ARG_ERROR;
+			}
+		} else if (g_str_has_prefix(word[i], "-dx=")) {
+			dx = (gint)g_ascii_strtoll(word[i] + 4, &end, 10);
+			if (end == word[i] + 4) {
+				siril_log_error(_("flis_canvas_resize: -dx= must be an integer\n"));
+				return CMD_ARG_ERROR;
+			}
+		} else if (g_str_has_prefix(word[i], "-dy=")) {
+			dy = (gint)g_ascii_strtoll(word[i] + 4, &end, 10);
+			if (end == word[i] + 4) {
+				siril_log_error(_("flis_canvas_resize: -dy= must be an integer\n"));
+				return CMD_ARG_ERROR;
+			}
+		} else {
+			siril_log_error(_("flis_canvas_resize: unknown option '%s'\n"), word[i]);
+			return CMD_ARG_ERROR;
+		}
+	}
+	if (w == 0 || h == 0) {
+		siril_log_error(_("flis_canvas_resize: -w= and -h= are required\n"));
+		return CMD_ARG_ERROR;
+	}
+	/* M-F12: direct mutation on the calling thread — writer lock over
+	 * the undo snapshot and the canvas op together. */
+	flis_stack_writer_lock();
+	if (undo_save_flis_multi_layer_props(com.uniq->layers, _("Resize canvas"))) {
+		siril_log_warning(_("flis_canvas_resize: could not save undo state\n"));
+	}
+	int canvas_ret = flis_canvas_resize((guint)w, (guint)h, dx, dy);
+	flis_stack_writer_unlock();
+	if (canvas_ret) return CMD_GENERIC_ERROR;
+	gui_iface.flis_invalidate_composite();
+	gui_iface.flis_gui_update();
+	return CMD_OK;
+}
+
+int process_flis_canvas_fit(int nb) {
+	if (!is_current_image_flis()) {
+		siril_log_error(_("flis_canvas_fit: requires a FLIS image\n"));
+		return CMD_GENERIC_ERROR;
+	}
+	gboolean include_invisible = FALSE;
+	for (int i = 1; i < nb; i++) {
+		if (!strcmp(word[i], "-all")) {
+			include_invisible = TRUE;
+		} else {
+			siril_log_error(_("flis_canvas_fit: unknown option '%s'\n"), word[i]);
+			return CMD_ARG_ERROR;
+		}
+	}
+	/* M-F12: direct mutation on the calling thread — writer lock over
+	 * the undo snapshot and the canvas op together. */
+	flis_stack_writer_lock();
+	if (undo_save_flis_multi_layer_props(com.uniq->layers, _("Fit canvas to layers"))) {
+		siril_log_warning(_("flis_canvas_fit: could not save undo state\n"));
+	}
+	int canvas_ret = flis_canvas_fit_to_layers(include_invisible);
+	flis_stack_writer_unlock();
+	if (canvas_ret) return CMD_GENERIC_ERROR;
+	gui_iface.flis_invalidate_composite();
+	gui_iface.flis_gui_update();
+	return CMD_OK;
+}
+
+int process_flis_canvas_rotate(int nb) {
+	if (!is_current_image_flis()) {
+		siril_log_error(_("flis_canvas_rotate: requires a FLIS image\n"));
+		return CMD_GENERIC_ERROR;
+	}
+	if (nb < 2) {
+		siril_log_error(_("Usage: flis_canvas_rotate <angle-degrees>\n"));
+		return CMD_WRONG_N_ARG;
+	}
+	char *end;
+	double angle = g_ascii_strtod(word[1], &end);
+	if (end == word[1]) {
+		siril_log_error(_("flis_canvas_rotate: angle must be a number\n"));
+		return CMD_ARG_ERROR;
+	}
+	/* M-F12: direct mutation on the calling thread — writer lock over
+	 * the undo snapshot and the canvas op together. */
+	flis_stack_writer_lock();
+	if (undo_save_flis_multi_layer_props(com.uniq->layers, _("Rotate canvas"))) {
+		siril_log_warning(_("flis_canvas_rotate: could not save undo state\n"));
+	}
+	int canvas_ret = flis_canvas_rotate(angle);
+	flis_stack_writer_unlock();
+	if (canvas_ret) return CMD_GENERIC_ERROR;
+	gui_iface.flis_invalidate_composite();
+	gui_iface.flis_gui_update();
+	return CMD_OK;
+}
+
+int process_flis_canvas_mirrorx(int nb) {
+	(void)nb;
+	if (!is_current_image_flis()) {
+		siril_log_error(_("flis_canvas_mirrorx: requires a FLIS image\n"));
+		return CMD_GENERIC_ERROR;
+	}
+	/* M-F12: direct mutation on the calling thread — writer lock over
+	 * the undo snapshot and the canvas op together. */
+	flis_stack_writer_lock();
+	if (undo_save_flis_multi_layer_props(com.uniq->layers, _("Mirror canvas X"))) {
+		siril_log_warning(_("flis_canvas_mirrorx: could not save undo state\n"));
+	}
+	int canvas_ret = flis_canvas_mirrorx();
+	flis_stack_writer_unlock();
+	if (canvas_ret) return CMD_GENERIC_ERROR;
+	gui_iface.flis_invalidate_composite();
+	gui_iface.flis_gui_update();
+	return CMD_OK;
+}
+
+int process_flis_canvas_mirrory(int nb) {
+	(void)nb;
+	if (!is_current_image_flis()) {
+		siril_log_error(_("flis_canvas_mirrory: requires a FLIS image\n"));
+		return CMD_GENERIC_ERROR;
+	}
+	/* M-F12: direct mutation on the calling thread — writer lock over
+	 * the undo snapshot and the canvas op together. */
+	flis_stack_writer_lock();
+	if (undo_save_flis_multi_layer_props(com.uniq->layers, _("Mirror canvas Y"))) {
+		siril_log_warning(_("flis_canvas_mirrory: could not save undo state\n"));
+	}
+	int canvas_ret = flis_canvas_mirrory();
+	flis_stack_writer_unlock();
+	if (canvas_ret) return CMD_GENERIC_ERROR;
+	gui_iface.flis_invalidate_composite();
+	gui_iface.flis_gui_update();
 	return CMD_OK;
 }
 
@@ -16673,82 +18873,101 @@ int process_ssr(int nb) {
 const op_descriptor op_desc_denoise = {
 	.id = "filters.denoise", .version = 1, .image_hook = denoise_image_hook,
 	.log_hook = denoise_log_hook, .description = N_("NL-Bayes Denoising"),
-	.mem_ratio = 3.0f, .flags = OP_MASK_CAPABLE,
+	.mem_ratio = 3.0f, .flags = OP_MASK_CAPABLE | OP_ROI_CAPABLE,
+	.serialize = denoise_serialize, .deserialize = denoise_deserialize,
 };
 const op_descriptor op_desc_gauss = {
 	.id = "filters.gauss", .version = 1, .image_hook = gauss_image_hook,
 	.log_hook = gauss_log_hook, .description = N_("Gaussian blur"),
 	.mem_ratio = 2.0f, .flags = OP_MASK_CAPABLE,
+	.serialize = gauss_serialize, .deserialize = gauss_deserialize,
 };
 const op_descriptor op_desc_unsharp = {
 	.id = "filters.unsharp", .version = 1, .image_hook = unsharp_cmd_image_hook,
 	.log_hook = unsharp_log_hook, .description = N_("Unsharp mask"),
 	.mem_ratio = 2.0f, .flags = OP_MASK_CAPABLE,
+	.serialize = unsharp_serialize, .deserialize = unsharp_deserialize,
 };
 const op_descriptor op_desc_imoper = {
 	.id = "arith.imoper", .version = 1, .image_hook = imoper_image_hook,
 	.log_hook = imoper_log_hook, .description = N_("Image addition"),
 	.mem_ratio = 2.0f, .flags = OP_MASK_CAPABLE,
+	.serialize = imoper_serialize, .deserialize = imoper_deserialize,
+	.replay_pre = imoper_replay_pre,
 };
 const op_descriptor op_desc_addmax = {
 	.id = "arith.addmax", .version = 1, .image_hook = addmax_image_hook,
 	.log_hook = addmax_log_hook, .description = N_("Add max"),
 	.mem_ratio = 1.0f, .flags = OP_MASK_CAPABLE,
+	.serialize = addmax_serialize, .deserialize = addmax_deserialize,
+	.replay_pre = addmax_replay_pre,
 };
 const op_descriptor op_desc_fdiv = {
 	.id = "arith.fdiv", .version = 1, .image_hook = fdiv_image_hook,
 	.log_hook = fdiv_log_hook, .description = N_("Image division"),
 	.mem_ratio = 1.0f, .flags = OP_MASK_CAPABLE,
+	.serialize = fdiv_serialize, .deserialize = fdiv_deserialize,
+	.replay_pre = fdiv_replay_pre,
 };
 const op_descriptor op_desc_fmul = {
 	.id = "arith.fmul", .version = 1, .image_hook = fmul_image_hook,
 	.log_hook = fmul_log_hook, .description = N_("Scalar multiplication"),
 	.mem_ratio = 1.0f, .flags = OP_MASK_CAPABLE,
+	.serialize = fmul_serialize, .deserialize = fmul_deserialize,
 };
 const op_descriptor op_desc_thresh = {
 	.id = "arith.thresh", .version = 1, .image_hook = thresh_image_hook,
 	.log_hook = thresh_log_hook, .description = N_("Threshold operation"),
 	.mem_ratio = 1.0f, .flags = OP_MASK_CAPABLE,
+	.serialize = thresh_serialize, .deserialize = thresh_deserialize,
 };
-/* neg has no log_hook (the op does not possess one) */
+/* neg has no log_hook (the op does not possess one); paramless serializer */
 const op_descriptor op_desc_neg = {
 	.id = "arith.neg", .version = 1, .image_hook = neg_image_hook,
 	.description = N_("Negative"), .mem_ratio = 1.0f, .flags = OP_MASK_CAPABLE,
+	.serialize = paramless_serialize, .deserialize = paramless_deserialize_v1,
 };
 const op_descriptor op_desc_nozero = {
 	.id = "arith.nozero", .version = 1, .image_hook = nozero_image_hook,
 	.log_hook = nozero_log_hook, .description = N_("Replace zeros"),
 	.mem_ratio = 1.0f, .flags = 0,
+	.serialize = nozero_serialize, .deserialize = nozero_deserialize,
 };
 const op_descriptor op_desc_ddp = {
 	.id = "filters.ddp", .version = 1, .image_hook = ddp_image_hook,
 	.log_hook = ddp_log_hook, .description = N_("Digital Development Processing"),
 	.mem_ratio = 2.0f, .flags = OP_MASK_CAPABLE,
+	.serialize = ddp_serialize, .deserialize = ddp_deserialize,
 };
 const op_descriptor op_desc_ffill = {
 	.id = "arith.ffill", .version = 1, .image_hook = ffill_image_hook,
 	.log_hook = ffill_log_hook, .description = N_("Fill mirrored region"),
 	.mem_ratio = 1.0f, .flags = OP_MASK_CAPABLE,
+	.serialize = ffill_serialize, .deserialize = ffill_deserialize,
 };
 const op_descriptor op_desc_fill = {
 	.id = "arith.fill", .version = 1, .image_hook = fill_image_hook,
 	.log_hook = fill_log_hook, .description = N_("Fill region"),
 	.mem_ratio = 1.0f, .flags = OP_MASK_CAPABLE,
+	.serialize = fill_serialize, .deserialize = fill_deserialize,
 };
 const op_descriptor op_desc_offset = {
 	.id = "arith.offset", .version = 1, .image_hook = offset_image_hook,
 	.log_hook = offset_log_hook, .description = N_("Offset"),
 	.mem_ratio = 1.0f, .flags = OP_MASK_CAPABLE,
+	.serialize = offset_serialize, .deserialize = offset_deserialize,
 };
-/* grey_flat has no log_hook */
+/* grey_flat has no log_hook; paramless serializer */
 const op_descriptor op_desc_grey_flat = {
 	.id = "color.grey_flat", .version = 1, .image_hook = grey_flat_image_hook,
 	.description = N_("Grey flat"), .mem_ratio = 1.0f, .flags = 0,
+	.serialize = paramless_serialize, .deserialize = paramless_deserialize_v1,
 };
-/* log stretch has no log_hook and does no memory check */
+/* log stretch has no log_hook and does no memory check; paramless serializer */
 const op_descriptor op_desc_logstretch = {
 	.id = "stretch.log", .version = 1, .image_hook = log_image_hook,
 	.description = N_("Log stretch"), .mem_ratio = 0.0f, .flags = 0,
+	.serialize = paramless_serialize, .deserialize = paramless_deserialize_v1,
 };
 const op_descriptor op_desc_entropy = {
 	.id = "stats.entropy", .version = 1, .image_hook = entropy_image_hook,
@@ -16775,15 +18994,18 @@ const op_descriptor op_desc_findhot = {
 	.id = "cfa.findhot", .version = 1, .image_hook = findhot_image_hook,
 	.description = N_("Find Hot/Cold Pixels"), .mem_ratio = 0.0f, .flags = 0,
 };
-/* fix_xtrans has no log_hook */
+/* fix_xtrans has no log_hook; paramless serializer */
 const op_descriptor op_desc_fix_xtrans = {
 	.id = "cfa.fix_xtrans", .version = 1, .image_hook = fix_xtrans_image_hook,
-	.description = N_("Fix X-Trans artefacts"), .mem_ratio = 1.0f, .flags = 0,
+	.description = N_("Fix X-Trans artefacts"), .mem_ratio = 1.0f,
+	.flags = OP_REQ_MONO,   /* a CFA pattern only exists before debayering */
+	.serialize = paramless_serialize, .deserialize = paramless_deserialize_v1,
 };
 const op_descriptor op_desc_limit = {
 	.id = "arith.limit", .version = 1, .image_hook = limit_image_hook,
 	.log_hook = limit_log_hook, .description = N_("Limit pixels"),
 	.mem_ratio = 0.0f, .flags = 0,
+	.serialize = limit_serialize, .deserialize = limit_deserialize,
 };
 const op_descriptor op_desc_stat = {
 	.id = "stats.stat", .version = 1, .image_hook = stat_cmd_image_hook,
@@ -16794,4 +19016,5 @@ const op_descriptor op_desc_autoghs_unlinked = {
 	.id = "stretch.autoghs_unlinked", .version = 1, .image_hook = autoghs_unlinked_hook,
 	.log_hook = autoghs_unlinked_log_hook, .description = N_("AutoGHS (unlinked)"),
 	.mem_ratio = 0.0f, .flags = OP_MASK_CAPABLE,
+	.serialize = autoghs_unlinked_serialize, .deserialize = autoghs_unlinked_deserialize,
 };

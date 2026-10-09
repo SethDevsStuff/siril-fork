@@ -25,12 +25,17 @@
 #include "algos/photometric_cc.h"
 #include "algos/siril_wcs.h"
 #include "algos/spcc.h"
+#include "core/nde/nde_history.h"
+#include "core/nde/nde_joint.h"
+#include "core/nde/nde_replay.h"
 #include "core/op_descriptors.h"
 #include "core/processing.h"
 #include "core/siril_log.h"
 #include "core/siril_networking.h"
 #include "core/siril_update.h"
+#include "core/undo.h"
 #include "gui-gtk4/dialogs.h"
+#include "gui-gtk4/flis_gui.h"
 #include "gui-gtk4/image_interactions.h"
 #include "gui-gtk4/message_dialog.h"
 #include "gui-gtk4/photometric_cc.h"
@@ -39,6 +44,7 @@
 #include "gui-gtk4/utils.h"
 #include "io/healpix/fluxcache_cat.h"
 #include "io/healpix/healpix_cat.h"
+#include "io/image_format_flis.h"
 #include "io/local_catalogues.h"
 
 #define MIN_PLOT 336.0
@@ -71,12 +77,17 @@ void reset_spcc_filters() {
 	spcc_filters_initialized = FALSE;
 }
 
+/* Forward: the amend context lives with start_photometric_cc below. */
+static void pcc_amend_cancel(void);
+
 void on_buttonPCC_close_clicked(GtkButton *button, gpointer user_data) {
+	pcc_amend_cancel();
 	flux_cache_close_all();
 	siril_close_dialog("s_pcc_dialog");
 }
 
 gboolean s_pcc_hide_on_delete(GtkWidget *widget) {
+	pcc_amend_cancel();
 	siril_close_dialog("s_pcc_dialog");
 	return TRUE;
 }
@@ -207,14 +218,11 @@ void check_gaia_archive_status() {
 	g_thread_unref(g_thread_new("gaia-status-check", gaia_check, NULL));
 }
 
-static void start_photometric_cc(gboolean spcc) {
+/* The dialog's state as a fresh params struct — shared by the ordinary run
+ * and the NDE amend path, which must record exactly what a fresh run would.
+ * NULL when the SPCC selections are incomplete (already reported). */
+static struct photometric_cc_data *pcc_args_from_widgets(gboolean spcc) {
 	GtkCheckButton *auto_bkg = GTK_CHECK_BUTTON(lookup_widget("button_cc_bkg_auto"));
-
-	if (!has_wcs(gfit)) {
-		siril_log_error(_("There is no valid WCS information in the header. Please platesolve first.\n"));
-		return;
-	}
-
 	struct photometric_cc_data *pcc_args = calloc(1, sizeof(struct photometric_cc_data));
 	set_bg_sigma(pcc_args);
 	if (spcc) {
@@ -223,24 +231,106 @@ static void start_photometric_cc(gboolean spcc) {
 		pcc_args->spcc = TRUE;
 		if (set_spcc_args(pcc_args)) {
 			free(pcc_args);
-			return;
+			return NULL;
 		}
 	} else {
 		pcc_args->catalog = get_photometry_catalog_from_GUI();
 		pcc_args->spcc = FALSE;
 	}
-
-	pcc_args->fit = gfit;
 	pcc_args->bg_auto = siril_toggle_get_active(GTK_WIDGET(auto_bkg));
 	pcc_args->bg_area = get_bkg_selection();
 	pcc_args->mag_mode = LIMIT_MAG_AUTO;
+	get_mag_settings_from_GUI(&pcc_args->mag_mode, &pcc_args->magnitude_arg);
+	pcc_args->destroy_fn = free_photometric_cc_data;
+	return pcc_args;
+}
+
+/* ---- NDE amend mode (nde_editors.c) -------------------------------------
+ * Editing a recorded PCC/SPCC step — single-image or a group joint record —
+ * reopens THIS dialog pre-filled from the record; OK routes the new
+ * parameters through the ordinary amend, whose replay re-runs the analysis
+ * against the record's embedded star catalogue.  No live preview: the
+ * pipeline runs at commit, and a joint record writes to several layers. */
+static struct {
+	gint64   record_id;   /* 0 = not amending */
+	gboolean is_joint;
+} pcc_amend;
+
+static void pcc_amend_apply(gboolean spcc);
+
+static void pcc_amend_cancel(void) {
+	pcc_amend.record_id = 0;
+}
+
+static void start_photometric_cc(gboolean spcc) {
+	if (pcc_amend.record_id) {
+		pcc_amend_apply(spcc);
+		return;
+	}
+
+	/* Group path: with a layer group selected the calibration runs on the
+	 * group's colour composite (WCS transplanted from a solved layer by the
+	 * hook), so gfit itself need not be solved. */
+	gint gid = is_current_image_flis() ? flis_panel_selected_group_id() : 0;
+
+	if (!gid && !has_wcs(gfit)) {
+		siril_log_error(_("There is no valid WCS information in the header. Please platesolve first.\n"));
+		return;
+	}
+
+	struct photometric_cc_data *pcc_args = pcc_args_from_widgets(spcc);
+	if (!pcc_args)
+		return;
+	pcc_args->fit = gfit;
 
 	set_cursor_waiting(TRUE);
-
-	get_mag_settings_from_GUI(&pcc_args->mag_mode, &pcc_args->magnitude_arg);
 	control_window_switch_to_tab(OUTPUT_LOGS);
 
-	pcc_args->destroy_fn = free_photometric_cc_data;
+	if (gid) {
+		const char *label = spcc ? _("Spectrophotometric CC (group)")
+		                         : _("Photometric CC (group)");
+		flis_group_t *grp = flis_group_get_by_id(gid);
+		GSList *members = grp ? flis_group_get_layers(grp) : NULL;
+		if (!members) {
+			siril_log_error(_("%s: the selected group has no layers\n"), label);
+			free_photometric_cc_data(pcc_args);
+			set_cursor_waiting(FALSE);
+			return;
+		}
+		if (undo_save_flis_multi_layer(members, "%s", label))
+			siril_log_warning(_("%s: could not save undo state\n"), label);
+		g_slist_free(members);
+
+		pcc_args->fit = NULL;	/* the hook renders and owns the composite */
+		struct flis_group_calib_args *p = new_flis_group_calib_args();
+		if (!p) {
+			free_photometric_cc_data(pcc_args);
+			set_cursor_waiting(FALSE);
+			PRINT_ALLOC_ERR;
+			return;
+		}
+		p->kind = spcc ? FLIS_GROUP_CALIB_SPCC : FLIS_GROUP_CALIB_PCC;
+		p->group_id = gid;
+		p->pcc = pcc_args;	/* ownership transferred */
+
+		struct generic_layer_args *gargs = calloc(1, sizeof(*gargs));
+		if (!gargs) {
+			free_flis_group_calib_args(p);
+			set_cursor_waiting(FALSE);
+			PRINT_ALLOC_ERR;
+			return;
+		}
+		gargs->layer = NULL;	/* multi-layer op */
+		gargs->layer_hook = flis_group_calibration_hook;
+		gargs->user = p;
+		gargs->description = g_strdup(label);
+		gargs->invalidate_flags = FLIS_INV_ALL;
+		if (!start_in_new_thread(generic_layer_worker, gargs)) {
+			free_generic_layer_args(gargs);
+			set_cursor_waiting(FALSE);
+		}
+		return;
+	}
 
 	struct generic_img_args *img_args = calloc(1, sizeof(struct generic_img_args));
 	img_args->fit = gfit;
@@ -510,6 +600,193 @@ void on_button_spcc_ok_clicked(GtkButton *button, gpointer user_data) {
 				_("Make a selection of the background area"));
 	}
 	else start_photometric_cc(TRUE);
+}
+
+/* ---- NDE amend mode: record access, prefill, apply ---------------------- */
+
+/* The recorded photometric params of @record_id — deserialized from the
+ * record itself (single-image) or from the pcc blob nested inside a group
+ * joint record.  Caller frees via destroy_fn. */
+static struct photometric_cc_data *record_pcc_params(gint64 record_id,
+                                                     gboolean *is_joint) {
+	gchar *op_id = NULL, *params = NULL;
+	int op_version = 0;
+	GPtrArray *snap = nde_history_snapshot(NULL);
+	for (guint i = 0; snap && i < snap->len; i++) {
+		const nde_record *rec = g_ptr_array_index(snap, i);
+		if (rec->record_id == record_id) {
+			op_id = g_strdup(rec->op_id);
+			params = g_strdup(rec->params);
+			op_version = rec->op_version;
+			break;
+		}
+	}
+	if (snap)
+		g_ptr_array_unref(snap);
+	struct photometric_cc_data *d = NULL;
+	/* The RECORD's version for the record's own blob: this deserializer
+	 * branches on it (a v1 record is exact, a v2 one recomputes), so passing
+	 * the descriptor's current version would silently re-interpret every
+	 * older record.
+	 *
+	 * The NESTED blob is a different version namespace — it was written by
+	 * the photometric_cc serializer, not the group one, and the wrapper does
+	 * not record which version that was.  The descriptor's current version is
+	 * therefore the only available answer, and it is right for anything this
+	 * build captured.  If flis.group_calibration ever gains a v2, store the
+	 * nested blob's version alongside it rather than reusing the wrapper's. */
+	if (op_id && params && !g_strcmp0(op_id, "color.photometric_cc")) {
+		*is_joint = FALSE;
+		d = op_desc_photometric_cc.deserialize(params, op_version);
+	} else if (op_id && params && !g_strcmp0(op_id, "flis.group_calibration")) {
+		*is_joint = TRUE;
+		struct nde_joint_group_calib_data *gd =
+				op_desc_flis_group_calibration.deserialize(params, op_version);
+		if (gd && gd->pcc_blob)
+			d = op_desc_photometric_cc.deserialize(gd->pcc_blob,
+					op_desc_photometric_cc.version);
+		if (gd)
+			nde_joint_group_calib_data_free(gd);
+	}
+	g_free(op_id);
+	g_free(params);
+	return d;
+}
+
+/* Push the recorded parameters onto the dialog's widgets.  The catalogue
+ * combos are left alone: at replay the star data comes from the catalogue
+ * embedded with the record, so which service it once came from is not an
+ * editable input. */
+static void pcc_prefill_from(const struct photometric_cc_data *d) {
+	siril_toggle_set_active(lookup_widget("button_cc_bkg_auto"), d->bg_auto);
+	if (!d->bg_auto) {
+		const char *adj[4] = { "adjustment_cc_bkg_x", "adjustment_cc_bkg_y",
+		                       "adjustment_cc_bkg_w", "adjustment_cc_bkg_h" };
+		const int vals[4] = { d->bg_area.x, d->bg_area.y,
+		                      d->bg_area.w, d->bg_area.h };
+		for (int i = 0; i < 4; i++)
+			gtk_adjustment_set_value(GTK_ADJUSTMENT(
+					gtk_builder_get_object(gui.builder, adj[i])), vals[i]);
+	}
+	siril_toggle_set_active(lookup_widget("S_PCC_Mag_Limit"),
+	                        d->mag_mode != LIMIT_MAG_ABSOLUTE);
+	if (d->mag_mode == LIMIT_MAG_ABSOLUTE)
+		gtk_spin_button_set_value(GTK_SPIN_BUTTON(lookup_widget("GtkSpinPCC_Mag_Limit")),
+		                          d->magnitude_arg);
+	gtk_spin_button_set_value(GTK_SPIN_BUTTON(lookup_widget("bg_tol_lower")), 0.0 - d->t0);
+	gtk_spin_button_set_value(GTK_SPIN_BUTTON(lookup_widget("bg_tol_upper")), d->t1);
+	if (!d->spcc)
+		return;
+	gtk_switch_set_active(GTK_SWITCH(lookup_widget("spcc_sensor_switch")),
+	                      d->spcc_mono_sensor);
+	struct { const char *w; int sel; } combos[] = {
+		{ "combo_spcc_whitepoint",   d->selected_white_ref },
+		{ "combo_spcc_sensors_mono", d->selected_sensor_m },
+		{ "combo_spcc_sensors_osc",  d->selected_sensor_osc },
+		{ "combo_spcc_filters_r",    d->selected_filter_r },
+		{ "combo_spcc_filters_g",    d->selected_filter_g },
+		{ "combo_spcc_filters_b",    d->selected_filter_b },
+		{ "combo_spcc_filters_osc",  d->selected_filter_osc },
+		{ "combo_spcc_filters_lpf",  d->selected_filter_lpf },
+	};
+	for (guint i = 0; i < G_N_ELEMENTS(combos); i++) {
+		if (combos[i].sel >= 0)
+			gtk_drop_down_set_selected(GTK_DROP_DOWN(lookup_widget(combos[i].w)),
+			                           (guint)combos[i].sel);
+	}
+	siril_toggle_set_active(lookup_widget("spcc_atmos_corr"), d->atmos_corr);
+	gtk_spin_button_set_value(GTK_SPIN_BUTTON(lookup_widget("spcc_height")),
+	                          d->atmos_obs_height);
+	gtk_spin_button_set_value(GTK_SPIN_BUTTON(lookup_widget("spcc_pressure")),
+	                          d->atmos_pressure);
+	siril_toggle_set_active(lookup_widget("spcc_pressure_is_slp"),
+	                        d->atmos_pressure_is_slp);
+	siril_toggle_set_active(lookup_widget("spcc_toggle_nb"), d->nb_mode);
+	if (d->nb_mode) {
+		gtk_spin_button_set_value(GTK_SPIN_BUTTON(lookup_widget("spcc_nb_r_wl")), d->nb_center[RLAYER]);
+		gtk_spin_button_set_value(GTK_SPIN_BUTTON(lookup_widget("spcc_nb_g_wl")), d->nb_center[GLAYER]);
+		gtk_spin_button_set_value(GTK_SPIN_BUTTON(lookup_widget("spcc_nb_b_wl")), d->nb_center[BLAYER]);
+		gtk_spin_button_set_value(GTK_SPIN_BUTTON(lookup_widget("spcc_nb_r_bw")), d->nb_bandwidth[RLAYER]);
+		gtk_spin_button_set_value(GTK_SPIN_BUTTON(lookup_widget("spcc_nb_g_bw")), d->nb_bandwidth[GLAYER]);
+		gtk_spin_button_set_value(GTK_SPIN_BUTTON(lookup_widget("spcc_nb_b_bw")), d->nb_bandwidth[BLAYER]);
+	}
+}
+
+gboolean pcc_open_amend(gint64 record_id) {
+	gboolean is_joint = FALSE;
+	struct photometric_cc_data *d = record_pcc_params(record_id, &is_joint);
+	if (!d)
+		return FALSE;   /* kv-grid fallback still shows the raw blob */
+	if (d->spcc) {
+		/* The sensor/filter combos fill from the SPCC metadata, which may
+		 * not have been touched this session — synchronously here (main
+		 * thread), so the prefill below lands on populated models. */
+		load_spcc_metadata_if_needed();
+		populate_spcc_combos(NULL);
+		initialize_spectrophotometric_cc_dialog();
+	} else {
+		initialize_photometric_cc_dialog();
+	}
+	siril_open_dialog("s_pcc_dialog");
+	pcc_prefill_from(d);
+	pcc_amend.record_id = record_id;
+	pcc_amend.is_joint = is_joint;
+	if (d->destroy_fn)
+		d->destroy_fn(d);
+	return TRUE;
+}
+
+/* OK while amending: serialize the dialog's state into the record — the
+ * replay re-runs the pipeline with it, against the embedded catalogue. */
+static void pcc_amend_apply(gboolean spcc) {
+	const gint64 rid = pcc_amend.record_id;
+	const gboolean joint = pcc_amend.is_joint;
+	struct photometric_cc_data *pa = pcc_args_from_widgets(spcc);
+	if (!pa)
+		return;   /* invalid selections; the dialog stays open */
+	/* The old record's computed coefficients stay recorded as the offline
+	 * fallback (photometric_cc.c serializer contract). */
+	gboolean was_joint = FALSE;
+	struct photometric_cc_data *old = record_pcc_params(rid, &was_joint);
+	if (old) {
+		memcpy(pa->eff_kw, old->eff_kw, sizeof(pa->eff_kw));
+		memcpy(pa->eff_bg, old->eff_bg, sizeof(pa->eff_bg));
+		pa->have_fallback = old->have_fallback || old->have_effective;
+		if (old->destroy_fn)
+			old->destroy_fn(old);
+	}
+	gchar *pblob = op_desc_photometric_cc.serialize(pa);
+	gchar *blob = pblob;
+	if (joint) {
+		gchar *jparams = NULL;
+		GPtrArray *snap = nde_history_snapshot(NULL);
+		for (guint i = 0; snap && i < snap->len; i++) {
+			const nde_record *rec = g_ptr_array_index(snap, i);
+			if (rec->record_id == rid)
+				jparams = g_strdup(rec->params);
+		}
+		if (snap)
+			g_ptr_array_unref(snap);
+		struct nde_joint_group_calib_data *gd = jparams ?
+				op_desc_flis_group_calibration.deserialize(jparams,
+						op_desc_flis_group_calibration.version) : NULL;
+		g_free(jparams);
+		if (!gd) {
+			siril_log_error(_("The recorded step could not be re-read — nothing was changed\n"));
+			g_free(pblob);
+			free_photometric_cc_data(pa);
+			return;
+		}
+		g_free(gd->pcc_blob);
+		gd->pcc_blob = pblob;   /* ownership moves; freed with gd */
+		blob = op_desc_flis_group_calibration.serialize(gd);
+		nde_joint_group_calib_data_free(gd);
+	}
+	free_photometric_cc_data(pa);
+	pcc_amend.record_id = 0;
+	siril_close_dialog("s_pcc_dialog");
+	nde_amend_start(rid, blob);   /* refresh via nde_history_changed */
+	g_free(blob);
 }
 
 void on_button_cc_bkg_auto_toggled(GtkCheckButton *button,

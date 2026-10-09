@@ -20,6 +20,7 @@
 #include "core/siril_log.h"
 #include "core/undo.h"
 /* gui_calls.h removed: all former direct calls now route through gui_iface */
+#include "core/nde/nde_script_scope.h"
 #include "gui-gtk4/user_polygons.h"
 #include "io/image_format_fits.h"
 #include "io/sequence.h"
@@ -193,7 +194,7 @@ static int fits_to_py(fits *fit, unsigned char *ptr, size_t maxlen) {
 	COPY_BE64((uint64_t) fit->top_down, uint64_t);
 	COPY_BE64((uint64_t) fit->focalkey, uint64_t);
 	COPY_BE64((uint64_t) fit->pixelkey, uint64_t);
-	COPY_BE64((uint64_t) fit->color_managed, uint64_t);
+	COPY_BE64((uint64_t) fit_get_color_managed(fit), uint64_t);
 	return 0;
 }
 
@@ -1238,6 +1239,14 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 					success = send_response(conn, STATUS_NONE, error_msg, strlen(error_msg));
 					break;
 				}
+				if (processing_is_reserved_for_replay()) {
+					/* NDE replay re-run: gfit temporarily holds intermediate
+					 * replay state — an undo entry snapshotting it could later
+					 * restore pixels the history no longer describes.  Accept
+					 * silently so scripts behave identically under replay. */
+					success = send_response(conn, STATUS_OK, NULL, 0);
+					break;
+				}
 				// Ensure null-terminated string for undo message
 				char* log_msg = g_strndup(payload, payload_length);
 				g_rw_lock_reader_lock(&gfit->rwlock);
@@ -1330,9 +1339,13 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 				const char* error_msg = _("Invalid payload length");
 				success = send_response(conn, STATUS_ERROR, error_msg, strlen(error_msg));
 			} else {
+				/* Quiesce the materialise pool before gfit's writer lock
+				 * (writer-starvation protocol, gui_iface_impl.c). */
+				gui_iface.set_suppress_redraws(TRUE);
 				g_rw_lock_writer_lock(&gfit->rwlock);
 				success = handle_set_pixeldata_request(conn, gfit, payload, payload_length);
 				g_rw_lock_writer_unlock(&gfit->rwlock);
+				gui_iface.set_suppress_redraws(FALSE);
 				// Writer lock must be released before dispatching the idle:
 				// update_single_image_from_gfit acquires the reader lock, which
 				// would deadlock if we still held the writer lock here.
@@ -1937,11 +1950,12 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 			}
 			ptr += sizeof(shared_memory_info_t);
 
-			// Always handle ICC profile data (if available)
+			// Always handle ICC profile data (if available — only the current image has one)
 			shared_memory_info_t *icc_info = NULL;
-			if (fit->icc_profile) {
+			cmsHPROFILE _icc = fit_get_icc_profile(fit);
+			if (_icc) {
 				guint32 profile_size;
-				unsigned char* profile_data = get_icc_profile_data(fit->icc_profile, &profile_size);
+				unsigned char* profile_data = get_icc_profile_data(_icc, &profile_size);
 				if (profile_data && profile_size > 0) {
 					icc_info = handle_rawdata_request(conn, profile_data, profile_size);
 				}
@@ -2227,7 +2241,8 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 				break;
 			}
 			g_rw_lock_reader_lock(&gfit->rwlock);
-			if (gfit->icc_profile == NULL) {
+			cmsHPROFILE _gprof = current_icc_profile();
+			if (_gprof == NULL) {
 				g_rw_lock_reader_unlock(&gfit->rwlock);
 				const char* error_msg = _("Image has no ICC profile");
 				success = send_response(conn, STATUS_NONE, error_msg, strlen(error_msg));
@@ -2235,7 +2250,7 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 			}
 			// Prepare data
 			guint32 profile_size;
-			unsigned char* profile_data = get_icc_profile_data(gfit->icc_profile, &profile_size);
+			unsigned char* profile_data = get_icc_profile_data(_gprof, &profile_size);
 			g_rw_lock_reader_unlock(&gfit->rwlock);
 
 			shared_memory_info_t *info = handle_rawdata_request(conn, profile_data, profile_size);
@@ -2679,9 +2694,11 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 				incoming_image_info_t* info = (incoming_image_info_t*)payload;
 				info->shm_name[sizeof(info->shm_name) - 1] = '\0';
 				info->size = GUINT64_FROM_BE(info->size);
+				gui_iface.set_suppress_redraws(TRUE);
 				g_rw_lock_writer_lock(&gfit->rwlock);
 				success = handle_set_image_header_request(conn, info);
 				g_rw_lock_writer_unlock(&gfit->rwlock);
+				gui_iface.set_suppress_redraws(FALSE);
 			}
 			break;
 		}
@@ -3021,10 +3038,11 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 			free(headerinfo);
 			ptr += sizeof(shared_memory_info_t);
 
-			// Add icc profile here as another shm (if there is an ICC profile)
-			if (fit->icc_profile) {
+			// Add icc profile here as another shm (only meaningful for the current image)
+			cmsHPROFILE _f_icc = fit_get_icc_profile(fit);
+			if (_f_icc) {
 				guint32 profile_size;
-				unsigned char* profile_data = get_icc_profile_data(fit->icc_profile, &profile_size);
+				unsigned char* profile_data = get_icc_profile_data(_f_icc, &profile_size);
 				shared_memory_info_t *info = handle_rawdata_request(conn, profile_data, profile_size);
 				if (!info) {
 					const char* error_message = _("Shared memory allocation error");
@@ -3198,9 +3216,11 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 				incoming_image_info_t* info = (incoming_image_info_t*)payload;
 				info->shm_name[sizeof(info->shm_name) - 1] = '\0';
 				info->size = GUINT64_FROM_BE(info->size);
+				gui_iface.set_suppress_redraws(TRUE);
 				g_rw_lock_writer_lock(&gfit->rwlock);
 				success = handle_set_iccprofile_request(conn, info);
 				g_rw_lock_writer_unlock(&gfit->rwlock);
+				gui_iface.set_suppress_redraws(FALSE);
 			}
 			break;
 		}
@@ -3481,7 +3501,10 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 				filename[payload_length] = '\0'; // Null-terminate the string
 				gboolean exists = g_file_test(filename, G_FILE_TEST_EXISTS);
 				if (!com.uniq) {
-					create_uniq_from_gfit(filename, exists);  // com.uniq takes ownership of filename, no need to free it here
+					// A name for an image the script produced, or the file it
+					// read: only the second is an origin "from a file".
+					create_uniq_from_gfit(filename, exists,
+					                      exists ? "file" : "generated");  // com.uniq takes ownership of filename, no need to free it here
 				} else {
 					free(com.uniq->filename);
 					com.uniq->filename = filename; // com.uniq takes ownership of filename, no need to free it here
@@ -3565,9 +3588,11 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 				incoming_image_info_t* info = (incoming_image_info_t*)payload;
 				info->shm_name[sizeof(info->shm_name) - 1] = '\0';
 				info->size = GUINT64_FROM_BE(info->size);
+				gui_iface.set_suppress_redraws(TRUE);
 				g_rw_lock_writer_lock(&gfit->rwlock);
 				success = handle_set_image_mask_request(conn, gfit, info);
 				g_rw_lock_writer_unlock(&gfit->rwlock);
+				gui_iface.set_suppress_redraws(FALSE);
 				gui_iface.show_or_hide_mask_tab();
 				if (!com.script) {
 					gui_iface.redraw_mask_idle(TRUE); // mask data changed: tints are stale
@@ -3577,6 +3602,7 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 		}
 
 		case CMD_SET_IMAGE_MASK_STATE: {
+			gui_iface.set_suppress_redraws(TRUE);
 			g_rw_lock_writer_lock(&gfit->rwlock);
 			if (single_image_is_loaded() && gfit->mask && gfit->mask->data) {
 				if (payload_length == 1) {
@@ -3584,9 +3610,11 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 					gboolean state = (statebyte);
 					set_mask_active(gfit, state);
 					g_rw_lock_writer_unlock(&gfit->rwlock);
+					gui_iface.set_suppress_redraws(FALSE);
 					success = send_response(conn, STATUS_OK, NULL, 0);
 				} else {
 					g_rw_lock_writer_unlock(&gfit->rwlock);
+					gui_iface.set_suppress_redraws(FALSE);
 					const char* error_msg = _("Failed to set mask state - invalid payload length");
 					success = send_response(conn, STATUS_ERROR, error_msg, strlen(error_msg));
 					if (!success)
@@ -3594,6 +3622,7 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 				}
 			} else {
 				g_rw_lock_writer_unlock(&gfit->rwlock);
+				gui_iface.set_suppress_redraws(FALSE);
 				const char* error_msg = _("Failed to set mask state - no image loaded or image has no mask");
 				success = send_response(conn, STATUS_ERROR, error_msg, strlen(error_msg));
 			}
@@ -3844,6 +3873,36 @@ void process_connection(Connection* conn, const gchar* buffer, gsize length) {
 					break;
 				}
 			}
+		}
+
+		case CMD_DECLARE_REPLAYABLE: {
+			/* NDE phase 5: the script declares its argument schema (JSON built
+			 * by sirilpy from the argparse parser).  Outside a capture scope
+			 * (e.g. during a replay re-run) this is a harmless no-op — scripts
+			 * must behave identically either way. */
+			if (payload_length == 0) {
+				const char* error_msg = _("Empty replay schema");
+				success = send_response(conn, STATUS_ERROR, error_msg, strlen(error_msg));
+				break;
+			}
+			gchar *schema = g_strndup(payload, payload_length);
+			nde_script_scope_declare_replayable(schema);
+			g_free(schema);
+			success = send_response(conn, STATUS_OK, NULL, 0);
+			break;
+		}
+
+		case CMD_RECORD_REPLAY_ARGS: {
+			/* NDE phase 5: the script commits its final argument values (a JSON
+			 * argv array built by sirilpy).  This is the commit signal that
+			 * upgrades the script's record to Tier-C; a well-behaved script
+			 * sends it only on Apply, never on preview or cancel.  No-op when
+			 * no capture scope is open (replay re-runs). */
+			gchar *args = g_strndup(payload, payload_length);
+			nde_script_scope_record_args(args ? args : "");
+			g_free(args);
+			success = send_response(conn, STATUS_OK, NULL, 0);
+			break;
 		}
 
 		default:

@@ -33,6 +33,7 @@
 #include "io/conversion.h"
 #include "io/FITS_symlink.h"
 #include "io/image_format_fits.h"
+#include "io/image_format_flis.h"
 #include "io/sequence.h"
 #include "io/single_image.h"
 /* global registration */
@@ -238,6 +239,15 @@ void livestacking_queue_file(char *file) {
 int start_livestacking(gboolean with_filewatcher) {
 	if (live_stacker_thread)
 		return 1;
+	/* §5.8: livestacking takes plain FITS frames from CWD and accumulates
+	 * them into a stacked single-image result.  If the user already has a
+	 * FLIS loaded, that state has no place in livestacking — refuse and
+	 * leave the FLIS untouched. */
+	if (is_current_image_flis()) {
+		siril_log_error(_("Live stacking cannot run while a FLIS layered image "
+		                  "is loaded.  Flatten the image or close it first.\n"));
+		return 1;
+	}
 	livestacking_display(_("Starting live stacking"), FALSE);
 	if (!com.headless)
 		gui_iface.livestacking_setup_gui(prepro && prepro->use_dark, prepro && prepro->use_flat, (int)reg_type);
@@ -831,7 +841,7 @@ static gpointer live_stacker(gpointer arg) {
 			if (first_stacking_result) {
 				/* number of channels may have changed */
 				com.seq.current = RESULT_IMAGE;
-				com.uniq->nb_layers = gfit->naxes[2];
+				com.uniq->chans = gfit->naxes[2];
 				com.uniq->fit = gfit;
 				siril_add_idle(livestacking_first_result_idle, NULL);
 				first_stacking_result = FALSE;

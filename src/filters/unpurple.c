@@ -22,6 +22,7 @@
 
 #include "algos/colors.h"
 #include "core/gui_iface.h"
+#include "core/nde/nde_history.h"
 #include "core/op_descriptors.h"
 #include "core/siril.h"
 #include "core/siril_log.h"
@@ -30,6 +31,104 @@
 #include "io/image_format_fits.h"
 #include "opencv/opencv.h"
 
+/* NDE serializers (phase 4.5 Convention 2 — captured effective star list).
+ *
+ * When withstarmask is TRUE the binary star mask is GENERATED from com.stars at
+ * the construction site, so we stash the effective star list (`stars=` blob,
+ * shared codec in synthstar.c) and regenerate the mask at replay:
+ * generate_binary_starmask needs only the target fits + threshold + com.stars,
+ * which replay_pre reinstalls from the blob before calling it.  When
+ * withstarmask is FALSE there is no external input and the op serializes as
+ * plain POD (no stars key). */
+static gchar *unpurple_serialize(gconstpointer user) {
+	const struct unpurpleargs *p = user;
+	GString *kv = nde_kv_start();
+	nde_kv_add_double(kv, "mod_b", p->mod_b);
+	nde_kv_add_double(kv, "thresh", p->thresh);
+	nde_kv_add_bool(kv, "withstarmask", p->withstarmask);
+	if (p->withstarmask) {
+		/* Provenance of the star set the mask was built from (see synthstar.h).
+		 * EXPLICIT ⇒ pin the list; DELEGATED ⇒ record the detection params. */
+		if (p->star_auto) {
+			nde_kv_add_bool(kv, "stars_auto", TRUE);
+			synthstar_conf_to_kv(kv, &p->star_conf);
+		} else if (p->stars_blob && *p->stars_blob) {
+			nde_kv_add_str(kv, "stars", p->stars_blob);
+		}
+	}
+	return nde_kv_end(kv);
+}
+
+static gpointer unpurple_deserialize(const gchar *blob, int version) {
+	if (version > op_desc_unpurple.version)
+		return NULL;
+	GHashTable *kv = nde_kv_parse(blob);
+	double mod_b, thresh;
+	gboolean withstarmask;
+	NDE_KV_REQUIRE(kv, nde_kv_get_double(kv, "mod_b", &mod_b) &&
+	                   nde_kv_get_double(kv, "thresh", &thresh) &&
+	                   nde_kv_get_bool(kv, "withstarmask", &withstarmask));
+	gboolean auto_d = FALSE;
+	nde_kv_get_bool(kv, "stars_auto", &auto_d);
+	const char *stars = nde_kv_get_str(kv, "stars");
+	star_finder_params conf;
+	/* A withstarmask record must carry a provenance: a pinned list (EXPLICIT)
+	 * or a complete detection conf (DELEGATED).  Anything else (e.g. a
+	 * pre-feature record) stays honestly non-replayable. */
+	if (withstarmask) {
+		if (auto_d) {
+			NDE_KV_REQUIRE(kv, synthstar_conf_from_kv(kv, &conf));
+		} else if (!stars || !*stars) {
+			g_hash_table_unref(kv);
+			return NULL;
+		}
+	}
+	struct unpurpleargs *p = new_unpurple_args();
+	if (p) {
+		p->mod_b = mod_b;
+		p->thresh = thresh;
+		p->withstarmask = withstarmask;
+		p->applying = TRUE;
+		if (withstarmask && auto_d) {
+			p->star_auto = TRUE;
+			p->star_conf = conf;
+		} else if (stars && *stars) {
+			p->stars_blob = g_strdup(stars);
+		}
+	}
+	g_hash_table_unref(kv);
+	return p;
+}
+
+/* replay_pre: for the mask variant, rebuild the binary star mask against the
+ * replay target.  EXPLICIT ⇒ reinstall com.stars from the pinned blob and let
+ * the mask build consume it.  DELEGATED ⇒ re-detect with the recorded conf
+ * (ignoring com.stars).  The POD variant (no mask) is a no-op. */
+static int unpurple_replay_pre(gpointer user, GHashTable *kv, fits *target) {
+	(void)kv;
+	struct unpurpleargs *p = user;
+	if (!p->withstarmask)
+		return 0;
+	if (!p->star_auto) {
+		int nb = 0;
+		psf_star **arr = synthstar_stars_from_blob(p->stars_blob, &nb);
+		if (!arr || nb < 1)
+			return 1;
+		replace_com_stars(arr);   /* installs + frees any previous list */
+	}
+	p->starmask = calloc(1, sizeof(fits));
+	if (!p->starmask)
+		return 1;
+	const star_finder_params *ov = p->star_auto ? &p->star_conf : NULL;
+	if (generate_binary_starmask(target, &p->starmask, p->thresh, NULL, NULL, NULL, ov)) {
+		free(p->starmask);
+		p->starmask = NULL;
+		return 1;
+	}
+	p->starmask_needs_freeing = TRUE;
+	return 0;
+}
+
 /* Op descriptor — single source of truth for this operation (op_descriptor.h) */
 const op_descriptor op_desc_unpurple = {
 	.id = "filters.unpurple", .version = 1,
@@ -37,7 +136,9 @@ const op_descriptor op_desc_unpurple = {
 	.log_hook = unpurple_log_hook,
 	.description = N_("Unpurple Filter"),
 	.mem_ratio = 2.0f,
-	.flags = OP_MASK_CAPABLE,
+	.flags = OP_MASK_CAPABLE | OP_ROI_CAPABLE | OP_REQ_RGB,
+	.serialize = unpurple_serialize, .deserialize = unpurple_deserialize,
+	.replay_pre = unpurple_replay_pre,
 };
 
 /*****************************************************************************
@@ -64,6 +165,7 @@ void free_unpurple_args(void *ptr) {
 		free(args->starmask);
 		args->starmask = NULL;
 	}
+	g_free(args->stars_blob);
 	free(ptr);
 }
 
@@ -75,17 +177,26 @@ static gboolean is_purple(float red, float green, float blue) {
 	return (h >= 0.40f && h <= 0.99f) && (s >= 0.0f) && (v >= 0.0f);
 }
 
-int generate_binary_starmask(fits *fit, fits **star_mask, double threshold) {
+int generate_binary_starmask(fits *fit, fits **star_mask, double threshold,
+                             gchar **stars_blob_out, gboolean *auto_out,
+                             star_finder_params *conf_out,
+                             const star_finder_params *conf_override) {
 	gboolean stars_needs_freeing = FALSE;
 	psf_star **stars = NULL;
 	int channel = 1;
 	int nb_stars = 0;
+	/* DELEGATED replay: ignore com.stars and re-detect with the recorded conf.
+	 * Capture / EXPLICIT replay: consume com.stars, auto-detecting when empty. */
+	gboolean force_detect = (conf_override != NULL);
+	gboolean auto_detected = FALSE;
 
-	// Private, reader-locked copy of com.stars so the starmask loop below can
-	// run off the main thread without racing a concurrent free/replace.
-	stars = snapshot_com_stars(&nb_stars);
-	if (stars)
-		stars_needs_freeing = TRUE;
+	if (!force_detect) {
+		// Private, reader-locked copy of com.stars so the starmask loop below can
+		// run off the main thread without racing a concurrent free/replace.
+		stars = snapshot_com_stars(&nb_stars);
+		if (stars)
+			stars_needs_freeing = TRUE;
+	}
 
 	int dimx = fit->naxes[0];
 	int dimy = fit->naxes[1];
@@ -93,6 +204,7 @@ int generate_binary_starmask(fits *fit, fits **star_mask, double threshold) {
 
 	// Do we have stars from Dynamic PSF or not?
 	if (nb_stars < 1) {
+		auto_detected = TRUE;
 		// snapshot_com_stars() can return a non-NULL (but empty) array if the
 		// first duplicate_psf failed; free it before peaker() overwrites stars.
 		// (stars / stars_needs_freeing are unconditionally reassigned just below.)
@@ -103,8 +215,13 @@ int generate_binary_starmask(fits *fit, fits **star_mask, double threshold) {
 		input_image->fit = fit;
 		input_image->from_seq = NULL;
 		input_image->index_in_seq = -1;
-		stars = peaker(input_image, channel, &com.pref.starfinder_conf, &nb_stars,
-						NULL, FALSE, FALSE, 0, com.pref.starfinder_conf.profile, com.max_thread);
+		if (conf_override)
+			WITH_STARFINDER_CONF(conf_override,
+					stars = peaker(input_image, channel, &com.pref.starfinder_conf, &nb_stars,
+							NULL, FALSE, FALSE, 0, com.pref.starfinder_conf.profile, com.max_thread));
+		else
+			stars = peaker(input_image, channel, &com.pref.starfinder_conf, &nb_stars,
+							NULL, FALSE, FALSE, 0, com.pref.starfinder_conf.profile, com.max_thread);
 		free(input_image);
 		stars_needs_freeing = TRUE;
 	}
@@ -114,6 +231,22 @@ int generate_binary_starmask(fits *fit, fits **star_mask, double threshold) {
 		if (stars_needs_freeing)
 			free_fitted_stars(stars);
 		return -1;
+	}
+
+	/* NDE Convention 2: record provenance for replay (capture only — an
+	 * override implies we are already replaying).  EXPLICIT ⇒ pin the effective
+	 * list; DELEGATED ⇒ record the detection params (the list is dropped, so
+	 * replay re-detects against amended upstream pixels). */
+	if (auto_out)
+		*auto_out = auto_detected;
+	if (!force_detect) {
+		if (auto_detected) {
+			if (conf_out)
+				*conf_out = com.pref.starfinder_conf;
+		} else if (stars_blob_out) {
+			g_free(*stars_blob_out);
+			*stars_blob_out = synthstar_stars_to_blob(stars, nb_stars);
+		}
 	}
 
 	siril_log_message(_("Creating binary star mask for %d stars...\n"), nb_stars);
@@ -234,8 +367,6 @@ static int unpurple_filter(struct unpurpleargs *args) {
 		}
 	}
 
-	/* No populate_roi() here: generic_image_worker performs it universally
-	 * when args->fit == gfit. */
 
 	if (fit == gfit && args->applying) {
 		siril_log_info(_("Unpurple filter applied: mod_b=%.3f, threshold=%.3f, withstarmask=%d\n"),

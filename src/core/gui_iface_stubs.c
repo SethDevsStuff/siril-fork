@@ -110,7 +110,7 @@ static void stub_update_status_bar(void) {}
 static void stub_update_menu_state(void) {}
 static void stub_set_suppress_redraws(gboolean suppress) { (void)suppress; }
 static gboolean stub_get_suppress_redraws(void) { return FALSE; }
-static void stub_populate_roi(void) {}
+static void stub_drain_tile_workers(void) {}
 static void stub_on_geometry_changed(void) {}
 static void stub_on_mask_state_changed(void) {}
 static void stub_on_crop_complete(void) {}
@@ -133,6 +133,16 @@ static void stub_invalidate_histogram(void) {}
 static void stub_update_histogram(void) {}
 static void stub_curves_reset_after_undo(void) {}
 static void stub_redraw_mask_idle(gboolean remap_tints) { (void)remap_tints; }
+static void stub_flis_invalidate_composite(void) {}
+static void stub_flis_display_invalidate(int flags, int item_id) { (void)flags; (void)item_id; }
+static void *stub_flis_get_composite(void) { return NULL; }
+static void stub_flis_composite_free(void) {}
+static void stub_flis_gui_update(void) {}
+static void stub_on_active_layer_changed(void) {}
+static gboolean stub_flis_group_is_selected(void) { return FALSE; }
+static gboolean stub_flis_multi_is_selected(void) { return FALSE; }
+static void stub_flis_gui_present_if_flis(void) {}
+static void stub_nde_history_changed(void) {}
 
 /* G additions */
 static void stub_on_channel_count_changed(void) {}
@@ -141,10 +151,9 @@ static void stub_on_precision_changed(void) {}
 /* H additions */
 static gboolean stub_roi_is_active(void) { return FALSE; }
 static gboolean stub_roi_operation_supports(void) { return FALSE; }
-static gpointer stub_get_roi_fit(void) { return NULL; }
 static void stub_get_roi_selection(rectangle *rect) { (void)rect; }
 static void stub_clear_roi(void) {}
-static void stub_restore_roi(const rectangle *rect) { (void)rect; }
+static gboolean stub_roi_active_layer_rect(rectangle *rect) { (void)rect; return FALSE; }
 static void stub_reset_display_transform(void) {}
 
 /* N – Preview */
@@ -274,6 +283,7 @@ static void stub_sequence_list_change_current(void) {}
 static void stub_enable_view_reference_checkbox(gboolean status) { (void)status; }
 static void stub_close_tab(void) {}
 static void stub_init_right_tab(void) {}
+static void stub_sync_colour_vports(void) {}
 static void stub_initialize_display_mode(void) {}
 static void stub_display_filename(void) {}
 static void stub_update_display_fwhm(void) {}
@@ -288,7 +298,6 @@ static void stub_update_menu_item(void) {}
 static void stub_update_seqlist(int layer) { (void)layer; }
 static void stub_update_sequence_overlay_async(void) {}
 static void stub_ensure_seqlist_dialog_closed(void) {}
-static void stub_copy_roi_into_gfit(void) {}
 static void stub_lock_roi_mutex(void) {}
 static void stub_unlock_roi_mutex(void) {}
 static void stub_show_or_hide_mask_tab(void) {}
@@ -310,6 +319,8 @@ static void stub_reset_cut_gui_filedependent(gpointer u) { (void)u; }
 /* Preview */
 static int stub_copy_backup_to_gfit(void) { return 0; }
 static gpointer stub_get_preview_gfit_backup(void) { return NULL; }
+static gpointer stub_get_preop_gfit(void) { return NULL; }
+static void stub_preview_note_gfit_change(const rectangle *r) { (void)r; }
 /* Registration */
 static void stub_update_reg_interface(gboolean b) { (void)b; }
 static void stub_reset_3stars_gui(void) {}
@@ -352,7 +363,7 @@ SirilGuiInterface gui_iface = {
 	.update_menu_state      = stub_update_menu_state,
 	.set_suppress_redraws   = stub_set_suppress_redraws,
 	.get_suppress_redraws   = stub_get_suppress_redraws,
-	.populate_roi           = stub_populate_roi,
+	.drain_tile_workers     = stub_drain_tile_workers,
 	.on_geometry_changed    = stub_on_geometry_changed,
 	.on_mask_state_changed  = stub_on_mask_state_changed,
 	.on_crop_complete       = stub_on_crop_complete,
@@ -369,14 +380,23 @@ SirilGuiInterface gui_iface = {
 	.update_histogram            = stub_update_histogram,
 	.curves_reset_after_undo     = stub_curves_reset_after_undo,
 	.redraw_mask_idle            = stub_redraw_mask_idle,
+	.flis_invalidate_composite   = stub_flis_invalidate_composite,
+	.flis_display_invalidate     = stub_flis_display_invalidate,
+	.flis_get_composite          = stub_flis_get_composite,
+	.flis_composite_free         = stub_flis_composite_free,
+	.flis_gui_update             = stub_flis_gui_update,
+	.on_active_layer_changed     = stub_on_active_layer_changed,
+	.flis_group_is_selected      = stub_flis_group_is_selected,
+	.flis_multi_is_selected      = stub_flis_multi_is_selected,
+	.flis_gui_present_if_flis    = stub_flis_gui_present_if_flis,
+	.nde_history_changed         = stub_nde_history_changed,
 	.on_channel_count_changed    = stub_on_channel_count_changed,
 	.on_precision_changed        = stub_on_precision_changed,
 	.roi_is_active               = stub_roi_is_active,
 	.roi_operation_supports      = stub_roi_operation_supports,
-	.get_roi_fit                 = stub_get_roi_fit,
 	.get_roi_selection           = stub_get_roi_selection,
 	.clear_roi                   = stub_clear_roi,
-	.restore_roi                 = stub_restore_roi,
+	.roi_active_layer_rect       = stub_roi_active_layer_rect,
 	.reset_display_transform     = stub_reset_display_transform,
 	.is_preview_active           = stub_is_preview_active,
 	.hide_preview                = stub_hide_preview,
@@ -444,6 +464,8 @@ SirilGuiInterface gui_iface = {
 	/* Preview */
 	.copy_backup_to_gfit             = stub_copy_backup_to_gfit,
 	.get_preview_gfit_backup         = stub_get_preview_gfit_backup,
+	.get_preop_gfit                  = stub_get_preop_gfit,
+	.preview_note_gfit_change        = stub_preview_note_gfit_change,
 	/* Registration */
 	.update_reg_interface            = stub_update_reg_interface,
 	.reset_3stars_gui                = stub_reset_3stars_gui,
@@ -483,6 +505,7 @@ SirilGuiInterface gui_iface = {
 	.enable_view_reference_checkbox  = stub_enable_view_reference_checkbox,
 	.close_tab                       = stub_close_tab,
 	.init_right_tab                  = stub_init_right_tab,
+	.sync_colour_vports              = stub_sync_colour_vports,
 	.initialize_display_mode         = stub_initialize_display_mode,
 	.display_filename                = stub_display_filename,
 	.update_display_fwhm             = stub_update_display_fwhm,
@@ -497,7 +520,6 @@ SirilGuiInterface gui_iface = {
 	.update_seqlist                  = stub_update_seqlist,
 	.update_sequence_overlay_async   = stub_update_sequence_overlay_async,
 	.ensure_seqlist_dialog_closed    = stub_ensure_seqlist_dialog_closed,
-	.copy_roi_into_gfit              = stub_copy_roi_into_gfit,
 	.lock_roi_mutex                  = stub_lock_roi_mutex,
 	.unlock_roi_mutex                = stub_unlock_roi_mutex,
 	.show_or_hide_mask_tab           = stub_show_or_hide_mask_tab,

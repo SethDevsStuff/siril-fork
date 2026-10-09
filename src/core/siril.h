@@ -173,6 +173,13 @@ typedef enum {
 	TYPEXISF = (1 << 11),
 	TYPEJXL = (1 << 12),
 	TYPEAVIF = (1 << 13),
+	/* FLIS = FITS Layered Image Specification — a constrained FITS file
+	 * carrying a multi-layer image stack.  On *open*, a .flis file is
+	 * recognised as TYPEFITS (it satisfies the FITS spec) and readfits
+	 * delegates to load_flis based on the FLIS=T header keyword.  On
+	 * *save*, the save dialog uses TYPEFLIS to select save_flis instead
+	 * of savefits. */
+	TYPEFLIS = (1 << 14),
 	TYPEAVI = (1 << 20),
 	TYPESER = (1 << 21)
 } image_type;
@@ -241,6 +248,14 @@ typedef struct historic_struct historic;
 typedef struct fwhm_struct psf_star;
 typedef struct photometry_struct photometry;
 typedef struct tilt_struct sensor_tilt;
+
+/* FLIS forward declarations — full definitions live in io/image_format_flis.h.
+ * Declaring them here lets non-GUI code reference the types from `single` and
+ * `historic_struct` without pulling in the FLIS header. */
+typedef struct _flis_layer_t       flis_layer_t;
+typedef struct _flis_group_t       flis_group_t;
+typedef struct flis_layer_props_t  flis_layer_props_t;
+typedef struct _layermask_t        layermask_t;
 
 typedef struct _mask_t {
 	uint8_t bitpix;
@@ -518,10 +533,65 @@ struct sequ {
 /* this struct is used to manage data associated with a single image loaded, outside a sequence */
 typedef struct {
 	char *filename;		// the name of the file
-	gboolean fileexist;// flag of existing file
+	gboolean fileexist;	// flag of existing file
 	char *comment;		// comment on how the file got there (user load, result...)
-	int nb_layers;		// number of layers embedded in each image file
-	fits *fit;		// the fits is still gfit, but a reference doesn't hurt
+
+	/* ---- FLIS layer list (NULL for plain FITS, non-NULL for FLIS) ----- */
+	GSList *layers;		// ordered list of flis_layer_t*, ascending by
+				// layer_order; lowest order is the base layer
+				// (which defines the canvas dimensions).
+	GSList *groups;		// list of flis_group_t*, unsorted. Each group
+				// is a named container for a subset of layers.
+	gint active_layer;	// index into `layers` of the layer currently
+				// bound to `fit` / gfit.  0 when no FLIS loaded.
+	gint next_item_id;	// next ITEM_ID to assign to a new layer/group.
+				// Initialised to 1; never reused.
+
+	/* ---- Channel count of the active layer --------------------------- */
+	int chans;		// channels in the active layer: 1 for mono,
+				// 3 for RGB.  Formerly nb_layers — renamed for
+				// clarity now that the field describes the
+				// active layer's channels rather than a layer
+				// count.  Equals fit->naxes[2]; kept in sync
+				// when active_layer changes.
+
+	fits *fit;		// the fits is still gfit, but a reference doesn't
+				// hurt.  In FLIS mode, equals the active layer's
+				// fit.  Kept in sync when active_layer changes.
+
+	/* ICC Color Management — authoritative store for the current image's
+	 * colour profile.  Single-image-only: sequence frames have no profile
+	 * (the project does not colour-manage sequence operations).  For FLIS
+	 * the same field describes the always-RGB composite — there is no
+	 * per-layer profile.  Both fields are persisted to / loaded from the
+	 * file at save/load time via the format-specific I/O paths. */
+	cmsHPROFILE icc_profile;
+	gboolean    color_managed;
+
+	/* §4.2 mask-view radio: which mask source feeds the mask tab + the
+	 * tint overlay on image vports.  0 = processing mask (gfit->mask,
+	 * the default), 1 = layer mask (active layer's lmask).  Only takes
+	 * effect when both sources exist; the panel's radio row is hidden
+	 * otherwise. */
+	gint flis_mask_view;  /* 0 = PROC, 1 = LAYER */
+
+	/* §7 canvas decoupling: the FLIS canvas is a document property,
+	 * independent of any layer.  Every layer (including the base) is
+	 * composited at its own dimensions, positioned at position_x/y on
+	 * the canvas; pixels not covered by any layer take canvas_bg.
+	 *
+	 * Populated on FLIS load (from CANVASW/H/BG, defaulting from the
+	 * base layer when those keys are absent — see §7.1 leniency) and
+	 * on flis_promote_from_gfit (canvas = the promoted fits dims).
+	 * Zero on non-FLIS images. */
+	guint canvas_w, canvas_h;
+	double canvas_bg_r, canvas_bg_g, canvas_bg_b;
+
+	/* Nondestructive-editing operation log (provenance).  Lazily created on
+	 * first capture or FLIS load; freed via nde_history_attach(NULL) in
+	 * free_image_data().  All access goes through the nde_history.[ch] API,
+	 * which guards it with its own leaf mutex. */
+	struct nde_history *nde_history;
 } single;
 
 typedef struct {
@@ -662,9 +732,11 @@ struct ffit {
 
 	GSList *history;	// HISTORY comments of FITS file, list of gchar *
 
-	/* ICC Color Management data */
-	gboolean color_managed;	// Whether color management applies to this FITS
-	cmsHPROFILE icc_profile; // ICC color management profile
+	/* ICC color management state is no longer stored per-fits; it lives
+	 * on com.uniq (see icc_profile.h current_*_icc_* accessors).  Sequence
+	 * frames and intermediate buffers operate without colour profile
+	 * tracking — the project explicitly excludes colour management from
+	 * sequence operations. */
 	mask_t* mask; // Mask for image operations
 	gboolean mask_active;	// Whether or not the mask is active
 
@@ -796,9 +868,46 @@ typedef struct _child_info {
 	GDateTime *datetime; // start time of program - distinguishes between multiple children with the same argv0
 } child_info;
 
+/* Per-layer snapshot within a compound (multi-layer) undo entry.
+ * Used by undo_save_flis_multi_layer() for operations such as registration
+ * or layer matching that atomically change multiple layers at once.
+ * Defined here rather than in image_format_flis.h because historic_struct
+ * (below) carries an array of these. */
+typedef struct {
+	gint            flis_layer_id;   /* item_id of the layer */
+	char           *filename;        /* pixel swap file path, or NULL */
+	char           *mask_filename;   /* processing mask swap file, or NULL */
+	uint8_t         mask_bitpix;
+	int             rx, ry, nchans;
+	data_type       type;
+	wcs_info        wcsdata;
+	struct wcsprm  *wcslib;
+	double          focal_length;
+	cmsHPROFILE     icc_profile;
+	gint            position_x;
+	gint            position_y;
+	flis_layer_props_t *layer_props; /* full props snapshot, always set */
+	/* If TRUE, only layer_props is restored on undo; pixel, mask, and
+	 * lmask data are not touched.  Used by undo_save_flis_multi_layer_props(). */
+	gboolean        props_only;
+	/* Layer mask snapshot for compound undo (NULL = no lmask at save time) */
+	gchar          *lmask_filename;
+	size_t          lmask_w;
+	size_t          lmask_h;
+	guint8          lmask_bitpix;
+} historic_layer_entry_t;
+
 struct historic_struct {
-	int fd;		/* open fd for the swap file; -1 if none */
-	int mask_fd;	/* open fd for the mask swap file; -1 if none */
+	/* Main pixel snapshot — since convergence phase C2 this lives in the
+	 * shared refcounted snapshot store (core/nde/nde_snapstore.h): the entry
+	 * owns one reference; NULL means the flavour saved no pixels
+	 * (props-only, icc-only, reorder, pmask-only...).  Masks below and the
+	 * compound per-layer entries keep the legacy fd/filename swap files
+	 * (delete-on-close for orphan-safety; filename-mode for compound
+	 * entries because N open fds per entry would blow the fd limit). */
+	struct nde_snap *snap;
+	int mask_fd;        /* open fd for the mask swap file; -1 if filename used or none */
+	char *mask_filename;/* path to mask swap file; non-NULL only in filename-mode */
 	char history[FLEN_VALUE];
 	int rx, ry, nchans;
 	data_type type;
@@ -808,6 +917,67 @@ struct historic_struct {
 	double focal_length;
 	cmsHPROFILE icc_profile;
 	gboolean spcc_applied;
+
+	/* ---- FLIS-aware single-layer undo fields ------------------------- */
+	/* For undo entries that target a specific FLIS layer (property change,
+	 * pixel change, geometry change).  Zero / NULL when the entry was
+	 * saved from plain-FITS state. */
+	gint                flis_layer_id;     /* item_id of the layer */
+	flis_layer_props_t *layer_props;       /* full property snapshot */
+	gint                flis_position_x;   /* layer offset at time of save */
+	gint                flis_position_y;
+
+	/* ---- Layer-mask (LMASK) undo --------------------------------------- */
+	/* For undo entries that capture a layer mask (add / remove / move).
+	 * lmask_layer_id == FLIS_UNDO_LAYER_NONE when unused. */
+	gchar  *lmask_filename;     /* swap file path; NULL for "no mask" state */
+	gint    lmask_layer_id;     /* item_id; FLIS_UNDO_LAYER_NONE if unused */
+	size_t  lmask_w;
+	size_t  lmask_h;
+	guint8  lmask_bitpix;
+	gint    lmask_dest_layer_id;  /* target for lmask-move undo */
+
+	/* ---- Reorder undo (move-up / move-down swap of layer_order) ------- */
+	gint    reorder_layer_a_id;
+	gint    reorder_layer_a_order;
+	gint    reorder_layer_b_id;
+	gint    reorder_layer_b_order;
+
+	/* ---- Undo entry flavour flags ------------------------------------- */
+	gboolean pmask_only;   /* processing-mask-only state (no pixel data) */
+	gboolean full_layer;   /* full layer state: pixels + pmask + lmask + props */
+	gboolean icc_only;     /* com.uniq->icc_profile + color_managed snapshot
+	                          only — no swap files; restore is a single
+	                          current_image_set_icc_profile + color_manage
+	                          call.  icc_profile (above) holds the snapshot. */
+	gboolean icc_was_managed;  /* snapshot of color_managed at save time
+	                              (icc_only entries only) */
+
+	/* ---- Canvas dimensions (compound FLIS entries) -------------------- */
+	/* Captured by the multi-layer save paths; canvas ops (resize / fit /
+	 * rotate) change com.uniq->canvas_w/h alongside layer positions, and
+	 * restoring positions onto the post-op canvas would leave the
+	 * document internally inconsistent.  0 = not captured. */
+	guint flis_canvas_w;
+	guint flis_canvas_h;
+
+	/* ---- Compound (multi-layer) undo ---------------------------------- */
+	/* Non-NULL only when this entry was saved via undo_save_flis_multi_layer().
+	 * When set, the single-layer fields above are unused. */
+	historic_layer_entry_t *multi_entries;
+	guint                   n_multi_entries;
+
+	/* ---- NDE provenance coupling (sketch §13.3) ----------------------- */
+	/* Id of the nde_record captured for the same operation, 0 = none.
+	 * Restoring this entry moves the history's live_count via
+	 * nde_history_on_undo()/on_redo(); counterpart entries pushed to the
+	 * opposite stack inherit the id so undo↔redo round-trips stay coupled. */
+	gint64 nde_record_id;
+	/* Last record id when one undo entry covers a RANGE of consecutive
+	 * records (multi-layer ops: layers match, group colour calibration).
+	 * 0 = single record.  Undo rewinds live_count to before nde_record_id;
+	 * redo advances it to include nde_record_id_last. */
+	gint64 nde_record_id_last;
 };
 
 /* struct layer, struct image_view, draw_data_t, and struct guiinf have been
@@ -815,8 +985,55 @@ struct historic_struct {
  * should include that header.  The forward typedef below lets non-GUI code
  * name the type without accessing its fields. */
 
+/* ── Region of interest ──────────────────────────────────────────────────────
+ *
+ * AN ROI IS A PREVIEW SCOPE, NEVER AN EDIT SCOPE.  It exists to make an
+ * expensive computation cheap to preview — historically a single operation
+ * (deconvolution), and in due course an NDE replay tail.  Apply is always
+ * full-image, and nothing recorded in the edit history is ever region-scoped:
+ * every record is a full-image op on one item.  If "apply to this region only"
+ * is ever wanted it must arrive as a rectangular PROCESSING MASK derived from
+ * the ROI, not as a new kind of record — NDE already records `mask_active` and
+ * pins the mask, so that keeps "records are full-image ops, optionally masked"
+ * intact.
+ *
+ * THE ROI IS A RECTANGLE.  `selection` is the whole concept.  There is no
+ * region pixel buffer: a cache of one layer's pixels was of no use to a
+ * multi-layer replay, which needs only the rectangle and derives its own
+ * per-item rects from it, and keeping it in step with gfit was a standing
+ * source of staleness bugs.
+ *
+ * THE ROI IS LAYER-SCOPED, NOT COMPOSITE-SCOPED.  `selection` is in DISPLAY
+ * (canvas) coordinates; translate and clip it to the item being processed with
+ * flis_display_to_active_layer_rect() (io/image_format_flis.h).  Because gfit
+ * IS the active layer, a single-op region preview is already composited live.
+ *
+ * OUTSIDE THE RECTANGLE, THE VIEWPORT SHOWS THE PRE-OPERATION STATE.  The
+ * rectangle marks where the preview differs from the pre-op state, regardless
+ * of how those pixels were computed or how long they took.
+ *
+ * THE HALO EXTENDS THE INPUT, NEVER SHRINKS THE OUTPUT.  Where an op's result
+ * at a pixel depends on its neighbours, the INPUT crop is grown by the op's
+ * declared halo and exactly the drawn rectangle is written back.  The drawn
+ * rectangle is therefore always the updated area, so the existing overlay is
+ * correct and there is nothing extra to denote.  (The alternative — shrink the
+ * displayed region to an inner "valid" rect and explain it in the UI — was
+ * rejected: it puts a permanent explanatory burden in the UI to cover a
+ * shortcut.)
+ *
+ * WHO DECIDES.  generic_image_worker, and only it.  A run is region-scoped iff
+ * it is a preview (args->for_preview — for a dialog with no live preview this
+ * is the button discriminator, and it is what keeps commands, scripts and
+ * replays full-image), a ROI is active, the op descriptor carries
+ * OP_ROI_CAPABLE, and the open dialog has declared that op via
+ * roi_declare_op() — which is what `operation_supports_roi` holds, and what
+ * the overlay colour shows the user.  Both terms are required so the outline
+ * cannot promise something the run does not do.
+ *
+ * `operation_supports_roi` belongs to the OPEN DIALOG, not to the rectangle:
+ * clearing the ROI deliberately preserves it.
+ */
 typedef struct roi {
-	fits fit;
 	rectangle selection;
 	gboolean active;
 	gboolean operation_supports_roi;

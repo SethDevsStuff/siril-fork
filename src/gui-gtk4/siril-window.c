@@ -88,7 +88,9 @@ static GActionEntry image_entries[] = {
 	{ "regframe", regframe_activate , NULL, "true", regframe_state },
 	{ "nina_light_curve", nina_lc_activate },
 	{ "compstars", compstars_activate },
-	{ "catmag", catmag_activate }
+	{ "catmag", catmag_activate },
+	{ "show-layers", show_layers_activate },
+	{ "show-nde-history", show_nde_history_activate }
 };
 
 static GActionEntry selection_entries[] = {
@@ -341,6 +343,27 @@ void siril_window_enable_rgb_wcs_proc_actions(GtkApplicationWindow *window, gboo
 		NULL,
 	};
 	_siril_window_enable_action_group(G_ACTION_MAP(window), rgb_wcs_processing_actions, enable);
+}
+
+/* Override enabling the colour-calibration tools for the FLIS
+ * group-calibration path: with an effectively-colour layer group selected
+ * they apply to the group's composite even though gfit (the active layer)
+ * is mono.  Called AFTER the rgb/rgb_wcs groups so it only ever widens. */
+void siril_window_enable_group_calib_actions(GtkApplicationWindow *window,
+                                             gboolean calib, gboolean pcc) {
+	static const gchar *calib_actions[] = {
+		"color-calib-processing",
+		NULL,
+	};
+	static const gchar *pcc_actions[] = {
+		"pcc-processing",
+		"spcc-processing",
+		NULL,
+	};
+	if (calib)
+		_siril_window_enable_action_group(G_ACTION_MAP(window), calib_actions, TRUE);
+	if (pcc)
+		_siril_window_enable_action_group(G_ACTION_MAP(window), pcc_actions, TRUE);
 }
 
 void siril_window_enable_any_proc_actions(GtkApplicationWindow *window, gboolean enable) {

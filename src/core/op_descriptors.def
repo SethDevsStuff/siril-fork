@@ -5,8 +5,35 @@
  * (op_descriptor.c) via the X-macro idiom, so the two can never drift.  The
  * descriptor DEFINITIONS still live next to their hooks in the owning modules.
  *
- * To add an operation: add its definition in the owning .c, then add one line
- * here.  Keep this list ordered by id.
+ * To add an operation:
+ *
+ *  1. define the descriptor next to its hooks in the owning .c;
+ *  2. add one OP_DESC line here, ordered by id;
+ *  3. write serialize/deserialize so the op can be replayed by the edit
+ *     history — or add its id to opaque_by_design[] in
+ *     src/tests/test_op_descriptor.c with the reason it cannot be.  There is
+ *     no third option: a descriptor that is neither fails that test, which is
+ *     deliberate.  Without a serializer the op is recorded as an opaque
+ *     barrier and the user cannot edit any step before it;
+ *  4. add replay_pre only if the hook reads something outside its params
+ *     struct.  For an external file operand, pin it by path + size + SHA-256;
+ *  5. add a round-trip test to src/tests/test_nde_serializers.c;
+ *  6. if the hook can compute a sub-rectangle of the image, set
+ *     OP_ROI_CAPABLE so region previews can use it;
+ *  7. and then write roi_halo() — how much INPUT context it needs around that
+ *     rectangle.  This is a separate question from (6): 0 is the right answer
+ *     for a pixel-local op and does not mean "no region support";
+ *  8. and set roi_halo_exact, and add the op to src/tests/roi_halo_test.c.
+ *     TRUE means the test asserts the halo is a true bound on the op's
+ *     spatial support; FALSE means it only reports (iterative and non-local
+ *     ops have no such bound);
+ *  9. optionally register a native amend editor in gui-gtk4/nde_editors.c.
+ *     If it has a live preview, call roi_declare_op() at dialog startup and
+ *     pass the descriptor to nde_amend_note_update().
+ *
+ * Steps 3 and 6-8 are the ones most often forgotten, which is why each has a
+ * test that fails when it is.  See doc/NDE.rst and doc/WritingFeature.rst in
+ * siril-contrib-doc for the long form.
  */
 OP_DESC(op_desc_addmax)                  /* arith.addmax */
 OP_DESC(op_desc_fdiv)                    /* arith.fdiv */
@@ -27,10 +54,13 @@ OP_DESC(op_desc_cfa_extract_haoiii)      /* cfa.extract_haoiii */
 OP_DESC(op_desc_findhot)                 /* cfa.findhot */
 OP_DESC(op_desc_fix_xtrans)              /* cfa.fix_xtrans */
 OP_DESC(op_desc_cfa_split)               /* cfa.split */
+OP_DESC(op_desc_bkg_neutral)             /* color.background_neutralization */
+OP_DESC(op_desc_color_calib)             /* color.calibration */
 OP_DESC(op_desc_ccm)                     /* color.ccm */
 OP_DESC(op_desc_grey_flat)               /* color.grey_flat */
 OP_DESC(op_desc_linear_match)            /* color.linear_match */
 OP_DESC(op_desc_photometric_cc)          /* color.photometric_cc */
+OP_DESC(op_desc_rgb_align)               /* color.rgb_align */
 OP_DESC(op_desc_saturation)              /* color.saturation */
 OP_DESC(op_desc_banding)                 /* filters.banding */
 OP_DESC(op_desc_clahe)                   /* filters.clahe */
@@ -47,15 +77,17 @@ OP_DESC(op_desc_rgradient)               /* filters.rgradient */
 OP_DESC(op_desc_scnr)                    /* filters.scnr */
 OP_DESC(op_desc_unpurple)                /* filters.unpurple */
 OP_DESC(op_desc_unsharp)                 /* filters.unsharp */
+OP_DESC(op_desc_flis_group_calibration)  /* flis.group_calibration */
+OP_DESC(op_desc_flis_layer_scale)        /* flis.layer_scale */
+OP_DESC(op_desc_flis_layers_match)       /* flis.layers_match */
+OP_DESC(op_desc_flis_register)           /* flis.register */
 OP_DESC(op_desc_binning)                 /* geometry.binning */
 OP_DESC(op_desc_crop)                    /* geometry.crop */
 OP_DESC(op_desc_mirrorx)                 /* geometry.mirrorx */
 OP_DESC(op_desc_mirrory)                 /* geometry.mirrory */
 OP_DESC(op_desc_resample)                /* geometry.resample */
 OP_DESC(op_desc_rotation)                /* geometry.rotation */
-OP_DESC(op_desc_icc_assign)              /* icc.assign */
 OP_DESC(op_desc_icc_convert)             /* icc.convert */
-OP_DESC(op_desc_icc_remove)              /* icc.remove */
 OP_DESC(op_desc_mask_autostretch)        /* mask.autostretch */
 OP_DESC(op_desc_mask_bitpix)             /* mask.bitpix */
 OP_DESC(op_desc_mask_blur)               /* mask.blur */

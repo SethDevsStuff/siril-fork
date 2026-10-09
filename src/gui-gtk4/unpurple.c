@@ -59,7 +59,7 @@ static void get_unpurple_values(double *mod_b_out, double *thresh_out, gboolean 
 }
 
 /* Create and launch unpurple processing */
-static int unpurple_process_with_worker(gboolean for_preview, gboolean for_roi) {
+static int unpurple_process_with_worker(gboolean for_preview) {
 	// Allocate parameters
 	struct unpurpleargs *params = new_unpurple_args();
 	if (!params) {
@@ -71,7 +71,7 @@ static int unpurple_process_with_worker(gboolean for_preview, gboolean for_roi) 
 	gboolean withstarmask;
 	get_unpurple_values(&params->mod_b, &params->thresh, &withstarmask);
 	params->withstarmask = withstarmask;
-	params->fit = for_roi ? &gui.roi.fit : gfit;
+	params->fit = gfit;
 
 	// Set up starmask if needed
 	params->starmask_needs_freeing = FALSE;
@@ -88,7 +88,8 @@ static int unpurple_process_with_worker(gboolean for_preview, gboolean for_roi) 
 				return 1;
 			}
 
-			if (generate_binary_starmask(params->fit, &params->starmask, params->thresh)) {
+			if (generate_binary_starmask(params->fit, &params->starmask, params->thresh,
+					&params->stars_blob, &params->star_auto, &params->star_conf, NULL)) {
 				free_unpurple_args(params);
 				return 1;
 			}
@@ -118,14 +119,13 @@ static int unpurple_process_with_worker(gboolean for_preview, gboolean for_roi) 
 	}
 
 	// Set the fit based on whether ROI is active
-	args->fit = for_roi ? &gui.roi.fit : gfit;
+	args->fit = gfit;
 	args->op = &op_desc_unpurple;
 	args->idle_function = NULL;
 	args->verbose = !for_preview;
 	args->user = params;
 	args->max_threads = com.max_thread;
 	args->for_preview = for_preview;
-	args->for_roi = for_roi;
 
 	if (!start_in_new_thread(generic_image_worker, args)) {
 		free_generic_img_args(args);
@@ -137,13 +137,12 @@ static int unpurple_process_with_worker(gboolean for_preview, gboolean for_roi) 
 static int unpurple_update_preview() {
 	if (siril_toggle_get_active(GTK_WIDGET(unpurple_preview_btn))) {
 		copy_backup_to_gfit();
-		return unpurple_process_with_worker(TRUE, gui.roi.active);
+		return unpurple_process_with_worker(TRUE);
 	}
 	return 0;
 }
 
 void unpurple_change_between_roi_and_image() {
-	gui.roi.operation_supports_roi = TRUE;
 	// If we are showing the preview, update it after the ROI change.
 	update_image *param = malloc(sizeof(update_image));
 	param->update_preview_fn = unpurple_update_preview;
@@ -154,7 +153,7 @@ void unpurple_change_between_roi_and_image() {
 static void unpurple_startup() {
 	copy_gfit_to_backup();
 	add_roi_callback(unpurple_change_between_roi_and_image);
-	roi_supported(TRUE);
+	roi_declare_op(&op_desc_unpurple);
 }
 
 static void unpurple_close(gboolean revert) {
@@ -165,7 +164,7 @@ static void unpurple_close(gboolean revert) {
 	} else {
 		invalidate_stats_from_fit(gfit);
 	}
-	roi_supported(FALSE);
+	roi_declare_op(NULL);
 	remove_roi_callback(unpurple_change_between_roi_and_image);
 	clearfits(&starmask);
 	clear_backup();
@@ -215,7 +214,7 @@ void on_unpurple_apply_clicked(GtkButton *button, gpointer user_data) {
 	}
 
 	// Always process full image when Apply is clicked
-	unpurple_process_with_worker(FALSE, FALSE);
+	unpurple_process_with_worker(FALSE);
 
 	apply_unpurple_changes();
 	siril_close_dialog("unpurple_dialog");

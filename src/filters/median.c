@@ -24,12 +24,60 @@
 #include "algos/sorting.h"
 #include "algos/statistics.h"
 #include "core/gui_iface.h"
+#include "core/nde/nde_history.h"
 #include "core/op_descriptors.h"
 #include "core/optimize_utils.h"
 #include "core/processing.h"
 #include "core/proto.h"
 #include "core/siril.h"
 #include "filters/median.h"
+
+/* NDE serializers (flis-nde-sketch.md §11-§12).  The median hook reads ksize,
+ * amount, iterations (fit is a runtime pointer, previewing is preview state).
+ * Construction sites leave destroy_fn NULL (POD, framework free-fallback); the
+ * deserializer sets destroy_fn = free (behaviourally identical). */
+static gchar *median_serialize(gconstpointer user) {
+	const struct median_filter_data *p = user;
+	GString *kv = nde_kv_start();
+	nde_kv_add_int(kv, "ksize", p->ksize);
+	nde_kv_add_double(kv, "amount", p->amount);
+	nde_kv_add_int(kv, "iterations", p->iterations);
+	return nde_kv_end(kv);
+}
+
+static gpointer median_deserialize(const gchar *blob, int version) {
+	if (version > op_desc_median.version)
+		return NULL;
+	GHashTable *kv = nde_kv_parse(blob);
+	gint64 ksize, iterations;
+	double amount;
+	NDE_KV_REQUIRE(kv, nde_kv_get_int(kv, "ksize", &ksize) &&
+	                   nde_kv_get_double(kv, "amount", &amount) &&
+	                   nde_kv_get_int(kv, "iterations", &iterations));
+	struct median_filter_data *p = calloc(1, sizeof(*p));
+	if (p) {
+		p->destroy_fn = free;
+		p->ksize = (int)ksize;
+		p->amount = amount;
+		p->iterations = (int)iterations;
+	}
+	g_hash_table_unref(kv);
+	return p;
+}
+
+/* Input context a region preview needs (op_descriptor.h).  One pass reaches
+ * `radius` pixels; iteration k reads the previous pass's output, so N passes
+ * reach N*radius.  Exact: pixels that far outside the requested rectangle
+ * cannot influence anything inside it, and `amount` only blends the result
+ * with the pixel itself. */
+static int median_roi_halo(gconstpointer user) {
+	const struct median_filter_data *p = user;
+	if (!p)
+		return 0;
+	const int radius = (p->ksize - 1) / 2;
+	const int iters = p->iterations > 0 ? p->iterations : 1;
+	return radius * iters;
+}
 
 /* Op descriptor — single source of truth for this operation (op_descriptor.h) */
 const op_descriptor op_desc_median = {
@@ -38,7 +86,9 @@ const op_descriptor op_desc_median = {
 	.log_hook = median_log_hook,
 	.description = N_("Median filter"),
 	.mem_ratio = 2.0f,
-	.flags = OP_MASK_CAPABLE,
+	.flags = OP_MASK_CAPABLE | OP_ROI_CAPABLE,
+	.roi_halo = median_roi_halo, .roi_halo_exact = TRUE,
+	.serialize = median_serialize, .deserialize = median_deserialize,
 };
 
 gchar* median_log_hook(gpointer p, log_hook_detail detail) {

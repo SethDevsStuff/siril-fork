@@ -21,6 +21,9 @@
 #include "algos/background_extraction.h"
 #include "algos/demosaicing.h"
 #include "algos/statistics.h"
+#include "core/nde/nde_checkpoint.h"
+#include "core/nde/nde_history.h"
+#include "core/nde/nde_replay.h"
 #include "core/op_descriptors.h"
 #include "core/processing.h"
 #include "core/processing_thread.h"
@@ -30,6 +33,7 @@
 #include "gui-gtk4/image_display.h"
 #include "gui-gtk4/image_interactions.h"
 #include "gui-gtk4/message_dialog.h"
+#include "gui-gtk4/nde_editors.h"
 #include "gui-gtk4/progress_and_log.h"
 #include "gui-gtk4/siril_actions.h"
 #include "gui-gtk4/siril_preview.h"
@@ -72,6 +76,18 @@ static GtkCheckButton *ag_simplified_check = NULL;
 static GtkSpinButton *ag_degree_spin = NULL;
 static GtkWidget *ag_degree_label = NULL;
 static GtkDropDown *ag_downsample_combo = NULL;
+static GtkWidget *bkg_amend_note = NULL;
+
+/* Amend mode (convergence C5): the dialog edits an existing history record.
+ * gfit holds the pre-record state installed by nde_amend_preview_start.  BGE
+ * has no live preview in amend mode (its compute/apply split does not fit the
+ * backup preview cheaply): the sample-generation and preview controls are
+ * insensitive, and only the model-fit parameters that do NOT invalidate the
+ * recorded sample positions are editable (correction, interpolation method,
+ * polynomial degree, RBF smoothing, dither).  Apply routes the widget state
+ * through nde_amend_preview_end; the recorded samples= key is preserved via
+ * the deserialize → overwrite → reserialize round trip. */
+static gboolean bkg_amend_mode = FALSE;
 
 static void bkg_sync_method(void);
 
@@ -109,6 +125,7 @@ static void background_extraction_init_statics(void) {
 	ag_degree_spin = GTK_SPIN_BUTTON(gtk_builder_get_object(gui.builder, "spin_ag_degree"));
 	ag_degree_label = GTK_WIDGET(gtk_builder_get_object(gui.builder, "label_ag_degree"));
 	ag_downsample_combo = GTK_DROP_DOWN(gtk_builder_get_object(gui.builder, "bkg_ag_downsample_combo"));
+	bkg_amend_note = GTK_WIDGET(gtk_builder_get_object(gui.builder, "bkg_amend_note"));
 }
 
 static poly_order get_poly_order() {
@@ -314,6 +331,100 @@ void on_background_clear_all_clicked(GtkButton *button, gpointer user_data) {
 	set_cursor_waiting(FALSE);
 }
 
+/* Fill @bkg with the parameter set currently shown in the dialog for @method.
+ * Shared by the Compute invocations and the NDE provenance capture on Apply so
+ * the recorded model matches the applied one without duplicating the
+ * widget-reading code.  Leaves runtime-only fields (fit/seq/seqEntry/destroy_fn)
+ * untouched. */
+static void fill_background_data_from_ui(struct background_data *bkg,
+                                         background_method method) {
+	bkg->method = method;
+	bkg->threads = com.max_thread;
+	bkg->from_ui = TRUE;
+	bkg->correction = get_correction_type();
+	bkg->dither = is_dither_checked();
+	if (method == BACKGROUND_METHOD_AUTO) {
+		fill_autograd_from_ui(&bkg->autograd);
+	} else {
+		sensor_pattern pattern = get_cfa_pattern_index_from_string(gfit->keywords.bayer_pattern);
+		bkg->interpolation_method = get_interpolation_method();
+		bkg->degree = (poly_order)get_poly_order();
+		bkg->smoothing = get_smoothing_parameter();
+		bkg->nb_of_samples = get_nb_samples_per_line();
+		bkg->tolerance = get_tolerance_value();
+		bkg->is_cfa = gfit->naxes[2] == 1 && pattern >= BAYER_FILTER_MIN
+				&& pattern <= BAYER_FILTER_MAX;
+	}
+}
+
+/* Grey out everything that would change the recorded sample set (or preview),
+ * leaving only the model-fit parameters editable.  Also extends the amend
+ * note and hides the Compute/preview affordances. */
+static void bkg_amend_lock_controls(void) {
+	/* sample-generation + method: recorded samples must survive untouched */
+	gtk_widget_set_sensitive(GTK_WIDGET(bkg_method_combo), FALSE);
+	gtk_widget_set_sensitive(GTK_WIDGET(bkg_nb_samples_spin), FALSE);
+	gtk_widget_set_sensitive(GTK_WIDGET(bkg_tolerance_scale), FALSE);
+	gtk_widget_set_sensitive(GTK_WIDGET(bkg_randomize_btn), FALSE);
+	gtk_widget_set_sensitive(GTK_WIDGET(bkg_grad_descent_btn), FALSE);
+	gtk_widget_set_sensitive(GTK_WIDGET(bkg_keep_samples_btn), FALSE);
+	/* no live preview / compute / view switching / sequence in amend mode */
+	gtk_widget_set_sensitive(bkg_compute_bkg_button, FALSE);
+	gtk_widget_set_visible(bkg_compute_bkg_button, FALSE);
+	if (bkg_view_box)
+		gtk_widget_set_sensitive(bkg_view_box, FALSE);
+	gtk_widget_set_sensitive(GTK_WIDGET(bkg_seq_btn), FALSE);
+	/* the automatic (sample-free) model has no recorded samples to preserve,
+	 * so editing it here would be meaningless: keep the whole panel off */
+	gtk_widget_set_sensitive(bkg_auto_expander, FALSE);
+	/* Apply is always available (there is a recorded model to re-fit) */
+	gtk_widget_set_sensitive(bkg_ok_button, TRUE);
+	/* no interactive sample overlay in amend mode */
+	mouse_status = MOUSE_ACTION_SELECT_REG_AREA;
+	gui.hide_bkg_samples = TRUE;
+	redraw(REDRAW_OVERLAY);
+}
+
+/* Re-enable everything amend mode locked, so a subsequent NORMAL open of the
+ * dialog is not left with greyed-out controls.  Compute sensitivity is left to
+ * bkg_sync_method / update_bkg_compute_button_sensitivity. */
+static void bkg_amend_unlock_controls(void) {
+	gtk_widget_set_sensitive(GTK_WIDGET(bkg_method_combo), TRUE);
+	gtk_widget_set_sensitive(GTK_WIDGET(bkg_nb_samples_spin), TRUE);
+	gtk_widget_set_sensitive(GTK_WIDGET(bkg_tolerance_scale), TRUE);
+	gtk_widget_set_sensitive(GTK_WIDGET(bkg_randomize_btn), TRUE);
+	gtk_widget_set_sensitive(GTK_WIDGET(bkg_grad_descent_btn), TRUE);
+	gtk_widget_set_sensitive(GTK_WIDGET(bkg_keep_samples_btn), TRUE);
+	gtk_widget_set_visible(bkg_compute_bkg_button, TRUE);
+	gtk_widget_set_sensitive(GTK_WIDGET(bkg_seq_btn), TRUE);
+	gtk_widget_set_sensitive(bkg_auto_expander, TRUE);
+}
+
+/* Prefill the editable widgets from the record.  Only the model-fit fields
+ * are touched; sample-generation fields keep the record's values for display
+ * but stay insensitive (bkg_amend_lock_controls). */
+static void bkg_prefill_from_amend(void) {
+	struct background_data *p = op_desc_remove_gradient.deserialize(
+			nde_amend_preview_params(), nde_amend_preview_op_version());
+	if (!p)
+		return;
+	/* sample-based method: show its panel (the auto model has no samples) */
+	gtk_drop_down_set_selected(bkg_method_combo, BACKGROUND_METHOD_SAMPLES);
+	gtk_drop_down_set_selected(bkg_interp_combo, p->interpolation_method);
+	gtk_notebook_set_current_page(bkg_notebook, p->interpolation_method);
+	gtk_drop_down_set_selected(bkg_poly_order_combo, p->degree);
+	gtk_spin_button_set_value(bkg_smoothing_spin, p->smoothing);
+	gtk_drop_down_set_selected(bkg_correction_combo, p->correction);
+	siril_toggle_set_active(GTK_WIDGET(bkg_dither_btn), p->dither);
+	/* display-only (insensitive) fields */
+	gtk_spin_button_set_value(bkg_nb_samples_spin, p->nb_of_samples);
+	gtk_range_set_value(bkg_tolerance_scale, p->tolerance);
+	if (p->destroy_fn)
+		p->destroy_fn(p);
+	else
+		free(p);
+}
+
 void on_bkg_compute_bkg_clicked(GtkButton *button, gpointer user_data) {
 	background_method method = get_background_method();
 
@@ -323,13 +434,8 @@ void on_bkg_compute_bkg_clicked(GtkButton *button, gpointer user_data) {
 
 		struct background_data *bkg_args = calloc(1, sizeof(struct background_data));
 		bkg_args->destroy_fn = free_background_data;
-		bkg_args->method = BACKGROUND_METHOD_AUTO;
-		bkg_args->threads = com.max_thread;
-		bkg_args->from_ui = TRUE;
-		bkg_args->correction = get_correction_type();
-		bkg_args->dither = is_dither_checked();
+		fill_background_data_from_ui(bkg_args, BACKGROUND_METHOD_AUTO);
 		bkg_args->fit = gfit;
-		fill_autograd_from_ui(&bkg_args->autograd);
 
 		struct generic_img_args *args = calloc(1, sizeof(struct generic_img_args));
 		args->fit = gfit;
@@ -355,27 +461,10 @@ void on_bkg_compute_bkg_clicked(GtkButton *button, gpointer user_data) {
 	set_cursor_waiting(TRUE);
 	copy_backup_to_gfit();
 
-	background_correction correction = get_correction_type();
-	poly_order degree = get_poly_order();
-	gboolean use_dither = is_dither_checked();
-	double smoothing = get_smoothing_parameter();
-	background_interpolation interpolation_method = get_interpolation_method();
-
-	// Check if the image has a Bayer CFA pattern
-	sensor_pattern pattern = get_cfa_pattern_index_from_string(gfit->keywords.bayer_pattern);
-	gboolean is_cfa = gfit->naxes[2] == 1 && pattern >= BAYER_FILTER_MIN && pattern <= BAYER_FILTER_MAX;
-
 	struct background_data *bkg_args = calloc(1, sizeof(struct background_data));
 	bkg_args->destroy_fn = free_background_data;
-	bkg_args->threads = com.max_thread;
-	bkg_args->from_ui = TRUE;
-	bkg_args->correction = correction;
-	bkg_args->interpolation_method = interpolation_method;
-	bkg_args->degree = (poly_order)degree;
-	bkg_args->smoothing = smoothing;
-	bkg_args->dither = use_dither;
+	fill_background_data_from_ui(bkg_args, method);
 	bkg_args->fit = gfit;
-	bkg_args->is_cfa = is_cfa;
 
 	struct generic_img_args *args = calloc(1, sizeof(struct generic_img_args));
 	args->fit = gfit;
@@ -393,6 +482,49 @@ void on_bkg_compute_bkg_clicked(GtkButton *button, gpointer user_data) {
 
 void on_background_ok_button_clicked(GtkButton *button, gpointer user_data) {
 	background_extraction_init_statics();
+
+	if (bkg_amend_mode) {
+		/* Deserialize → overwrite the widget-backed fields → reserialize, so
+		 * non-widget recorded state survives.  Critically the recorded
+		 * samples= key (which the deserializer discards) is re-emitted by
+		 * setting effective_samples from the record blob: the serializer
+		 * prefers it over com.grad_samples. */
+		struct background_data *applied = op_desc_remove_gradient.deserialize(
+				nde_amend_preview_params(), nde_amend_preview_op_version());
+		if (!applied) {
+			/* corrupt record: cannot round-trip — leave amend mode untouched */
+			nde_amend_preview_end(FALSE, NULL);
+			bkg_amend_mode = FALSE;
+			siril_close_dialog("background_extraction_dialog");
+			return;
+		}
+		/* overwrite only the exposed, sample-preserving fields */
+		applied->interpolation_method = get_interpolation_method();
+		applied->degree = (poly_order)get_poly_order();
+		applied->smoothing = get_smoothing_parameter();
+		applied->correction = get_correction_type();
+		applied->dither = is_dither_checked();
+		/* preserve the recorded sample positions across the round trip */
+		GHashTable *kv = nde_kv_parse(nde_amend_preview_params());
+		const char *samples = kv ? nde_kv_get_str(kv, "samples") : NULL;
+		gchar *samples_copy = samples ? g_strdup(samples) : NULL;
+		applied->effective_samples = samples_copy;
+		gchar *blob = op_desc_remove_gradient.serialize(applied);
+		applied->effective_samples = NULL;   /* free our copy ourselves */
+		g_free(samples_copy);
+		if (kv)
+			g_hash_table_unref(kv);
+		if (applied->destroy_fn)
+			applied->destroy_fn(applied);
+		else
+			free(applied);
+		nde_amend_preview_end(TRUE, blob);
+		g_free(blob);
+		bkg_amend_mode = FALSE;
+		siril_close_dialog("background_extraction_dialog");
+		return;
+	}
+
 	GtkCheckButton *seq_button = bkg_seq_btn;
 	if (siril_toggle_get_active(GTK_WIDGET(seq_button)) && sequence_is_loaded()
 			&& get_background_method() == BACKGROUND_METHOD_AUTO) {
@@ -465,8 +597,25 @@ void on_background_ok_button_clicked(GtkButton *button, gpointer user_data) {
 				copyfits(&bkg_processed, gfit, CP_COPYA, -1);
 				notify_gfit_data_modified();
 			}
-			undo_save_state(get_preview_gfit_backup(), _("Background extraction (Correction: %s)"),
+			gchar *summary = g_strdup_printf(_("Background extraction (Correction: %s)"),
 					bkg_view_correction == BACKGROUND_CORRECTION_DIVIDE ? "Division" : "Subtraction");
+			/* NDE provenance capture: the Compute invocations ran the worker
+			 * with skip_generic_undo, so nothing was recorded there — this
+			 * Apply is the sole commit point.  Reconstruct the applied model
+			 * from the dialog (the serializer also reads com.grad_samples,
+			 * still present here) and capture before the save (worker order). */
+			struct background_data applied = { 0 };
+			fill_background_data_from_ui(&applied, get_background_method());
+			applied.correction = bkg_view_correction;
+			/* NDE baseline (phase 2): the preview backup holds the pre-op pixels. */
+			fits *nde_base = get_preview_gfit_backup();
+			if (nde_base)
+				nde_checkpoint_baseline_ensure(nde_base, nde_checkpoint_active_item_id());
+			gint64 rid = nde_capture_from_descriptor(&op_desc_remove_gradient,
+					&applied, summary, gfit, FALSE);
+			if (!undo_save_state(get_preview_gfit_backup(), "%s", summary))
+				undo_tag_top_nde_record(rid);
+			g_free(summary);
 			background_computed = FALSE;
 			clear_backup();
 			siril_close_dialog("background_extraction_dialog");
@@ -478,6 +627,11 @@ void on_background_ok_button_clicked(GtkButton *button, gpointer user_data) {
 }
 
 void apply_background_cancel() {
+	if (bkg_amend_mode) {
+		/* Leave amend mode: restore the true pixels (nothing committed). */
+		nde_amend_preview_end(FALSE, NULL);
+		bkg_amend_mode = FALSE;
+	}
 	siril_close_dialog("background_extraction_dialog");
 }
 
@@ -515,6 +669,23 @@ void on_background_extraction_dialog_hide(GtkWidget *widget, gpointer user_data)
 
 void on_background_extraction_dialog_show(GtkWidget *widget, gpointer user_data) {
 	background_extraction_init_statics();
+	nde_amend_note_update(bkg_amend_note, bkg_amend_mode,
+	                      NULL);
+
+	if (bkg_amend_mode) {
+		/* Form-only: no sample overlay, no live preview.  gfit already shows
+		 * the pre-record state; leave it on screen while the form is open. */
+		mouse_status = MOUSE_ACTION_SELECT_REG_AREA;
+		gui.hide_bkg_samples = TRUE;
+		set_notify_block(TRUE);
+		bkg_prefill_from_amend();
+		set_notify_block(FALSE);
+		bkg_sync_method();
+		bkg_amend_lock_controls();
+		return;
+	}
+
+	bkg_amend_unlock_controls();   /* undo any leftover amend-mode greying */
 	mouse_status = MOUSE_ACTION_DRAW_SAMPLES;
 	background_startup();
 	bkg_sync_method();   /* show the panel/overlay matching the selected method */
@@ -655,4 +826,21 @@ void on_checkBkgSeq_toggled(GtkCheckButton *button, gpointer user_data) {
 				? background_computed : ((com.grad_samples != NULL) && background_computed);
 		gtk_widget_set_sensitive(ok, have_model);
 	}
+}
+
+/* ---- amend-mode entry (nde_editors registry) --------------------------- */
+
+static void bge_amend_ready(gboolean ok, gpointer user) {
+	(void)user;
+	if (!ok)
+		return;   /* the core logged the reason; nothing was changed */
+	bkg_amend_mode = TRUE;
+	siril_open_dialog("background_extraction_dialog");
+}
+
+gboolean bge_open_amend(gint64 record_id) {
+	/* The dialog opens from the ready callback, once the pre-record state
+	 * has been synthesized and installed. */
+	nde_amend_preview_start(record_id, bge_amend_ready, NULL);
+	return TRUE;
 }

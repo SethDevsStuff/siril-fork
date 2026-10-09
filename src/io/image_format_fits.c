@@ -44,6 +44,7 @@
 #include "io/fits_sequence.h"
 #include "io/gps_parser.h"
 #include "io/image_format_fits.h"
+#include "io/image_format_flis.h"
 #include "io/single_image.h"
 
 #define RECIPSQRT2 0.70710678f // 1/sqrt(2) as float
@@ -1166,7 +1167,7 @@ ERROR_MESSAGE_AND_RETURN:
 }
 
 int write_icc_profile_to_fits(fits *fit) {
-	int retval = write_icc_profile_to_fptr(fit->fptr, fit->icc_profile);
+	int retval = write_icc_profile_to_fptr(fit->fptr, fit_get_icc_profile(fit));
 	return retval;
 }
 
@@ -1262,9 +1263,8 @@ int read_icc_profile_from_fits(fits *fit) {
 	int ihdu, nhdus, hdutype, orig_hdu = 1;
 	fits_get_hdu_num(fit->fptr, &orig_hdu);
 	// siril_log_debug("Original HDU before looking for ICC profile: %d\n", orig_hdu);
-	if (fit->icc_profile)
-		cmsCloseProfile(fit->icc_profile);
-	fit->icc_profile = NULL;
+	/* Reset any existing profile (only meaningful for the current image). */
+	if (fit == gfit) current_image_clear_icc_profile();
 	fits_get_num_hdus(fit->fptr, &nhdus, &status);
 	for (ihdu = 2 ; ihdu <= nhdus ; ihdu++) {
 		fits_movabs_hdu(fit->fptr,ihdu, &hdutype, &status);
@@ -1331,13 +1331,12 @@ int read_icc_profile_from_fits(fits *fit) {
 			siril_log_debug("Error returning to original HDU!\n");
 		return 1;
 	}
-	fit->icc_profile = cmsOpenProfileFromMem(profile, profile_length);
-	if (fit->icc_profile) {
+	cmsHPROFILE _embedded = cmsOpenProfileFromMem(profile, profile_length);
+	/* Routes to com.uniq (gfit), the staging area (pending threaded-open
+	 * fits, or gfit before com.uniq exists), or closes it (sequence
+	 * frames / intermediate buffers have no profile storage). */
+	if (icc_profile_attach_from_load(fit, _embedded) && _embedded)
 		siril_log_debug("Embedded ICC profile read from FITS\n");
-		color_manage(fit, TRUE);
-	} else {
-		color_manage(fit, FALSE);
-	}
 	free(profile);
 	free(header);
 	fits_movabs_hdu(fit->fptr, orig_hdu, &hdutype, &status);
@@ -1415,6 +1414,36 @@ int readfits(const char *filename, fits *fit, char *realname, gboolean force_flo
 		report_fits_error(status);
 		free(name);
 		return status;
+	}
+
+	/* FLIS dispatch: if the primary HDU carries the FLIS=T marker and the
+	 * caller is loading into gfit, delegate to load_flis which builds the
+	 * full layer stack into com.uniq.  load_flis re-opens the file, so we
+	 * close our handle and free `name` first.
+	 *
+	 * For non-gfit destinations (e.g. preview / sequence-frame loads into
+	 * a private fits) we deliberately fall through to the normal FITS
+	 * reader, which reads the HDU-0 thumbnail and returns a flat 8-bit RGB
+	 * — exactly the legacy-viewer fallback the spec promises (§10.5). */
+	if (fit == gfit) {
+		int flis_flag = 0, flis_status = 0;
+		fits_read_key(fit->fptr, TLOGICAL, "FLIS", &flis_flag, NULL, &flis_status);
+		if (flis_status == 0 && flis_flag) {
+			fits_close_file(fit->fptr, &flis_status);
+			fit->fptr = NULL;
+			if (realname) strcpy(realname, name);
+			siril_log_message(_("Detected FLIS file, loading layer stack: %s\n"),
+			                  filename);
+			int rv = load_flis(name);
+			free(name);
+			/* load_flis repointed the global gfit at the active layer's
+			 * fits; the (clearfits'd, pixel-less) struct the caller
+			 * passed in is deliberately left allocated: another thread
+			 * may still hold the old gfit pointer (python bridge, a
+			 * blocked rwlock waiter), and freeing it here would turn a
+			 * ~500-byte one-off leak into a use-after-free. */
+			return rv;
+		}
 	}
 	free(name);
 
@@ -1545,9 +1574,9 @@ void clearfits_header(fits *fit) {
 		fit->stats = NULL;
 	}
 	color_manage(fit, FALSE);
-	if (fit->icc_profile)
-		cmsCloseProfile(fit->icc_profile);
-	fit->icc_profile = NULL;
+	/* Per-fits profile state is gone; clear the image-level profile if
+	 * this is the current image being cleared. */
+	if (fit == gfit) current_image_clear_icc_profile();
 	free_wcs(fit);
 	reset_wcsdata(fit);
 	if (fit == gfit && gui_iface.is_preview_active())
@@ -1711,7 +1740,7 @@ int readfits_partial(const char *filename, int layer, fits *fit,
 	 * is raw data and no longer associated with a color managed image. Care must be taken
 	 * regarding subsequent reintegration of this data into a color managed workflow.
 	 */
-	fit->icc_profile = NULL;
+	if (fit == gfit) current_image_clear_icc_profile();
 	color_manage(fit, FALSE);
 
 	status = 0;
@@ -2135,13 +2164,13 @@ int savefits(const char *name, fits *f) {
 		return 1;
 	}
 
-	if (com.pref.fits_save_icc && f->color_managed) {
-		/* Only write the ICC profile for color managed FITS. This avoids writing
-		 * ICC profiles to things like extracted channels where it doesn't really
-		 * make sense. */
-		if (f->icc_profile) {
-			write_icc_profile_to_fits(f);
-		} else {
+	if (com.pref.fits_save_icc && f == gfit) {
+		/* Only the current image has an ICC profile to embed.  Sequence
+		 * frames and intermediate buffers don't carry profile state. */
+		cmsHPROFILE save_prof = current_icc_profile();
+		if (current_image_color_managed() && save_prof) {
+			write_icc_profile_to_fptr(f->fptr, save_prof);
+		} else if (current_image_color_managed()) {
 			siril_log_debug("Info: FITS has no assigned ICC profile, saving without one.\n");
 		}
 	}
@@ -2366,8 +2395,6 @@ int copyfits(fits *from, fits *to, unsigned int oper, int layer) {
 		to->keywords.date = NULL;
 		to->keywords.date_obs = NULL;
 		to->keywords.gps_data = clone_gps_data(from->keywords.gps_data);
-		to->icc_profile = NULL;
-		to->color_managed = FALSE;
 		to->keywords.wcslib = NULL;
 	}
 
@@ -2486,16 +2513,10 @@ int copyfits(fits *from, fits *to, unsigned int oper, int layer) {
 		}
 	}
 
-	if ((oper & CP_ALLOC) || (oper & CP_COPYA)) {
-		// copy color management data
-		to->color_managed = from->color_managed;
-		if (to->color_managed) {
-			to->icc_profile = copyICCProfile(from->icc_profile);
-		} else {
-			to->icc_profile = NULL;
-		}
-		color_manage(to, to->color_managed);
-	}
+	/* No per-fits ICC state to copy any more — colour management lives
+	 * on com.uniq for the current image and copyfits does not transfer
+	 * that ownership.  Callers that want to install a copied fits as
+	 * the current image must handle the profile separately. */
 
 	/* Heap-owned metadata: CP_FORMAT clones the scalar keywords but nulls
 	 * each of these pointers, so they get their own bits. Every block frees
@@ -2596,7 +2617,6 @@ int extract_fits(fits *from, fits *to, int channel, gboolean to_float) {
 	 * subsequently reintegrating it into a color managed workflow.
 	 */
 	color_manage(to, FALSE);
-	to->icc_profile = NULL;
 	to->keywords.wcslib = NULL;
 	to->mask = NULL; // since this is not a deep copy we must clear this to avoid problems when
 	// this shallow copy is cleared
@@ -2670,7 +2690,7 @@ void keep_only_first_channel(fits *fit) {
 	 * expect 3-channel data at the transform endpoint. Now we only have 1 channel of the 3.
 	 * As above, we set icc_profile to NULL and color_managed to FALSE.
 	 */
-	fit->icc_profile = NULL;
+	/* per-fits ICC removed */
 	color_manage(fit, FALSE);
 }
 
@@ -2745,10 +2765,8 @@ int save1fits16(const char *filename, fits *fit, int layer) {
 	}
 	fit->naxis = 2;
 	fit->naxes[2] = 1;
-	if (fit->icc_profile) {
-		cmsCloseProfile(fit->icc_profile);
-		fit->icc_profile = NULL;
-	}
+	/* Per-fits ICC removed; for the current image, clear via accessor. */
+	if (fit == gfit) current_image_clear_icc_profile();
 	color_manage(fit, FALSE);
 	int retval = savefits(filename, fit);
 	return retval;
@@ -2761,10 +2779,8 @@ int save1fits32(const char *filename, fits *fit, int layer) {
 	}
 	fit->naxis = 2;
 	fit->naxes[2] = 1;
-	if (fit->icc_profile) {
-		cmsCloseProfile(fit->icc_profile);
-		fit->icc_profile = NULL;
-	}
+	/* Per-fits ICC removed; for the current image, clear via accessor. */
+	if (fit == gfit) current_image_clear_icc_profile();
 	color_manage(fit, FALSE);
 	int retval = savefits(filename, fit);
 	return retval;
@@ -2922,7 +2938,7 @@ static void extract_region_from_fits_ushort(fits *from, int layer, fits *to,
 	to->pdata[2] = to->data;
 	to->bitpix = from->bitpix;
 	to->type = DATA_USHORT;
-	to->icc_profile = NULL;
+	/* per-fits ICC removed */
 	color_manage(to, FALSE);
 }
 
@@ -2952,7 +2968,7 @@ static void extract_region_from_fits_float(fits *from, int layer, fits *to,
 	to->fpdata[2] = to->fdata;
 	to->bitpix = from->bitpix;
 	to->type = DATA_FLOAT;
-	to->icc_profile = NULL;
+	/* per-fits ICC removed */
 	color_manage(to, FALSE);
 }
 

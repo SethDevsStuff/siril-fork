@@ -28,6 +28,8 @@
 #include "core/command.h"
 #include "core/initfile.h"
 #include "core/masks.h"
+#include "core/nde/nde_checkpoint.h"
+#include "core/nde/nde_history.h"
 #include "core/op_descriptors.h"
 #include "core/processing.h"
 #include "core/proto.h"
@@ -35,6 +37,7 @@
 #include "core/siril_log.h"
 #include "core/siril_update.h"
 #include "core/undo.h"
+#include "filters/synthstar.h"
 #include "gui-gtk4/about_dialog.h"
 #include "gui-gtk4/callbacks.h"
 #include "gui-gtk4/ccd-inspector.h"
@@ -42,6 +45,7 @@
 #include "gui-gtk4/curves.h"
 #include "gui-gtk4/dialogs.h"
 #include "gui-gtk4/documentation.h"
+#include "gui-gtk4/flis_gui.h"
 #include "gui-gtk4/histo_display.h"
 #include "gui-gtk4/histogram.h"
 #include "gui-gtk4/icc_profile.h"
@@ -64,6 +68,7 @@
 #include "gui-gtk4/user_polygons.h"
 #include "gui-gtk4/utils.h"
 #include "io/annotation_catalogues.h"
+#include "io/image_format_flis.h"
 #include "io/sequence.h"
 #include "io/single_image.h"
 #include "io/siril_catalogues.h"
@@ -138,6 +143,13 @@ void undo_action_activate(GSimpleAction *action, GVariant *parameter, gpointer u
 		mpp_ap_editor_undo();
 		return;
 	}
+	/* The restore path rewrites gfit — and for a FLIS, layer payloads
+	 * without the stack lock (documented-benign case (d) in
+	 * image_format_flis.c) — so it must not race a running job. */
+	if (processing_is_job_active()) {
+		siril_log_message(_("Cannot undo while a processing task is running.\n"));
+		return;
+	}
 	gui_iface.set_busy(TRUE);
 	undo_display_data(UNDO);
 	gui_iface.set_busy(FALSE);
@@ -146,6 +158,10 @@ void undo_action_activate(GSimpleAction *action, GVariant *parameter, gpointer u
 void redo_action_activate(GSimpleAction *action, GVariant *parameter,gpointer user_data) {
 	if (mpp_ap_editor_is_open()) {
 		mpp_ap_editor_redo();
+		return;
+	}
+	if (processing_is_job_active()) {
+		siril_log_message(_("Cannot redo while a processing task is running.\n"));
 		return;
 	}
 	gui_iface.set_busy(TRUE);
@@ -620,9 +636,16 @@ void annotate_dialog_activate(GSimpleAction *action, GVariant *parameter, gpoint
 
 void annotate_object_state(GSimpleAction *action, GVariant *state, gpointer user_data) {
 	if (g_variant_get_boolean(state)) {
-		if (has_wcs(gfit)) {
-			com.found_object = find_objects_in_field(gfit);
+		if (!has_wcs(gfit)) {
+			/* Refuse the toggle rather than latching a button that can
+			 * show nothing — the enabled-state can be stale (e.g. after
+			 * a FLIS active-layer switch). */
+			siril_log_message(_("Cannot show objects: the current image is not plate solved\n"));
+			return;
 		}
+		com.found_object = find_objects_in_field(gfit);
+		if (!com.found_object)
+			siril_log_message(_("No objects from the enabled annotation catalogues are in this field\n"));
 	} else {
 		clear_user_polygons();
 		g_slist_free(com.found_object);
@@ -965,6 +988,16 @@ void catmag_activate(GSimpleAction *action, GVariant *parameter, gpointer user_d
 	siril_open_dialog("catmag");
 }
 
+void show_layers_activate(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
+	(void)action; (void)parameter; (void)user_data;
+	flis_gui_toggle_visible();
+}
+
+void show_nde_history_activate(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
+	(void)action; (void)parameter; (void)user_data;
+	flis_gui_history_toggle_visible();
+}
+
 void denoise_activate(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
 	siril_open_dialog("denoise_dialog");
 }
@@ -980,6 +1013,7 @@ void star_desaturate_activate(GSimpleAction *action, GVariant *parameter, gpoint
 	struct generic_img_args *args = calloc(1, sizeof(struct generic_img_args));
 	args->fit = gfit;
 	args->op = &op_desc_unclip;
+	args->user = new_synthstar_data();  /* records the detection conf for NDE replay */
 	args->verbose = TRUE;
 	if (!start_in_new_thread(generic_image_worker, args))
 		free_generic_img_args(args);
@@ -993,18 +1027,21 @@ void star_synthetic_activate(GSimpleAction *action, GVariant *parameter, gpointe
 	struct generic_img_args *args = calloc(1, sizeof(struct generic_img_args));
 	args->fit = gfit;
 	args->op = &op_desc_synthstar;
+	args->user = new_synthstar_data();  /* stashes the effective star list for NDE replay */
 	args->verbose = TRUE;
 	if (!start_in_new_thread(generic_image_worker, args))
 		free_generic_img_args(args);
 }
 
 /* the undo state must only be pushed once the prerequisites are known to be
- * met, otherwise an aborted alignment leaves a no-op entry on the undo stack */
-static void align_activate(rgb_align_method m, const char *undo_message) {
+ * met, otherwise an aborted alignment leaves a no-op entry on the undo stack.
+ * rgb_align_and_capture (align_rgb.c) records the NDE provenance for the
+ * direct-apply path and tags the undo entry saved here. */
+static void align_activate(rgb_align_method m, const char *summary) {
 	if (!rgb_align_prerequisites_met(m))
 		return;
-	undo_save_state(gfit, undo_message);
-	rgb_align(m);
+	int undo_err = undo_save_state(gfit, "%s", summary);
+	rgb_align_and_capture(m, undo_err, summary);
 }
 
 void align_dft_activate(GSimpleAction *action, GVariant *parameter, gpointer user_data) {

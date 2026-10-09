@@ -33,6 +33,13 @@ struct unpurpleargs {
 	gboolean withstarmask;
 	gboolean verbose;
 	gboolean applying;
+	/* NDE Convention 2 provenance of the mask's star set (see synthstar.h).
+	 * EXPLICIT (star_auto FALSE): stars_blob pins the consumed com.stars.
+	 * DELEGATED (star_auto TRUE): star_conf records the auto-detection params,
+	 * re-run at replay; stars_blob unused. */
+	gchar *stars_blob;
+	gboolean star_auto;
+	star_finder_params star_conf;
 };
 
 /* Allocator and destructor functions */
@@ -44,6 +51,16 @@ int unpurple_image_hook(struct generic_img_args *args, fits *fit, int nb_threads
 gchar *unpurple_log_hook(gpointer p, log_hook_detail detail);
 
 void apply_unpurple_cancel();
-int generate_binary_starmask(fits *fit, fits **star_mask, double threshold);
+/* Build a binary star mask from the star set.  Provenance outputs (any may be
+ * NULL) record NDE replay info: on return *auto_out tells whether the set was
+ * auto-detected (DELEGATED) rather than taken from com.stars (EXPLICIT);
+ * *stars_blob_out receives the effective list (EXPLICIT only, caller g_free);
+ * *conf_out receives the detection params used (DELEGATED only).
+ * @conf_override (non-NULL only during DELEGATED replay) forces auto-detection
+ * with those params installed, ignoring com.stars. */
+int generate_binary_starmask(fits *fit, fits **star_mask, double threshold,
+                             gchar **stars_blob_out, gboolean *auto_out,
+                             star_finder_params *conf_out,
+                             const star_finder_params *conf_override);
 
 #endif /* SRC_FILTERS_CA_H_ */

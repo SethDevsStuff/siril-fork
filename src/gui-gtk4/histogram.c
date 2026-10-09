@@ -27,6 +27,9 @@
 #include "algos/colors.h"
 #include "algos/statistics.h"
 #include "core/icc_profile.h"
+#include "core/nde/nde_checkpoint.h"
+#include "core/nde/nde_history.h"
+#include "core/nde/nde_replay.h"
 #include "core/op_descriptors.h"
 #include "core/processing.h"
 #include "core/proto.h"
@@ -38,9 +41,11 @@
 #include "gui-gtk4/histogram.h"
 #include "gui-gtk4/histogram_utils.h"
 #include "gui-gtk4/message_dialog.h"
+#include "gui-gtk4/nde_editors.h"
 #include "gui-gtk4/progress_and_log.h"
 #include "gui-gtk4/siril_preview.h"
 #include "gui-gtk4/utils.h"	// for lookup_widget()
+#include "io/image_format_fits.h"
 #include "io/sequence.h"
 #include "io/single_image.h"
 
@@ -57,6 +62,19 @@
 // Type of invocation - HISTO_STRETCH or GHT_STRETCH
 static int invocation = NO_STRETCH_SET_YET;
 
+/* Amend mode (convergence C5): the dialog edits an existing history record
+ * (op_desc_mtf when invocation==HISTO_STRETCH, op_desc_ghs when
+ * invocation==GHT_STRETCH).  gfit holds the pre-record state installed by
+ * nde_amend_preview_start; previews run against it through the ordinary
+ * backup machinery, and Apply/Cancel route through nde_amend_preview_end
+ * instead of a worker run + undo save. */
+static gboolean histo_amend_mode = FALSE;
+static GtkWidget *histo_amend_note = NULL;
+/* The amended record's auto_display_compensation, captured at prefill and
+ * re-serialized on Apply: adc is pixel-affecting but has no widget, so the
+ * recorded value must survive the amend round trip. */
+static gboolean histo_amend_adc = FALSE;
+
 static gboolean closing = FALSE;
 // Parameters for use in calculations
 static float _B = 0.5f, _D = 0.0f, _BP = 0.0f, _LP = 0.0f, _SP = 0.0f, _HP = 1.0f;
@@ -66,7 +84,12 @@ static int _stretchtype = STRETCH_PAYNE_NORMAL;
 static int _payne_colourstretchmodel = COL_INDEP;
 static ght_compute_params compute_params;
 
+/* The image the DISPLAYED histograms and HSL buffers are computed from: gfit,
+ * or a snapshot of the ROI when one is active (roi_stats_source, callbacks.h).
+ * A snapshot and not an alias, so it must be re-taken before pixels are read —
+ * see refresh_stats_fit() below. */
 static fits* fit = NULL;
+static fits roi_stats_cache = { 0 };
 
 static gboolean auto_display_compensation = FALSE;
 
@@ -95,8 +118,10 @@ static gboolean lp_warning_given, hp_warning_given = FALSE;
 void *huebuf = NULL, *satbuf_orig = NULL, *satbuf_working = NULL, *lumbuf = NULL;
 
 static void setup_hsl();
+static void refresh_stats_fit(void);
 static void clear_hsl();
 static void stretch_dialog_compute_histograms(fits *thefit);
+void updateGHTcontrols(void);
 
 /* create_mtf_data, destroy_mtf_data, create_ght_data, destroy_ght_data
  * moved to filters/mtf.c and filters/ght.c */
@@ -201,14 +226,24 @@ static void set_controls_active(gboolean state) {
 }
 
 static void histo_startup() {
+	/* FIRST: init_toggles() performs the one-time `fit = gfit`, and everything
+	 * below dereferences fit.  It used to sit after the first of those
+	 * dereferences, which was safe only because every entry point that reaches
+	 * here (toggle_histogram_window_visibility, histo_amend_open) happens to
+	 * call init_toggles() itself beforehand — open the dialog by any route
+	 * that does not and this is a NULL deref. */
+	init_toggles();
+
 	set_controls_active(TRUE);
 	add_roi_callback(histo_change_between_roi_and_image);
-	roi_supported(TRUE);
+	/* This dialog hosts two ops; declare the one it is currently invoked
+	 * for.  Both are ROI-capable, but saying which keeps the declaration
+	 * honest if that ever stops being true for one of them. */
+	roi_declare_op(invocation == GHT_STRETCH ? &op_desc_ghs : &op_desc_mtf);
 	copy_gfit_to_backup();
 	if (fit->naxes[2] == 3 && _payne_colourstretchmodel == COL_SAT)
 		setup_hsl();
 
-	init_toggles();
 	do_channel[0] = siril_toggle_get_active(GTK_WIDGET(toggles[0]));
 	do_channel[1] = siril_toggle_get_active(GTK_WIDGET(toggles[1]));
 	do_channel[2] = siril_toggle_get_active(GTK_WIDGET(toggles[2]));
@@ -229,6 +264,7 @@ static void histo_startup() {
 	// also get the backup histogram
 	/* histogram_mutex guards layers_hist[]/sat_hist against the worker thread,
 	 * which frees and recomputes them in notify_gfit_data_modified(). */
+	refresh_stats_fit();
 	g_mutex_lock(&com.histogram_mutex);
 	stretch_dialog_compute_histograms(fit);
 	for (int i = 0; i < fit->naxes[2]; i++)
@@ -268,15 +304,19 @@ static void histo_close(gboolean revert, gboolean update_image_if_needed, gboole
 		clear_hsl();
 	}
 	if (revert_icc_profile && !single_image_stretch_applied) {
-		if (gfit->icc_profile)
-			cmsCloseProfile(gfit->icc_profile);
-		gfit->icc_profile = copyICCProfile(original_icc);
-		color_manage(gfit, gfit->icc_profile != NULL);
+		current_image_set_icc_profile(original_icc
+			? copyICCProfile(original_icc) : NULL);
+		current_image_color_manage(original_icc != NULL);
 	}
 	clear_backup();
 	clear_hist_backup();
-	roi_supported(FALSE);
+	roi_declare_op(NULL);
 	remove_roi_callback(histo_change_between_roi_and_image);
+	/* Drop the region snapshot: it can be the size of the whole image and the
+	 * dialog may not be reopened.  Point `fit` away from it first — several
+	 * draw handlers read fit->naxes[2] without checking whether we are open. */
+	fit = gfit;
+	clearfits(&roi_stats_cache);
 }
 
 
@@ -312,8 +352,10 @@ static void histo_recompute(gboolean for_preview) {
 	gboolean auto_comp = auto_display_compensation;
 	auto_display_compensation = FALSE;
 
-	// Ensure we're working with the right fit
-	fit = gui.roi.active ? &gui.roi.fit : gfit;
+	/* Re-take the region snapshot the DISPLAYED histograms are computed
+	 * from.  This is not the image the op runs on — that is always gfit,
+	 * and the worker decides for itself whether to region-scope the run. */
+	fit = roi_stats_source(&roi_stats_cache);
 
 	copy_backup_to_gfit();
 
@@ -327,7 +369,7 @@ static void histo_recompute(gboolean for_preview) {
 			return;
 		}
 
-		data->fit = fit;
+		data->fit = gfit;
 		data->params.shadows = _shadows;
 		data->params.midtones = _midtones;
 		data->params.highlights = _highlights;
@@ -344,7 +386,7 @@ static void histo_recompute(gboolean for_preview) {
 			return;
 		}
 
-		args->fit = fit;
+		args->fit = gfit;
 		args->op = &op_desc_mtf;
 		args->idle_function = mtf_single_image_idle;
 		args->description = _("Midtone Transfer Function");  // override: variant label
@@ -354,7 +396,6 @@ static void histo_recompute(gboolean for_preview) {
 		args->for_preview = TRUE;
 		args->skip_generic_undo = TRUE;
 		args->mask_aware = TRUE;
-		args->for_roi = gui.roi.active;
 
 	} else if (invocation == GHT_STRETCH) {
 		struct ght_data *data = create_ght_data();
@@ -363,7 +404,7 @@ static void histo_recompute(gboolean for_preview) {
 			return;
 		}
 
-		data->fit = fit;
+		data->fit = gfit;
 		data->params_ght = malloc(sizeof(struct ght_params));
 		if (!data->params_ght) {
 			destroy_ght_data(data);
@@ -393,7 +434,7 @@ static void histo_recompute(gboolean for_preview) {
 			return;
 		}
 
-		args->fit = fit;
+		args->fit = gfit;
 		args->op = &op_desc_ghs;
 		args->mem_ratio = (_payne_colourstretchmodel == COL_SAT) ? 2.0f : 1.0f;  // override: computed
 		args->idle_function = ght_single_image_idle;
@@ -403,7 +444,6 @@ static void histo_recompute(gboolean for_preview) {
 		args->max_threads = com.max_thread;
 		args->for_preview = TRUE;
 		args->mask_aware = TRUE;
-		args->for_roi = gui.roi.active;
 	}
 
 	if (args) {
@@ -887,6 +927,76 @@ static void queue_window_redraw() {
 	gtk_widget_queue_draw(drawarea);
 }
 
+/* Fill the widgets and the parameter statics from the amended record through
+ * the op's own deserializer — the same fields the apply path reads.  Runs
+ * inside set_notify_block(TRUE/FALSE).  invocation must already match the
+ * record's op (set by the open function). */
+static void histo_prefill_from_amend(void) {
+	if (invocation == HISTO_STRETCH) {
+		struct mtf_data *d = op_desc_mtf.deserialize(nde_amend_preview_params(),
+		                                            nde_amend_preview_op_version());
+		if (!d)
+			return;
+		_shadows    = d->params.shadows;
+		_midtones   = d->params.midtones;
+		_highlights = d->params.highlights;
+		do_channel[0] = d->params.do_red;
+		do_channel[1] = d->params.do_green;
+		do_channel[2] = d->params.do_blue;
+		histo_amend_adc = d->auto_display_compensation;
+		siril_toggle_set_active(GTK_WIDGET(toggles[0]), do_channel[0]);
+		if (toggles[1]) siril_toggle_set_active(GTK_WIDGET(toggles[1]), do_channel[1]);
+		if (toggles[2]) siril_toggle_set_active(GTK_WIDGET(toggles[2]), do_channel[2]);
+		_update_entry_text();
+		destroy_mtf_data(d);
+	} else if (invocation == GHT_STRETCH) {
+		struct ght_data *d = op_desc_ghs.deserialize(nde_amend_preview_params(),
+		                                            nde_amend_preview_op_version());
+		if (!d || !d->params_ght) {
+			if (d) destroy_ght_data(d);
+			return;
+		}
+		const ght_params *p = d->params_ght;
+		_B  = p->B;  _D = p->D;  _LP = p->LP;  _SP = p->SP;  _HP = p->HP;  _BP = p->BP;
+		_stretchtype = p->stretchtype;
+		_payne_colourstretchmodel = p->payne_colourstretchmodel;
+		_clip_mode = p->clip_mode;
+		do_channel[0] = p->do_red;
+		do_channel[1] = p->do_green;
+		do_channel[2] = p->do_blue;
+		histo_amend_adc = d->auto_display_compensation;
+		siril_toggle_set_active(GTK_WIDGET(toggles[0]), do_channel[0]);
+		if (toggles[1]) siril_toggle_set_active(GTK_WIDGET(toggles[1]), do_channel[1]);
+		if (toggles[2]) siril_toggle_set_active(GTK_WIDGET(toggles[2]), do_channel[2]);
+		gtk_spin_button_set_value(GTK_SPIN_BUTTON(lookup_widget("spin_ghtD")), _D);
+		gtk_spin_button_set_value(GTK_SPIN_BUTTON(lookup_widget("spin_ghtB")), _B);
+		gtk_spin_button_set_value(GTK_SPIN_BUTTON(lookup_widget("spin_ghtSP")), _SP);
+		gtk_spin_button_set_value(GTK_SPIN_BUTTON(lookup_widget("spin_ghtLP")), _LP);
+		gtk_spin_button_set_value(GTK_SPIN_BUTTON(lookup_widget("spin_ghtHP")), _HP);
+		gtk_spin_button_set_value(GTK_SPIN_BUTTON(lookup_widget("spin_ghtBP")), _BP);
+		gtk_drop_down_set_selected(GTK_DROP_DOWN(lookup_widget("combo_payneTyp")), _stretchtype);
+		gtk_drop_down_set_selected(GTK_DROP_DOWN(lookup_widget("combo_payne_colour_stretch_model")), _payne_colourstretchmodel);
+		gtk_drop_down_set_selected(GTK_DROP_DOWN(lookup_widget("histo_clip_mode")), _clip_mode);
+		updateGHTcontrols();
+		destroy_ght_data(d);
+	}
+}
+
+/* Common amend-mode exit: tear down without touching the pixels (preview_end
+ * restores the true pixels wholesale), then run the amend (apply==TRUE with
+ * @blob) or discard it (apply==FALSE, blob NULL).  Returns TRUE when it
+ * handled the amend case. */
+static gboolean histo_amend_exit(gboolean apply, gchar *blob) {
+	if (!histo_amend_mode)
+		return FALSE;
+	closing = TRUE;
+	histo_close(TRUE, FALSE, FALSE);   /* restores histograms, drops backup; no ICC revert */
+	nde_amend_preview_end(apply, blob);
+	histo_amend_mode = FALSE;
+	siril_close_dialog("histogram_dialog");
+	return TRUE;
+}
+
 static void update_histo_mtf() {
 	/* Lock against notify_gfit_data_modified() on the worker thread, which
 	 * calls invalidate_gfit_histogram() + compute_histo_for_fit() under the
@@ -925,7 +1035,7 @@ static void update_histo_mtf() {
 }
 
 static int histo_update_preview() {
-	fit = gui.roi.active ? &gui.roi.fit : gfit;
+	fit = roi_stats_source(&roi_stats_cache);
 	if (!closing)
 		histo_recompute(TRUE);
 	return 0;
@@ -961,6 +1071,8 @@ static void stretch_dialog_compute_histograms(fits *thefit) {
 
 /* call from main thread */
 void update_gfit_histogram_if_needed() {
+	/* Outside the mutex: the snapshot reads gfit, not the histograms. */
+	refresh_stats_fit();
 	/* Hold histogram_mutex across the invalidate+recompute pair so no other
 	 * thread observes a partially-nullified layers_hist[]. */
 	g_mutex_lock(&com.histogram_mutex);
@@ -993,6 +1105,7 @@ gboolean mtf_single_image_idle(gpointer p) {
 	// Check if processing succeeded
 	if (args->retval == 0) {
 		// Update histograms
+		refresh_stats_fit();
 		g_mutex_lock(&com.histogram_mutex);
 		stretch_dialog_compute_histograms(fit);
 		g_mutex_unlock(&com.histogram_mutex);
@@ -1032,6 +1145,7 @@ gboolean ght_single_image_idle(gpointer p) {
 	// Check if processing succeeded
 	if (args->retval == 0) {
 		// Update histograms
+		refresh_stats_fit();
 		g_mutex_lock(&com.histogram_mutex);
 		stretch_dialog_compute_histograms(fit);
 		g_mutex_unlock(&com.histogram_mutex);
@@ -1059,7 +1173,16 @@ gboolean ght_single_image_idle(gpointer p) {
 	return FALSE;
 }
 
+/* Re-take the ROI snapshot immediately before pixels are read through `fit`.
+ * A no-op when `fit` is gfit: the whole-image case needs no snapshot, and the
+ * apply paths that deliberately point `fit` at gfit must stay there. */
+static void refresh_stats_fit(void) {
+	if (fit == &roi_stats_cache)
+		fit = roi_stats_source(&roi_stats_cache);
+}
+
 static void setup_hsl() {
+	refresh_stats_fit();
 	if (huebuf)
 		free(huebuf);
 	if (fit->type == DATA_FLOAT) {
@@ -1117,13 +1240,12 @@ void histo_change_between_roi_and_image() {
 	// This should be called if the ROI is set, changed or cleared to ensure the
 	// histogram dialog continues to process the right data. Especially important
 	// in GHT saturation stretch mode.
-	fit = gui.roi.active ? &gui.roi.fit : gfit;
+	fit = roi_stats_source(&roi_stats_cache);
 	if (_payne_colourstretchmodel == COL_SAT) {
 		clear_hsl();
 		setup_hsl();
 	}
 	update_histo_mtf();
-	gui.roi.operation_supports_roi = TRUE;
 	// If we are showing the preview, update it after the ROI change.
 	update_image *param = malloc(sizeof(update_image));
 	param->update_preview_fn = histo_update_preview;
@@ -1203,15 +1325,44 @@ void on_histo_toggled(GtkToggleButton *togglebutton, gpointer user_data) {
 
 void on_histogram_window_show(GtkWidget *object, gpointer user_data) {
 	closing = FALSE;
+	if (!histo_amend_note)
+		histo_amend_note = lookup_widget("histo_amend_note");
+	nde_amend_note_update(histo_amend_note, histo_amend_mode,
+	                      invocation == GHT_STRETCH ? &op_desc_ghs : &op_desc_mtf);
+
 	histo_startup();
 	_initialize_clip_text();
 	reset_cursors_and_values(TRUE);
+	refresh_stats_fit();
 	g_mutex_lock(&com.histogram_mutex);
 	stretch_dialog_compute_histograms(fit);
 	g_mutex_unlock(&com.histogram_mutex);
+
+	if (histo_amend_mode) {
+		/* Show the RECORD's parameters, not a fresh autostretch: prefill
+		 * after reset_cursors_and_values so the record's values win.  The
+		 * ROI stays armed as histo_startup() left it: its backup IS the
+		 * pre-record state, so a region preview crops the right pixels and
+		 * the worker replays the successors inside the rectangle
+		 * (nde_replay.h). */
+		set_notify_block(TRUE);
+		siril_toggle_set_active(GTK_WIDGET(GTK_CHECK_BUTTON(lookup_widget("HistoCheckPreview"))), TRUE);
+		histo_prefill_from_amend();
+		set_notify_block(FALSE);
+		update_histo_mtf();
+		queue_window_redraw();
+		/* One preview tick so the dialog opens showing the record applied
+		 * with its current parameters. */
+		update_image *param = malloc(sizeof(update_image));
+		param->update_preview_fn = histo_update_preview;
+		param->show_preview = TRUE;
+		notify_update((gpointer) param);
+	}
 }
 
 gboolean on_button_histo_close_clicked(GtkButton *button, gpointer user_data) {
+	if (histo_amend_exit(FALSE, NULL))
+		return FALSE;
 	closing = TRUE;
 	set_cursor_waiting(TRUE);
 	histo_close(TRUE, TRUE, TRUE);
@@ -1222,6 +1373,21 @@ gboolean on_button_histo_close_clicked(GtkButton *button, gpointer user_data) {
 
 void on_button_histo_reset_clicked(GtkButton *button, gpointer user_data) {
 	set_cursor_waiting(TRUE);
+	if (histo_amend_mode) {
+		/* Reset means "back to the record's recorded parameters" here. */
+		reset_cursors_and_values(FALSE);
+		set_notify_block(TRUE);
+		histo_prefill_from_amend();
+		set_notify_block(FALSE);
+		update_histo_mtf();
+		queue_window_redraw();
+		update_image *param = malloc(sizeof(update_image));
+		param->update_preview_fn = histo_update_preview;
+		param->show_preview = siril_toggle_get_active(GTK_WIDGET(GTK_CHECK_BUTTON(lookup_widget("HistoCheckPreview"))));
+		notify_update((gpointer) param);
+		set_cursor_waiting(FALSE);
+		return;
+	}
 	reset_cursors_and_values(FALSE);
 	histo_close(TRUE, TRUE, FALSE);
 	histo_startup();
@@ -1240,6 +1406,42 @@ gboolean on_scale_key_release_event(GtkWidget *widget, GdkEvent *event,
 
 
 void on_button_histo_apply_clicked(GtkButton *button, gpointer user_data) {
+	if (histo_amend_mode) {
+		/* Serialize the current widget state through the SAME struct and
+		 * serializer the normal apply uses, then route it through the amend
+		 * path.  The parameter statics were kept in sync by the widget
+		 * callbacks (and seeded by histo_prefill_from_amend). */
+		gchar *blob = NULL;
+		if (invocation == HISTO_STRETCH) {
+			struct mtf_data data = {
+				.destroy_fn = NULL, .fit = NULL, .seq = NULL, .linked = TRUE,
+				.params = {
+					.midtones = _midtones, .shadows = _shadows, .highlights = _highlights,
+					.do_red = do_channel[0], .do_green = do_channel[1], .do_blue = do_channel[2]
+				},
+				.uparams = {}, .seqEntry = NULL,
+				/* preserve the record's adc — pixel-affecting, no widget */
+				.auto_display_compensation = histo_amend_adc, .is_preview = FALSE
+			};
+			blob = op_desc_mtf.serialize(&data);
+		} else if (invocation == GHT_STRETCH) {
+			struct ght_params params = {
+				.B = _B, .D = _D, .LP = _LP, .SP = _SP, .HP = _HP, .BP = _BP,
+				.stretchtype = _stretchtype,
+				.payne_colourstretchmodel = _payne_colourstretchmodel,
+				.do_red = do_channel[0], .do_green = do_channel[1], .do_blue = do_channel[2],
+				.clip_mode = _clip_mode
+			};
+			struct ght_data data = { .params_ght = &params,
+				/* preserve the record's adc — pixel-affecting, no widget */
+				.auto_display_compensation = histo_amend_adc };
+			blob = op_desc_ghs.serialize(&data);
+		}
+		histo_amend_exit(TRUE, blob);
+		g_free(blob);
+		return;
+	}
+
 	if (!check_ok_if_cfa())
 		return;
 
@@ -1348,17 +1550,23 @@ void on_button_histo_apply_clicked(GtkButton *button, gpointer user_data) {
 			// The stretch is already applied to gfit via preview
 			// Just need to prepare undo with the backup
 
-			populate_roi();
-
-			// Prepare undo state with ICC profile handling
-			// Use the backup which contains the original unstretched image
+			// Prepare undo state with separate ICC snapshot
 			fits *backup = get_preview_gfit_backup();
-			fits undo_fit = {0};
-			memcpy(&undo_fit, backup, sizeof(fits));
-			undo_fit.icc_profile = original_icc;
-			undo_fit.color_managed = original_icc != NULL;
+
+			/* NDE baseline (phase 2): the preview backup holds the pre-stretch
+			 * pixels for this item — the baseline for replaying its chain. */
+			if (backup)
+				nde_checkpoint_baseline_ensure(backup, nde_checkpoint_active_item_id());
 
 			gchar *log_string = NULL;
+			/* NDE provenance capture for this preview-on / non-ROI
+			 * branch: the stretch was applied incrementally by the preview
+			 * pipeline, so no generic_image_worker run (which would
+			 * capture) fires here — this undo save is the sole commit
+			 * point.  The preview-off / ROI branch below DOES run the
+			 * worker without skip_generic_undo, so it is captured there,
+			 * NOT here.  Capture before the save (worker order). */
+			gint64 rid = 0;
 
 			if (invocation == HISTO_STRETCH) {
 				struct mtf_data data = {
@@ -1380,6 +1588,7 @@ void on_button_histo_apply_clicked(GtkButton *button, gpointer user_data) {
 					.is_preview = FALSE
 				};
 				log_string = generate_mtf_log_message(&data, SUMMARY);
+				rid = nde_capture_from_descriptor(&op_desc_mtf, &data, log_string, gfit, TRUE);
 
 			} else if (invocation == GHT_STRETCH) {
 				struct ght_params params = {
@@ -1397,10 +1606,20 @@ void on_button_histo_apply_clicked(GtkButton *button, gpointer user_data) {
 					.clip_mode = _clip_mode
 				};
 				log_string = generate_ght_log_message(&params);
+				/* ght_serialize reads struct ght_data->params_ght */
+				struct ght_data data = {
+					.params_ght = &params,
+					.auto_display_compensation = FALSE
+				};
+				rid = nde_capture_from_descriptor(&op_desc_ghs, &data, log_string, gfit, TRUE);
 			}
 
 			if (log_string) {
-				undo_save_state(&undo_fit, log_string);
+				/* One entry: pre-stretch pixels + pre-stretch ICC
+				 * profile — a single Ctrl-Z reverts both. */
+				if (!undo_save_state_with_icc(backup, original_icc,
+						"%s", log_string))
+					undo_tag_top_nde_record(rid);
 				siril_log_info("%s\n", log_string);
 				g_free(log_string);
 			}
@@ -1422,19 +1641,20 @@ void on_button_histo_apply_clicked(GtkButton *button, gpointer user_data) {
 		if (!preview_active || gui.roi.active) {
 			copy_backup_to_gfit();
 			if (_payne_colourstretchmodel == COL_SAT) {
+				/* The HSL buffers are consumed by the hook, indexed by the
+				 * pixel count of the fits it is handed — so they must be
+				 * sized from THAT, not from the statistics view.  Apply is
+				 * always full-image, so point `fit` at gfit before
+				 * setup_hsl(): sized from a region snapshot instead, the
+				 * hook reads past the end of every one of them. */
+				fit = gfit;
 				clear_hsl();
 				setup_hsl();
 			}
 		}
 
-		populate_roi();
-
-		// Prepare undo state with ICC profile handling BEFORE applying stretch
+		// Prepare undo state with separate ICC snapshot BEFORE applying stretch
 		fits *backup = get_preview_gfit_backup();
-		fits undo_fit = {0};
-		memcpy(&undo_fit, backup, sizeof(fits));
-		undo_fit.icc_profile = original_icc;
-		undo_fit.color_managed = original_icc != NULL;
 
 		gchar *log_string = NULL;
 
@@ -1478,7 +1698,10 @@ void on_button_histo_apply_clicked(GtkButton *button, gpointer user_data) {
 		}
 
 		if (log_string) {
-			undo_save_state(&undo_fit, log_string);
+			/* One entry: pre-stretch pixels + pre-stretch ICC profile —
+			 * a single Ctrl-Z reverts both. */
+			undo_save_state_with_icc(backup, original_icc,
+					"%s", log_string);
 			siril_log_info("%s\n", log_string);
 			g_free(log_string);
 		}
@@ -1519,7 +1742,6 @@ void on_button_histo_apply_clicked(GtkButton *button, gpointer user_data) {
 			args->max_threads = com.max_thread;
 			args->for_preview = FALSE;
 			args->mask_aware = TRUE;
-			args->for_roi = gui.roi.active;
 
 		} else if (invocation == GHT_STRETCH) {
 			struct ght_data *data = create_ght_data();
@@ -1567,7 +1789,6 @@ void on_button_histo_apply_clicked(GtkButton *button, gpointer user_data) {
 			args->max_threads = com.max_thread;
 			args->mask_aware = TRUE;
 			args->for_preview = FALSE;
-			args->for_roi = gui.roi.active;
 		}
 
 		if (args) {
@@ -1582,6 +1803,8 @@ void on_button_histo_apply_clicked(GtkButton *button, gpointer user_data) {
 }
 
 void apply_histo_cancel() {
+	if (histo_amend_exit(FALSE, NULL))
+		return;
 	set_cursor_waiting(TRUE);
 	histo_close(TRUE, TRUE, TRUE);
 	set_cursor_waiting(FALSE);
@@ -1615,7 +1838,7 @@ void on_histoToolAutoStretch_clicked(GtkButton *button, gpointer user_data) {
 		update_histo_mtf();
 
 		// Set auto display compensation flag and trigger recompute
-		if (fit->color_managed && !profiles_identical(fit->icc_profile, com.gui_icc.monitor))
+		if (fit_get_color_managed(fit) && !profiles_identical(fit_get_icc_profile(fit), com.gui_icc.monitor))
 			auto_display_compensation = TRUE;
 
 		update_image *param = malloc(sizeof(update_image));
@@ -1737,7 +1960,7 @@ void toggle_histogram_window_visibility(int _invocation) {
 		fit = gfit;
 		if (original_icc)
 			cmsCloseProfile(original_icc);
-		original_icc = copyICCProfile(gfit->icc_profile);
+		original_icc = copyICCProfile(current_icc_profile());
 		icc_auto_assign_or_convert(gfit, ICC_ASSIGN_ON_STRETCH);
 		single_image_stretch_applied = FALSE;
 		// When opening the dialog with a single image loaded, we cache the original ICC
@@ -1746,7 +1969,7 @@ void toggle_histogram_window_visibility(int _invocation) {
 		if (single_image_is_loaded()) {
 			if (original_icc) {
 				cmsCloseProfile(original_icc);
-				original_icc = copyICCProfile(gfit->icc_profile);
+				original_icc = copyICCProfile(current_icc_profile());
 			}
 			icc_auto_assign_or_convert(gfit, ICC_ASSIGN_ON_STRETCH);
 		} else {
@@ -2280,4 +2503,81 @@ void on_histo_preview_toggled(GtkCheckButton *button, gpointer user_data) {
 		param->show_preview = TRUE;
 		notify_update((gpointer) param);
 	}
+}
+
+/* ---- amend-mode entry (nde_editors registry) --------------------------- */
+
+/* Set up the dialog for @_invocation (HISTO_STRETCH / GHT_STRETCH) and open
+ * it.  Mirrors the open branch of toggle_histogram_window_visibility(); the
+ * show handler prefills from the record rather than autostretching. */
+static void histo_amend_open(int _invocation) {
+	siril_close_preview_dialogs();
+	init_toggles();
+	invocation = _invocation;
+	fit = gfit;
+	/* No ICC juggling in amend mode (asinh template): an amend only changes
+	 * pixels, and icc_auto_assign_or_convert could CONVERT the installed
+	 * pre-record state, making the preview diverge from the replayed
+	 * commit. */
+	if (original_icc) {
+		cmsCloseProfile(original_icc);
+		original_icc = NULL;
+	}
+	single_image_stretch_applied = FALSE;
+	_payne_colourstretchmodel = gtk_drop_down_get_selected(GTK_DROP_DOWN(lookup_widget("combo_payne_colour_stretch_model")));
+	if (invocation == HISTO_STRETCH) {
+		setup_histo_dialog();
+	} else if (invocation == GHT_STRETCH) {
+		setup_ght_dialog();
+		updateGHTcontrols();
+	}
+	if (gui.rendering_mode == LINEAR_DISPLAY)
+		setup_stretch_sliders();
+	histo_amend_mode = TRUE;
+	siril_open_dialog("histogram_dialog");
+}
+
+static void histo_mtf_amend_ready(gboolean ok, gpointer user) {
+	(void)user;
+	if (!ok)
+		return;   /* the core logged the reason; nothing was changed */
+	histo_amend_open(HISTO_STRETCH);
+}
+
+static void histo_ghs_amend_ready(gboolean ok, gpointer user) {
+	(void)user;
+	if (!ok)
+		return;
+	histo_amend_open(GHT_STRETCH);
+}
+
+gboolean histogram_mtf_open_amend(gint64 record_id) {
+	/* Unlinked MTF records (e.g. autostretch captures) carry per-channel
+	 * parameter triples this dialog's linked sliders cannot represent —
+	 * amending one here would silently collapse it to a linked stretch.
+	 * Veto so the Edit button falls back to the kv-grid editor. */
+	gboolean linked = TRUE;
+	GPtrArray *snap = nde_history_snapshot(NULL);
+	for (guint i = 0; snap && i < snap->len; i++) {
+		const nde_record *rec = g_ptr_array_index(snap, i);
+		if (rec->record_id == record_id) {
+			GHashTable *kv = rec->params ? nde_kv_parse(rec->params) : NULL;
+			if (kv) {
+				nde_kv_get_bool(kv, "linked", &linked);
+				g_hash_table_unref(kv);
+			}
+			break;
+		}
+	}
+	if (snap)
+		g_ptr_array_unref(snap);
+	if (!linked)
+		return FALSE;
+	nde_amend_preview_start(record_id, histo_mtf_amend_ready, NULL);
+	return TRUE;
+}
+
+gboolean histogram_ghs_open_amend(gint64 record_id) {
+	nde_amend_preview_start(record_id, histo_ghs_amend_ready, NULL);
+	return TRUE;
 }

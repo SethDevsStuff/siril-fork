@@ -226,6 +226,7 @@ struct gui_config {
 	gchar *first_start;		// use to display information at first use
 	gboolean silent_quit;
 	gboolean silent_linear;
+	gboolean silent_hist_move;	// don't confirm edit-history reorders
 	gboolean remember_windows;	// restore windows at their previous location
 	rectangle main_w_pos;
 	gint open_dialog_w;		// remembered width of the custom open-file dialog (0 = use default)
@@ -272,6 +273,9 @@ struct gui_config {
 	struct mouse_config mouse_cfg; // String representation of mouse & scroll actions
 	struct editor_config editor_cfg; // Configuration for the script editor
 	gboolean mask_tints_vports; // Whether to show the mask as a red tint in the image mask_tints_vports
+	int flis_tile_budget_mb;    // FLIS per-layer GdkTexture tile cache byte
+	                            // budget in MiB (LRU evicts oldest tile once
+	                            // exceeded).  128–4096; default 256.
 };
 
 // TODO: is any of the following used for something else than providing the default GUI value?
@@ -408,6 +412,15 @@ struct pref_struct {
 	int lazy_tile_cache_mb; // RAM budget (MB) for displaying very large images: images
 	                        // whose display buffer fits go eager (no tiling); larger ones
 	                        // use the tiled lazy renderer capped at this many MB resident
+
+	int nde_cache_mb; // DISK budget (MB) for ALL nondestructive-editing storage
+	                  // (swap files): the speed-cache pool of replay restart
+	                  // points AND the editability pins (baselines, output
+	                  // checkpoints, pinned masks) that keep earlier steps
+	                  // amendable. Over budget, cache is evicted first and
+	                  // silently, then the oldest pins with a warning — see
+	                  // nde_retention.h. 0 disables the pool only; pins are
+	                  // correctness and are always stored.
 
 	gboolean script_check_requires;	// check the requires command in scripts
 	gboolean pipe_check_requires;	// check the requires command in pipes

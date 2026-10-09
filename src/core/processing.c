@@ -32,8 +32,15 @@
 
 #include "algos/siril_wcs.h"
 #include "algos/statistics.h"
+#include "core/fits_region.h"
 #include "core/gui_iface.h"
 #include "core/masks.h"
+#include "core/nde/nde_checkpoint.h"
+#include "core/nde/nde_history.h"
+#include "core/nde/nde_op_class.h"
+#include "core/nde/nde_replay.h"
+#include "core/nde/nde_script_scope.h"
+#include "core/nde/nde_snapstore.h"
 #include "core/op_descriptor.h"
 #include "core/OS_utils.h"
 #include "core/processing.h"
@@ -45,6 +52,7 @@
 #include "io/annotation_catalogues.h"
 #include "io/fits_sequence.h"
 #include "io/image_format_fits.h"
+#include "io/image_format_flis.h"
 #include "io/sequence.h"
 #include "io/seqwriter.h"
 #include "io/ser.h"
@@ -67,7 +75,9 @@ void child_mutex_unlock() {
  * user_data fit this polymorphic pattern. If the destroy_fn is NULL we assume
  * there are no dynamically allocated members and the struct can just be freed.
  */
-static void destroy_any_args(void *obj) {
+void destroy_any_args(void *obj) {
+	if (!obj)
+		return;
     destructor *destroy_fn = obj; // first field assumed destroy
     if (*destroy_fn)
 		(*destroy_fn)(obj);
@@ -1342,6 +1352,20 @@ static int default_mask_mem_hook(struct generic_mask_args *args) {
 		required_mem = (gint64) (args->mem_ratio * args->fit->rx * args->fit->ry * 4); // worst case
 	}
 
+	/* The worker's swap path (fit == gfit) snapshots the WHOLE fit — pixels
+	 * and mask — before the hook runs.  That cost scales with the image,
+	 * not the mask, so it cannot be folded into mem_ratio (whose basis is
+	 * the mask size): add it explicitly.  The ratio keeps describing the
+	 * hook's own working set on top. */
+	if (args->fit == gfit) {
+		required_mem += (gint64) args->fit->rx * args->fit->ry
+			* args->fit->naxes[2]
+			* (args->fit->type == DATA_FLOAT ? sizeof(float) : sizeof(WORD));
+		if (args->fit->mask)
+			required_mem += (gint64) args->fit->rx * args->fit->ry
+				* (args->fit->mask->bitpix >> 3);
+	}
+
 	gint64 available_mem = get_available_memory();
 
 	if (required_mem > available_mem) {
@@ -1414,7 +1438,7 @@ void free_generic_img_args(struct generic_img_args *args) {
 }
 
 FAST_MATH_PUSH
-static inline void blend_fits_with_mask(fits* fit, fits* orig) {
+void blend_fits_with_mask(fits* fit, fits* orig) {
 	size_t npixels = fit->rx * fit->ry;
 	mask_t *mask = fit->mask;
 
@@ -1539,6 +1563,25 @@ static inline void blend_fits_with_mask(fits* fit, fits* orig) {
 }
 FAST_MATH_POP
 
+/* The exit shared by generic_image_worker's pre-flight guards.  They all run
+ * before any lock is taken and before the hook, the undo save and the NDE
+ * capture, so refusing here leaves the image and its history untouched;
+ * finishing through the same idle the normal path uses is what hands `args`
+ * back to be freed.  Takes ownership of @desc. */
+static gpointer img_worker_refuse(struct generic_img_args *args,
+                                  gboolean use_swap, gchar *desc) {
+	args->retval = 1;
+	if (!com.script && !com.python_command && use_swap)
+		gui_iface.set_suppress_redraws(FALSE);
+	gui_iface.set_progress(PROGRESS_RESET, NULL);
+	if (args->idle_function)
+		siril_add_idle(args->idle_function, args);
+	else
+		siril_add_idle(end_generic_image_update_gfit, args);
+	g_free(desc);
+	return GINT_TO_POINTER(1);
+}
+
 /** Main generic image worker function
  * Works with a single image, optionally using multiple threads for processing
  */
@@ -1552,6 +1595,10 @@ gpointer generic_image_worker(gpointer p) {
 	 * before anything reads those fields. No-op for un-migrated sites. */
 	op_descriptor_fill_img_args(args);
 	assert(args->image_hook);
+	/* Replay records apply to a PRIVATE fits only (nde-phase2-3-plan.md
+	 * decision 1): the non-swap path is what makes undo, NDE capture and
+	 * the HISTORY fallback skip without further gating. */
+	g_assert(!args->nde_replay || args->fit != gfit);
 
 	/* Stack copies of args fields — args is freed by the sync-idle at
 	 * the end of the function, so anything used past that point must be
@@ -1560,30 +1607,136 @@ gpointer generic_image_worker(gpointer p) {
 	gboolean argpreview = args->for_preview;
 	gboolean arg_skip_undo = args->skip_generic_undo;
 	gboolean arg_update_gfit = args->command_updates_gfit;
-	gboolean verbose = args->verbose || !args->for_preview;
+	gboolean verbose = (args->verbose || !args->for_preview) && !args->nde_replay;
 	gchar* desc = g_strdup(args->description);
 
-	/* Two processing strategies live in this one function:
+	/* Region preview (the ROI model, core/siril.h).  DERIVED here, never
+	 * passed in: an op declares only that it CAN be computed on a
+	 * sub-rectangle (OP_ROI_CAPABLE), and this is the single place that
+	 * decides whether a given run is one.  Deriving it is what removes the
+	 * class of drift where a dialog's fit and its flag disagreed.
 	 *
-	 *   Swap path (argfit == gfit) — the long-running image_hook works
-	 *   on a private copy (`orig`).  gfit is left untouched for the
-	 *   duration so the GUI can keep reading it; readers (motion
-	 *   handlers, ROI fills) hit the lock for ~µs only at the swap
-	 *   point.  After the hook, fits_swap_all_except_rwlock(gfit, orig)
-	 *   installs the result.  As a happy side effect, `orig` then
-	 *   holds the pre-modification image — exactly what
-	 *   undo_save_state() wants.  An aborted swap-path op leaves gfit
-	 *   untouched (no swap on retval).
+	 * for_preview is the load-bearing term.  For a dialog with no live
+	 * preview it is the BUTTON discriminator — "Preview ROI" sets it, Apply
+	 * does not — which is what makes "the ROI is a preview scope, never an
+	 * edit scope" true rather than aspirational.  It is also what keeps
+	 * commands, scripts and replays full-image.
 	 *
-	 *   Non-swap path (argfit == &gui.roi.fit or similar) — keep the
-	 *   in-place pattern.  Take args->fit's writer lock for the
-	 *   duration of the hook.  The lock isn't on gfit, so it doesn't
-	 *   block GTK main-thread readers.
+	 * Both the descriptor AND the dialog have to agree.  The descriptor says
+	 * what the op can do; roi_operation_supports() is what the ROI overlay
+	 * colour shows the user, and a dialog can withhold it for the session it
+	 * is in (an amend-mode editor previews full-image against the pre-record
+	 * backup).  Region-scoping a run the overlay says is not region-scoped
+	 * would make the outline a lie. */
+	rectangle roi_rect = { 0 };
+	args->for_roi = FALSE;
+	if (args->for_preview && !args->nde_replay && argfit == gfit
+	    && op_descriptor_is_roi_capable(args->op)
+	    && !com.script && !com.python_command && !com.headless
+	    && gui_iface.roi_is_active()
+	    && gui_iface.roi_operation_supports()
+	    && gui_iface.roi_active_layer_rect(&roi_rect)) {
+		args->for_roi = TRUE;
+		args->roi_rect = roi_rect;
+	}
+	const gboolean for_roi = args->for_roi;
+	fits *roi_work = NULL;    /* region preview: the crop the hook runs on,
+	                           * pasted back into gfit afterwards. */
+	/* The crop actually taken: roi_rect grown by the op's halo and clipped to
+	 * the image.  The hook sees this; only roi_rect is written back, so the
+	 * halo extends the input and never shrinks what the user sees. */
+	rectangle roi_grown = roi_rect;
+	/* Non-NULL when this preview is a dialog amending a history record whose
+	 * SUCCESSORS can be recomputed on the rectangle too (nde_replay.h).  Held
+	 * across the hook so the halo the crop was grown by and the records
+	 * replayed into it come from one snapshot of the tail. */
+	nde_region_tail *roi_tail = NULL;
+
+	/* FLIS geometry-op undo capture: when geometry_changing is set AND a FLIS
+	 * is loaded, route the undo entry through undo_save_flis_layer_full so the
+	 * active layer's pixels, pmask, lmask and props are reverted together.
+	 * The pre-op lmask and props are captured below (before the hook mutates
+	 * them) and consumed in the post-hook undo block. */
+	gboolean geom_flis = args->geometry_changing && args->fit == gfit
+	                     && is_current_image_flis()
+	                     && !args->skip_generic_undo && !args->for_preview && !com.script;
+	flis_layer_t      *geom_active     = NULL;
+	flis_layer_props_t geom_pre_props  = { 0 };
+	layermask_t       *geom_pre_lmask  = NULL;
+
+	/* Where the layer is standing BEFORE the hook runs — half of the pre-op
+	 * state the NDE baseline is seeded from (nde_state.h).  Captured here
+	 * because the hook is what moves it, and NOT gated on the undo policy the
+	 * way geom_pre_props is: a replay needs the starting position whether or
+	 * not this run saved an undo entry, scripts included.  Its pixels are
+	 * attached at capture time, below, once `orig` holds them. */
+	nde_state nde_pre = { 0 };
+	if (argfit == gfit && !for_roi && !args->nde_replay && is_current_image_flis()) {
+		flis_layer_t *pos_lay = flis_active_layer();
+		if (pos_lay) {
+			nde_pre.pos_x   = pos_lay->position_x;
+			nde_pre.pos_y   = pos_lay->position_y;
+			nde_pre.has_pos = TRUE;
+		}
+	}
+
+	/* Job identity, resolved ONCE at job start.  Everything the post-swap
+	 * bookkeeping needs to attribute the result — the NDE target item, the
+	 * undo layer, the mask pin — is captured here, from the state the user
+	 * actually launched the op against.  Re-reading the live globals after
+	 * the swap raced the layers panel: a switch landing in the microseconds
+	 * between the swap and the bookkeeping attributed the old layer's op to
+	 * the new layer.  It also closes a non-race gap in the undo push: the
+	 * pointer walk in undo_push_to can never match `orig` (a private
+	 * snapshot), so generic-path FLIS entries carried no layer id and a
+	 * later undo restored the pixels into whatever layer was active by
+	 * then.  A job that survives the swap-point retarget guard necessarily
+	 * ran against this identity: any intervening switch (even away and
+	 * back) leaves the active layer equal to the one captured here. */
+	gint job_item_id    = -1;                    /* NDE target (edit-at borrow aware) */
+	gint job_undo_layer = FLIS_UNDO_LAYER_NONE;  /* undo attribution */
+	gint job_pmask_id   = 0;                     /* mask-pin item id */
+	if (argfit == gfit && !for_roi && !args->nde_replay) {
+		job_item_id = nde_capture_target_item();
+		if (is_current_image_flis()) {
+			flis_layer_t *job_lay = flis_layer_get_by_fit(argfit);
+			if (job_lay)
+				job_undo_layer = job_lay->item_id;
+			/* Same materialisation the capture block used to do post-swap,
+			 * under the same effective condition (a mask the op will run
+			 * under exists now, pre-hook, or not at all). */
+			if (args->mask_aware && argfit->mask && argfit->mask_active)
+				job_pmask_id = flis_layer_pmask_id(flis_active_layer());
+		}
+	}
+
+	/* Three processing strategies live in this one function:
+	 *
+	 *   Swap path (argfit == gfit, whole image) — the long-running
+	 *   image_hook works on a private copy (`orig`).  gfit is left
+	 *   untouched for the duration so the GUI can keep reading it;
+	 *   readers (motion handlers, tile fills) hit the lock for ~µs only
+	 *   at the swap point.  After the hook,
+	 *   fits_swap_all_except_rwlock(gfit, orig) installs the result.  As
+	 *   a happy side effect, `orig` then holds the pre-modification
+	 *   image — exactly what undo_save_state() wants.  An aborted
+	 *   swap-path op leaves gfit untouched (no swap on retval).
+	 *
+	 *   Region path (for_roi) — the same shape at a smaller scale: crop
+	 *   the region out of the PRE-OP image, run the hook on the crop with
+	 *   no lock held, then paste the result back into gfit under a brief
+	 *   writer lock.  Nothing outside the rectangle changes, and no undo
+	 *   entry or provenance record is created — a region run is a preview.
+	 *
+	 *   Non-swap path (argfit is some other fits) — keep the in-place
+	 *   pattern.  Take args->fit's writer lock for the duration of the
+	 *   hook.  The lock isn't on gfit, so it doesn't block GTK
+	 *   main-thread readers.
 	 *
 	 * The 87-of-94 hook audit confirmed every image_hook operates only
 	 * on its `fit` parameter, so passing `orig` instead of gfit on the
 	 * swap path is safe. */
-	gboolean use_swap = (argfit == gfit);
+	gboolean use_swap = (argfit == gfit) && !for_roi;
 
 	fits *orig = NULL;        /* original backup + (swap path) hook
 	                           * working buffer.  After the swap it
@@ -1595,6 +1748,12 @@ gpointer generic_image_worker(gpointer p) {
 	gchar *history = NULL;
 	gchar *summary = NULL;
 	gboolean undo_state = FALSE;
+	/* Assigned below once hook_fit's mask state is known; declared here so
+	 * the guard gotos above the assignment don't leave it indeterminate at
+	 * the_end (never read on those paths — retval gates it — but the
+	 * compiler cannot see that). */
+	gboolean using_mask = FALSE;
+	gboolean nonswap_quiesced = FALSE;
 
 	/* Suppress viewport redraws for any op that writes gfit, so partial
 	 * remap_index updates from background threads don't make it to the
@@ -1603,9 +1762,70 @@ gpointer generic_image_worker(gpointer p) {
 	if (!com.script && !com.python_command && use_swap)
 		gui_iface.set_suppress_redraws(TRUE);
 
-	gui_iface.set_progress(PROGRESS_RESET, NULL);
+	if (!args->nde_replay)
+		gui_iface.set_progress(PROGRESS_RESET, NULL);
 	gettimeofday(&t_start, NULL);
 	args->retval = 0;
+
+	/* Refuse to run a GUI-initiated op while a layer GROUP row is selected
+	 * in the FLIS panel: the op would silently apply to the active layer
+	 * only, which is misleading when the user intends the whole group.
+	 * Command/script invocations (args->command) are exempt — they target
+	 * gfit explicitly and have no panel selection semantics.  No locks are
+	 * held yet, so finish through the same idle the normal path uses (it
+	 * owns and frees args). */
+	if (!args->command && !args->nde_replay && is_current_image_flis()
+	    && (gui_iface.flis_group_is_selected()
+	        || gui_iface.flis_multi_is_selected())) {
+		const gboolean multi = gui_iface.flis_multi_is_selected();
+		siril_log_error(multi
+		    ? _("%s: cannot apply with multiple layers selected — select a single layer.\n")
+		    : _("%s: cannot apply to a layer group — select an individual layer.\n"),
+		                desc ? desc : "Operation");
+		gui_iface.message_dialog(SIRIL_MSG_ERROR,
+		    multi ? _("Multiple Layers Selected") : _("Layer Group Selected"),
+		    multi ? _("This operation cannot be applied to a multiple selection.\n"
+		              "Please select a single layer.")
+		          : _("This operation cannot be applied to a layer group.\n"
+		              "Please select an individual layer."));
+		return img_worker_refuse(args, use_swap, desc);
+	}
+
+	/* Same shape, different reason: canvas geometry on a layered document is
+	 * not part of any one layer's lineage, so it cannot join an open edit
+	 * history insertion point — and closing the point restores the true
+	 * image, which would silently revert it (nde_replay.h). */
+	if (args->geometry_changing && !args->nde_replay && argfit == gfit
+	    && is_current_image_flis() && nde_edit_at_refuses_op(desc)) {
+		return img_worker_refuse(args, use_swap, desc);
+	}
+
+	/* Same shape again: the op declares a colour model it needs and this
+	 * image is the other one.  Without this the hooks answered for
+	 * themselves and disagreed — PCC logged "will do nothing for monochrome
+	 * images" and returned SUCCESS, so the worker went on to save undo and
+	 * record a history step for an operation that did nothing; SCNR,
+	 * saturation and unpurple had no check at all and would write through
+	 * the G/B plane aliases a mono fits carries, corrupting it silently.
+	 * Refusing here answers it once, before the hook, the undo save and the
+	 * capture — nothing runs and nothing is recorded.
+	 *
+	 * A replay is exempt: documents saved before this guard existed can
+	 * contain exactly the record it now prevents, and refusing mid-chain
+	 * would make them unopenable to punish a step that did nothing. */
+	if (args->op && !args->nde_replay) {
+		const gboolean rgb = isrgb(argfit);
+		if ((args->op->flags & OP_REQ_RGB) && !rgb) {
+			siril_log_error(_("%s can only be applied to a colour image\n"),
+			                desc ? desc : _("This operation"));
+			return img_worker_refuse(args, use_swap, desc);
+		}
+		if ((args->op->flags & OP_REQ_MONO) && rgb) {
+			siril_log_error(_("%s can only be applied to a monochrome image\n"),
+			                desc ? desc : _("This operation"));
+			return img_worker_refuse(args, use_swap, desc);
+		}
+	}
 
 	g_rw_lock_reader_lock(&com.pref_rwlock);
 
@@ -1633,11 +1853,81 @@ gpointer generic_image_worker(gpointer p) {
 			goto the_end;
 		}
 		hook_fit = orig;
+	} else if (for_roi) {
+		/* Region path: crop the region out of the pre-op image.  The
+		 * source is get_preop_gfit(), not gfit, and that is what makes a
+		 * live region preview idempotent — by the second slider tick gfit
+		 * already holds the first tick's result inside the rectangle, so
+		 * cropping gfit would compound the effect. */
+		fits *roi_src = (fits *)gui_iface.get_preop_gfit();
+		roi_work = calloc(1, sizeof(fits));
+		if (!roi_work) {
+			PRINT_ALLOC_ERR;
+			args->retval = 1;
+			goto the_end;
+		}
+		/* Grow by the op's declared halo, clipped to the image.  Clipping is
+		 * not an approximation: a hook's own edge handling at the image
+		 * border is what a full-image run would do there too. */
+		int tail_halo = 0;
+		roi_tail = nde_region_tail_begin(args->op, &tail_halo);
+		const int halo = op_descriptor_roi_halo(args->op, args->user) + tail_halo;
+		if (halo > 0) {
+			const gint x0 = MAX(0, roi_rect.x - halo);
+			const gint y0 = MAX(0, roi_rect.y - halo);
+			const gint x1 = MIN((gint)roi_src->rx, roi_rect.x + roi_rect.w + halo);
+			const gint y1 = MIN((gint)roi_src->ry, roi_rect.y + roi_rect.h + halo);
+			roi_grown = (rectangle){ x0, y0, x1 - x0, y1 - y0 };
+		}
+		args->roi_rect = roi_grown;   /* what the hook is about to receive */
+		int rc;
+		if (roi_src == gfit) {
+			g_rw_lock_reader_lock(&gfit->rwlock);
+			rc = crop_fits_region(roi_src, &roi_grown, roi_work);
+			g_rw_lock_reader_unlock(&gfit->rwlock);
+		} else {
+			/* The preview backup is written only from the GTK main
+			 * thread, and only while no job is in flight. */
+			rc = crop_fits_region(roi_src, &roi_grown, roi_work);
+		}
+		if (rc) {
+			siril_log_error(_("Failed to copy original image.\n"));
+			args->retval = 1;
+			goto the_end;
+		}
+		hook_fit = roi_work;
+		/* Mask blending compares against the pre-hook pixels, which on this
+		 * path the hook is about to overwrite in place.  Keep a copy, under
+		 * the same condition (and in the same variable) as the non-swap
+		 * path below, so the blend call itself needs no special case. */
+		if (args->mask_aware && roi_work->mask && roi_work->mask_active) {
+			orig = calloc(1, sizeof(fits));
+			if (!orig) {
+				PRINT_ALLOC_ERR;
+				args->retval = 1;
+				goto the_end;
+			}
+			if (copyfits(roi_work, orig, CP_ALLOC | CP_FORMAT | CP_COPYA | CP_COPYMASK, -1)) {
+				siril_log_error(_("Failed to copy original image.\n"));
+				args->retval = 1;
+				goto the_end;
+			}
+		}
 	} else {
 		/* Non-swap path: writer-lock args->fit for the hook's
 		 * duration (legacy in-place pattern).  Allocate orig as a
 		 * pre-hook backup only when mask blending needs it — undo
-		 * doesn't apply here (undo_state requires argfit == gfit). */
+		 * doesn't apply here (undo_state requires argfit == gfit).
+		 *
+		 * When args->fit IS the displayed image (previews, ROI), quiesce
+		 * the lazy-tile materialise pool first: GRWLock has no writer
+		 * preference, so this writer otherwise starves behind the pool's
+		 * back-to-back reader-locked tile fills on a large image.
+		 * Counting suppression — nests safely inside the swap-path
+		 * suppression above.  Released at the non-swap unlock below. */
+		nonswap_quiesced = (argfit == gfit);
+		if (nonswap_quiesced)
+			gui_iface.set_suppress_redraws(TRUE);
 		g_rw_lock_writer_lock(&argfit->rwlock);
 		gboolean preview_using_mask = args->mask_aware && argfit->mask && argfit->mask_active;
 		if (preview_using_mask) {
@@ -1655,7 +1945,22 @@ gpointer generic_image_worker(gpointer p) {
 		}
 	}
 
-	gboolean using_mask = args->mask_aware && hook_fit->mask && hook_fit->mask_active;
+	using_mask = args->mask_aware && hook_fit->mask && hook_fit->mask_active;
+
+	/* Capture pre-op layer state for the FLIS geometry undo path.  The hook
+	 * has not run yet, so the active layer's lmask and props still hold their
+	 * pre-op values; orig holds the pre-op pixel snapshot (swap path). */
+	if (geom_flis && orig) {
+		geom_active = flis_active_layer();
+		if (geom_active) {
+			flis_layer_capture_props(geom_active, &geom_pre_props);
+			geom_pre_lmask = layermask_clone(geom_active->lmask);
+		} else {
+			/* Active layer pointer unexpectedly missing — fall back to the
+			 * plain undo path rather than silently dropping the undo entry. */
+			geom_flis = FALSE;
+		}
+	}
 
 	/* An unset (zero) max_threads means "use the whole machine"; callers only
 	 * set it when they want fewer. Resolve it here so the hook always receives
@@ -1678,7 +1983,8 @@ gpointer generic_image_worker(gpointer p) {
 		g_free(desc_pretty);
 	}
 
-	gui_iface.set_progress(0.1f, _("Processing image..."));
+	if (!args->nde_replay)
+		gui_iface.set_progress(0.1f, _("Processing image..."));
 
 	/* Run the image processing hook on hook_fit (orig on the swap path,
 	 * args->fit on the non-swap path). */
@@ -1711,8 +2017,18 @@ gpointer generic_image_worker(gpointer p) {
 		// Generate the message used for undo label and HISTORY
 		history = args->log_hook ? args->log_hook(args->user, DETAILED): g_strdup(args->description);
 		/* Undo only applies on the swap path (argfit == gfit), not
-		 * when previewing or running from a script. */
-		undo_state = use_swap && !(args->skip_generic_undo || args->for_preview || com.script);
+		 * when previewing, running from a script, inside a python script
+		 * provenance scope (the scope suppresses per-command undo — its single
+		 * record covers the whole script), or during an NDE replay (a replayed
+		 * Tier-C script's cmd() ops reproduce existing history).  The scope
+		 * suppression applies only to the script's own ops (jobs submitted from
+		 * a python comm thread): a resident script merely being connected must
+		 * not swallow the undo of ops the user runs from the GUI. */
+		undo_state = use_swap && !(args->skip_generic_undo || args->for_preview
+		                           || com.script
+		                           || (nde_script_scope_active()
+		                               && processing_current_job_from_python())
+		                           || processing_is_reserved_for_replay());
 		if (undo_state)
 			summary = args->log_hook ? args->log_hook(args->user, SUMMARY): g_strdup(args->description);
 	}
@@ -1744,26 +2060,161 @@ the_end:;
 	 * aborted op leaves gfit pristine.  After the swap, `orig` holds
 	 * the pre-op image (perfect undo source).
 	 *
+	 * Region path: paste the crop back over exactly the rectangle it came
+	 * from, under the same brief writer-lock window.
+	 *
 	 * Non-swap path: just release the long-held writer lock on
-	 * args->fit.  notify_gfit_data_modified() below will take gfit's
-	 * writer lock briefly itself via copy_roi_into_gfit().
+	 * args->fit.
 	 *
 	 * The unlock-then-housekeeping ordering is also load-bearing for
 	 * deadlock avoidance: holding the writer lock across the
 	 * execute_idle_sync() further down would self-deadlock the main
-	 * thread (motion handlers take the reader lock), and the
-	 * notify→copy_roi_into_gfit chain would recursively acquire
-	 * gfit's writer lock on the swap path. */
+	 * thread (motion handlers take the reader lock), and
+	 * notify_gfit_data_modified() reaches the display remap, which takes
+	 * gfit's rwlock as a reader — re-entering it from the thread holding
+	 * the writer lock deadlocks. */
 	if (use_swap) {
 		if (!retval) {
-			g_rw_lock_writer_lock(&gfit->rwlock);
-			fits_swap_all_except_rwlock(gfit, orig);
-			g_rw_lock_writer_unlock(&gfit->rwlock);
+			/* Re-check the swap target: on a FLIS image the active-layer
+			 * switch can retarget gfit while the hook runs on the snapshot
+			 * of the previous layer (nothing gates the layers panel during
+			 * processing).  Swapping blindly would install the previous
+			 * layer's result — and its geometry — into the new layer, and
+			 * send the new layer's pixels to orig's clearfits below.
+			 * Lock argfit (the fits this job was started on), NOT the
+			 * possibly-retargeted gfit: the switch path's preview restore
+			 * writer-locks the outgoing fits, so this serialises with it.
+			 * The retarget flag covers the remainder of the switch body
+			 * (restore→repoint), where gfit still equals argfit but is
+			 * about to stop being current.  A discarded result is the
+			 * right outcome either way: the job ran against a layer the
+			 * user is leaving. */
+			/* Quiesce around the micro swap window too: the swap-path
+			 * suppression above is skipped for script/python-driven jobs,
+			 * whose GUI can still have the pool churning.  Counting —
+			 * a redundant bracket under the existing suppression is
+			 * harmless. */
+			gui_iface.set_suppress_redraws(TRUE);
+			g_rw_lock_writer_lock(&argfit->rwlock);
+			gboolean retargeted = (gfit != argfit) || flis_gfit_retarget_in_progress();
+			/* Swap into argfit, not gfit: the check just proved them equal,
+			 * and argfit is a local the switch path cannot repoint between
+			 * the check and the swap. */
+			if (!retargeted)
+				fits_swap_all_except_rwlock(argfit, orig);
+			g_rw_lock_writer_unlock(&argfit->rwlock);
+			gui_iface.set_suppress_redraws(FALSE);
+			/* A whole-image result: gfit may now differ from the preview
+			 * backup everywhere, so drop any region it was holding. */
+			gui_iface.preview_note_gfit_change(NULL);
+			if (retargeted) {
+				siril_log_message(_("%s: the active layer changed during processing, discarding the result.\n"),
+						desc ? desc : _("Operation"));
+				args->retval = 1;
+				retval = 1;
+			}
+		}
+	} else if (for_roi) {
+		if (!retval) {
+			/* Amend preview: replay the amended record's SUCCESSORS over the
+			 * crop, so inside the rectangle the user sees the whole chain and
+			 * not just the step being edited.  The crop was grown by their
+			 * halos as well as this op's, so the requested rectangle is still
+			 * computed from full context.
+			 *
+			 * The nested worker takes com.pref_rwlock's reader lock, which
+			 * this one already holds — recursive read locks are explicitly
+			 * permitted by GRWLock.
+			 *
+			 * A partial failure is pasted anyway: the rectangle then shows
+			 * what the rest of the image is showing, which beats a frozen
+			 * preview.  nde_region_tail_apply logs it once and disarms. */
+			if (roi_tail)
+				nde_region_tail_apply(roi_tail, roi_work, &roi_grown,
+				                      args->max_threads);
+			/* A hook may hand back a different pixel type than it was
+			 * given (deconvolution normalises to float internally).  A
+			 * region preview replaces a rectangle, so it cannot change
+			 * gfit's type the way a swap can — coerce the result back. */
+			if (roi_work->type != gfit->type) {
+				const size_t n = (size_t)roi_work->rx * roi_work->ry * roi_work->naxes[2];
+				if (gfit->type == DATA_FLOAT) {
+					fit_replace_buffer(roi_work,
+					        roi_work->bitpix == BYTE_IMG ?
+					            ushort8_buffer_to_float(roi_work->data, n) :
+					            ushort_buffer_to_float(roi_work->data, n),
+					        DATA_FLOAT);
+				} else {
+					fit_replace_buffer(roi_work,
+					        float_buffer_to_ushort(roi_work->fdata, n), DATA_USHORT);
+					if (gfit->bitpix == BYTE_IMG) {
+						for (size_t i = 0; i < n; i++)
+							roi_work->data[i] >>= 8;
+						roi_work->bitpix = BYTE_IMG;
+					}
+				}
+			}
+			gui_iface.set_suppress_redraws(TRUE);
+			g_rw_lock_writer_lock(&argfit->rwlock);
+			/* Same retarget check as the swap path, for the same reason:
+			 * roi_rect was translated against the layer this job started
+			 * on.  Dropping a preview is the right outcome — unlike a
+			 * discarded apply it needs no error, the next tick redraws. */
+			/* Write back ONLY the requested rectangle.  With a halo the
+			 * hook's result is larger than that, and its outer ring is the
+			 * part computed from truncated context — exactly what the halo
+			 * exists to keep out of the image. */
+			fits roi_inner = { 0 };
+			fits *to_paste = roi_work;
+			if (memcmp(&roi_grown, &roi_rect, sizeof(rectangle))) {
+				const rectangle inner = { roi_rect.x - roi_grown.x,
+				                          roi_rect.y - roi_grown.y,
+				                          roi_rect.w, roi_rect.h };
+				if (crop_fits_region(roi_work, &inner, &roi_inner))
+					to_paste = NULL;
+				else
+					to_paste = &roi_inner;
+			}
+			gboolean pasted = FALSE;
+			if (!to_paste)
+				siril_log_error(_("%s image processing failed.\n"), args->description);
+			else if (gfit == argfit && !flis_gfit_retarget_in_progress())
+				pasted = !paste_fits_region(to_paste, gfit, &roi_rect);
+			else
+				siril_log_debug("region preview discarded: the active layer changed\n");
+			clearfits(&roi_inner);
+			/* Tell the preview module what changed, so its next restore copies
+			 * back one rectangle instead of the whole image.  Only a paste that
+			 * actually happened may be reported; anything else must leave the
+			 * conservative "assume all" answer in place. */
+			gui_iface.preview_note_gfit_change(pasted ? &roi_rect : NULL);
+			g_rw_lock_writer_unlock(&argfit->rwlock);
+			gui_iface.set_suppress_redraws(FALSE);
 		}
 	} else {
 		g_rw_lock_writer_unlock(&argfit->rwlock);
+		if (nonswap_quiesced)
+			gui_iface.set_suppress_redraws(FALSE);
 	}
 	g_rw_lock_reader_unlock(&com.pref_rwlock);
+
+	/* NDE replay: the driver called us directly inside its own job and
+	 * owns args — no idles, no stop_processing_thread, no progress, no
+	 * notify.  Everything undo/capture/HISTORY/display-related above was
+	 * skipped via the non-swap path (asserted at entry).  Free only the
+	 * locals this invocation created. */
+	if (args->nde_replay) {
+		g_free(summary);
+		g_free(history);
+		g_free(desc);
+		if (orig) {
+			clearfits(orig);
+			free(orig);
+		}
+		return GINT_TO_POINTER(retval);
+	}
+	/* A replay is never a region run (asserted at entry), so roi_work is
+	 * necessarily NULL above. */
 
 	/* Geometry hooks reframe the WCS of their private copy, so annotations
 	 * can only be reprojected once the swap has installed it in gfit.
@@ -1775,23 +2226,94 @@ the_end:;
 
 	/* Carry out data updates (statistics, histograms, update Cairo
 	 * buffers in GUI mode).  Only invoke on success; on failure gfit
-	 * was not validly modified.  Runs outside the writer-lock window. */
-	if (!retval) {
+	 * was not validly modified.  Runs outside the writer-lock window.
+	 * Swap path: skip when a layer switch retargeted gfit AFTER the
+	 * successful swap — the display now shows a different layer and the
+	 * switch's own reconciliation refreshes it.  Best-effort (unlocked
+	 * pointer read): a refresh that slips through is redundant work, not
+	 * a correctness problem, which is why the bookkeeping below does NOT
+	 * use this check — it relies on the identity captured at job start. */
+	gboolean still_current = (!use_swap && !for_roi)
+			|| (gfit == argfit && !flis_gfit_retarget_in_progress());
+	if (!retval && still_current) {
 		notify_gfit_data_modified();
 	}
 
-	/* populate_roi() refreshes gui.roi.fit from the (now-updated) gfit
-	 * so the ROI preview reflects the result.  Only meaningful for the
-	 * swap path — non-swap ops worked on roi.fit directly and
-	 * re-populating from gfit would overwrite the result.
-	 * populate_roi() short-circuits if no ROI is selected. */
-	if (use_swap && !com.script && !com.python_command && !com.headless) {
-		gui_iface.populate_roi();
+	/* NDE provenance capture (nde sketch §13.1).  Same gate as undo below
+	 * EXCEPT com.script: scripts must leave provenance — the script
+	 * exclusion on undo exists for swap-file cost, not correctness.  Must
+	 * run before the completion idle is scheduled: the idle frees args
+	 * (including args->user, which serialize() reads).  Strings are
+	 * prepared here; the append itself is a few pointer ops under the
+	 * leaf mutex. */
+	gint64 nde_rec_id = 0;
+	if (!retval && use_swap && !arg_skip_undo && !argpreview
+	    && processing_is_reserved_for_replay()) {
+		/* The replay guard, checked before the scope: a Tier-C script re-run
+		 * issues cmd() ops on gfit with no scope of its own — they reproduce
+		 * an existing record and must neither capture new ones nor mark an
+		 * unrelated resident script's open scope dirty. */
+	} else if (!retval && use_swap && !arg_skip_undo && !argpreview
+	    && nde_script_scope_active() && processing_current_job_from_python()) {
+		/* Under a python script provenance scope, and this job came from the
+		 * script itself: the end-of-scope record subsumes this op's provenance
+		 * (nde-phase5 scope engine).  Flag the net pixel mutation and skip
+		 * per-op capture.  A user-run op while a resident script merely holds
+		 * a scope open falls through and captures its own record. */
+		nde_script_scope_mark_pixels_dirty();
+	} else if (!retval && use_swap && !arg_skip_undo && !argpreview) {
+		const op_descriptor *op = args->op;
+		/* An analysis op measures the image and reports; it must never write a
+		 * record, and today that holds only because every one of its call sites
+		 * remembers to pass skip_generic_undo (or for_preview).  A site that
+		 * forgets would put a step in the user's history that changed nothing
+		 * and, lacking a serializer, would freeze every earlier step behind it.
+		 * The family says what the op IS, so the guarantee can live here once
+		 * instead of at twenty call sites. */
+		g_warn_if_fail(nde_op_class_for(op ? op->id : NULL)->family
+		               != NDE_OPC_ANALYSIS);
+		gchar *nde_summary = args->log_hook ?
+				args->log_hook(args->user, SUMMARY) : g_strdup(args->description);
+		/* The swap put the pre-op pixels in `orig`; the position half was taken
+		 * at job start.  A borrowing state — `orig` stays the caller's. */
+		nde_pre.pix = orig;
+		nde_capture_req req = {
+			.op          = op,
+			.user        = args->user,
+			.summary     = nde_summary,
+			.tier        = NDE_DERIVE,
+			.scope       = NDE_DERIVE,
+			.target_item = job_item_id,
+			/* After the swap, `orig` holds the pre-op pixels — the baseline
+			 * for replaying this item's chain — completing the pre-op state
+			 * whose position was taken at job start. */
+			.pre         = &nde_pre,
+			/* The swap installed the post-op pixels into argfit, which still
+			 * points at the job's layer's fits even if a switch retargeted
+			 * gfit since; the global could already name another layer's. */
+			.post        = argfit,
+			.mask_active = using_mask,
+			/* The mask item is the one step 3 allocated, resolved at JOB START
+			 * (job_pmask_id) rather than from the live active layer, so a
+			 * mid-job layer switch cannot retarget the pin.  This is the one
+			 * place that differs from the dialog captures, which pass
+			 * NDE_MASK_LIVE. */
+			.mask_item   = is_current_image_flis() ? job_pmask_id
+			                                       : NDE_ITEM_PLAIN_MASK,
+			/* hook_fit carries the mask the op actually ran under — not
+			 * necessarily argfit, and not gfit. */
+			.mask_src    = hook_fit,
+		};
+		nde_rec_id = nde_capture(&req);
+		g_free(nde_summary);
 	}
 
 	/* Cairo buffers are up to date; re-enable full viewport redraws so the
-	 * completion idle paints the updated image. */
-	gui_iface.set_suppress_redraws(FALSE);
+	 * completion idle paints the updated image.  Same gate as the matching
+	 * suppress at worker entry — suppression is COUNTING now, so an
+	 * unpaired release would steal an enclosing section's suppression. */
+	if (!com.script && !com.python_command && use_swap)
+		gui_iface.set_suppress_redraws(FALSE);
 
 	// Cleanup / idles
 	if (args->command) {
@@ -1828,7 +2350,31 @@ the_end:;
 		/* On the swap path, `orig` now holds the pre-op image — the
 		 * swap above moved the original gfit content into it.  That's
 		 * exactly what undo_save_state wants to snapshot. */
-		undo_save_state(orig, summary);
+		int undo_err;
+		if (geom_flis && geom_active) {
+			/* Active-layer geometry undo: bundles pixels + pmask + lmask
+			 * + props.  On failure fall back to the legacy path so we
+			 * still record SOMETHING in the undo stack. */
+			undo_err = undo_save_flis_layer_full(orig, geom_active,
+			                                     geom_pre_lmask, &geom_pre_props,
+			                                     summary);
+			if (undo_err)
+				undo_err = undo_save_state_for_layer(orig, job_undo_layer, summary);
+		} else {
+			/* Explicit layer attribution: `orig` is a private snapshot, so
+			 * undo_save_state's pointer walk could never resolve its layer —
+			 * the entry restored into whichever layer was active at undo
+			 * time.  job_undo_layer was captured at job start. */
+			undo_err = undo_save_state_for_layer(orig, job_undo_layer, summary);
+		}
+		/* Couple the fresh undo entry to the provenance record so
+		 * undo/redo of this op moves live_count (nde sketch §13.3). */
+		if (!undo_err)
+			undo_tag_top_nde_record(nde_rec_id);
+	}
+	if (geom_pre_lmask) {
+		layermask_free(geom_pre_lmask);
+		geom_pre_lmask = NULL;
 	}
 	if (verbose) {
 		siril_log_info(_("%s %s.\n"), desc, retval ? _("failed") : _("succeeded"));
@@ -1842,19 +2388,82 @@ the_end:;
 	if (orig)
 		clearfits(orig);
 	free(orig);
+	if (roi_work)
+		clearfits(roi_work);
+	free(roi_work);
+	nde_region_tail_free(roi_tail);
 
 	return GINT_TO_POINTER(retval);
 }
 
-/* TODO: apply the same swap-on-completion treatment to generic_mask_worker
- * that generic_image_worker now uses (commit 28ea0b5c7).  Today this worker
- * holds args->fit->rwlock as a writer for the entire duration of the
- * mask_hook — usually fast, but long-running mask ops would block GUI
- * readers the same way image-hook ops used to.  The fix would mirror
- * generic_image_worker: snapshot the fit (or just mask) into a private
- * buffer, run the hook lock-free, briefly take the writer lock for a
- * fits_swap_all_except_rwlock at the end.  Low priority while mask ops
- * stay short. */
+/* FLIS layermask routing + mask activation, shared by generic_mask_worker's
+ * two install paths.  Moves the freshly-built mask onto the target layer's
+ * lmask slot and clears the processing-mask slot; a routing failure (no FLIS
+ * / layer gone / dimension mismatch) leaves the mask as the processing mask —
+ * better than dropping it on the floor.  The caller holds @fit's writer lock;
+ * taking the stack lock under it is the allowed direction (fits → stack,
+ * M-F12; see the rules in image_format_flis.c).  Returns the item id of the
+ * layer whose lmask received the mask, else 0. */
+static gint mask_route_and_activate(struct generic_mask_args *args, fits *fit) {
+	gint routed_to_layer = 0;
+	if (args->target_layer_id != 0 && fit->mask && fit->mask->data
+	    && is_current_image_flis()) {
+		flis_stack_writer_lock();
+		flis_layer_t *target = flis_layer_get_by_id(args->target_layer_id);
+		if (!target || !target->fit) {
+			siril_log_warning(_("Mask routing: target layer (id %d) not found; "
+			                    "mask left on processing slot\n"),
+			                  args->target_layer_id);
+		} else if ((size_t)target->fit->rx != fit->rx
+		           || (size_t)target->fit->ry != fit->ry) {
+			siril_log_warning(_("Mask routing: target layer '%s' (%ux%u) "
+			                    "does not match mask dimensions (%ux%u); "
+			                    "mask left on processing slot\n"),
+			                  target->layer_name ? target->layer_name : "?",
+			                  target->fit->rx, target->fit->ry,
+			                  fit->rx, fit->ry);
+		} else {
+			layermask_t *lm = calloc(1, sizeof(layermask_t));
+			if (lm) {
+				lm->w      = fit->rx;
+				lm->h      = fit->ry;
+				lm->bitpix = fit->mask->bitpix;
+				lm->data   = fit->mask->data;
+				fit->mask->data = NULL;
+				free_mask(fit->mask);
+				fit->mask = NULL;
+				set_mask_active(fit, FALSE);
+				if (flis_layer_set_lmask(target, lm)) {
+					layermask_free(lm);
+				} else {
+					routed_to_layer = target->item_id;
+					/* Name the destination.  The dialog's Target dropdown is
+					 * the only other place it appears, and when a mask turns
+					 * up on the wrong layer that dropdown is exactly what is
+					 * in question — so the log has to settle it. */
+					siril_log_message(_("FLIS: layer mask created on '%s'\n"),
+					                  target->layer_name ? target->layer_name : "?");
+					/* Show the result: flip the mask-view radio to
+					 * LAYER so the (now visible) mask tab displays
+					 * the lmask that was just created, not the empty
+					 * processing slot. */
+					if (com.uniq)
+						com.uniq->flis_mask_view = 1;
+					gui_iface.flis_invalidate_composite();
+					gui_iface.flis_gui_update();
+				}
+				/* Suppress the generic mask_creation activate below — the
+				 * processing mask is now empty. */
+				args->mask_creation = FALSE;
+			}
+		}
+		flis_stack_writer_unlock();
+	}
+	if (args->mask_creation)
+		set_mask_active(fit, TRUE);
+	return routed_to_layer;
+}
+
 gpointer generic_mask_worker(gpointer p) {
 	struct generic_mask_args *args = (struct generic_mask_args *)p;
 	struct timeval t_start, t_end;
@@ -1868,18 +2477,115 @@ gpointer generic_mask_worker(gpointer p) {
 	gboolean verbose = args->verbose;
 	gchar *history = NULL;
 	gboolean rwlocked = FALSE;
+	gboolean mask_nonswap_quiesced = FALSE;
+
+	/* Swap-path state (mirrors generic_image_worker): when the job targets
+	 * gfit, the hook runs on a private snapshot (`orig`) with no lock held,
+	 * and the result is installed — or discarded on a mid-job layer
+	 * retarget — in a microsecond writer-lock window at the end.  Declared
+	 * up here because the guard gotos below jump over the point of use and
+	 * the cleanup at the end must see initialised values. */
+	fits *argfit = args->fit;
+	gboolean use_swap = (argfit == gfit);
+	fits *orig = NULL;
+
+	/* Job identity, resolved ONCE at job start (same rationale as
+	 * generic_image_worker): the provenance block at the end runs after the
+	 * writer lock is released, and reading flis_active_layer() there raced
+	 * a layer switch — the mask record would attribute this op to the
+	 * incoming layer's mask.  job_layer_item names the layer whose
+	 * processing mask the op ran under; job_image_item is the image input
+	 * a mask-derivation op read. */
+	gint job_layer_item = 0;
+	gint job_image_item = NDE_ITEM_IMAGE;
+	if (is_current_image_flis()) {
+		flis_layer_t *job_lay = flis_active_layer();
+		job_layer_item = job_lay ? job_lay->item_id : 0;
+		job_image_item = nde_checkpoint_active_item_id();
+	}
+	/* Whether the undo-save block below actually pushed an entry; the NDE
+	 * tag at the end must match the SAVE's decision, not re-read gfit —
+	 * a switch between the two would tag an unrelated top-of-stack entry
+	 * (or skip a tag the entry needs). */
+	gboolean pushed_undo = FALSE;
 
 	gui_iface.set_progress(PROGRESS_RESET, NULL);
 	gettimeofday(&t_start, NULL);
 	args->retval = 0;
 	g_rw_lock_reader_lock(&com.pref_rwlock);
 
+	/* See the matching guard in generic_image_worker: mask ops are also
+	 * per-layer and must not run while a group row — or several rows —
+	 * are selected. */
+	if (!args->command && is_current_image_flis()
+	    && (gui_iface.flis_group_is_selected()
+	        || gui_iface.flis_multi_is_selected())) {
+		const gboolean multi = gui_iface.flis_multi_is_selected();
+		siril_log_error(multi
+		    ? _("%s: cannot apply with multiple layers selected — select a single layer.\n")
+		    : _("%s: cannot apply to a layer group — select an individual layer.\n"),
+		                args->description ? args->description : "Mask operation");
+		gui_iface.message_dialog(SIRIL_MSG_ERROR,
+		    multi ? _("Multiple Layers Selected") : _("Layer Group Selected"),
+		    multi ? _("This operation cannot be applied to a multiple selection.\n"
+		              "Please select a single layer.")
+		          : _("This operation cannot be applied to a layer group.\n"
+		              "Please select an individual layer."));
+		args->retval = 1;
+		goto the_end;
+	}
+
+	/* Same shape as generic_image_worker's geometry guard: an image-deriving
+	 * mask op records an "image" pin against the item's LAST record, but while
+	 * an edit-history insertion is open the display holds an earlier state —
+	 * the pin would name a state the op never saw.  Refuse rather than record
+	 * a lie.  A Tier-C replay re-run is exempt: it reproduces an existing
+	 * record and its pin is not re-captured. */
+	if (args->op && (args->op->flags & OP_MASK_FROM_IMAGE)
+	    && args->fit == gfit && !processing_is_reserved_for_replay()
+	    && nde_edit_at_refuses_op(args->description)) {
+		args->retval = 1;
+		goto the_end;
+	}
+
+	/* §5.2 routing pre-check: when the mask is destined for a layer's
+	 * lmask, validate the target BEFORE generating anything.  The
+	 * post-hoc check in the routing block below (kept as a backstop)
+	 * used to leave the freshly-built mask on the processing slot on a
+	 * dimension mismatch — an error message plus a stray processing
+	 * mask the user never asked for. */
+	if (args->target_layer_id != 0) {
+		flis_layer_t *pre_target = is_current_image_flis()
+			? flis_layer_get_by_id(args->target_layer_id) : NULL;
+		if (!pre_target || !pre_target->fit) {
+			siril_log_error(_("%s: target layer (id %d) not found — no mask created.\n"),
+			                args->description ? args->description : _("Mask operation"),
+			                args->target_layer_id);
+			args->retval = 1;
+			goto the_end;
+		}
+		if (pre_target->fit->rx != args->fit->rx
+		    || pre_target->fit->ry != args->fit->ry) {
+			siril_log_error(_("%s: cannot create a layer mask for '%s' — its "
+			                  "dimensions (%ux%u) do not match the mask source "
+			                  "(%ux%u).  No mask was created.\n"),
+			                args->description ? args->description : _("Mask operation"),
+			                pre_target->layer_name ? pre_target->layer_name : "?",
+			                pre_target->fit->rx, pre_target->fit->ry,
+			                args->fit->rx, args->fit->ry);
+			args->retval = 1;
+			goto the_end;
+		}
+	}
+
 	// Set default max_threads if not specified
 	if (args->max_threads < 1)
 		args->max_threads = com.max_thread;
 
-	// Memory check
-	if (args->mem_ratio > 0.0f) {
+	/* Memory check.  Ratio-0 ops used to skip it entirely; on the swap path
+	 * they still pay the full-fit snapshot, so run the hook for them too —
+	 * it adds the snapshot term on its own. */
+	if (args->mem_ratio > 0.0f || use_swap) {
 		if (default_mask_mem_hook(args)) {
 			args->retval = 1;
 			goto the_end;
@@ -1895,15 +2601,75 @@ gpointer generic_mask_worker(gpointer p) {
 
 	gui_iface.set_progress(0.1f, _("Processing mask..."));
 
-	g_rw_lock_writer_lock(&args->fit->rwlock);
-	rwlocked = TRUE;
-	if (args->fit == gfit && !args->command) {
-		gchar *undo_msg = args->log_hook ? args->log_hook(args->user, SUMMARY) : g_strdup(args->description);
-		undo_save_state(gfit, undo_msg);
-		g_free(undo_msg);
+	if (use_swap) {
+		/* Swap path: snapshot gfit → orig (CP_DEEPCOPY includes the mask)
+		 * under a brief reader lock, then drop it — the hook runs on the
+		 * snapshot with GUI readers unblocked.  The pre-hook undo saves
+		 * happen under the same reader lock: they only READ the fits (the
+		 * writer lock the old in-place flow held around them was for the
+		 * hook's benefit), and saving from the LIVE fit is load-bearing —
+		 * undo_push_to captures the ICC profile and the layer attribution
+		 * only when its argument is a live gfit, neither of which a
+		 * post-swap save from the private snapshot could provide.  The
+		 * cost: a discarded or failed op leaves a no-op entry on the
+		 * stack, a wart the hook-failure path always had. */
+		orig = calloc(1, sizeof(fits));
+		if (!orig) {
+			PRINT_ALLOC_ERR;
+			args->retval = 1;
+			goto the_end;
+		}
+		g_rw_lock_reader_lock(&gfit->rwlock);
+		if (!args->command) {
+			gchar *undo_msg = args->log_hook ? args->log_hook(args->user, SUMMARY) : g_strdup(args->description);
+			if (args->target_layer_id != 0 && is_current_image_flis()) {
+				/* §5.2 routed op (target validated by the pre-check above):
+				 * the meaningful pre-state is the target layer's lmask —
+				 * plus the processing mask the hook will clobber while
+				 * generating, if one exists.  A flavour-blind pixel
+				 * snapshot here left undo restoring identical pixels while
+				 * the freshly routed lmask survived untouched. */
+				if (argfit->mask && argfit->mask->data)
+					undo_save_processing_mask(argfit, "%s", undo_msg);
+				flis_layer_t *undo_target =
+					flis_layer_get_by_id(args->target_layer_id);
+				if (undo_target)
+					undo_save_flis_lmask(undo_target, undo_msg);
+			} else {
+				undo_save_state(argfit, undo_msg);
+			}
+			pushed_undo = TRUE;
+			g_free(undo_msg);
+		}
+		int rc = copyfits(gfit, orig, CP_DEEPCOPY | CP_ALLOC, -1);
+		g_rw_lock_reader_unlock(&gfit->rwlock);
+		if (rc) {
+			siril_log_error(_("Failed to copy original image.\n"));
+			args->retval = 1;
+			goto the_end;
+		}
+	} else {
+		/* Non-swap path: legacy in-place pattern — writer-lock args->fit
+		 * for the hook's duration.  No undo here: the undo gate requires
+		 * the job to target gfit, which is exactly use_swap.
+		 * Quiesce the materialise pool first when this IS the displayed
+		 * fits (writer-starvation protocol, see generic_image_worker). */
+		mask_nonswap_quiesced = (argfit == gfit);
+		if (mask_nonswap_quiesced)
+			gui_iface.set_suppress_redraws(TRUE);
+		g_rw_lock_writer_lock(&argfit->rwlock);
+		rwlocked = TRUE;
 	}
-	// Call the mask processing hook
-	if (args->mask_hook(args)) {
+
+	/* Run the mask processing hook — on the snapshot (swap path) or in
+	 * place (non-swap).  Mask hooks receive only args, so the redirect
+	 * repoints args->fit for the call; the hook audit (all 13 hooks in
+	 * core/masks.c) confirmed they operate on args->fit alone. */
+	if (use_swap)
+		args->fit = orig;
+	int hook_failed = args->mask_hook(args);
+	args->fit = argfit;
+	if (hook_failed) {
 		siril_log_error(_("%s mask processing failed.\n"), args->description);
 		args->retval = 1;
 	} else {
@@ -1928,12 +2694,172 @@ the_end:
 
 	int retval = args->retval;
 
-	if (args->mask_creation) {
-		set_mask_active(args->fit, TRUE);
+	/* Install the result.  Swap path: one writer-lock window that mirrors
+	 * generic_image_worker's swap point — re-check the target under the
+	 * lock, swap the snapshot in, and route/activate the mask inside the
+	 * same window so no reader observes the intermediate processing-mask
+	 * state.  A layer switch that retargeted gfit while the hook ran means
+	 * the result is discarded: the job ran against a layer the user is
+	 * leaving.  (That covers routed ops too — the routing target is an
+	 * explicit layer, but the mask was derived from the departed layer's
+	 * pixels, and one discard rule beats two.)  Non-swap path: route and
+	 * activate in place under the still-held writer lock, as before. */
+	gint routed_to_layer = 0;   /* layer whose lmask received the mask, if any */
+	if (use_swap) {
+		if (!retval) {
+			/* Quiesced micro swap window (writer-starvation protocol). */
+			gui_iface.set_suppress_redraws(TRUE);
+			g_rw_lock_writer_lock(&argfit->rwlock);
+			gboolean retargeted = (gfit != argfit) || flis_gfit_retarget_in_progress();
+			if (!retargeted) {
+				fits_swap_all_except_rwlock(argfit, orig);
+				routed_to_layer = mask_route_and_activate(args, argfit);
+			}
+			g_rw_lock_writer_unlock(&argfit->rwlock);
+			gui_iface.set_suppress_redraws(FALSE);
+			if (retargeted) {
+				siril_log_message(_("%s: the active layer changed during processing, discarding the result.\n"),
+						args->description ? args->description : _("Mask operation"));
+				args->retval = 1;
+				retval = 1;
+			}
+		}
+	} else if (rwlocked) {
+		if (!retval)
+			routed_to_layer = mask_route_and_activate(args, argfit);
+		g_rw_lock_writer_unlock(&argfit->rwlock);
+		if (mask_nonswap_quiesced)
+			gui_iface.set_suppress_redraws(FALSE);
 	}
-	if (rwlocked)
-		g_rw_lock_writer_unlock(&args->fit->rwlock);
 	g_rw_lock_reader_unlock(&com.pref_rwlock);
+
+	/* NDE provenance.  A mask is an item in its own right (step 3 gave it a
+	 * real id), so a mask operation is recorded against the MASK, not against
+	 * the layer whose pixels it will later modulate — that separation is what
+	 * lets an operation reference the mask it consumed instead of merely
+	 * flagging that one was active.  Which mask depends on where the result
+	 * landed: an lmask when the op was routed to one, otherwise the layer's
+	 * processing mask, or the plain image's (NDE_ITEM_PLAIN_MASK).
+	 *
+	 * Tier follows the descriptor as everywhere else — no mask op carries a
+	 * serializer yet, so these are all opaque today: the log says what was
+	 * done to the mask, and replaying it is a separate piece of work.
+	 *
+	 * Same capture gate as generic_image_worker, replay guard first: a Tier-C
+	 * script re-run's mask commands (cmd("mask_from_lum") etc.) travel through
+	 * this worker under SLOT_REPLAY and reproduce existing records — capturing
+	 * here would grow the mask's chain by one bogus step per replay.  And a
+	 * script's own mask op under an open provenance scope coalesces into the
+	 * end-of-scope record instead of capturing per-op. */
+	if (!retval && args->op && processing_is_reserved_for_replay()) {
+		/* Replay re-run: no capture, and never mark an unrelated resident
+		 * script's open scope dirty. */
+	} else if (!retval && args->op && nde_script_scope_active()
+	           && processing_current_job_from_python()) {
+		/* The script's own mask op: a mask change is invisible to the scope's
+		 * pixel-hash net-effect test, so flag it as a non-pixel mutation to
+		 * force an end-of-scope record (same as handle_set_image_mask). */
+		nde_script_scope_mark_nonpixel_dirty();
+	} else if (!retval && args->op) {
+		/* The image the op saw, captured BEFORE the ids below, because a
+		 * mask-creation op reads the layer's pixels to build the mask:
+		 * mask.from_channel and friends are image -> MASK nodes, and their
+		 * chain starts at that image rather than at a baseline of their own
+		 * (nde_replay.h).  Recorded as an ordinary input edge so the replay
+		 * re-derives the image instead of storing a copy of it. */
+		gint image_item = is_current_image_flis() ?
+				job_image_item : NDE_ITEM_IMAGE;
+		gint mask_item = NDE_ITEM_PLAIN_MASK;
+		if (routed_to_layer) {
+			mask_item = flis_layer_lmask_id(flis_layer_get_by_id(routed_to_layer));
+		} else if (is_current_image_flis()) {
+			/* The layer the op ran on, captured at job start — the live
+			 * active layer may already be a different one.  Resolved by id
+			 * post-hook (not a captured value) because a mask-CREATION op
+			 * allocates the pmask id during the hook. */
+			flis_layer_t *active = flis_layer_get_by_id(job_layer_item);
+			/* An op that EMPTIED the slot (mask.clear) still belongs to the
+			 * mask it emptied — and the accessor releases the id precisely
+			 * because the mask is now gone, so read it first. */
+			gint prev = active ? active->pmask_item_id : 0;
+			mask_item = flis_layer_pmask_id(active);
+			if (mask_item == 0)
+				mask_item = prev;
+		}
+		/* 0 means there was no mask item at all: a routing failure that left
+		 * nothing behind, or a clear of a slot that never held one. */
+		gboolean forget = FALSE;
+		if (mask_item != 0 && !routed_to_layer &&
+		    !g_strcmp0(args->op->id, "mask.clear") &&
+		    !nde_history_item_is_pinned(mask_item) &&
+		    !nde_edit_at_active()) {
+			/* Clearing a mask nothing ever consumed: no step pins it, so its
+			 * records describe an item that influenced no pixels and its only
+			 * future would be an orphan node in the graph.  Forget the whole
+			 * episode — records, stored states, cache — instead of recording
+			 * the clear.  A USED mask takes the ordinary path below: its
+			 * records and pinned states must persist so the steps that ran
+			 * under it stay replayable after it is cleared (it goes dormant,
+			 * not away).  Not during an open insertion point, whose stashed
+			 * tail is invisible to the pin scan. */
+			forget = TRUE;
+			if (nde_history_forget_item(mask_item)) {
+				nde_checkpoint_drop(mask_item);
+				nde_snapstore_invalidate_from(mask_item, 0);
+				nde_history_notify_panel();
+			}
+		}
+		if (mask_item != 0 && !forget) {
+			/* Serialized here rather than inside the capture, because the
+			 * input pin below is decided by looking INSIDE the blob. */
+			gchar *params = args->op->serialize ?
+					args->op->serialize(args->user) : NULL;
+			/* Only ops that DERIVE from the image need the pin; an edit of an
+			 * existing mask (blur, invert, threshold) reads the mask alone,
+			 * and pinning an image it never looked at would invent a
+			 * dependency.  An op reading an external file records that file
+			 * in its own params instead (Convention 1), so it needs no pin
+			 * either. */
+			gboolean from_image = (args->op->flags & OP_MASK_FROM_IMAGE) != 0;
+			if (from_image && params) {
+				/* Convention 1: an operand file in the params means the
+				 * mask came from THAT, not from the loaded image. */
+				GHashTable *kv = nde_kv_parse(params);
+				const char *path = nde_kv_get_str(kv, "operand_path");
+				if (path && *path)
+					from_image = FALSE;
+				g_hash_table_unref(kv);
+			}
+			gboolean pin_image = from_image && image_item != 0;
+			nde_pin_spec image_pin = { "image", image_item,
+			                           pin_image ?
+			                           nde_history_last_record_for_item(image_item) : 0 };
+			gchar *summary = args->log_hook ? args->log_hook(args->user, SUMMARY)
+			                                : g_strdup(args->description);
+			nde_capture_req req = {
+				.op          = args->op,
+				.params      = params,   /* ownership transferred */
+				.summary     = summary,
+				.tier        = args->op->serialize ? NDE_TIER_A : NDE_TIER_B,
+				.scope       = NDE_SCOPE_LAYER,   /* the mask IS the item */
+				.target_item = mask_item,
+				/* A mask op has no mask input, and no checkpoints: a mask
+				 * item's chain starts at the image it was derived from. */
+				.pins        = pin_image ? &image_pin : NULL,
+				.n_pins      = pin_image ? 1 : 0,
+			};
+			gint64 mask_rec_id = nde_capture(&req);
+			g_free(summary);
+			/* Couple the undo entry the worker saved above so undo/redo moves
+			 * live_count with the pixels — pushed_undo records the SAVE's own
+			 * decision, so save and tag cannot disagree (re-checking gfit here
+			 * raced a layer switch).  A command-context mask op saves no
+			 * entry, and an unguarded tag would re-couple whatever unrelated
+			 * entry sits on top of the undo stack. */
+			if (pushed_undo)
+				undo_tag_top_nde_record(mask_rec_id);
+		}
+	}
 
 	if (args->command) {
 		if (com.headless) {
@@ -1947,6 +2873,213 @@ the_end:
 		siril_add_idle(args->idle_function, args);
 	} else {
 		siril_add_idle(end_generic_mask, args);
+	}
+
+	/* After a successful swap, orig holds the pre-op image; on failure or
+	 * discard it holds the (dead) hook result.  Either way it is ours. */
+	if (orig) {
+		clearfits(orig);
+		free(orig);
+	}
+
+	return GINT_TO_POINTER(retval);
+}
+
+/* ===========================================================================
+ * generic_layer_worker (stage 1.5) — standardised wrapper for FLIS layer ops
+ * ===========================================================================
+ *
+ * Mirrors generic_image_worker / generic_mask_worker for layer-scoped work.
+ * The worker handles thread coordination, progress reporting, error logging,
+ * and the end-of-op idle that refreshes the GUI.  The undo gate per §C.1a
+ * lives inside the public undo_save_flis_* functions (each short-circuits
+ * when com.script is set); hooks call those directly and get the correct
+ * headless behaviour for free.
+ */
+
+void free_generic_layer_args(struct generic_layer_args *args) {
+	if (!args) return;
+	if (args->user)
+		destroy_any_args(args->user);
+	/* Legacy sites g_strdup() the description (owned); the descriptor-primary
+	 * path (op != NULL) borrows it from the descriptor via
+	 * op_descriptor_fill_layer_args() — mirroring free_generic_img_args, which
+	 * never frees the description — so only free it on the legacy path. */
+	if (!args->op)
+		g_free(args->description);
+	free(args);
+}
+
+/* Default end-idle for layer operations: invalidates the FLIS composite,
+ * refreshes the layers panel, optionally refreshes the mask tab if the
+ * lmask changed, and requests a redraw. */
+static gboolean end_generic_layer(gpointer p) {
+	struct generic_layer_args *args = (struct generic_layer_args *)p;
+	stop_processing_thread();
+
+	if (!args->retval && is_current_image_flis() && !args->read_only) {
+		int inv = args->invalidate_flags ? args->invalidate_flags : FLIS_INV_ALL;
+		gui_iface.flis_display_invalidate(inv, args->invalidate_item_id);
+		if (args->updates_lmask)
+			gui_iface.show_or_hide_mask_tab();
+		gui_iface.flis_gui_update();
+
+		/* Any FLIS layer-state change — stack mutation OR property
+		 * change (opacity / blend / visibility / tint) — needs the
+		 * full pipeline: the CPU composite cache, the per-vport
+		 * Cairo tile buffers, the histogram, and the hi/lo display
+		 * range all feed off the composite.  The GPU compose path
+		 * does pick up live property values per frame, but only when
+		 * it's actually selected — the CPU fallback is used for
+		 * 1-layer FLIS, CHROMA blend, etc., and never sees property
+		 * changes that don't also poke the composite cache.
+		 *
+		 * notify_gfit_data_modified() is the single chokepoint that
+		 * runs the whole pipeline.  Treat every FLIS_INV_* path
+		 * (other than the mask-only one which has its own machinery)
+		 * the same way. */
+		if (args->updates_lmask) {
+			/* Layer mask changed: refresh mask viewport.  redraw_mask_idle
+			 * also drives a full image redraw when mask tints are enabled,
+			 * so guard the explicit REMAP_ALL on that pref to avoid a
+			 * double-redraw. */
+			gui_iface.redraw_mask_idle(TRUE); // mask data changed: tints are stale
+			/* Lmask data sits next to layer pixels for compositing
+			 * purposes — recompute the composite too. */
+			notify_gfit_data_modified();
+			/* notify_gfit_data_modified rebuilds the tile buffers but
+			 * doesn't queue a paint — the cvport widget needs an
+			 * explicit invalidation for GTK to repaint with the new
+			 * tiles.  Without this the image only refreshes on the
+			 * next mouseover (which incidentally invalidates the
+			 * widget). */
+			gui_iface.redraw_image(REDRAW_ALL);
+		} else {
+			notify_gfit_data_modified();
+			gui_iface.redraw_image(REDRAW_ALL);
+		}
+	}
+
+	free_generic_layer_args(args);
+	return FALSE;
+}
+
+gpointer generic_layer_worker(gpointer p) {
+	struct generic_layer_args *args = (struct generic_layer_args *)p;
+
+	/* Descriptor-primary path: fill layer_hook/log_hook/description/mem_ratio
+	 * from args->op.  No-op when args->op == NULL (the legacy path used by the
+	 * self-recording FLIS op_hooks). */
+	op_descriptor_fill_layer_args(args);
+
+	assert(args && args->layer_hook);
+
+	struct timeval t_start, t_end;
+	gboolean verbose = args->verbose;
+	const gchar *desc = args->description ? args->description : "layer operation";
+
+	gui_iface.set_progress(PROGRESS_RESET, NULL);
+	gettimeofday(&t_start, NULL);
+	args->retval = 0;
+
+	if (verbose && args->description) {
+		siril_log_info(_("%s: processing layer...\n"), desc);
+	}
+
+	gui_iface.set_progress(0.1, _("Processing layer..."));
+
+	/* M-F12: hooks mutate com.uniq->layers and free/replace layer
+	 * payloads; the main thread walks the same list in the GPU compose
+	 * snapshot path, the prefetch idle, and the layers panel.  Exclusive
+	 * lock for the whole hook.  Hooks must obey the stack-lock rules in
+	 * image_format_flis.c: no fits rwlocks, no gui.cairo_mutex, no
+	 * blocking main-loop calls while it is held. */
+	flis_stack_writer_lock();
+	int hook_failed = args->layer_hook(args);
+	flis_stack_writer_unlock();
+	if (hook_failed) {
+		siril_log_error(_("%s layer processing failed.\n"), desc);
+		args->retval = 1;
+	} else if (verbose && args->description) {
+		siril_log_info(_("%s succeeded.\n"), desc);
+		gettimeofday(&t_end, NULL);
+		show_time(t_start, t_end);
+	}
+
+	int retval = args->retval;
+
+	/* NDE provenance capture (sketch §13.1/§13.2) — descriptor-primary layer
+	 * ops only.  Gated on args->op != NULL: legacy FLIS op_hooks (op == NULL)
+	 * self-record at their intent/backend sites (Part A) and must NOT be
+	 * double-recorded here.  Today only icc.convert reaches this branch.  The
+	 * stack writer lock is already released; end_generic_layer (scheduled
+	 * below) frees args, so capture here.  Skip on failure — the hook did not
+	 * validly mutate the document. */
+	gint64 nde_rec_id = 0;
+	if (!retval && args->op && processing_is_reserved_for_replay()) {
+		/* Same replay-first gate as the image and mask workers: a Tier-C
+		 * script re-run reproduces existing records — no new capture, and no
+		 * marking of an unrelated resident script's open scope. */
+	} else if (!retval && args->op && nde_script_scope_active()
+	           && processing_current_job_from_python()) {
+		/* The script's own layer op coalesces into its end-of-scope record.
+		 * Layer-worker ops rewrite document pixels, so the pixel-hash
+		 * net-effect test will see them. */
+		nde_script_scope_mark_pixels_dirty();
+	} else if (!retval && args->op) {
+		const op_descriptor *op = args->op;
+		/* Layer-worker ops act on the WHOLE document (DOCUMENT scope) and are
+		 * hard blockers in nde_chain_build (a document-wide pixel record fails
+		 * closed).  So they are recorded Tier B (opaque) here even when the
+		 * descriptor carries a serializer: icc.convert's single-image serializer
+		 * (phase 4.5 Convention 4) only encodes the target profile for the
+		 * plain-image pixel transform — it does NOT describe the multi-layer +
+		 * tint conversion a FLIS document undergoes, which must stay a full
+		 * blocker (phase-4 model).  Keeping it Tier B keeps the record honestly
+		 * opaque rather than carrying misleading, unreplayable params. */
+		gchar *summary = args->log_hook ?
+				args->log_hook(args->user, SUMMARY) : g_strdup(args->description);
+		nde_capture_req req = {
+			.op          = op,
+			.summary     = summary,
+			/* NDE_TIER_B, not NDE_DERIVE: the descriptor's serializer must
+			 * not be used here, for the reason above. */
+			.tier        = NDE_TIER_B,
+			.scope       = NDE_SCOPE_DOCUMENT,
+			.target_item = (args->invalidate_item_id > 0) ?
+					args->invalidate_item_id : -1,
+		};
+		nde_rec_id = nde_capture(&req);
+		g_free(summary);
+		/* icc_convert_flis_layer_hook saved a multi-layer undo entry (gated on
+		 * com.script — verified); couple it so undo/redo moves live_count.
+		 * Same com.script guard the undo save used. */
+		if (!com.script)
+			undo_tag_top_nde_record(nde_rec_id);
+	}
+
+	if (retval) {
+		gui_iface.set_progress(PROGRESS_RESET, _("Layer processing failed. Check the log."));
+	} else {
+		gui_iface.set_progress(PROGRESS_DONE, _("Layer processing succeeded."));
+	}
+
+	/* Idle dispatch mirrors generic_image_worker:
+	 *   command + headless     → run completion inline, no idle
+	 *   command + interactive  → execute_idle_sync (script blocks until idle runs)
+	 *   non-command            → siril_add_idle (custom or default)
+	 */
+	if (args->command) {
+		if (com.headless) {
+			stop_processing_thread();
+			free_generic_layer_args(args);
+		} else {
+			gui_iface.execute_idle_sync(end_generic_layer, args);
+		}
+	} else if (args->idle_function) {
+		siril_add_idle(args->idle_function, args);
+	} else {
+		siril_add_idle(end_generic_layer, args);
 	}
 
 	return GINT_TO_POINTER(retval);

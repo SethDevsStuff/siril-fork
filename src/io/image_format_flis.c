@@ -1,0 +1,6729 @@
+/*
+ * This file is part of Siril, an astronomy image processor.
+ * Copyright (C) 2005-2011 Francois Meyer (dulle at free.fr)
+ * Copyright (C) 2012-2026 team free-astro (see more in AUTHORS file)
+ * Reference site is https://siril.org
+ *
+ * Siril is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * Siril is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with Siril. If not, see <http://www.gnu.org/licenses/>.
+ */
+
+/*
+ * FLIS (FITS Layered Image Specification) I/O
+ *
+ * Loads and saves FLIS files to/from com.uniq.  The FLIS format extends
+ * standard FITS with a binary metadata table (FLIS_META) and per-layer
+ * image HDUs, allowing multi-layer astrophotography editing state to be
+ * round-tripped through a single FITS-compatible file.
+ *
+ * Functions from image_format_fits.c are reused wherever possible to
+ * avoid duplication:
+ *   read_fits_with_convert()   — layer pixel data reading
+ *   save_opened_fits()         — layer pixel data writing
+ *   write_icc_profile_to_fptr()— ICC profile HDU writing
+ *   read_icc_profile_from_fptr()— ICC profile HDU reading
+ *   siril_fits_compress()      — tile compression setup
+ *   siril_fits_create_diskfile()— file creation
+ *   manage_bitpix()            — BZERO/BSCALE handling
+ *   report_fits_error()        — CFITSIO error reporting
+ */
+
+#include "config.h"  /* VERSION */
+
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include <glib.h>
+#include <gsl/gsl_blas.h>
+#include <gsl/gsl_linalg.h>
+#include <gsl/gsl_matrix.h>
+#include <gsl/gsl_vector.h>
+
+#include "core/processing.h"
+#include "core/proto.h"
+#include "core/siril.h"
+#include "core/siril_log.h"
+
+/* siril_debug_print no longer exists in mainline master; the FLIS
+ * code from the flis branch relied on it for diagnostic output.
+ * Provide a local no-op shim so the call sites remain syntactically
+ * intact and can be promoted to a real logger later. */
+#define siril_debug_print(...) ((void)0)
+
+#include "algos/colors.h"
+#include "algos/photometric_cc.h"
+#include "algos/statistics.h"
+#include "core/gui_iface.h"
+#include "core/icc_profile.h"
+#include "core/masks.h"
+#include "core/nde/nde_cat.h"
+#include "core/nde/nde_checkpoint.h"
+#include "core/nde/nde_composite.h"
+#include "core/nde/nde_history.h"
+#include "core/nde/nde_joint.h"
+#include "core/nde/nde_replay.h"
+#include "core/nde/nde_script_scope.h"
+#include "core/nde/nde_snapstore.h"
+#include "core/op_descriptor.h"
+#include "core/undo.h"
+#include "io/flis_compose.h"
+#include "io/image_format_fits.h"
+#include "io/image_format_flis.h"
+
+/* =====================================================================
+ * FLIS stack lock (M-F12).
+ *
+ * Protects the STRUCTURE of com.uniq->layers / com.uniq->groups and the
+ * lifetime of flis_layer_t payloads (fit pixel buffers, lmask) against
+ * cross-thread races between worker-thread mutations and main-thread
+ * readers (GPU compose walk, CPU composite build, prefetch, layers
+ * panel).
+ *
+ * Global lock ORDER (outermost first):
+ *     fits rwlocks  →  gui.cairo_mutex  →  flis_stack_rwlock  →  g_cache_mutex
+ *
+ * Rules — violating any of these can deadlock:
+ *   1. While holding the stack lock, never acquire a fits rwlock or
+ *      gui.cairo_mutex, and never make a BLOCKING call into the main
+ *      loop (execute_idle_sync).  Async idles (gui_function,
+ *      siril_add_idle, g_idle_add) are fine.
+ *   2. Acquiring the stack lock while holding gui.cairo_mutex
+ *      (composite build) or a fits rwlock (mask worker) is allowed —
+ *      safe because of rule 1: stack holders never wait on those.
+ *   3. The lock is taken ONLY at dispatch level (generic_layer_worker
+ *      around hooks, generic_mask_worker around lmask routing, the
+ *      direct-mutating command functions, and the main-thread reader
+ *      sites).  FLIS primitives in this file stay lock-free, so hooks
+ *      and commands can never re-enter the lock.
+ *   4. GRWLock is not recursive — do not nest reader sections either
+ *      (a queued writer between two reader acquisitions deadlocks).
+ *   5. MAIN-THREAD RENDER/PANEL readers use flis_stack_reader_trylock(),
+ *      never the blocking acquire.  A long layer operation (registration,
+ *      group calibration, ICC convert) holds the WRITER lock for its whole
+ *      duration; a blocking reader on the main loop would freeze every
+ *      redraw and panel refresh until it finished — indistinguishable from
+ *      a hang, and the shape of the registration deadlock report.  On
+ *      contention these sites show the last composite / reschedule; the
+ *      operation ends by invalidating and redrawing, which acquires cleanly
+ *      once the writer has released.  Worker-thread and save-path readers
+ *      may still block (they are not the main loop).
+ *
+ * Documented-benign UNLOCKED accesses (everything else must lock):
+ *   a. Interactive-drag scalar writes from the main thread: a layer's
+ *      position_x/position_y during a canvas drag
+ *      (image_interactions.c) and opacity during a slider drag
+ *      (flis_gui.c).  Scalar stores racing a reader cost at most one
+ *      stale frame; the single processing slot serialises them against
+ *      structural mutation, and the drag-release commits through the
+ *      layer worker.
+ *   b. flis_group_t.collapsed (flis_gui.c): panel-only state, written
+ *      and read exclusively on the main thread.
+ *   c. gfit repointing by uniq_set_active_layer: a single atomic pointer
+ *      store.  Not benign because of where it is called from — the
+ *      display's tile pool reads gfit from its own threads, which that
+ *      reasoning never covered — but because of what the readers do with
+ *      it: materialise_worker latches the pointer once per job and then
+ *      locks and fills THAT fits, so a retarget under it costs at most one
+ *      tile rendered from the outgoing layer, and the rwlock it releases is
+ *      the one it took.  Any reader added later must latch once for the
+ *      same reason; re-reading gfit per dereference would straddle the
+ *      store and unlock a different lock than it acquired.
+ *
+ *      The retarget is therefore safe on its own.  FREEING the outgoing
+ *      layer's fits is not — see flis_layer_remove / flis_merge_down_layer
+ *      / flis_flatten_all, which retarget and then free.  A worker that
+ *      latched the old pointer is still reading it, and the pool cannot be
+ *      drained from under the stack writer lock (rule 1 forbids taking
+ *      gui.cairo_mutex there, which is what draining does).
+ *   d. The undo restore path (undo.c undo_display_data): rewrites layer
+ *      payloads on the MAIN thread with no stack lock.  Safe because
+ *      every unlocked reader is main-thread-confined (same thread,
+ *      serial), worker-thread readers/writers only run inside
+ *      processing jobs, and the GUI undo/redo entry points
+ *      (siril_actions.c, undo_gui.c) refuse while
+ *      processing_is_job_active().  The restore path cannot simply
+ *      take the stack lock itself: it acquires gfit's rwlock
+ *      internally, which would invert the fits→stack order.  If a
+ *      non-main-thread reader outside the processing slot is ever
+ *      added, revisit this.
+ * ===================================================================== */
+static GRWLock flis_stack_rwlock;
+
+void flis_stack_reader_lock(void)   { g_rw_lock_reader_lock(&flis_stack_rwlock); }
+void flis_stack_reader_unlock(void) { g_rw_lock_reader_unlock(&flis_stack_rwlock); }
+void flis_stack_writer_lock(void)   { g_rw_lock_writer_lock(&flis_stack_rwlock); }
+void flis_stack_writer_unlock(void) { g_rw_lock_writer_unlock(&flis_stack_rwlock); }
+
+/* Non-blocking reader acquisition — TRUE on success (caller must unlock).
+ * The MAIN-THREAD render and panel-refresh sites use this: a worker hook
+ * holds the writer lock for the whole of a long layer operation (registration,
+ * group calibration, ICC convert), and blocking on it there freezes the UI
+ * for the entire operation — which reads as a hang.  A dropped frame or a
+ * one-cycle-stale panel is the right trade: the operation ends with
+ * flis_invalidate_composite() + a redraw, which acquires cleanly once the
+ * writer has released, so nothing stays stale. */
+gboolean flis_stack_reader_trylock(void) { return g_rw_lock_reader_trylock(&flis_stack_rwlock); }
+
+/* Free an lmask on the GTK main thread.  redraw_mask_idle (main thread)
+ * reads the active layer's lmask under gfit's rwlock but cannot take the
+ * stack lock there (it would inverse-order against the mask worker's
+ * fits-rwlock→stack sequence).  Deferring the free to the main thread
+ * closes the use-after-free window instead: the reader IS the main
+ * thread, so the free can only run after it finishes. */
+static gboolean layermask_free_idle(gpointer p) {
+    layermask_free((layermask_t *)p);
+    return G_SOURCE_REMOVE;
+}
+void layermask_free_deferred(layermask_t *lm) {
+    if (!lm) return;
+    if (com.headless || g_main_context_is_owner(g_main_context_default()))
+        layermask_free(lm);
+    else
+        g_idle_add(layermask_free_idle, lm);
+}
+
+/* -----------------------------------------------------------------------
+ * FLIS_META binary table column definitions.
+ *
+ * The METADATA column uses the 1PA variable-length ASCII array format as
+ * described in the FLIS spec.  Each row stores a semicolon-delimited
+ * key=value string of arbitrary length in the FITS heap.  On read the
+ * actual byte count is queried with fits_read_descript and a correctly
+ * sized buffer is g_malloc'd per row; callers must free each
+ * row->metadata before freeing the rows array.
+ * ----------------------------------------------------------------------- */
+#define FLIS_META_NCOLS      14
+
+static const char *FLIS_COL_NAMES[FLIS_META_NCOLS] = {
+    "ITEM_ID", "ITEM_TYPE", "HDU_INDEX", "PARENT_ID", "LAYER_ORDER",
+    "LAYER_NAME", "COLOR_MDL", "BLEND_MODE", "OPACITY", "VISIBLE",
+    "POSITION_X", "POSITION_Y", "METADATA", "GROUP_ID"
+};
+static const char *FLIS_COL_FMTS[FLIS_META_NCOLS] = {
+    "1J", "8A", "1J", "1J", "1J",
+    "32A", "4A", "16A", "1E", "1L",
+    "1J", "1J", "1PA", "1J"
+};
+static const char *FLIS_COL_UNITS[FLIS_META_NCOLS] = {
+    "", "", "", "", "",
+    "", "", "", "", "",
+    "pix", "pix", "", ""
+};
+
+/* Column index constants (1-based for CFITSIO) */
+#define COL_ITEM_ID      1
+#define COL_ITEM_TYPE    2
+#define COL_HDU_INDEX    3
+#define COL_PARENT_ID    4
+#define COL_LAYER_ORDER  5
+#define COL_LAYER_NAME   6
+#define COL_COLOR_MDL    7
+#define COL_BLEND_MODE   8
+#define COL_OPACITY      9
+#define COL_VISIBLE     10
+#define COL_POSITION_X  11
+#define COL_POSITION_Y  12
+#define COL_METADATA    13
+#define COL_GROUP_ID    14
+
+/* ITEM_TYPE string constants */
+#define FLIS_TYPE_LAYER  "LAYER"
+#define FLIS_TYPE_MASK   "MASK"
+#define FLIS_TYPE_LMASK  "LMASK"
+#define FLIS_TYPE_GROUP  "GROUP"
+
+/* -----------------------------------------------------------------------
+ * Scratch structure for one FLIS_META table row during load.
+ * ----------------------------------------------------------------------- */
+typedef struct {
+    gint    item_id;
+    char    item_type[9];    /* 8A + NUL */
+    gint    hdu_index;       /* 1-based CFITSIO HDU number */
+    gint    parent_id;
+    gint    layer_order;
+    char    layer_name[33];  /* 32A + NUL */
+    char    color_mdl[5];    /* 4A + NUL  */
+    char    blend_mode[17];  /* 16A + NUL */
+    gfloat  opacity;
+    gboolean visible;
+    gint    position_x;
+    gint    position_y;
+    char   *metadata;        /* 1PA variable-length string, g_malloc'd */
+    gint    group_id;
+} flis_meta_row_t;
+
+/* ===================================================================== */
+/* Blend mode string conversion                                          */
+/* ===================================================================== */
+
+static const struct { flis_blend_mode_t mode; const char *name; }
+    BLEND_TABLE[] = {
+        { FLIS_BLEND_NORMAL,      "NORMAL"      },
+        { FLIS_BLEND_MULTIPLY,    "MULTIPLY"    },
+        { FLIS_BLEND_SCREEN,      "SCREEN"      },
+        { FLIS_BLEND_OVERLAY,     "OVERLAY"     },
+        { FLIS_BLEND_SOFT_LIGHT,  "SOFT_LIGHT"  },
+        { FLIS_BLEND_HARD_LIGHT,  "HARD_LIGHT"  },
+        { FLIS_BLEND_COLOR_DODGE, "COLOR_DODGE" },
+        { FLIS_BLEND_COLOR_BURN,  "COLOR_BURN"  },
+        { FLIS_BLEND_DARKEN,      "DARKEN"      },
+        { FLIS_BLEND_LIGHTEN,     "LIGHTEN"     },
+        { FLIS_BLEND_DIFFERENCE,  "DIFFERENCE"  },
+        { FLIS_BLEND_EXCLUSION,   "EXCLUSION"   },
+        { FLIS_BLEND_HUE,         "HUE"         },
+        { FLIS_BLEND_SATURATION,  "SATURATION"  },
+        { FLIS_BLEND_COLOR,       "COLOR"       },
+        { FLIS_BLEND_LUMINOSITY,  "LUMINOSITY"  },
+        { FLIS_BLEND_CHROMA,        "CHROMA"    },
+        { FLIS_BLEND_PASS_THROUGH,  "PASSTHRU"  },
+    };
+
+static const char *blend_mode_to_str(flis_blend_mode_t mode) {
+    for (int i = 0; i < G_N_ELEMENTS(BLEND_TABLE); i++) {
+        if (BLEND_TABLE[i].mode == mode)
+            return BLEND_TABLE[i].name;
+    }
+    return "NORMAL";
+}
+
+static flis_blend_mode_t str_to_blend_mode(const char *s) {
+    for (int i = 0; i < G_N_ELEMENTS(BLEND_TABLE); i++) {
+        if (!g_ascii_strcasecmp(s, BLEND_TABLE[i].name))
+            return BLEND_TABLE[i].mode;
+    }
+    siril_log_message(_("FLIS: unknown blend mode '%s', defaulting to NORMAL\n"), s);
+    return FLIS_BLEND_NORMAL;
+}
+
+/* ===================================================================== */
+/* Metadata string encoding / decoding                                   */
+/* ===================================================================== */
+
+/*
+ * Build the semicolon-delimited METADATA string for one layer.
+ * Format:  KEY=VALUE;KEY=VALUE;...
+ * Returns a g_malloc'd string that the caller must g_free().
+ */
+static gchar *build_metadata_string(const flis_layer_t *layer) {
+    GString *s = g_string_new(NULL);
+
+    if (layer->created)
+        g_string_append_printf(s, "CREATED=%s;", layer->created);
+    if (layer->modified)
+        g_string_append_printf(s, "MODIFIED=%s;", layer->modified);
+    if (layer->locked)
+        g_string_append(s, "LOCKED=T;");
+    if (layer->has_tint)
+        g_string_append_printf(s, "LAYER_COLOR=%.6f,%.6f,%.6f;",
+                               layer->layer_tint.r,
+                               layer->layer_tint.g,
+                               layer->layer_tint.b);
+
+    /* §6.3 forward-compat: re-emit any keys we didn't recognise at
+     * load time, so future Siril versions' fields survive a round-
+     * trip through this build. */
+    if (layer->unknown_metadata && layer->unknown_metadata[0])
+        g_string_append_printf(s, "%s;", layer->unknown_metadata);
+
+    /* Strip trailing semicolon */
+    if (s->len > 0 && s->str[s->len - 1] == ';')
+        g_string_truncate(s, s->len - 1);
+
+    return g_string_free(s, FALSE);
+}
+
+/*
+ * Parse a METADATA string into the relevant fields of a flis_layer_t.
+ * Unknown keys are silently ignored (per spec Section 8).
+ */
+static void parse_metadata_string(const char *meta, flis_layer_t *layer) {
+    if (!meta || meta[0] == '\0')
+        return;
+
+    /* §6.3 forward-compat: collect any pair we don't recognise into
+     * layer->unknown_metadata so it survives the next save unchanged. */
+    GString *unknown = NULL;
+
+    gchar **pairs = g_strsplit(meta, ";", -1);
+    for (int i = 0; pairs[i]; i++) {
+        if (!pairs[i][0]) continue;  /* skip empty fragment (trailing ;) */
+        gchar **kv = g_strsplit(pairs[i], "=", 2);
+        if (!kv[0] || !kv[1]) { g_strfreev(kv); continue; }
+
+        const char *k = g_strstrip(kv[0]);
+        const char *v = g_strstrip(kv[1]);
+
+        if (!g_ascii_strcasecmp(k, "CREATED")) {
+            g_free(layer->created);
+            layer->created = g_strdup(v);
+        } else if (!g_ascii_strcasecmp(k, "MODIFIED")) {
+            g_free(layer->modified);
+            layer->modified = g_strdup(v);
+        } else if (!g_ascii_strcasecmp(k, "LOCKED")) {
+            layer->locked = (v[0] == 'T' || v[0] == 't');
+        } else if (!g_ascii_strcasecmp(k, "LAYER_COLOR")) {
+            double r, g, b;
+            if (sscanf(v, "%lf,%lf,%lf", &r, &g, &b) == 3) {
+                layer->has_tint = TRUE;
+                layer->layer_tint.r = r;
+                layer->layer_tint.g = g;
+                layer->layer_tint.b = b;
+            }
+        } else {
+            /* Unrecognised key — preserve verbatim for re-emit on save. */
+            if (!unknown) unknown = g_string_new(NULL);
+            if (unknown->len) g_string_append_c(unknown, ';');
+            g_string_append_printf(unknown, "%s=%s", k, v);
+        }
+        g_strfreev(kv);
+    }
+    g_strfreev(pairs);
+    if (unknown) {
+        g_free(layer->unknown_metadata);
+        layer->unknown_metadata = g_string_free(unknown, FALSE);
+    }
+}
+
+/*
+ * Parse a group's METADATA string.  Recognised keys: COLLAPSED, CREATED,
+ * MODIFIED.  Unknown keys are stashed in group->unknown_metadata for
+ * lossless round-trip (§6.3).
+ */
+static void parse_group_metadata_string(const char *meta, flis_group_t *group) {
+    if (!meta || !meta[0]) return;
+    GString *unknown = NULL;
+    gchar **pairs = g_strsplit(meta, ";", -1);
+    for (int i = 0; pairs[i]; i++) {
+        if (!pairs[i][0]) continue;
+        gchar **kv = g_strsplit(pairs[i], "=", 2);
+        if (!kv[0] || !kv[1]) { g_strfreev(kv); continue; }
+        const char *k = g_strstrip(kv[0]);
+        const char *v = g_strstrip(kv[1]);
+
+        if (!g_ascii_strcasecmp(k, "COLLAPSED")) {
+            group->collapsed = (v[0] == '1' || v[0] == 'T' || v[0] == 't');
+        } else if (!g_ascii_strcasecmp(k, "CREATED")) {
+            g_free(group->created);
+            group->created = g_strdup(v);
+        } else if (!g_ascii_strcasecmp(k, "MODIFIED")) {
+            g_free(group->modified);
+            group->modified = g_strdup(v);
+        } else {
+            if (!unknown) unknown = g_string_new(NULL);
+            if (unknown->len) g_string_append_c(unknown, ';');
+            g_string_append_printf(unknown, "%s=%s", k, v);
+        }
+        g_strfreev(kv);
+    }
+    g_strfreev(pairs);
+    if (unknown) {
+        g_free(group->unknown_metadata);
+        group->unknown_metadata = g_string_free(unknown, FALSE);
+    }
+}
+
+/* ===================================================================== */
+/* Thumbnail generation                                                  */
+/* ===================================================================== */
+
+/*
+ * Generate an 8-bit RGB or greyscale thumbnail from the base layer.
+ *
+ * A proper composite thumbnail (all visible layers, layer masks applied)
+ * requires a compositor that does not yet exist.  For now we use the base
+ * layer as the thumbnail source.  The thumbnail is written bottom-to-top
+ * (FITS convention) so that FITS viewers display it correctly.
+ *
+ * @fit:       source layer (base layer, lowest layer_order)
+ * @out_w:     populated with thumbnail width
+ * @out_h:     populated with thumbnail height
+ * Returns:    heap-allocated uint8_t array (caller must free()), or NULL.
+ */
+static uint8_t *generate_thumbnail(const fits *fit,
+                                   long *out_w, long *out_h) {
+    if (!fit) return NULL;
+
+    /* Compute scale factor to fit within FLIS_THUMBNAIL_MAX x FLIS_THUMBNAIL_MAX */
+    double scale = 1.0;
+    if (fit->rx > FLIS_THUMBNAIL_MAX || fit->ry > FLIS_THUMBNAIL_MAX) {
+        double sx = (double)FLIS_THUMBNAIL_MAX / fit->rx;
+        double sy = (double)FLIS_THUMBNAIL_MAX / fit->ry;
+        scale = MIN(sx, sy);
+    }
+
+    long tw = (long)round(fit->rx * scale);
+    long th = (long)round(fit->ry * scale);
+    if (tw < 1) tw = 1;
+    if (th < 1) th = 1;
+
+    long nchans = fit->naxes[2] > 0 ? fit->naxes[2] : 1;
+    /* FLIS thumbnail is always RGB (3 channels) in FITS convention:
+     * planes stored as separate planes in a 3D array. */
+    long out_chans = (nchans >= 3) ? 3 : 1;
+    size_t npix_thumb = (size_t)(tw * th);
+
+    uint8_t *thumb = malloc(npix_thumb * out_chans);
+    if (!thumb) { PRINT_ALLOC_ERR; return NULL; }
+
+    /* Compute min/max for auto-stretch — sample every pixel */
+    double fmin = DBL_MAX, fmax = -DBL_MAX;
+    size_t npix_src = (size_t)(fit->rx * fit->ry);
+
+    if (fit->type == DATA_FLOAT && fit->fdata) {
+        for (size_t i = 0; i < npix_src; i++) {
+            if (fit->fdata[i] < fmin) fmin = fit->fdata[i];
+            if (fit->fdata[i] > fmax) fmax = fit->fdata[i];
+        }
+    } else if (fit->type == DATA_USHORT && fit->data) {
+        for (size_t i = 0; i < npix_src; i++) {
+            if (fit->data[i] < fmin) fmin = fit->data[i];
+            if (fit->data[i] > fmax) fmax = fit->data[i];
+        }
+    } else {
+        free(thumb);
+        return NULL;
+    }
+    if (fmax <= fmin) fmax = fmin + 1.0;
+    double range = fmax - fmin;
+
+    /* Nearest-neighbour downscale into output buffer */
+    for (long c = 0; c < out_chans; c++) {
+        /* Choose source channel: if mono source and RGB output, use ch 0 */
+        long src_chan = (nchans >= 3) ? c : 0;
+        size_t chan_off_src = (size_t)(src_chan * npix_src);
+        size_t chan_off_dst = (size_t)(c * npix_thumb);
+
+        for (long y = 0; y < th; y++) {
+            long sy = (long)((y / scale) + 0.5);
+            if (sy >= fit->ry) sy = fit->ry - 1;
+            for (long x = 0; x < tw; x++) {
+                long sx = (long)((x / scale) + 0.5);
+                if (sx >= fit->rx) sx = fit->rx - 1;
+
+                double v;
+                size_t src_idx = chan_off_src + (size_t)(sy * fit->rx + sx);
+                if (fit->type == DATA_FLOAT)
+                    v = fit->fdata[src_idx];
+                else
+                    v = (double)fit->data[src_idx];
+
+                /* Stretch to [0,255] */
+                double stretched = (v - fmin) / range * 255.0;
+                if (stretched < 0.0)   stretched = 0.0;
+                if (stretched > 255.0) stretched = 255.0;
+                thumb[chan_off_dst + (size_t)(y * tw + x)] = (uint8_t)stretched;
+            }
+        }
+    }
+
+    *out_w = tw;
+    *out_h = th;
+    return thumb;
+}
+
+/* ===================================================================== */
+/* HDU writing helpers                                                   */
+/* ===================================================================== */
+
+/*
+ * Write HDU 0: the 8-bit composite thumbnail.
+ * The fptr must be positioned at HDU 1 (the primary HDU) on entry;
+ * it remains there on successful return.
+ */
+static int write_thumbnail_hdu(fitsfile *fptr, const fits *base_fit,
+                               long canvas_w, long canvas_h,
+                               gboolean icc_present, gboolean nde_present) {
+    int status = 0;
+    long tw = 0, th = 0;
+
+    long nchans = (base_fit && base_fit->naxes[2] >= 3) ? 3 : 1;
+
+    uint8_t *thumb = generate_thumbnail(base_fit, &tw, &th);
+    if (!thumb) {
+        siril_log_warning(_("FLIS: thumbnail generation failed, writing empty HDU\n"));
+        /* Fall through to write a degenerate 1x1 placeholder — sized for
+         * the channel count: the write below covers tw*th*nchans pixels,
+         * so an RGB base needs 3 bytes here, not 1. */
+        tw = 1; th = 1;
+        thumb = calloc(nchans, 1);
+        if (!thumb) return 1;
+    }
+    int naxis = (nchans == 3) ? 3 : 2;
+    long naxes[3] = { tw, th, nchans };
+
+    /* Create the primary HDU.  fits_resize_img() would be wrong here because
+     * the file was just created by fits_create_diskfile() and has no primary
+     * HDU yet — calling resize on an empty file produces the "Extension
+     * doesn't start with SIMPLE or XTENSION" error.  fits_create_img() is
+     * the correct call for writing the very first HDU into a new file. */
+    if (fits_create_img(fptr, BYTE_IMG, naxis, naxes, &status)) {
+        report_fits_error(status);
+        free(thumb);
+        return 1;
+    }
+
+    /* Write FLIS identification keywords */
+    int ival;
+    fits_write_key(fptr, TLOGICAL, "FLIS",    &(int){1},       "FITS Layered Image Specification", &status);
+    fits_write_key(fptr, TSTRING,  "FLISVER", FLIS_VERSION_STRING, "FLIS version",                 &status);
+    fits_write_key(fptr, TLOGICAL, "FLISICC", &(int){icc_present}, "ICC profile present",          &status);
+    fits_write_key(fptr, TLOGICAL, "FLISTHMB",&(int){1},       "Primary HDU contains thumbnail",   &status);
+    /* §7: canvas size lives on com.uniq independently of any layer.  Written
+     * as CANVASW/CANVASH; older builds wrote FLISSIZX/Y derived from base,
+     * and the loader still recognises them as a fallback.  Once the spec is
+     * formally published the FLISSIZX/Y leniency can be dropped. */
+    ival = (int)canvas_w;
+    fits_write_key(fptr, TINT,     "CANVASW", &ival,           "Canvas width in pixels",           &status);
+    ival = (int)canvas_h;
+    fits_write_key(fptr, TINT,     "CANVASH", &ival,           "Canvas height in pixels",          &status);
+    /* CANVASBG: only written when non-default (saves a row in the typical
+     * case of a black background).  Format: "r g b" floats in [0,1]. */
+    if (com.uniq && (com.uniq->canvas_bg_r != 0.0
+                     || com.uniq->canvas_bg_g != 0.0
+                     || com.uniq->canvas_bg_b != 0.0)) {
+        gchar bg_str[64];
+        g_snprintf(bg_str, sizeof(bg_str), "%.6f %.6f %.6f",
+                   com.uniq->canvas_bg_r,
+                   com.uniq->canvas_bg_g,
+                   com.uniq->canvas_bg_b);
+        fits_write_key(fptr, TSTRING, "CANVASBG", bg_str,
+                       "Canvas background fill (R G B in [0,1])", &status);
+    }
+
+    /* §6.2 capability flags — declare what features this writer supports
+     * so older readers can decide whether they understand the file's
+     * contents.  These are per-implementation capabilities; the file's
+     * actual feature use is signalled separately (e.g. FLISICC above
+     * indicates whether THIS file embeds an ICC profile, not whether
+     * the writer supports ICC).  Reuse-of-FLISICC bug fixed: the
+     * second write was overwriting the presence flag with the
+     * capability flag and making the load-time `if (icc_present)`
+     * always true. */
+    gchar impl_str[FLEN_VALUE];
+    g_snprintf(impl_str, sizeof(impl_str), "Siril-%s-flis-gtk4", VERSION);
+    fits_write_key(fptr, TSTRING,  "FLISIMPL", impl_str,        "FLIS implementation/version",    &status);
+    fits_write_key(fptr, TLOGICAL, "FLISCORE",&(int){1},        "Core FLIS features supported",   &status);
+    ival = FLIS_BLND_ALL;
+    fits_write_key(fptr, TINT,     "FLISBLND",&ival,            "Supported blend modes bitmask",  &status);
+    fits_write_key(fptr, TLOGICAL, "FLISLMSK",&(int){1},        "Layer mask (LMASK) supported",   &status);
+    fits_write_key(fptr, TLOGICAL, "FLISGRP", &(int){1},        "Layer groups supported",         &status);
+    fits_write_key(fptr, TLOGICAL, "FLISEFF", &(int){0},        "Effects metadata supported",     &status);
+    /* FLISNDE signals that THIS file carries a FLIS_HIST provenance table
+     * (nde sketch §14.2) — a presence flag like FLISICC, not a capability. */
+    fits_write_key(fptr, TLOGICAL, "FLISNDE", &(int){nde_present}, "NDE history table present",   &status);
+    /* FLISEXT: comma-separated list of optional FLIS extensions this
+     * writer understands.  SPARSE = layers may extend past the canvas
+     * (§6.2 sparse-layer correctness).  Future extensions append. */
+    fits_write_key(fptr, TSTRING,  "FLISEXT", "SPARSE",         "Optional extensions supported",  &status);
+
+    if (status) {
+        report_fits_error(status);
+        free(thumb);
+        return 1;
+    }
+
+    long fpixel = 1;
+    size_t npix = (size_t)(tw * th * nchans);
+    if (fits_write_img(fptr, TBYTE, fpixel, npix, thumb, &status)) {
+        report_fits_error(status);
+        free(thumb);
+        return 1;
+    }
+    free(thumb);
+    return 0;
+}
+
+/*
+ * Write the FLIS_META binary table HDU.
+ *
+ * @fptr:         open FITS file (positioned at last HDU on entry)
+ * @layers:       GSList of flis_layer_t* sorted by layer_order
+ * @first_data_hdu: 1-based HDU number of the first data (layer/mask) HDU
+ *
+ * The FLIS_META HDU is appended to the file.  HDU_INDEX values in the
+ * table are pre-computed from first_data_hdu and the layer/mask structure.
+ */
+static int write_flis_meta_hdu(fitsfile *fptr, GSList *layers,
+                               int first_data_hdu) {
+    int status = 0;
+    int nrows = 0;
+
+    /* Count total rows: each layer + its optional lmask + its optional pmask */
+    for (GSList *l = layers; l; l = l->next) {
+        flis_layer_t *lay = (flis_layer_t *)l->data;
+        nrows++;
+        if (lay->lmask) nrows++;
+        if (lay->fit && lay->fit->mask) nrows++;
+    }
+    /* Also count group rows */
+    if (com.uniq && com.uniq->groups)
+        nrows += (int)g_slist_length(com.uniq->groups);
+
+    /* Create the binary table — cast away const for cfitsio API */
+    if (fits_create_tbl(fptr, BINARY_TBL, nrows, FLIS_META_NCOLS,
+                        (char **)FLIS_COL_NAMES, (char **)FLIS_COL_FMTS,
+                        (char **)FLIS_COL_UNITS, "FLIS_META", &status)) {
+        report_fits_error(status);
+        return 1;
+    }
+
+    /* Walk layers in order, assigning HDU indices as we go */
+    int row = 1;
+    int next_hdu = first_data_hdu;
+
+    for (GSList *l = layers; l; l = l->next) {
+        flis_layer_t *lay = (flis_layer_t *)l->data;
+        const char *color_mdl = (lay->fit && lay->fit->naxes[2] >= 3) ? "RGB" : "MONO";
+        int layer_hdu = next_hdu++;
+        int lmask_hdu = lay->lmask ? next_hdu++ : 0;
+        int pmask_hdu = (lay->fit && lay->fit->mask) ? next_hdu++ : 0;
+
+        /* --- Layer row --- */
+        {
+            gint id  = lay->item_id;
+            gint idx = layer_hdu;
+            gint pid = 0;
+            gint ord = lay->layer_order;
+            gint px  = lay->position_x;
+            gint py  = lay->position_y;
+            gfloat op = lay->opacity;
+            int vis  = lay->visible ? 1 : 0;
+            const char *blend = blend_mode_to_str(lay->blend_mode);
+            gchar *meta = build_metadata_string(lay);
+            const char *name = lay->layer_name ? lay->layer_name : "Layer";
+
+            fits_write_col(fptr, TINT,     COL_ITEM_ID,     row, 1, 1, &id,              &status);
+            fits_write_col(fptr, TSTRING,  COL_ITEM_TYPE,   row, 1, 1, &(char*){FLIS_TYPE_LAYER}, &status);
+            fits_write_col(fptr, TINT,     COL_HDU_INDEX,   row, 1, 1, &idx,             &status);
+            fits_write_col(fptr, TINT,     COL_PARENT_ID,   row, 1, 1, &pid,             &status);
+            fits_write_col(fptr, TINT,     COL_LAYER_ORDER, row, 1, 1, &ord,             &status);
+            fits_write_col(fptr, TSTRING,  COL_LAYER_NAME,  row, 1, 1, &name,            &status);
+            fits_write_col(fptr, TSTRING,  COL_COLOR_MDL,   row, 1, 1, &color_mdl,       &status);
+            fits_write_col(fptr, TSTRING,  COL_BLEND_MODE,  row, 1, 1, &blend,           &status);
+            fits_write_col(fptr, TFLOAT,   COL_OPACITY,     row, 1, 1, &op,              &status);
+            fits_write_col(fptr, TLOGICAL, COL_VISIBLE,     row, 1, 1, &vis,             &status);
+            fits_write_col(fptr, TINT,     COL_POSITION_X,  row, 1, 1, &px,              &status);
+            fits_write_col(fptr, TINT,     COL_POSITION_Y,  row, 1, 1, &py,              &status);
+            if (meta && meta[0]) {
+                fits_write_col(fptr, TSTRING, COL_METADATA, row, 1, 1, &meta,            &status);
+            } else {
+                const char *empty = "";
+                fits_write_col(fptr, TSTRING, COL_METADATA, row, 1, 1, &empty,           &status);
+            }
+            g_free(meta);
+            {
+                gint gid = lay->group_id;
+                fits_write_col(fptr, TINT, COL_GROUP_ID, row, 1, 1, &gid, &status);
+            }
+            row++;
+        }
+
+        /* --- Layer mask row (LMASK) --- */
+        if (lay->lmask) {
+            gint id  = flis_layer_lmask_id(lay);
+            gint idx = lmask_hdu;
+            gint pid = lay->item_id;
+            gint ord = 0;
+            gint px  = 0, py = 0;
+            gfloat op = 1.0f;
+            int vis = 1;
+            gchar *lname = g_strdup_printf("%s Layer Mask",
+                           lay->layer_name ? lay->layer_name : "Layer");
+            const char *empty = "";
+
+            fits_write_col(fptr, TINT,     COL_ITEM_ID,     row, 1, 1, &id,              &status);
+            fits_write_col(fptr, TSTRING,  COL_ITEM_TYPE,   row, 1, 1, &(char*){FLIS_TYPE_LMASK}, &status);
+            fits_write_col(fptr, TINT,     COL_HDU_INDEX,   row, 1, 1, &idx,             &status);
+            fits_write_col(fptr, TINT,     COL_PARENT_ID,   row, 1, 1, &pid,             &status);
+            fits_write_col(fptr, TINT,     COL_LAYER_ORDER, row, 1, 1, &ord,             &status);
+            fits_write_col(fptr, TSTRING,  COL_LAYER_NAME,  row, 1, 1, &lname,           &status);
+            fits_write_col(fptr, TSTRING,  COL_COLOR_MDL,   row, 1, 1, &(char*){"MONO"}, &status);
+            fits_write_col(fptr, TSTRING,  COL_BLEND_MODE,  row, 1, 1, &(char*){"NORMAL"}, &status);
+            fits_write_col(fptr, TFLOAT,   COL_OPACITY,     row, 1, 1, &op,              &status);
+            fits_write_col(fptr, TLOGICAL, COL_VISIBLE,     row, 1, 1, &vis,             &status);
+            fits_write_col(fptr, TINT,     COL_POSITION_X,  row, 1, 1, &px,              &status);
+            fits_write_col(fptr, TINT,     COL_POSITION_Y,  row, 1, 1, &py,              &status);
+            fits_write_col(fptr, TSTRING,  COL_METADATA,    row, 1, 1, &empty,           &status);
+            {
+                gint gid = 0;
+                fits_write_col(fptr, TINT, COL_GROUP_ID, row, 1, 1, &gid, &status);
+            }
+            g_free(lname);
+            row++;
+        }
+
+        /* --- Processing mask row (MASK) --- */
+        if (lay->fit && lay->fit->mask) {
+            gint id  = flis_layer_pmask_id(lay);
+            gint idx = pmask_hdu;
+            gint pid = lay->item_id;
+            gint ord = 0;
+            gint px  = 0, py = 0;
+            gfloat op = 1.0f;
+            int vis = 1;
+            gchar *mname = g_strdup_printf("%s Processing Mask",
+                           lay->layer_name ? lay->layer_name : "Layer");
+            const char *empty = "";
+
+            fits_write_col(fptr, TINT,     COL_ITEM_ID,     row, 1, 1, &id,              &status);
+            fits_write_col(fptr, TSTRING,  COL_ITEM_TYPE,   row, 1, 1, &(char*){FLIS_TYPE_MASK}, &status);
+            fits_write_col(fptr, TINT,     COL_HDU_INDEX,   row, 1, 1, &idx,             &status);
+            fits_write_col(fptr, TINT,     COL_PARENT_ID,   row, 1, 1, &pid,             &status);
+            fits_write_col(fptr, TINT,     COL_LAYER_ORDER, row, 1, 1, &ord,             &status);
+            fits_write_col(fptr, TSTRING,  COL_LAYER_NAME,  row, 1, 1, &mname,           &status);
+            fits_write_col(fptr, TSTRING,  COL_COLOR_MDL,   row, 1, 1, &(char*){"MONO"}, &status);
+            fits_write_col(fptr, TSTRING,  COL_BLEND_MODE,  row, 1, 1, &(char*){"NORMAL"}, &status);
+            fits_write_col(fptr, TFLOAT,   COL_OPACITY,     row, 1, 1, &op,              &status);
+            fits_write_col(fptr, TLOGICAL, COL_VISIBLE,     row, 1, 1, &vis,             &status);
+            fits_write_col(fptr, TINT,     COL_POSITION_X,  row, 1, 1, &px,              &status);
+            fits_write_col(fptr, TINT,     COL_POSITION_Y,  row, 1, 1, &py,              &status);
+            fits_write_col(fptr, TSTRING,  COL_METADATA,    row, 1, 1, &empty,           &status);
+            {
+                gint gid = 0;
+                fits_write_col(fptr, TINT, COL_GROUP_ID, row, 1, 1, &gid, &status);
+            }
+            g_free(mname);
+            row++;
+        }
+
+        if (status) {
+            report_fits_error(status);
+            return 1;
+        }
+    }
+
+    /* Write GROUP rows */
+    if (com.uniq && com.uniq->groups) {
+        for (GSList *g = com.uniq->groups; g; g = g->next) {
+            flis_group_t *grp = (flis_group_t *)g->data;
+            if (!grp) continue;
+            gint id   = grp->item_id;
+            gint zero = 0;
+            gfloat op = grp->opacity;
+            int vis   = grp->visible ? 1 : 0;
+            const char *name = grp->name ? grp->name : "Group";
+            /* Build metadata string for group: COLLAPSED + timestamps +
+             * §6.3 forward-compat re-emit of unrecognised keys. */
+            GString *gms = g_string_new(NULL);
+            g_string_append_printf(gms, "COLLAPSED=%d;CREATED=%s;MODIFIED=%s",
+                grp->collapsed ? 1 : 0,
+                grp->created  ? grp->created  : "",
+                grp->modified ? grp->modified : "");
+            if (grp->unknown_metadata && grp->unknown_metadata[0])
+                g_string_append_printf(gms, ";%s", grp->unknown_metadata);
+            gchar *meta = g_string_free(gms, FALSE);
+            fits_write_col(fptr, TINT,     COL_ITEM_ID,     row, 1, 1, &id,                        &status);
+            fits_write_col(fptr, TSTRING,  COL_ITEM_TYPE,   row, 1, 1, &(char*){FLIS_TYPE_GROUP},  &status);
+            fits_write_col(fptr, TINT,     COL_HDU_INDEX,   row, 1, 1, &zero,                      &status);
+            fits_write_col(fptr, TINT,     COL_PARENT_ID,   row, 1, 1, &zero,                      &status);
+            fits_write_col(fptr, TINT,     COL_LAYER_ORDER, row, 1, 1, &zero,                      &status);
+            fits_write_col(fptr, TSTRING,  COL_LAYER_NAME,  row, 1, 1, &name,                      &status);
+            fits_write_col(fptr, TSTRING,  COL_COLOR_MDL,   row, 1, 1, &(char*){"N/A"},            &status);
+            const char *bm_str = blend_mode_to_str(grp->blend_mode);
+            fits_write_col(fptr, TSTRING,  COL_BLEND_MODE,  row, 1, 1, &bm_str,                    &status);
+            fits_write_col(fptr, TFLOAT,   COL_OPACITY,     row, 1, 1, &op,                        &status);
+            fits_write_col(fptr, TLOGICAL, COL_VISIBLE,     row, 1, 1, &vis,                       &status);
+            fits_write_col(fptr, TINT,     COL_POSITION_X,  row, 1, 1, &zero,                      &status);
+            fits_write_col(fptr, TINT,     COL_POSITION_Y,  row, 1, 1, &zero,                      &status);
+            if (meta && meta[0]) {
+                fits_write_col(fptr, TSTRING, COL_METADATA, row, 1, 1, &meta,                      &status);
+            } else {
+                const char *empty = "";
+                fits_write_col(fptr, TSTRING, COL_METADATA, row, 1, 1, &empty,                     &status);
+            }
+            fits_write_col(fptr, TINT,     COL_GROUP_ID,    row, 1, 1, &zero,                      &status);
+            g_free(meta);
+
+            if (status) { report_fits_error(status); return 1; }
+            row++;
+        }
+    }
+
+    return 0;
+}
+
+/*
+ * Write one layer's pixel data as a new image HDU.
+ * Temporarily borrows fptr into layer->fit to reuse save_opened_fits().
+ * The flis_id and flis_type keywords are added after the pixel write.
+ */
+/*
+ * SHA-256 of a layer's in-memory pixel buffer, as a heap hex string (or NULL
+ * for an empty/absent buffer).  Used for the PIXHASH external-edit check
+ * (nde sketch §14.4): computed at save and re-checked at load, never at
+ * runtime.  The hash covers the raw buffer for the image's data_type, so it
+ * only round-trips when the on-disk representation is lossless — callers
+ * skip it when tile compression is enabled.
+ */
+static gchar *flis_pixel_sha256(const fits *f) {
+    if (!f)
+        return NULL;
+    size_t npix = (size_t)f->rx * f->ry * (f->naxes[2] ? f->naxes[2] : 1);
+    const guchar *buf;
+    gsize nbytes;
+    if (f->type == DATA_FLOAT) {
+        buf = (const guchar *)f->fdata;
+        nbytes = npix * sizeof(float);
+    } else {
+        buf = (const guchar *)f->data;
+        nbytes = npix * sizeof(WORD);
+    }
+    if (!buf || !npix)
+        return NULL;
+    GChecksum *ck = g_checksum_new(G_CHECKSUM_SHA256);
+    g_checksum_update(ck, buf, nbytes);
+    gchar *hex = g_strdup(g_checksum_get_string(ck));
+    g_checksum_free(ck);
+    return hex;
+}
+
+static int write_layer_hdu(fitsfile *fptr, flis_layer_t *layer) {
+    int status = 0;
+    fits *f = layer->fit;
+
+    f->naxes[0] = f->rx;
+    f->naxes[1] = f->ry;
+
+    if (fits_create_img(fptr, f->bitpix, f->naxis, f->naxes, &status)) {
+        report_fits_error(status);
+        return 1;
+    }
+
+    /* BZERO/BSCALE for unsigned 16-bit: CFITSIO sets these automatically
+     * when USHORT_IMG is used, but be explicit for FLIS conformance. */
+    if (f->bitpix == USHORT_IMG) {
+        double bzero = 32768.0, bscale = 1.0;
+        fits_write_key(fptr, TDOUBLE, "BZERO",  &bzero,  "Unsigned 16-bit offset", &status);
+        fits_write_key(fptr, TDOUBLE, "BSCALE", &bscale, "Scale factor",           &status);
+        status = 0;
+    }
+
+    /* Temporarily borrow fptr so save_opened_fits() writes to this HDU */
+    fitsfile *saved_fptr = f->fptr;
+    f->fptr = fptr;
+    int ret = save_opened_fits(f);
+    f->fptr = saved_fptr;
+
+    if (ret) return 1;
+
+    /* Add FLIS-specific keywords */
+    gint flis_id = layer->item_id;
+    const char *name = layer->layer_name ? layer->layer_name : "Layer";
+    fits_write_key(fptr, TINT,    "FLIS_ID",   &flis_id,        "FLIS item ID",          &status);
+    fits_write_key(fptr, TSTRING, "FLIS_TYPE", FLIS_TYPE_LAYER, "FLIS HDU type",         &status);
+    fits_write_key(fptr, TSTRING, "EXTNAME",   (void *)name,    "Extension name",        &status);
+
+    /* PIXHASH external-edit check (nde sketch §14.4).  Skipped under tile
+     * compression: float quantisation is lossy, so the loaded buffer would
+     * never hash-match and every file would present as stale. */
+    if (!com.pref.comp.fits_enabled) {
+        gchar *hash = flis_pixel_sha256(f);
+        if (hash) {
+            fits_write_key(fptr, TSTRING, "PIXHASH", hash,
+                           "SHA-256 of in-memory pixel buffer", &status);
+            g_free(hash);
+        }
+    }
+
+    if (status) { report_fits_error(status); return 1; }
+    return 0;
+}
+
+/*
+ * Write a layermask_t as a new greyscale image HDU.
+ * @bitpix_fits: BYTE_IMG (8) for LMASK, FLOAT_IMG (-32) for MASK.
+ * @cfitsio_type: TBYTE or TFLOAT, matching bitpix_fits.
+ */
+static int write_mask_hdu(fitsfile *fptr, const layermask_t *mask,
+                          gint flis_id, const char *flis_type,
+                          const char *extname,
+                          int bitpix_fits, int cfitsio_type,
+                          gboolean mask_active) {
+    int status = 0;
+    long naxes[2] = { (long)mask->w, (long)mask->h };
+
+    if (fits_create_img(fptr, bitpix_fits, 2, naxes, &status)) {
+        report_fits_error(status);
+        return 1;
+    }
+
+    gint id = flis_id;
+    fits_write_key(fptr, TINT,    "FLIS_ID",   &id,             "FLIS item ID",  &status);
+    fits_write_key(fptr, TSTRING, "FLIS_TYPE", (void *)flis_type,"FLIS HDU type",&status);
+    fits_write_key(fptr, TSTRING, "EXTNAME",   (void *)extname,  "Extension name",&status);
+
+    /* MASK_ACT: mask active flag — present in both LMASK and MASK HDUs */
+    {
+        int act = mask_active ? 1 : 0;
+        fits_write_key(fptr, TLOGICAL, "MASK_ACT", &act,
+                       "Mask active in compositing", &status);
+    }
+
+    if (status) { report_fits_error(status); return 1; }
+
+    long npix = (long)(mask->w * mask->h);
+    if (fits_write_img(fptr, cfitsio_type, 1, npix, mask->data, &status)) {
+        report_fits_error(status);
+        return 1;
+    }
+    return 0;
+}
+
+/* ===================================================================== */
+/* HDU reading helpers                                                   */
+/* ===================================================================== */
+
+/*
+ * Read all rows from the FLIS_META binary table into a heap-allocated
+ * array.  The file's active HDU is expected to be the FLIS_META table
+ * on entry; it is left unchanged on return.
+ *
+ * @nrows_out: populated with the number of rows read.
+ * Returns: heap-allocated flis_meta_row_t array, or NULL on error.
+ *          Caller must free() the array.
+ */
+/* Hardening caps for the FLIS_META table.  A real FLIS document holds at
+ * most a few dozen items; the caps only exist so a crafted file cannot
+ * drive huge allocations. */
+#define FLIS_META_MAX_ROWS      4096
+#define FLIS_META_MAX_METADATA  (1L << 20)   /* 1 MiB per METADATA cell */
+
+/* Resolve a FLIS_META column by NAME.  The writer emits a fixed order,
+ * but the format does not forbid other writers reordering columns —
+ * fixed indices would silently misread such (conforming) files, and a
+ * crafted file could exploit the mismatch. */
+static int meta_colnum(fitsfile *fptr, const char *name, int *out) {
+    int status = 0;
+    if (fits_get_colnum(fptr, CASEINSEN, (char *)name, out, &status)) {
+        siril_log_error(_("FLIS: metadata table is missing column %s\n"), name);
+        return 1;
+    }
+    return 0;
+}
+
+/* Bounded string-cell read: reads at most dstsz-1 raw chars (TBYTE) so a
+ * column DECLARED wider than our fixed row-struct fields truncates
+ * instead of overflowing them (CFITSIO's TSTRING copies the declared
+ * width into the caller's buffer unconditionally). */
+static void meta_read_string(fitsfile *fptr, int col, long row,
+                             char *dst, size_t dstsz, int *status) {
+    dst[0] = '\0';
+    int typecode = 0;
+    long repeat = 0, width = 0;
+    int s2 = 0;
+    if (fits_get_coltype(fptr, col, &typecode, &repeat, &width, &s2) || s2)
+        return;
+    long n = repeat;
+    if (n > (long)dstsz - 1) n = (long)dstsz - 1;
+    if (n <= 0) return;
+    unsigned char nulval = 0;
+    int s3 = 0;
+    if (fits_read_col(fptr, TBYTE, col, row, 1, n, &nulval,
+                      (unsigned char *)dst, NULL, &s3) == 0) {
+        dst[n] = '\0';
+        /* FITS pads A-cells with trailing blanks — trim like TSTRING. */
+        for (long i = n - 1; i >= 0 && dst[i] == ' '; i--)
+            dst[i] = '\0';
+    } else {
+        dst[0] = '\0';
+        if (*status == 0) *status = s3;
+    }
+}
+
+static flis_meta_row_t *read_flis_meta(fitsfile *fptr, long *nrows_out) {
+    int status = 0;
+    long nrows = 0;
+    fits_get_num_rows(fptr, &nrows, &status);
+    if (status || nrows <= 0) {
+        report_fits_error(status);
+        return NULL;
+    }
+    if (nrows > FLIS_META_MAX_ROWS) {
+        siril_log_error(_("FLIS: metadata table declares %ld rows (max %d) — "
+                          "refusing to load\n"), nrows, FLIS_META_MAX_ROWS);
+        return NULL;
+    }
+
+    /* Resolve the required columns by name; GROUP_ID stays optional for
+     * files written before groups existed. */
+    int c_item_id, c_item_type, c_hdu_index, c_parent_id, c_layer_order;
+    int c_layer_name, c_color_mdl, c_blend_mode, c_opacity, c_visible;
+    int c_pos_x, c_pos_y, c_metadata;
+    int c_group_id = 0;
+    if (meta_colnum(fptr, "ITEM_ID",     &c_item_id)     ||
+        meta_colnum(fptr, "ITEM_TYPE",   &c_item_type)   ||
+        meta_colnum(fptr, "HDU_INDEX",   &c_hdu_index)   ||
+        meta_colnum(fptr, "PARENT_ID",   &c_parent_id)   ||
+        meta_colnum(fptr, "LAYER_ORDER", &c_layer_order) ||
+        meta_colnum(fptr, "LAYER_NAME",  &c_layer_name)  ||
+        meta_colnum(fptr, "COLOR_MDL",   &c_color_mdl)   ||
+        meta_colnum(fptr, "BLEND_MODE",  &c_blend_mode)  ||
+        meta_colnum(fptr, "OPACITY",     &c_opacity)     ||
+        meta_colnum(fptr, "VISIBLE",     &c_visible)     ||
+        meta_colnum(fptr, "POSITION_X",  &c_pos_x)       ||
+        meta_colnum(fptr, "POSITION_Y",  &c_pos_y)       ||
+        meta_colnum(fptr, "METADATA",    &c_metadata))
+        return NULL;
+    {
+        int s_grp = 0;
+        if (fits_get_colnum(fptr, CASEINSEN, "GROUP_ID", &c_group_id, &s_grp))
+            c_group_id = 0;
+    }
+
+    flis_meta_row_t *rows = calloc(nrows, sizeof(flis_meta_row_t));
+    if (!rows) { PRINT_ALLOC_ERR; return NULL; }
+
+    for (long r = 1; r <= nrows; r++) {
+        flis_meta_row_t *row = &rows[r - 1];
+        char anull = '\0';
+
+        fits_read_col(fptr, TINT,    c_item_id,     r, 1, 1, &(int){0},  &row->item_id,     NULL, &status);
+        meta_read_string(fptr, c_item_type, r, row->item_type, sizeof(row->item_type), &status);
+        fits_read_col(fptr, TINT,    c_hdu_index,   r, 1, 1, &(int){0},  &row->hdu_index,    NULL, &status);
+        fits_read_col(fptr, TINT,    c_parent_id,   r, 1, 1, &(int){0},  &row->parent_id,    NULL, &status);
+        fits_read_col(fptr, TINT,    c_layer_order, r, 1, 1, &(int){0},  &row->layer_order,  NULL, &status);
+        meta_read_string(fptr, c_layer_name, r, row->layer_name, sizeof(row->layer_name), &status);
+        meta_read_string(fptr, c_color_mdl,  r, row->color_mdl,  sizeof(row->color_mdl),  &status);
+        meta_read_string(fptr, c_blend_mode, r, row->blend_mode, sizeof(row->blend_mode), &status);
+        fits_read_col(fptr, TFLOAT,  c_opacity,     r, 1, 1, &(float){1.0f}, &row->opacity,  NULL, &status);
+
+        char vis_char = 'T';
+        fits_read_col(fptr, TLOGICAL, c_visible,    r, 1, 1, &anull,     &vis_char,          NULL, &status);
+        row->visible = (vis_char != 'F' && vis_char != 0);
+
+        fits_read_col(fptr, TINT,    c_pos_x,       r, 1, 1, &(int){0},  &row->position_x,   NULL, &status);
+        fits_read_col(fptr, TINT,    c_pos_y,       r, 1, 1, &(int){0},  &row->position_y,   NULL, &status);
+        {
+            /* Variable-length 1PA column: query actual byte count first,
+             * then allocate an exact-fit buffer and read into it.  The
+             * descriptor is file-controlled: cap it and use a
+             * non-aborting allocation. */
+            long vl_repeat = 0, vl_offset = 0;
+            int vl_status = 0;
+            fits_read_descript(fptr, c_metadata, r, &vl_repeat, &vl_offset, &vl_status);
+            if (vl_status || vl_repeat < 0) vl_repeat = 0;
+            if (vl_repeat > FLIS_META_MAX_METADATA) {
+                siril_log_warning(_("FLIS: metadata cell of %ld bytes exceeds the "
+                                    "%ld byte limit — ignored\n"),
+                                  vl_repeat, FLIS_META_MAX_METADATA);
+                vl_repeat = 0;
+            }
+            row->metadata = g_try_malloc(vl_repeat + 1);
+            if (!row->metadata) {
+                PRINT_ALLOC_ERR;
+                row->metadata = g_strdup("");
+            } else {
+                row->metadata[0] = '\0';
+                if (vl_repeat > 0) {
+                    char *strptr = row->metadata;
+                    fits_read_col(fptr, TSTRING, c_metadata, r, 1, 1, &anull, &strptr, NULL, &status);
+                    row->metadata[vl_repeat] = '\0'; /* guarantee NUL termination */
+                }
+            }
+        }
+        if (c_group_id > 0) {
+            fits_read_col(fptr, TINT, c_group_id, r, 1, 1, &(int){0}, &row->group_id, NULL, &status);
+        } else {
+            row->group_id = 0;
+        }
+
+        if (status) {
+            siril_log_warning(_("FLIS: error reading metadata row %ld: %d\n"), r, status);
+            status = 0; /* continue with next row */
+        }
+    }
+
+    *nrows_out = nrows;
+    return rows;
+}
+
+/*
+ * Load pixel data from the HDU at hdu_index (1-based) into a newly
+ * allocated fits*.  The file's active HDU is restored on return.
+ */
+static fits *load_layer_from_hdu(fitsfile *fptr, int hdu_index) {
+    int status = 0;
+    int orig_hdu;
+    fits_get_hdu_num(fptr, &orig_hdu);
+
+    if (fits_movabs_hdu(fptr, hdu_index, NULL, &status)) {
+        report_fits_error(status);
+        return NULL;
+    }
+
+    fits *f = calloc(1, sizeof(fits));
+    if (!f) { PRINT_ALLOC_ERR; goto restore; }
+
+    /* Read geometry and BZERO/BSCALE */
+    f->naxes[2] = 1;
+    fits_get_img_param(fptr, 3, &f->bitpix, &f->naxis, f->naxes, &status);
+    if (status) { report_fits_error(status); free(f); f = NULL; goto restore; }
+
+    manage_bitpix(fptr, &f->bitpix, &f->orig_bitpix);
+
+    if (f->naxis == 2 && f->naxes[2] == 0)
+        f->naxes[2] = 1;
+
+    f->rx = (unsigned int)f->naxes[0];
+    f->ry = (unsigned int)f->naxes[1];
+    f->fptr = fptr;  /* temporary borrow for read_fits_with_convert */
+
+    if (read_fits_with_convert(f, "FLIS layer", FALSE)) {
+        clearfits(f);
+        free(f);
+        f = NULL;
+        goto restore;
+    }
+    f->fptr = NULL;
+    f->top_down = FALSE;
+
+    /* Read FITS keywords (exposure, WCS, etc.) into the layer's fits struct.
+     * This preserves per-layer science metadata for round-tripping. */
+    f->fptr = fptr;
+    read_fits_header(f);
+    f->fptr = NULL;
+
+restore:
+    status = 0;
+    fits_movabs_hdu(fptr, orig_hdu, NULL, &status);
+    return f;
+}
+
+/*
+ * Load a mask from the HDU at hdu_index into a newly allocated layermask_t.
+ * The file's active HDU is restored on return.
+ * @expect_float: TRUE for processing masks (FLOAT_IMG), FALSE for layer masks (BYTE_IMG).
+ */
+/* Read the MASK_ACT logical keyword from the given HDU index.
+ * Returns TRUE (active) if the keyword is absent or unreadable. */
+static gboolean read_mask_act_from_hdu(fitsfile *fptr, int hdu_index) {
+    int hdu_status = 0;
+    int orig_hdu;
+    fits_get_hdu_num(fptr, &orig_hdu);
+    int act_val = 1; /* default: active */
+    if (!fits_movabs_hdu(fptr, hdu_index, NULL, &hdu_status)) {
+        fits_read_key(fptr, TLOGICAL, "MASK_ACT", &act_val, NULL, &hdu_status);
+        hdu_status = 0;
+        fits_movabs_hdu(fptr, orig_hdu, NULL, &hdu_status);
+    }
+    return (act_val != 0);
+}
+
+static layermask_t *load_mask_from_hdu(fitsfile *fptr, int hdu_index,
+                                       gboolean expect_float) {
+    int status = 0;
+    int orig_hdu;
+    fits_get_hdu_num(fptr, &orig_hdu);
+
+    if (fits_movabs_hdu(fptr, hdu_index, NULL, &status)) {
+        report_fits_error(status);
+        return NULL;
+    }
+
+    int bitpix, naxis;
+    long naxes[2] = { 0, 0 };
+    fits_get_img_param(fptr, 2, &bitpix, &naxis, naxes, &status);
+    if (status || naxis != 2) {
+        report_fits_error(status);
+        fits_movabs_hdu(fptr, orig_hdu, NULL, &status);
+        return NULL;
+    }
+
+    layermask_t *mask = calloc(1, sizeof(layermask_t));
+    if (!mask) { PRINT_ALLOC_ERR; goto restore_mask; }
+
+    mask->w = (size_t)naxes[0];
+    mask->h = (size_t)naxes[1];
+    mask->bitpix = expect_float ? 32 : 8;
+    /* Dimensions come straight from the file header — guard the byte-count
+     * computation so a corrupt header cannot wrap to a short allocation
+     * that fits_read_img then overruns. */
+    size_t elem_sz = mask->bitpix / 8;
+    if (mask->w == 0 || mask->h == 0 ||
+        mask->w > SIZE_MAX / elem_sz / mask->h) {
+        siril_log_error(_("FLIS: mask HDU has invalid dimensions %zux%zu\n"),
+                        mask->w, mask->h);
+        free(mask);
+        mask = NULL;
+        goto restore_mask;
+    }
+    size_t nbytes = mask->w * mask->h * elem_sz;
+
+    mask->data = malloc(nbytes);
+    if (!mask->data) {
+        PRINT_ALLOC_ERR;
+        free(mask);
+        mask = NULL;
+        goto restore_mask;
+    }
+
+    int zero = 0;
+    int cftype = expect_float ? TFLOAT : TBYTE;
+    long npix = (long)(mask->w * mask->h);
+    fits_read_img(fptr, cftype, 1, npix, &zero, mask->data, &zero, &status);
+    if (status) {
+        report_fits_error(status);
+        layermask_free(mask);
+        mask = NULL;
+    }
+
+restore_mask:
+    status = 0;
+    fits_movabs_hdu(fptr, orig_hdu, NULL, &status);
+    return mask;
+}
+
+/* ===================================================================== */
+/* Public API — lifecycle helpers                                        */
+/* ===================================================================== */
+
+void layermask_free(layermask_t *mask) {
+    if (!mask) return;
+    free(mask->data);
+    free(mask);
+}
+
+gboolean flis_get_displayed_mask(struct _mask_t *out_mask) {
+    if (!out_mask) return FALSE;
+    out_mask->bitpix = 0;
+    out_mask->data   = NULL;
+
+    /* Non-FLIS path: always the processing mask. */
+    if (!is_current_image_flis() || !com.uniq) {
+        if (gfit && gfit->mask && gfit->mask->data) {
+            out_mask->bitpix = gfit->mask->bitpix;
+            out_mask->data   = gfit->mask->data;
+            return TRUE;
+        }
+        return FALSE;
+    }
+
+    /* FLIS, view = LAYER: source the active layer's lmask if present.
+     * Callers (the vport tint overlay in remap() and the mask tab) index
+     * the returned buffer with gfit-linear indices, and mask_t carries no
+     * dimensions — during display the composite swapped into gfit is
+     * canvas-sized while the lmask is layer-sized.  Only return the lmask
+     * when its dimensions match the displayed image, otherwise a sparse
+     * layer's mask would be read out of bounds. */
+    if (com.uniq->flis_mask_view == 1) {
+        flis_layer_t *act = flis_active_layer();
+        if (act && act->lmask && act->lmask->data &&
+            gfit && act->lmask->w == (size_t)gfit->rx &&
+            act->lmask->h == (size_t)gfit->ry) {
+            out_mask->bitpix = act->lmask->bitpix;
+            out_mask->data   = act->lmask->data;
+            return TRUE;
+        }
+        /* Fall through to the processing mask if the layer source isn't
+         * available — better than a black mask tab. */
+    }
+
+    /* FLIS, view = PROC (or LAYER fallback): the processing mask. */
+    if (gfit && gfit->mask && gfit->mask->data) {
+        out_mask->bitpix = gfit->mask->bitpix;
+        out_mask->data   = gfit->mask->data;
+        return TRUE;
+    }
+    return FALSE;
+}
+
+layermask_t *layermask_clone(const layermask_t *src) {
+    if (!src) return NULL;
+    size_t elem;
+    switch (src->bitpix) {
+        case 8:  elem = sizeof(uint8_t);  break;
+        case 16: elem = sizeof(uint16_t); break;
+        case 32: elem = sizeof(float);    break;
+        default: return NULL;
+    }
+    layermask_t *out = calloc(1, sizeof(layermask_t));
+    if (!out) return NULL;
+    out->w = src->w;
+    out->h = src->h;
+    out->bitpix = src->bitpix;
+    if (src->data && src->w && src->h) {
+        size_t bytes = (size_t)src->w * src->h * elem;
+        out->data = malloc(bytes);
+        if (!out->data) { free(out); return NULL; }
+        memcpy(out->data, src->data, bytes);
+    }
+    return out;
+}
+
+void flis_layer_capture_props(const flis_layer_t *layer,
+                              flis_layer_props_t *out) {
+    if (!layer || !out) return;
+    out->blend_mode   = layer->blend_mode;
+    out->opacity      = layer->opacity;
+    out->visible      = layer->visible;
+    out->locked       = layer->locked;
+    out->has_tint     = layer->has_tint;
+    out->tint         = layer->layer_tint;
+    out->lmask_active = layer->lmask_active;
+    out->position_x   = layer->position_x;
+    out->position_y   = layer->position_y;
+    out->layer_order  = layer->layer_order;
+    g_strlcpy(out->name,
+              layer->layer_name ? layer->layer_name : "",
+              sizeof(out->name));
+}
+
+flis_layer_t *flis_layer_new(fits *fit, const gchar *name) {
+    flis_layer_t *layer = g_new0(flis_layer_t, 1);
+    if (!layer) return NULL;
+
+    layer->fit          = fit;
+    layer->layer_name   = g_strdup(name ? name : "Layer");
+    layer->blend_mode   = FLIS_BLEND_NORMAL;
+    layer->opacity      = 1.0f;
+    layer->visible      = TRUE;
+    layer->has_tint     = FALSE;
+    layer->layer_tint   = (flis_tint_t){ 1.0, 1.0, 1.0 };
+    layer->lmask_active = TRUE;
+    /* item_id and layer_order must be set by the caller */
+    return layer;
+}
+
+/* ── Retiring a layer's pixels ────────────────────────────────────────────
+ * A layer's fits cannot be freed at the moment its layer is destroyed.  The
+ * display's tile workers latch gfit once per job and fill from the fits they
+ * latched, so the layer that was active a moment ago may still be under a
+ * worker when flis_layer_remove() / flis_merge_down_layer() / flis_flatten_all()
+ * drop it.  The pool has to be stopped before that memory goes back to the
+ * allocator, and it cannot be stopped from here: all three run under the FLIS
+ * stack writer lock, which may not take gui.cairo_mutex (rule 1 above), and
+ * draining does exactly that.
+ *
+ * So the fits is RETIRED instead — detached, queued, and released from a main
+ * thread idle that suppresses redraws, drains the pool, and only then frees.
+ * The idle takes no stack lock and touches nothing the operation owns (a
+ * retired fits is off the layer list and is not gfit), so it cannot deadlock
+ * against the operation that queued it, whichever thread that ran on.
+ *
+ * Deferring costs no extra peak memory in the case that would matter: flatten
+ * already holds every layer alive until it has built its result.
+ *
+ * Unlike layermask_free_deferred() above, being the main-loop owner is NOT a
+ * licence to free inline here — the racing reader is a worker thread, not the
+ * main loop, and the stack lock is held either way. */
+static GMutex flis_retired_mutex;
+static GSList *flis_retired_fits = NULL;
+
+/* Take whatever has been retired so far and release it with the pool stopped.
+ * Safe to call with an empty queue, and safe to call more than once — each
+ * caller takes the whole batch or nothing, so a second one simply finds
+ * nothing to do. */
+static void flis_release_retired(void) {
+    g_mutex_lock(&flis_retired_mutex);
+    GSList *batch = flis_retired_fits;
+    flis_retired_fits = NULL;
+    g_mutex_unlock(&flis_retired_mutex);
+    if (!batch) return;
+
+    const gboolean prev_suppress = gui_iface.get_suppress_redraws();
+    gui_iface.set_suppress_redraws(TRUE);
+    gui_iface.drain_tile_workers();
+    for (GSList *l = batch; l; l = l->next) {
+        clearfits((fits *)l->data);
+        free(l->data);
+    }
+    gui_iface.set_suppress_redraws(prev_suppress);
+    g_slist_free(batch);
+}
+
+static gboolean flis_retire_idle(gpointer unused) {
+    (void)unused;
+    flis_release_retired();
+    return G_SOURCE_REMOVE;
+}
+
+/* Shutdown flush.  Anything retired after the last idle ran would otherwise
+ * still be queued when the process exits — bounded, but a leak.  Called from
+ * main() once g_application_run() has returned, i.e. with the main loop gone,
+ * so the idle that would normally do this can no longer fire.  The drain still
+ * happens: the tile pool outlives the main loop, and joining it is how we know
+ * nothing is reading the buffers we are about to free. */
+void flis_flush_retired_fits(void) {
+    flis_release_retired();
+}
+
+void flis_retire_fits(fits *f) {
+    if (!f) return;
+    /* Retiring what gfit still points at would leave the global dangling once
+     * the idle ran.  Every caller retargets first, so this is a bug if it
+     * happens; leak the buffer rather than hand out freed pixels. */
+    if (f == (fits *)g_atomic_pointer_get(&gfit)) {
+        siril_log_debug("BUG: refusing to retire the fits gfit points at; leaking it\n");
+        return;
+    }
+    /* No display registered — CLI, or a unit test — means no tile pool to
+     * race and no main loop to run the idle on, so free it here.  This tests
+     * gui_registered rather than com.headless deliberately: com.headless says
+     * which binary is running, not whether anything is rendering. */
+    if (!gui_iface.gui_registered) {
+        clearfits(f);
+        free(f);
+        return;
+    }
+    g_mutex_lock(&flis_retired_mutex);
+    flis_retired_fits = g_slist_prepend(flis_retired_fits, f);
+    g_mutex_unlock(&flis_retired_mutex);
+    g_idle_add(flis_retire_idle, NULL);
+}
+
+void flis_layer_free(flis_layer_t *layer) {
+    if (!layer) return;
+    if (layer->fit) {
+        flis_retire_fits(layer->fit);
+        layer->fit = NULL;
+    }
+    layermask_free(layer->lmask);
+    g_free(layer->layer_name);
+    g_free(layer->created);
+    g_free(layer->modified);
+    g_free(layer->unknown_metadata);
+    g_free(layer);
+}
+
+void flis_free_layers(single *uniq) {
+    if (!uniq) return;
+    /* Detach gfit before the stack goes.  Every OTHER path that frees a layer
+     * — flis_layer_remove, flis_merge_down_layer, flis_flatten — retargets
+     * gfit at a surviving layer first, which is the contract flis_retire_fits
+     * enforces.  Here there is no survivor to retarget to, so the caller
+     * cannot honour it and retiring the active layer's fits would hit the
+     * guard and leak the buffer instead.  NULL is the honest answer; the
+     * caller installs a valid gfit before anything dereferences it again
+     * (close_single_image allocates a fresh empty fits, load_flis repoints via
+     * uniq_set_active_layer once the new stack is in place).
+     *
+     * Atomic for the same reason as the store in uniq_set_active_layer: gfit
+     * is read off other threads.  It is not a synchronisation point — callers
+     * that free pixels under a live display drain the tile pool around this,
+     * and flis_retire_fits defers the free itself. */
+    for (GSList *l = uniq->layers; l; l = l->next) {
+        if (((flis_layer_t *)l->data)->fit == (fits *)g_atomic_pointer_get(&gfit)) {
+            g_atomic_pointer_set(&gfit, NULL);
+            break;
+        }
+    }
+    g_slist_free_full(uniq->layers, (GDestroyNotify)flis_layer_free);
+    uniq->layers = NULL;
+    uniq->fit    = NULL;
+    uniq->chans  = 0;
+    uniq->active_layer = 0;
+    flis_free_groups(uniq);
+}
+
+void uniq_set_active_layer(single *uniq, gint index) {
+    flis_layer_t *layer = (flis_layer_t *)g_slist_nth_data(uniq->layers, index);
+    g_return_if_fail(layer != NULL && layer->fit != NULL);
+    const int old_chans = uniq->chans;
+    gboolean changed = (gfit != layer->fit);
+    uniq->active_layer = index;
+    uniq->fit   = layer->fit;
+    uniq->chans = (layer->fit->naxes[2] > 0) ? (int)layer->fit->naxes[2] : 1;
+    /* Atomic store, because gfit is read off this thread: the display's tile
+     * workers latch it once per job (materialise_worker) and then lock and
+     * fill the fits they latched.  A retarget racing that is harmless to them
+     * — they finish against the layer they picked up, which stays alive in the
+     * layer list — but the store itself should be well defined rather than a
+     * torn read waiting to happen.
+     *
+     * Deliberately NO pool drain here: this runs inside worker hooks holding
+     * the FLIS stack writer lock, which may not take gui.cairo_mutex (rule 1
+     * below, and generic_layer_worker in core/processing.c), and draining does
+     * exactly that.  What needs the pool stopped is FREEING a layer's fits,
+     * not repointing gfit at a different one. */
+    g_atomic_pointer_set(&gfit, layer->fit);
+    /* Single layer-change chokepoint: every GUI state keyed to the
+     * active layer is reconciled by ONE asynchronous callback, whatever
+     * path performed the switch (user, load, worker hook).  Async by
+     * contract — callers may hold the FLIS stack writer lock.
+     *
+     * The pointer test alone is not the whole of "which image is gfit":
+     * flatten and merge-down composite mono layers into an RGB result
+     * IN PLACE (flis_layer_install_render keeps pointer identity), so a
+     * document can go mono -> colour without gfit ever moving.  Nothing
+     * then re-ran the reconciler, and action sensitivity — which asks
+     * isrgb(gfit) — went on describing the mono image: Saturation,
+     * Remove Green Noise and the colour-calibration tools stayed greyed
+     * out on a colour result until some unrelated event refreshed them. */
+    if (changed || uniq->chans != old_chans)
+        gui_iface.on_active_layer_changed();
+}
+
+/* User-driven active-layer switch (panel row click, flis_active_layer
+ * command).  Unlike the bare uniq_set_active_layer, this keeps a live
+ * preview coherent across the retarget: the preview's full-image backup
+ * belongs to the OUTGOING gfit, and restoring it into a different layer
+ * later would write another layer's pixels (junk for a smaller backup,
+ * heap overflow for a larger one).  Revert the preview on the outgoing
+ * layer while the backup still matches, then re-arm it on the incoming
+ * one.  The ROI needs nothing: it is a canvas-space rectangle,
+ * re-translated to whichever layer is active each time it is used.
+ *
+ * NOT for use inside worker hooks: the preview revert takes gfit's
+ * rwlock, which is forbidden under the FLIS stack lock (see the lock
+ * rules at the top of this file).  Hook-driven switches (merge, flatten,
+ * remove) rely on copy_backup_to_gfit's dimension guard instead.
+ * All gui_iface members are stubbed headless, so scripts are safe. */
+/* ---- Coordinate-model helpers (see the block comment in the header) -- */
+
+void flis_active_layer_offset(gint *ox, gint *oy) {
+    *ox = 0;
+    *oy = 0;
+    if (!is_current_image_flis()) return;
+    flis_layer_t *act = flis_active_layer();
+    if (act) {
+        *ox = act->position_x;
+        *oy = act->position_y;
+    }
+}
+
+gboolean flis_display_to_active_layer_pt(pointi disp, pointi *out) {
+    gint ox, oy;
+    flis_active_layer_offset(&ox, &oy);
+    pointi local = { disp.x - ox, disp.y - oy };
+    if (out) *out = local;
+    if (!gfit) return FALSE;
+    return local.x >= 0 && local.y >= 0
+        && local.x < (gint)gfit->rx && local.y < (gint)gfit->ry;
+}
+
+gboolean flis_display_to_active_layer_rect(const rectangle *disp,
+                                           rectangle *out,
+                                           gboolean partial) {
+    if (!disp || !gfit) return FALSE;
+    gint ox, oy;
+    flis_active_layer_offset(&ox, &oy);
+    rectangle local = { disp->x - ox, disp->y - oy, disp->w, disp->h };
+    if (partial) {
+        gint x0 = MAX(0, local.x);
+        gint y0 = MAX(0, local.y);
+        gint x1 = MIN((gint)gfit->rx, local.x + local.w);
+        gint y1 = MIN((gint)gfit->ry, local.y + local.h);
+        if (x0 >= x1 || y0 >= y1) return FALSE;
+        local.x = x0;
+        local.y = y0;
+        local.w = x1 - x0;
+        local.h = y1 - y0;
+        if (out) *out = local;
+        return TRUE;
+    }
+    if (out) *out = local;
+    return local.x >= 0 && local.y >= 0
+        && local.x + local.w <= (gint)gfit->rx
+        && local.y + local.h <= (gint)gfit->ry;
+}
+
+/* Raised for the duration of a user-driven active-layer switch (below).
+ * The generic_image_worker swap point re-checks its target identity under
+ * gfit's writer lock before installing a result; that alone still leaves a
+ * hole between the preview restore and the gfit repoint here, during which
+ * gfit == the job's fits again.  The worker also refuses to swap while this
+ * flag is up, closing that window: any job completing mid-switch is
+ * discarded, which is the desired outcome for a layer the user is leaving.
+ * Worker-hook and replay switches call uniq_set_active_layer directly and
+ * hold the processing slot, so no generic worker can race those. */
+static gint gfit_retarget_in_progress = 0;
+
+gboolean flis_gfit_retarget_in_progress(void) {
+    return g_atomic_int_get(&gfit_retarget_in_progress) != 0;
+}
+
+void flis_switch_active_layer_gui(gint index) {
+    if (!com.uniq) return;
+    g_atomic_int_set(&gfit_retarget_in_progress, 1);
+    gboolean preview_was_active = gui_iface.is_preview_active();
+    if (preview_was_active) {
+        gui_iface.copy_backup_to_gfit();
+        gui_iface.clear_backup();
+    }
+    uniq_set_active_layer(com.uniq, index);
+    if (preview_was_active)
+        gui_iface.copy_gfit_to_backup();
+    g_atomic_int_set(&gfit_retarget_in_progress, 0);
+}
+
+/* ===================================================================== */
+/* Public API — save_flis / load_flis                                    */
+/* ===================================================================== */
+
+/*
+ * Comparator for g_slist_sort / g_slist_insert_sorted.
+ * Sorts flis_layer_t* entries ascending by layer_order.
+ * Used by both save_flis (for consistent HDU layout) and load_flis
+ * (to maintain the sorted invariant of com.uniq->layers).
+ */
+static gint layer_order_cmp(gconstpointer a, gconstpointer b) {
+    const flis_layer_t *la = (const flis_layer_t *)a;
+    const flis_layer_t *lb = (const flis_layer_t *)b;
+    return la->layer_order - lb->layer_order;
+}
+
+/* =====================================================================
+ * FLIS_HIST — NDE provenance table (nde sketch §14)
+ * ===================================================================== */
+
+/* Column count WRITTEN.  The table grows by appending, and the reader resolves
+ * columns BY NAME — so a file written before a column existed must still load,
+ * and every column past the v1 set is looked up optionally.  We also keep
+ * writing an (always empty) MASKREF, which the pin list superseded, so that an
+ * older build still finds every column it expects.  FLISHVER says how many
+ * there are; a build meeting a higher one reads it best-effort and says so.
+ *
+ * A v3 file read by a v2 build sees TARGET and no OUTPUTS, so a multi-output
+ * record degrades to its primary output — the same graceful degradation
+ * INPUTS already relies on. */
+#define FLIS_HIST_NCOLS 14
+#define FLIS_HIST_NCOLS_V1 12   /* what a version-1 table has */
+#define FLIS_HIST_VER 3         /* 1 = the original 12 columns; 2 = + INPUTS;
+                                 * 3 = + OUTPUTS */
+
+/*
+ * Write the FLIS_HIST binary table from a history snapshot.  Appended after
+ * the data HDUs and located by EXTNAME on load, so it never disturbs the
+ * FLIS_META hdu_index arithmetic.  String columns are fixed-width ASCII
+ * sized to the longest value in this save (min 1 — cfitsio rejects 0A).
+ */
+static int write_flis_hist_hdu(fitsfile *fptr, GPtrArray *records, gint64 next_id) {
+    int status = 0;
+    size_t w_op = 1, w_par = 1, w_sum = 1, w_ts = 1, w_impl = 1, w_mref = 1,
+           w_in = 1, w_out = 1;
+    for (guint i = 0; i < records->len; i++) {
+        nde_record *rec = g_ptr_array_index(records, i);
+        if (rec->op_id)     w_op   = MAX(w_op,   strlen(rec->op_id));
+        if (rec->params)    w_par  = MAX(w_par,  strlen(rec->params));
+        if (rec->summary)   w_sum  = MAX(w_sum,  strlen(rec->summary));
+        if (rec->timestamp) w_ts   = MAX(w_ts,   strlen(rec->timestamp));
+        if (rec->impl)      w_impl = MAX(w_impl, strlen(rec->impl));
+        if (rec->mask_ref)  w_mref = MAX(w_mref, strlen(rec->mask_ref));
+        gchar *pins = nde_pins_serialize(rec->inputs);
+        if (pins) w_in = MAX(w_in, strlen(pins));
+        g_free(pins);
+        gchar *outs = nde_pins_serialize(rec->outputs);
+        if (outs) w_out = MAX(w_out, strlen(outs));
+        g_free(outs);
+    }
+    char f_op[24], f_par[24], f_sum[24], f_ts[24], f_impl[24], f_mref[24],
+         f_in[24], f_out[24];
+    g_snprintf(f_op,   sizeof(f_op),   "%zuA", w_op);
+    g_snprintf(f_par,  sizeof(f_par),  "%zuA", w_par);
+    g_snprintf(f_sum,  sizeof(f_sum),  "%zuA", w_sum);
+    g_snprintf(f_ts,   sizeof(f_ts),   "%zuA", w_ts);
+    g_snprintf(f_impl, sizeof(f_impl), "%zuA", w_impl);
+    g_snprintf(f_mref, sizeof(f_mref), "%zuA", w_mref);
+    g_snprintf(f_in,   sizeof(f_in),   "%zuA", w_in);
+    g_snprintf(f_out,  sizeof(f_out),  "%zuA", w_out);
+
+    const char *names[FLIS_HIST_NCOLS] = {
+        "RECORD_ID", "OP_ID", "OP_VER", "SCOPE", "TARGET", "TIER",
+        "MASKACT", "PARAMS", "SUMMARY", "TSTAMP", "IMPL", "MASKREF", "INPUTS",
+        "OUTPUTS"
+    };
+    const char *fmts[FLIS_HIST_NCOLS] = {
+        "1K", f_op, "1J", "1J", "1J", "1J",
+        "1L", f_par, f_sum, f_ts, f_impl, f_mref, f_in, f_out
+    };
+
+    if (fits_create_tbl(fptr, BINARY_TBL, records->len, FLIS_HIST_NCOLS,
+                        (char **)names, (char **)fmts, NULL, "FLIS_HIST", &status)) {
+        report_fits_error(status);
+        return 1;
+    }
+    int hver = FLIS_HIST_VER;
+    LONGLONG seq = next_id;
+    fits_write_key(fptr, TINT,      "FLISHVER", &hver, "FLIS_HIST format version", &status);
+    fits_write_key(fptr, TLONGLONG, "FLISHSEQ", &seq,  "Next NDE record id",       &status);
+
+    for (guint i = 0; i < records->len; i++) {
+        nde_record *rec = g_ptr_array_index(records, i);
+        long row = i + 1;
+        LONGLONG rid = rec->record_id;
+        int ver  = rec->op_version;
+        int scp  = rec->scope;
+        int tgt  = rec->target_item_id;
+        int tier = rec->tier;
+        int act  = rec->mask_active ? 1 : 0;
+        char *s_op   = rec->op_id     ? rec->op_id     : (char *)"";
+        char *s_par  = rec->params    ? rec->params    : (char *)"";
+        char *s_sum  = rec->summary   ? rec->summary   : (char *)"";
+        char *s_ts   = rec->timestamp ? rec->timestamp : (char *)"";
+        char *s_impl = rec->impl      ? rec->impl      : (char *)"";
+        char *s_mref = rec->mask_ref  ? rec->mask_ref  : (char *)"";
+        fits_write_col(fptr, TLONGLONG, 1,  row, 1, 1, &rid,    &status);
+        fits_write_col(fptr, TSTRING,   2,  row, 1, 1, &s_op,   &status);
+        fits_write_col(fptr, TINT,      3,  row, 1, 1, &ver,    &status);
+        fits_write_col(fptr, TINT,      4,  row, 1, 1, &scp,    &status);
+        fits_write_col(fptr, TINT,      5,  row, 1, 1, &tgt,    &status);
+        fits_write_col(fptr, TINT,      6,  row, 1, 1, &tier,   &status);
+        fits_write_col(fptr, TLOGICAL,  7,  row, 1, 1, &act,    &status);
+        fits_write_col(fptr, TSTRING,   8,  row, 1, 1, &s_par,  &status);
+        fits_write_col(fptr, TSTRING,   9,  row, 1, 1, &s_sum,  &status);
+        fits_write_col(fptr, TSTRING,   10, row, 1, 1, &s_ts,   &status);
+        fits_write_col(fptr, TSTRING,   11, row, 1, 1, &s_impl, &status);
+        fits_write_col(fptr, TSTRING,   12, row, 1, 1, &s_mref, &status);
+        gchar *pins = nde_pins_serialize(rec->inputs);
+        char *s_in = pins ? pins : (char *)"";
+        fits_write_col(fptr, TSTRING,   13, row, 1, 1, &s_in,   &status);
+        g_free(pins);
+        /* Empty for the ~95% of records that write their target and nothing
+         * else: an output list is only written down when it says something
+         * TARGET does not (nde_history.h). */
+        gchar *outs = nde_pins_serialize(rec->outputs);
+        char *s_out = outs ? outs : (char *)"";
+        fits_write_col(fptr, TSTRING,   14, row, 1, 1, &s_out,  &status);
+        g_free(outs);
+    }
+    if (status) { report_fits_error(status); return 1; }
+    return 0;
+}
+
+/* ===================================================================== */
+/* NDE_BASE — baseline pixel checkpoints (nde phase 2, plan P2.C)         */
+/*                                                                       */
+/* One image HDU per baseline, EXTNAME='NDE_BASE', FLIS_ID=<item_id>.    */
+/* Written after FLIS_HIST, only for item_ids that have live records.    */
+/* Persisted LOSSLESSLY regardless of the user's compression preference  */
+/* (decision 4): float baselines would poison every replay if quantised. */
+/* ===================================================================== */
+
+/* Switch @fptr to lossless GZIP tile compression with float quantisation
+ * disabled, so subsequently created image HDUs round-trip bit-exactly. */
+static int nde_base_set_lossless(fitsfile *fptr) {
+    int status = 0;
+    if (fits_set_compression_type(fptr, GZIP_1, &status)) {
+        report_fits_error(status);
+        return 1;
+    }
+    status = 0;
+    /* qlevel 0.0 disables quantisation → lossless float compression. */
+    if (fits_set_quantize_level(fptr, 0.0f, &status)) {
+        report_fits_error(status);
+        return 1;
+    }
+    return 0;
+}
+
+/* Restore @fptr's compression state to the user's preference after the
+ * lossless baseline writes (defensive — NDE_BASE HDUs are the last ones
+ * written, but leave the fptr as save_flis's own settings expect). */
+static void nde_base_restore_compression(fitsfile *fptr) {
+    if (com.pref.comp.fits_enabled) {
+        fits tmp_f = { .fptr = fptr };
+        siril_fits_compress(&tmp_f);
+    } else {
+        int status = 0;
+        fits_set_compression_type(fptr, NOCOMPRESS, &status);
+    }
+}
+
+/* A checkpoint's BITPIX describes the buffer it was written from, not the
+ * depth its content really has: mask_to_fits widens an 8-bit mask into WORDs,
+ * and fits_to_mask reads orig_bitpix to decide what to rebuild.  The FITS
+ * reader can only infer orig_bitpix from BITPIX, so an 8-bit mask would come
+ * back as a 16-bit one.  Record it explicitly; absent on older files, where
+ * the inferred value is the best available answer. */
+static void write_orig_bitpix_key(fitsfile *fptr, const fits *f, int *status) {
+    if (f->orig_bitpix == f->bitpix)
+        return;         /* derivable — no need to spend a keyword */
+    int obp = f->orig_bitpix;
+    fits_write_key(fptr, TINT, "FLIS_OBPX", &obp, "Original bit depth of the content", status);
+}
+
+/* Restore what write_orig_bitpix_key stored, leaving @f alone when absent. */
+static void read_orig_bitpix_key(fitsfile *fptr, fits *f) {
+    int obp = 0, status = 0;
+    fits_read_key(fptr, TINT, "FLIS_OBPX", &obp, NULL, &status);
+    if (!status)
+        f->orig_bitpix = obp;
+}
+
+/* Write @f as one NDE_BASE image HDU tagged with @item_id.  @f must carry a
+ * valid pixel buffer.  Compression is assumed already set to lossless. */
+/* @pos_x/@pos_y (when @has_pos) are the layer's position at baseline time —
+ * the other half of a layer's replay value (nde_checkpoint.h).  Absent for a
+ * plain image and for files written before geometry replay existed. */
+static int write_nde_base_hdu(fitsfile *fptr, fits *f, gint item_id,
+                              gboolean has_pos, gint pos_x, gint pos_y) {
+    int status = 0;
+    f->naxes[0] = f->rx;
+    f->naxes[1] = f->ry;
+    if (fits_create_img(fptr, f->bitpix, f->naxis, f->naxes, &status)) {
+        report_fits_error(status);
+        return 1;
+    }
+    if (f->bitpix == USHORT_IMG) {
+        double bzero = 32768.0, bscale = 1.0;
+        fits_write_key(fptr, TDOUBLE, "BZERO",  &bzero,  "Unsigned 16-bit offset", &status);
+        fits_write_key(fptr, TDOUBLE, "BSCALE", &bscale, "Scale factor",           &status);
+        status = 0;
+    }
+
+    fitsfile *saved_fptr = f->fptr;
+    f->fptr = fptr;
+    int ret = save_opened_fits(f);
+    f->fptr = saved_fptr;
+    if (ret) return 1;
+
+    int id = item_id;
+    fits_write_key(fptr, TINT,    "FLIS_ID",   &id,           "FLIS item ID",   &status);
+    if (has_pos) {
+        int px = pos_x, py = pos_y;
+        fits_write_key(fptr, TINT, "FLIS_POSX", &px, "Layer X at baseline", &status);
+        fits_write_key(fptr, TINT, "FLIS_POSY", &py, "Layer Y at baseline", &status);
+    }
+    write_orig_bitpix_key(fptr, f, &status);
+    fits_write_key(fptr, TSTRING, "FLIS_TYPE", (void *)"NDE_BASE", "FLIS HDU type", &status);
+    fits_write_key(fptr, TSTRING, "EXTNAME",   (void *)"NDE_BASE",  "Extension name", &status);
+    if (status) { report_fits_error(status); return 1; }
+    return 0;
+}
+
+/* Write one NDE_BASE HDU per DISTINCT item_id present in @records, pulling
+ * each baseline from the in-session checkpoint store.  Only item_ids with a
+ * live record are persisted (the saver-side of the "live records only" gate).
+ * The lossless compression settings are applied here and restored after, so
+ * baselines round-trip bit-exactly whatever the user's compression pref. */
+static void write_nde_base_hdus(fitsfile *fptr, GPtrArray *records) {
+    /* Every item the history mentions, at either end of any of its edges.
+     * Neither direction is redundant.  A layer merged away without ever having
+     * been edited has no records of its own, only a baseline and an edge to the
+     * composite that consumed it, and dropping that baseline on save would make
+     * the merge unreplayable after a round-trip (nde_composite.h).  A SECONDARY
+     * output is the mirror case: it is written by a record that TARGETS another
+     * item, so if it was never separately edited nothing else here names it. */
+    GPtrArray *ids = g_ptr_array_new();
+    for (guint i = 0; i < records->len; i++) {
+        nde_record *rec = g_ptr_array_index(records, i);
+        g_ptr_array_add(ids, GINT_TO_POINTER(rec->target_item_id));
+        for (guint p = 0; rec->inputs && p < rec->inputs->len; p++) {
+            const nde_pin *pin = g_ptr_array_index(rec->inputs, p);
+            g_ptr_array_add(ids, GINT_TO_POINTER(pin->item_id));
+        }
+        for (guint p = 0; p < nde_record_output_count(rec); p++) {
+            const nde_pin *pin = nde_record_output(rec, p);
+            if (pin)
+                g_ptr_array_add(ids, GINT_TO_POINTER(pin->item_id));
+        }
+    }
+    GHashTable *seen = g_hash_table_new(g_direct_hash, g_direct_equal);
+    gboolean wrote_any = FALSE;
+    for (guint i = 0; i < ids->len; i++) {
+        gint id = GPOINTER_TO_INT(g_ptr_array_index(ids, i));
+        if (g_hash_table_contains(seen, GINT_TO_POINTER(id)))
+            continue;
+        g_hash_table_add(seen, GINT_TO_POINTER(id));
+        if (!nde_checkpoint_baseline_exists(id))
+            continue;   /* no baseline captured for this item — chain not replayable */
+        nde_state *base = nde_checkpoint_baseline_get(id);
+        if (!base)
+            continue;
+        if (!wrote_any) {
+            if (nde_base_set_lossless(fptr)) {
+                nde_state_free(base);
+                break;
+            }
+            wrote_any = TRUE;
+        }
+        if (write_nde_base_hdu(fptr, base->pix, id, base->has_pos,
+                               base->pos_x, base->pos_y))
+            siril_log_warning(_("FLIS: failed to write NDE baseline for item %d\n"), id);
+        nde_state_free(base);
+    }
+    if (wrote_any)
+        nde_base_restore_compression(fptr);
+    g_hash_table_destroy(seen);
+    g_ptr_array_free(ids, TRUE);
+}
+
+/* ===================================================================== */
+/* NDE_CKPT — barrier output checkpoints (nde phase 4, plan P4.3)         */
+/*                                                                       */
+/* One image HDU per LIVE barrier record that has an in-session output   */
+/* checkpoint, EXTNAME='NDE_CKPT', RECORD_ID=<record_id>, FLIS_ID=<item>.*/
+/* Written after NDE_BASE, LOSSLESSLY via the SAME force-GZIP/quantize-0 */
+/* wrapper NDE_BASE uses (shared, not copied) — a float checkpoint would */
+/* poison the tail replay if quantised.  A barrier is Tier B, or Tier A  */
+/* with a mask active at capture.                                        */
+/* ===================================================================== */
+
+/* Write @f as one NDE_CKPT image HDU tagged with @record_id / @item_id.  @f
+ * must carry a valid pixel buffer.  Compression is assumed already lossless. */
+static int write_nde_ckpt_hdu(fitsfile *fptr, const nde_state *st, gint64 record_id, gint item_id) {
+    fits *f = st->pix;
+    int status = 0;
+    f->naxes[0] = f->rx;
+    f->naxes[1] = f->ry;
+    if (fits_create_img(fptr, f->bitpix, f->naxis, f->naxes, &status)) {
+        report_fits_error(status);
+        return 1;
+    }
+    if (f->bitpix == USHORT_IMG) {
+        double bzero = 32768.0, bscale = 1.0;
+        fits_write_key(fptr, TDOUBLE, "BZERO",  &bzero,  "Unsigned 16-bit offset", &status);
+        fits_write_key(fptr, TDOUBLE, "BSCALE", &bscale, "Scale factor",           &status);
+        status = 0;
+    }
+
+    fitsfile *saved_fptr = f->fptr;
+    f->fptr = fptr;
+    int ret = save_opened_fits(f);
+    f->fptr = saved_fptr;
+    if (ret) return 1;
+
+    LONGLONG rid = record_id;
+    int id = item_id;
+    fits_write_key(fptr, TLONGLONG, "RECORD_ID", &rid, "NDE record ID",  &status);
+    fits_write_key(fptr, TINT,      "FLIS_ID",   &id,  "FLIS item ID",   &status);
+    if (st->has_pos) {   /* the restart point's layer position */
+        int px = st->pos_x, py = st->pos_y;
+        fits_write_key(fptr, TINT, "FLIS_POSX", &px, "Layer X at checkpoint", &status);
+        fits_write_key(fptr, TINT, "FLIS_POSY", &py, "Layer Y at checkpoint", &status);
+    }
+    write_orig_bitpix_key(fptr, f, &status);
+    fits_write_key(fptr, TSTRING,   "FLIS_TYPE", (void *)"NDE_CKPT", "FLIS HDU type", &status);
+    fits_write_key(fptr, TSTRING,   "EXTNAME",   (void *)"NDE_CKPT", "Extension name", &status);
+    if (status) { report_fits_error(status); return 1; }
+    return 0;
+}
+
+/* Write one NDE_CKPT HDU per LIVE record in @records that HAS an in-session
+ * output checkpoint, pulling each from the checkpoint store.  Having one is
+ * the criterion, not being a barrier: barriers were the only reason to keep a
+ * state when this was written, but a mask referenced by another record's input
+ * pin is kept under its own record id too (nde_replay.h), and dropping it on
+ * save would silently turn its consumer back into a barrier on reload.
+ * Shares NDE_BASE's lossless compression wrapper so checkpoints round-trip
+ * bit-exactly whatever the user's compression pref; restored after.  Records
+ * without a checkpoint (pre-phase-4, deleted, truncated) produce no HDU. */
+static void write_nde_ckpt_hdus(fitsfile *fptr, GPtrArray *records) {
+    gboolean wrote_any = FALSE;
+    for (guint i = 0; i < records->len; i++) {
+        nde_record *rec = g_ptr_array_index(records, i);
+        if (!nde_checkpoint_output_exists(rec->record_id))
+            continue;
+        nde_state *ck = nde_checkpoint_output_get(rec->record_id);
+        if (!ck)
+            continue;
+        if (!wrote_any) {
+            if (nde_base_set_lossless(fptr)) {
+                nde_state_free(ck);
+                break;
+            }
+            wrote_any = TRUE;
+        }
+        if (write_nde_ckpt_hdu(fptr, ck, rec->record_id, rec->target_item_id))
+            siril_log_warning(_("FLIS: failed to write NDE checkpoint for record %" G_GINT64_FORMAT "\n"),
+                              rec->record_id);
+        nde_state_free(ck);
+    }
+    if (wrote_any)
+        nde_base_restore_compression(fptr);
+}
+
+/* ---- FLIS_NDE_CAT: embedded star catalogues (nde_cat.h) -----------------
+ * One binary-table HDU per photometric calibration record whose analysis
+ * catalogue is registered, so the .flis is self-contained: replay re-runs
+ * PCC/SPCC offline from the very star data (B/V magnitudes, Teff, sampled
+ * flux spectra) the original run used.  Located by EXTNAME scan like
+ * FLIS_HIST; the owning record is named by the NDECATID keyword.  The FLIS
+ * spec does not forbid extra binary tables — documented in the NDE annex. */
+
+static int write_flis_nde_cat_hdu(fitsfile *fptr, gint64 record_id,
+                                  const siril_catalogue *cat) {
+    int status = 0;
+    const long n = cat->nbitems > 0 ? cat->nbitems : 0;
+    gboolean has_xp = FALSE;
+    long w_name = 1;
+    for (long i = 0; i < n; i++) {
+        if (cat->cat_items[i].xp_sampled)
+            has_xp = TRUE;
+        if (cat->cat_items[i].name)
+            w_name = MAX(w_name, (long)strlen(cat->cat_items[i].name));
+    }
+    char f_name[24], f_xp[24];
+    g_snprintf(f_name, sizeof(f_name), "%ldA", w_name);
+    g_snprintf(f_xp, sizeof(f_xp), "%dD", XPSAMPLED_LEN);
+    const char *names[12] = { "RA", "DEC", "PMRA", "PMDEC", "MAG", "BMAG",
+                              "EMAG", "EBMAG", "TEFF", "GAIAID", "NAME", "XPSAMP" };
+    const char *fmts[12]  = { "1D", "1D", "1D", "1D", "1E", "1E",
+                              "1E", "1E", "1E", "1K", f_name, f_xp };
+    const int ncols = has_xp ? 12 : 11;
+    if (fits_create_tbl(fptr, BINARY_TBL, n, ncols, (char **)names,
+                        (char **)fmts, NULL, "FLIS_NDE_CAT", &status)) {
+        report_fits_error(status);
+        return 1;
+    }
+    int ver = 1;
+    LONGLONG rid = record_id;
+    int catix = (int)cat->cat_index;
+    long colmask = (long)cat->columns;
+    int phot = cat->phot ? 1 : 0;
+    double kd;
+    fits_write_key(fptr, TINT, "NDECATV", &ver, "FLIS_NDE_CAT format version", &status);
+    fits_write_key(fptr, TLONGLONG, "NDECATID", &rid, "owning NDE record id", &status);
+    fits_write_key(fptr, TINT, "NDECATIX", &catix, "siril_cat_index of the query", &status);
+    fits_write_key(fptr, TLONG, "NDECATCO", &colmask, "parsed-columns bitmask", &status);
+    fits_write_key(fptr, TLOGICAL, "NDECATPH", &phot, "photometric query", &status);
+    kd = cat->center_ra;
+    fits_write_key(fptr, TDOUBLE, "NDECATRA", &kd, "cone centre RA (deg)", &status);
+    kd = cat->center_dec;
+    fits_write_key(fptr, TDOUBLE, "NDECATDE", &kd, "cone centre Dec (deg)", &status);
+    kd = cat->radius;
+    fits_write_key(fptr, TDOUBLE, "NDECATRD", &kd, "cone radius (arcmin)", &status);
+    kd = cat->limitmag;
+    fits_write_key(fptr, TDOUBLE, "NDECATMG", &kd, "limit magnitude", &status);
+    if (status) {
+        report_fits_error(status);
+        return 1;
+    }
+    if (!n)
+        return 0;
+
+    double *dcol = malloc(n * sizeof(double));
+    float *fcol = malloc(n * sizeof(float));
+    LONGLONG *lcol = malloc(n * sizeof(LONGLONG));
+    char **scol = malloc(n * sizeof(char *));
+    double *xcol = has_xp ? calloc(n * XPSAMPLED_LEN, sizeof(double)) : NULL;
+    if (!dcol || !fcol || !lcol || !scol || (has_xp && !xcol)) {
+        PRINT_ALLOC_ERR;
+        free(dcol); free(fcol); free(lcol); free(scol); free(xcol);
+        return 1;
+    }
+    const cat_item *it = cat->cat_items;
+#define CAT_WRITE_D(colidx, field) do { \
+        for (long i = 0; i < n; i++) dcol[i] = it[i].field; \
+        fits_write_col(fptr, TDOUBLE, colidx, 1, 1, n, dcol, &status); \
+    } while (0)
+#define CAT_WRITE_E(colidx, field) do { \
+        for (long i = 0; i < n; i++) fcol[i] = it[i].field; \
+        fits_write_col(fptr, TFLOAT, colidx, 1, 1, n, fcol, &status); \
+    } while (0)
+    CAT_WRITE_D(1, ra);
+    CAT_WRITE_D(2, dec);
+    CAT_WRITE_D(3, pmra);
+    CAT_WRITE_D(4, pmdec);
+    CAT_WRITE_E(5, mag);
+    CAT_WRITE_E(6, bmag);
+    CAT_WRITE_E(7, e_mag);
+    CAT_WRITE_E(8, e_bmag);
+    CAT_WRITE_E(9, teff);
+#undef CAT_WRITE_D
+#undef CAT_WRITE_E
+    for (long i = 0; i < n; i++)
+        lcol[i] = (LONGLONG)it[i].gaiasourceid;
+    fits_write_col(fptr, TLONGLONG, 10, 1, 1, n, lcol, &status);
+    for (long i = 0; i < n; i++)
+        scol[i] = it[i].name ? it[i].name : (char *)"";
+    fits_write_col(fptr, TSTRING, 11, 1, 1, n, scol, &status);
+    if (has_xp) {
+        for (long i = 0; i < n; i++)
+            if (it[i].xp_sampled)
+                memcpy(xcol + i * XPSAMPLED_LEN, it[i].xp_sampled,
+                       XPSAMPLED_LEN * sizeof(double));
+        fits_write_col(fptr, TDOUBLE, 12, 1, 1, n * XPSAMPLED_LEN, xcol, &status);
+    }
+    free(dcol); free(fcol); free(lcol); free(scol); free(xcol);
+    if (status) {
+        report_fits_error(status);
+        return 1;
+    }
+    return 0;
+}
+
+static void write_flis_nde_cat_hdus(fitsfile *fptr, GPtrArray *records) {
+    for (guint i = 0; i < records->len; i++) {
+        nde_record *rec = g_ptr_array_index(records, i);
+        siril_catalogue *cat = nde_cat_peek(rec->record_id);
+        if (!cat)
+            continue;
+        if (write_flis_nde_cat_hdu(fptr, rec->record_id, cat))
+            siril_log_warning(_("FLIS: failed to write the star catalogue for record %" G_GINT64_FORMAT "\n"),
+                              rec->record_id);
+    }
+}
+
+typedef struct {
+    gint64 record_id;
+    siril_catalogue *cat;
+} nde_cat_load_t;
+
+static void nde_cat_load_free(gpointer p) {
+    nde_cat_load_t *c = p;
+    if (!c)
+        return;
+    if (c->cat)
+        siril_catalog_free(c->cat);
+    g_free(c);
+}
+
+static GPtrArray *read_flis_nde_cat_hdus(fitsfile *fptr, int nhdus,
+                                         nde_history *hist) {
+    if (!hist || !hist->records || hist->records->len == 0)
+        return NULL;
+    GHashTable *rec_ids = g_hash_table_new_full(g_int64_hash, g_int64_equal,
+                                                g_free, NULL);
+    for (guint i = 0; i < hist->records->len; i++) {
+        nde_record *rec = g_ptr_array_index(hist->records, i);
+        gint64 *k = g_new(gint64, 1);
+        *k = rec->record_id;
+        g_hash_table_add(rec_ids, k);
+    }
+
+    GPtrArray *out = NULL;
+    for (int h = 2; h <= nhdus; h++) {
+        int status = 0;
+        char extname[FLEN_VALUE] = { 0 };
+        if (fits_movabs_hdu(fptr, h, NULL, &status)) { status = 0; continue; }
+        fits_read_key(fptr, TSTRING, "EXTNAME", extname, NULL, &status); status = 0;
+        if (g_ascii_strcasecmp(extname, "FLIS_NDE_CAT"))
+            continue;
+        int ver = 0;
+        LONGLONG rid_ll = 0;
+        fits_read_key(fptr, TINT, "NDECATV", &ver, NULL, &status); status = 0;
+        fits_read_key(fptr, TLONGLONG, "NDECATID", &rid_ll, NULL, &status); status = 0;
+        gint64 rid = (gint64)rid_ll;
+        if (ver > 1) {
+            siril_log_warning(_("FLIS: star catalogue for record %" G_GINT64_FORMAT
+                                " uses a newer format (v%d) — skipped\n"), rid, ver);
+            continue;
+        }
+        if (!g_hash_table_contains(rec_ids, &rid))
+            continue;   /* catalogue for a record not in the loaded history */
+        int catix = 0, phot = 0;
+        long colmask = 0, nrows = 0;
+        double cra = 0, cdec = 0, crad = 0, cmag = 0;
+        fits_read_key(fptr, TINT, "NDECATIX", &catix, NULL, &status); status = 0;
+        fits_read_key(fptr, TLONG, "NDECATCO", &colmask, NULL, &status); status = 0;
+        fits_read_key(fptr, TLOGICAL, "NDECATPH", &phot, NULL, &status); status = 0;
+        fits_read_key(fptr, TDOUBLE, "NDECATRA", &cra, NULL, &status); status = 0;
+        fits_read_key(fptr, TDOUBLE, "NDECATDE", &cdec, NULL, &status); status = 0;
+        fits_read_key(fptr, TDOUBLE, "NDECATRD", &crad, NULL, &status); status = 0;
+        fits_read_key(fptr, TDOUBLE, "NDECATMG", &cmag, NULL, &status); status = 0;
+        fits_get_num_rows(fptr, &nrows, &status); status = 0;
+        int xp_col = 0;
+        fits_get_colnum(fptr, CASEINSEN, "XPSAMP", &xp_col, &status); status = 0;
+
+        siril_catalogue *cat = siril_catalog_new((siril_cat_index)catix);
+        cat->center_ra = cra;
+        cat->center_dec = cdec;
+        cat->radius = crad;
+        cat->limitmag = cmag;
+        cat->phot = phot != 0;
+        cat->columns = (uint32_t)colmask;
+        cat->nbitems = (int)nrows;
+        gboolean ok = TRUE;
+        if (nrows > 0) {
+            cat->cat_items = calloc(nrows, sizeof(cat_item));
+            double *dcol = malloc(nrows * sizeof(double));
+            float *fcol = malloc(nrows * sizeof(float));
+            LONGLONG *lcol = malloc(nrows * sizeof(LONGLONG));
+            double *xcol = xp_col ? malloc(nrows * XPSAMPLED_LEN * sizeof(double)) : NULL;
+            if (!cat->cat_items || !dcol || !fcol || !lcol || (xp_col && !xcol)) {
+                PRINT_ALLOC_ERR;
+                ok = FALSE;
+            }
+            int anynul = 0;
+#define CAT_READ_D(colidx, field) do { \
+            if (ok && !fits_read_col(fptr, TDOUBLE, colidx, 1, 1, nrows, NULL, \
+                                     dcol, &anynul, &status)) \
+                for (long i = 0; i < nrows; i++) cat->cat_items[i].field = dcol[i]; \
+            status = 0; \
+        } while (0)
+#define CAT_READ_E(colidx, field) do { \
+            if (ok && !fits_read_col(fptr, TFLOAT, colidx, 1, 1, nrows, NULL, \
+                                     fcol, &anynul, &status)) \
+                for (long i = 0; i < nrows; i++) cat->cat_items[i].field = fcol[i]; \
+            status = 0; \
+        } while (0)
+            CAT_READ_D(1, ra);
+            CAT_READ_D(2, dec);
+            CAT_READ_D(3, pmra);
+            CAT_READ_D(4, pmdec);
+            CAT_READ_E(5, mag);
+            CAT_READ_E(6, bmag);
+            CAT_READ_E(7, e_mag);
+            CAT_READ_E(8, e_bmag);
+            CAT_READ_E(9, teff);
+#undef CAT_READ_D
+#undef CAT_READ_E
+            if (ok && !fits_read_col(fptr, TLONGLONG, 10, 1, 1, nrows, NULL,
+                                     lcol, &anynul, &status))
+                for (long i = 0; i < nrows; i++)
+                    cat->cat_items[i].gaiasourceid = (uint64_t)lcol[i];
+            status = 0;
+            if (ok) {
+                int ntype = 0;
+                long nwidth = 0;
+                fits_get_coltype(fptr, 11, &ntype, &nwidth, NULL, &status);
+                status = 0;
+                for (long i = 0; ok && nwidth > 0 && i < nrows; i++) {
+                    gchar *buf = g_malloc0(nwidth + 1);
+                    char *ptr = buf;
+                    if (!fits_read_col(fptr, TSTRING, 11, i + 1, 1, 1,
+                                       (char *)"", &ptr, &anynul, &status)) {
+                        g_strchomp(buf);
+                        cat->cat_items[i].name = buf[0] ? buf : (g_free(buf), NULL);
+                    } else {
+                        g_free(buf);
+                        status = 0;
+                    }
+                }
+            }
+            if (ok && xp_col &&
+                !fits_read_col(fptr, TDOUBLE, xp_col, 1, 1,
+                               nrows * XPSAMPLED_LEN, NULL, xcol, &anynul, &status)) {
+                for (long i = 0; i < nrows; i++) {
+                    const double *row = xcol + i * XPSAMPLED_LEN;
+                    /* A star recorded without a spectrum wrote zeros into its
+                     * slot; an all-zero spectrum is physically meaningless, so
+                     * absence is what it means. */
+                    gboolean any = FALSE;
+                    for (int k = 0; k < XPSAMPLED_LEN && !any; k++)
+                        any = row[k] != 0.0;
+                    if (!any)
+                        continue;
+                    cat->cat_items[i].xp_sampled =
+                            malloc(XPSAMPLED_LEN * sizeof(double));
+                    memcpy(cat->cat_items[i].xp_sampled, row,
+                           XPSAMPLED_LEN * sizeof(double));
+                }
+            }
+            status = 0;
+            for (long i = 0; ok && i < nrows; i++)
+                cat->cat_items[i].included = TRUE;
+            free(dcol); free(fcol); free(lcol); free(xcol);
+        }
+        if (!ok) {
+            siril_catalog_free(cat);
+            siril_log_warning(_("FLIS: failed to read the star catalogue for record %" G_GINT64_FORMAT "\n"), rid);
+            continue;
+        }
+        if (!out)
+            out = g_ptr_array_new_with_free_func(nde_cat_load_free);
+        nde_cat_load_t *c = g_new0(nde_cat_load_t, 1);
+        c->record_id = rid;
+        c->cat = cat;
+        g_ptr_array_add(out, c);
+    }
+    g_hash_table_destroy(rec_ids);
+    return out;
+}
+
+/* Read one cell of a fixed-width ASCII column as a heap string; NULL for an
+ * empty cell (which is how NULL record fields were written).  Trailing
+ * blanks are trimmed — fixed-width A columns are space-padded on disk, so
+ * they cannot round-trip anyway, and cfitsio returns a lone " " for a cell
+ * that was written empty. */
+static gchar *hist_read_str_cell(fitsfile *fptr, int col, long row, long width,
+                                 int *status) {
+    if (*status || width <= 0)
+        return NULL;
+    gchar *buf = g_malloc0(width + 1);
+    char *ptr = buf;
+    int anynul = 0;
+    if (fits_read_col(fptr, TSTRING, col, row, 1, 1, (char *)"", &ptr,
+                      &anynul, status)) {
+        g_free(buf);
+        return NULL;
+    }
+    g_strchomp(buf);
+    if (!buf[0]) {
+        g_free(buf);
+        return NULL;
+    }
+    return buf;
+}
+
+/*
+ * Locate (by EXTNAME scan over @nhdus HDUs) and read the FLIS_HIST table.
+ * Returns a fully-populated history (all records live) or NULL when the
+ * table is absent or unreadable.  Unknown OP_IDs load fine — op identity is
+ * just a string (§14.3).  Leaves the file positioned at an arbitrary HDU.
+ */
+static nde_history *read_flis_hist(fitsfile *fptr, int nhdus) {
+    int status = 0;
+    gboolean found = FALSE;
+    for (int h = 2; h <= nhdus; h++) {
+        char extname[FLEN_VALUE] = { 0 };
+        fits_movabs_hdu(fptr, h, NULL, &status); status = 0;
+        fits_read_key(fptr, TSTRING, "EXTNAME", extname, NULL, &status); status = 0;
+        if (!g_ascii_strcasecmp(extname, "FLIS_HIST")) {
+            found = TRUE;
+            break;
+        }
+    }
+    if (!found)
+        return NULL;
+
+    int hver = 1;
+    fits_read_key(fptr, TINT, "FLISHVER", &hver, NULL, &status); status = 0;
+    if (hver > FLIS_HIST_VER)
+        siril_log_warning(_("FLIS: history table version %d is newer than this build understands (%d); reading best-effort\n"),
+                          hver, FLIS_HIST_VER);
+    LONGLONG seq = 0;
+    fits_read_key(fptr, TLONGLONG, "FLISHSEQ", &seq, NULL, &status); status = 0;
+
+    long nrows = 0;
+    fits_get_num_rows(fptr, &nrows, &status);
+    int cols[FLIS_HIST_NCOLS];
+    long widths[FLIS_HIST_NCOLS] = { 0 };
+    static const char *colnames[FLIS_HIST_NCOLS] = {
+        "RECORD_ID", "OP_ID", "OP_VER", "SCOPE", "TARGET", "TIER",
+        "MASKACT", "PARAMS", "SUMMARY", "TSTAMP", "IMPL", "MASKREF", "INPUTS",
+        "OUTPUTS"
+    };
+    /* Columns beyond the v1 set are OPTIONAL: a table written before they
+     * existed is not malformed, it is older.  Their absence leaves cols[c]
+     * at 0, which the row loop treats as "no value". */
+    for (int c = 0; c < FLIS_HIST_NCOLS; c++) {
+        gboolean optional = (c >= FLIS_HIST_NCOLS_V1);
+        int cstatus = 0;
+        cols[c] = 0;
+        fits_get_colnum(fptr, CASEINSEN, (char *)colnames[c], &cols[c], &cstatus);
+        if (cstatus) {
+            if (optional) {
+                cols[c] = 0;
+                continue;   /* older table: nothing to read for this column */
+            }
+            status = cstatus;
+            break;
+        }
+        int typecode = 0;
+        long repeat = 0, w = 0;
+        fits_get_coltype(fptr, cols[c], &typecode, &repeat, &w, &status);
+        widths[c] = repeat;
+    }
+    if (status) {
+        report_fits_error(status);
+        siril_log_warning(_("FLIS: malformed FLIS_HIST table, ignoring history\n"));
+        return NULL;
+    }
+
+    nde_history *hist = g_new0(nde_history, 1);
+    hist->records = g_ptr_array_new_with_free_func((GDestroyNotify)nde_record_free);
+    gint64 max_id = 0;
+    for (long r = 1; r <= nrows; r++) {
+        nde_record *rec = nde_record_new();
+        LONGLONG rid = 0;
+        int ver = 0, scp = 0, tgt = -1, tier = NDE_TIER_B, act = 0, anynul = 0;
+        fits_read_col(fptr, TLONGLONG, cols[0], r, 1, 1, &(LONGLONG){0}, &rid, &anynul, &status);
+        rec->op_id = hist_read_str_cell(fptr, cols[1], r, widths[1], &status);
+        fits_read_col(fptr, TINT,     cols[2], r, 1, 1, &(int){0},  &ver,  &anynul, &status);
+        fits_read_col(fptr, TINT,     cols[3], r, 1, 1, &(int){0},  &scp,  &anynul, &status);
+        fits_read_col(fptr, TINT,     cols[4], r, 1, 1, &(int){-1}, &tgt,  &anynul, &status);
+        fits_read_col(fptr, TINT,     cols[5], r, 1, 1, &(int){1},  &tier, &anynul, &status);
+        fits_read_col(fptr, TLOGICAL, cols[6], r, 1, 1, &(int){0},  &act,  &anynul, &status);
+        rec->params    = hist_read_str_cell(fptr, cols[7],  r, widths[7],  &status);
+        rec->summary   = hist_read_str_cell(fptr, cols[8],  r, widths[8],  &status);
+        rec->timestamp = hist_read_str_cell(fptr, cols[9],  r, widths[9],  &status);
+        rec->impl      = hist_read_str_cell(fptr, cols[10], r, widths[10], &status);
+        rec->mask_ref  = hist_read_str_cell(fptr, cols[11], r, widths[11], &status);
+        if (cols[12] > 0) {
+            gchar *pins = hist_read_str_cell(fptr, cols[12], r, widths[12], &status);
+            rec->inputs = nde_pins_parse(pins);
+            g_free(pins);
+        }
+        if (cols[13] > 0) {
+            gchar *outs = hist_read_str_cell(fptr, cols[13], r, widths[13], &status);
+            rec->outputs = nde_pins_parse(outs);
+            g_free(outs);
+        }
+        if (status) {
+            nde_record_free(rec);
+            report_fits_error(status);
+            siril_log_warning(_("FLIS: error reading FLIS_HIST row %ld, dropping the rest\n"), r);
+            break;
+        }
+        rec->record_id      = rid;
+        rec->op_version     = ver;
+        rec->scope          = scp;
+        rec->target_item_id = tgt;
+        rec->tier           = tier;
+        rec->mask_active    = act != 0;
+        if (rid > max_id)
+            max_id = rid;
+        g_ptr_array_add(hist->records, rec);
+    }
+    hist->live_count = hist->records->len;
+    hist->next_record_id = MAX((gint64)seq, max_id + 1);
+    return hist;
+}
+
+/* One in-flight baseline read during load: an item_id + its reconstructed
+ * fits.  Adopted into the checkpoint store AFTER nde_history_attach (which
+ * purges the store), then freed. */
+typedef struct {
+    gint     item_id;
+    fits    *fit;
+    gboolean has_pos;   /* FLIS_POSX/Y were present (see nde_checkpoint.h) */
+    gint     pos_x, pos_y;
+} nde_base_load_t;
+
+static void nde_base_load_free(gpointer p) {
+    nde_base_load_t *b = p;
+    if (!b) return;
+    if (b->fit) { clearfits(b->fit); free(b->fit); }
+    g_free(b);
+}
+
+/*
+ * Read every NDE_BASE image HDU (located by EXTNAME scan, like FLIS_HIST) into
+ * a GPtrArray of nde_base_load_t.  Only baselines for item_ids that have a
+ * live record in @hist are adopted (the loader-side of the "live records only"
+ * gate); baselines for other ids are skipped.  Returns NULL when there is no
+ * history or no baseline HDUs.  Leaves @fptr at an arbitrary HDU.
+ */
+static GPtrArray *read_nde_base_hdus(fitsfile *fptr, int nhdus, nde_history *hist) {
+    if (!hist || !hist->records || hist->records->len == 0)
+        return NULL;
+    /* Set of item_ids the history still refers to — as a record's target or as
+     * the source of an input pin.  The writer's set, mirrored (see
+     * write_nde_base_hdus): an input consumed by a composite may have no
+     * records of its own and still need its baseline back. */
+    GHashTable *live_ids = g_hash_table_new(g_direct_hash, g_direct_equal);
+    for (guint i = 0; i < hist->records->len; i++) {
+        nde_record *rec = g_ptr_array_index(hist->records, i);
+        g_hash_table_add(live_ids, GINT_TO_POINTER(rec->target_item_id));
+        for (guint p = 0; rec->inputs && p < rec->inputs->len; p++) {
+            const nde_pin *pin = g_ptr_array_index(rec->inputs, p);
+            g_hash_table_add(live_ids, GINT_TO_POINTER(pin->item_id));
+        }
+    }
+
+    GPtrArray *out = NULL;
+    for (int h = 2; h <= nhdus; h++) {
+        int status = 0;
+        char extname[FLEN_VALUE] = { 0 };
+        if (fits_movabs_hdu(fptr, h, NULL, &status)) { status = 0; continue; }
+        fits_read_key(fptr, TSTRING, "EXTNAME", extname, NULL, &status); status = 0;
+        if (g_ascii_strcasecmp(extname, "NDE_BASE"))
+            continue;
+        int item_id = -1;
+        fits_read_key(fptr, TINT, "FLIS_ID", &item_id, NULL, &status); status = 0;
+        if (!g_hash_table_contains(live_ids, GINT_TO_POINTER(item_id)))
+            continue;   /* baseline for an item with no live record — ignore */
+        fits *f = load_layer_from_hdu(fptr, h);
+        if (!f) {
+            siril_log_warning(_("FLIS: failed to read NDE baseline HDU %d\n"), h);
+            continue;
+        }
+        if (!out)
+            out = g_ptr_array_new_with_free_func(nde_base_load_free);
+        read_orig_bitpix_key(fptr, f);
+        nde_base_load_t *b = g_new0(nde_base_load_t, 1);
+        b->item_id = item_id;
+        b->fit     = f;
+        {   /* absent on a plain image, and on files older than geometry replay */
+            int px = 0, py = 0, s1 = 0, s2 = 0;
+            fits_read_key(fptr, TINT, "FLIS_POSX", &px, NULL, &s1);
+            fits_read_key(fptr, TINT, "FLIS_POSY", &py, NULL, &s2);
+            if (!s1 && !s2) {
+                b->has_pos = TRUE;
+                b->pos_x = px;
+                b->pos_y = py;
+            }
+        }
+        g_ptr_array_add(out, b);
+    }
+    g_hash_table_destroy(live_ids);
+    return out;
+}
+
+/* One in-flight checkpoint read during load: a record_id + owning item_id +
+ * its reconstructed fits.  Adopted into the store AFTER nde_history_attach
+ * (which purges), then freed. */
+typedef struct {
+    gint64   record_id;
+    gint     item_id;
+    fits    *fit;
+    gboolean has_pos;
+    gint     pos_x, pos_y;
+} nde_ckpt_load_t;
+
+static void nde_ckpt_load_free(gpointer p) {
+    nde_ckpt_load_t *c = p;
+    if (!c) return;
+    if (c->fit) { clearfits(c->fit); free(c->fit); }
+    g_free(c);
+}
+
+/*
+ * Read every NDE_CKPT image HDU (located by EXTNAME scan) into a GPtrArray of
+ * nde_ckpt_load_t.  Only checkpoints whose RECORD_ID is present in @hist's
+ * loaded records are adopted (the loader-side of the "records in the history"
+ * gate); others are skipped.  Returns NULL when there is no history or no
+ * checkpoint HDUs.  Leaves @fptr at an arbitrary HDU.
+ */
+static GPtrArray *read_nde_ckpt_hdus(fitsfile *fptr, int nhdus, nde_history *hist) {
+    if (!hist || !hist->records || hist->records->len == 0)
+        return NULL;
+    /* Set of record_ids present in the loaded history. */
+    GHashTable *rec_ids = g_hash_table_new_full(g_int64_hash, g_int64_equal,
+                                                g_free, NULL);
+    for (guint i = 0; i < hist->records->len; i++) {
+        nde_record *rec = g_ptr_array_index(hist->records, i);
+        gint64 *k = g_new(gint64, 1);
+        *k = rec->record_id;
+        g_hash_table_add(rec_ids, k);
+    }
+
+    GPtrArray *out = NULL;
+    for (int h = 2; h <= nhdus; h++) {
+        int status = 0;
+        char extname[FLEN_VALUE] = { 0 };
+        if (fits_movabs_hdu(fptr, h, NULL, &status)) { status = 0; continue; }
+        fits_read_key(fptr, TSTRING, "EXTNAME", extname, NULL, &status); status = 0;
+        if (g_ascii_strcasecmp(extname, "NDE_CKPT"))
+            continue;
+        LONGLONG record_id = 0;
+        int item_id = -1;
+        fits_read_key(fptr, TLONGLONG, "RECORD_ID", &record_id, NULL, &status); status = 0;
+        fits_read_key(fptr, TINT,      "FLIS_ID",   &item_id,   NULL, &status); status = 0;
+        gint64 rid = (gint64)record_id;
+        if (!g_hash_table_contains(rec_ids, &rid))
+            continue;   /* checkpoint for a record not in the loaded history */
+        fits *f = load_layer_from_hdu(fptr, h);
+        if (!f) {
+            siril_log_warning(_("FLIS: failed to read NDE checkpoint HDU %d\n"), h);
+            continue;
+        }
+        read_orig_bitpix_key(fptr, f);
+        if (!out)
+            out = g_ptr_array_new_with_free_func(nde_ckpt_load_free);
+        nde_ckpt_load_t *c = g_new0(nde_ckpt_load_t, 1);
+        {
+            int px = 0, py = 0, s1 = 0, s2 = 0;
+            fits_read_key(fptr, TINT, "FLIS_POSX", &px, NULL, &s1);
+            fits_read_key(fptr, TINT, "FLIS_POSY", &py, NULL, &s2);
+            if (!s1 && !s2) {
+                c->has_pos = TRUE;
+                c->pos_x = px;
+                c->pos_y = py;
+            }
+        }
+        c->record_id = rid;
+        c->item_id   = item_id;
+        c->fit       = f;
+        g_ptr_array_add(out, c);
+    }
+    g_hash_table_destroy(rec_ids);
+    return out;
+}
+
+int save_flis(const gchar *filename) {
+    /* The pixels on screen are a mid-history state while an insertion point
+     * is open; writing them alongside the full FLIS_HIST log would produce a
+     * file whose history does not describe its pixels. */
+    if (nde_edit_at_refuses_op(_("Saving"))) return 1;
+    if (!com.uniq || !com.uniq->layers) {
+        siril_log_message(_("FLIS save: no layers to save\n"));
+        return 1;
+    }
+
+    gchar *outpath = g_strdup(filename);
+
+    if (g_unlink(outpath))
+        siril_debug_print("g_unlink() failed (may not exist)\n");
+
+    int status = 0;
+    fitsfile *fptr = NULL;
+    if (siril_fits_create_diskfile(&fptr, outpath, &status)) {
+        report_fits_error(status);
+        g_free(outpath);
+        return 1;
+    }
+
+    /* Sort layers by layer_order (ascending) for consistent HDU layout */
+    GSList *sorted = g_slist_copy(com.uniq->layers);
+    sorted = g_slist_sort(sorted, (GCompareFunc)layer_order_cmp);
+
+    /* NDE provenance (nde sketch §14): snapshot the live records up front —
+     * FLISNDE on the primary HDU must reflect whether the table follows.
+     * Only the live prefix is persisted, so the file's history always
+     * matches its pixels. */
+    gint64 nde_next_id = 1;
+    GPtrArray *nde_records = nde_history_snapshot(&nde_next_id);
+
+    /* §7: canvas dimensions live on com.uniq, independent of any layer.
+     * Fall back to base dims only if the canvas wasn't initialised (which
+     * shouldn't happen for a loaded/promoted FLIS but is defensive). */
+    flis_layer_t *base = (flis_layer_t *)sorted->data;
+    long canvas_w = com.uniq->canvas_w
+                    ? (long)com.uniq->canvas_w
+                    : (base->fit ? (long)base->fit->rx : 0);
+    long canvas_h = com.uniq->canvas_h
+                    ? (long)com.uniq->canvas_h
+                    : (base->fit ? (long)base->fit->ry : 0);
+
+    /* Determine whether an ICC profile should be written.  The profile
+     * is image-level state on com.uniq, not per-layer. */
+    cmsHPROFILE save_profile = (com.uniq) ? com.uniq->icc_profile : NULL;
+    gboolean    save_managed = (com.uniq) ? com.uniq->color_managed : FALSE;
+    gboolean icc_present = (save_profile != NULL && save_managed
+                            && com.pref.fits_save_icc);
+
+    /* ----------------------------------------------------------------
+     * HDU 1 (index 0): primary thumbnail HDU
+     * ---------------------------------------------------------------- */
+    if (write_thumbnail_hdu(fptr, base->fit, canvas_w, canvas_h, icc_present,
+                            nde_records != NULL)) {
+        siril_log_error(_("FLIS: failed to write thumbnail HDU\n"));
+        fits_close_file(fptr, &status);
+        g_slist_free(sorted);
+        if (nde_records)
+            g_ptr_array_unref(nde_records);
+        g_free(outpath);
+        return 1;
+    }
+
+    /* ----------------------------------------------------------------
+     * HDU 2 (optional): ICC profile
+     * ---------------------------------------------------------------- */
+    if (icc_present) {
+        if (write_icc_profile_to_fptr(fptr, save_profile)) {
+            siril_log_warning(_("FLIS: warning — ICC profile write failed, continuing\n"));
+            icc_present = FALSE;
+        }
+    }
+
+    /* ----------------------------------------------------------------
+     * HDU 2 or 3: FLIS_META binary table.
+     * first_data_hdu = thumbnail(1) + optional_icc + meta_table + 1
+     * All indices are 1-based (CFITSIO convention).
+     * ---------------------------------------------------------------- */
+    int first_data_hdu = icc_present ? 4 : 3;
+
+    if (write_flis_meta_hdu(fptr, sorted, first_data_hdu)) {
+        siril_log_error(_("FLIS: failed to write FLIS_META table\n"));
+        fits_close_file(fptr, &status);
+        g_slist_free(sorted);
+        if (nde_records)
+            g_ptr_array_unref(nde_records);
+        g_free(outpath);
+        return 1;
+    }
+
+    /* ----------------------------------------------------------------
+     * Data HDUs: layers and masks, in layer_order sequence.
+     * Apply the same compression settings as standard FITS saves.
+     * ---------------------------------------------------------------- */
+    if (com.pref.comp.fits_enabled) {
+        /* siril_fits_compress() needs a fits* with a valid fptr.
+         * We use a temporary wrapper — it only reads fptr. */
+        fits tmp_f = { .fptr = fptr };
+        siril_fits_compress(&tmp_f);
+    }
+
+    int saved_ok = 1;
+    for (GSList *l = sorted; l; l = l->next) {
+        flis_layer_t *lay = (flis_layer_t *)l->data;
+
+        /* --- Layer pixel data HDU --- */
+        if (write_layer_hdu(fptr, lay)) {
+            siril_log_error(_("FLIS: failed writing layer '%s'\n"),
+                                    lay->layer_name ? lay->layer_name : "?");
+            saved_ok = 0;
+            break;
+        }
+
+        /* --- Layer mask HDU (LMASK) --- */
+        if (lay->lmask) {
+            gchar *lname = g_strdup_printf("%s Layer Mask",
+                           lay->layer_name ? lay->layer_name : "Layer");
+            int lmask_id = flis_layer_lmask_id(lay);
+            /* LMASK HDUs are 8-bit on disk (the loader reads them as
+             * such).  16-/32-bit in-memory masks must be quantised first
+             * — writing their raw buffers as TBYTE would store garbage
+             * bytes as the mask. */
+            const layermask_t *wm = lay->lmask;
+            layermask_t conv = { 0 };
+            if (wm->bitpix != 8 && wm->data) {
+                size_t mN = wm->w * wm->h;
+                conv.w = wm->w;
+                conv.h = wm->h;
+                conv.bitpix = 8;
+                conv.data = malloc(mN);
+                if (conv.data) {
+                    uint8_t *dst = (uint8_t *)conv.data;
+                    if (wm->bitpix == 32) {
+                        const float *mf = (const float *)wm->data;
+                        for (size_t i = 0; i < mN; i++) {
+                            float v = mf[i];
+                            v = v < 0.f ? 0.f : (v > 1.f ? 1.f : v);
+                            dst[i] = (uint8_t)(v * 255.f + 0.5f);
+                        }
+                    } else {    /* 16-bit */
+                        const uint16_t *mw16 = (const uint16_t *)wm->data;
+                        for (size_t i = 0; i < mN; i++)
+                            dst[i] = (uint8_t)(mw16[i] >> 8);
+                    }
+                    wm = &conv;
+                } else {
+                    PRINT_ALLOC_ERR;
+                    siril_log_warning(_("FLIS: out of memory converting layer mask for '%s', mask not saved\n"),
+                                      lay->layer_name ? lay->layer_name : "?");
+                    wm = NULL;
+                }
+            }
+            if (wm && write_mask_hdu(fptr, wm, lmask_id,
+                               FLIS_TYPE_LMASK, lname,
+                               BYTE_IMG, TBYTE, lay->lmask_active)) {
+                siril_log_warning(_("FLIS: failed writing layer mask for '%s'\n"), lay->layer_name ? lay->layer_name : "?");
+            }
+            free(conv.data);
+            g_free(lname);
+        }
+
+        /* --- Processing mask HDU (MASK) --- */
+        if (lay->fit && lay->fit->mask) {
+            /* Processing masks are always written as float32 [0,1] in FLIS.
+             * mask_t.bitpix follows FITS convention (8/16/32 = bits per pixel),
+             * so convert uint8 or uint16 masks to float before writing. */
+            mask_t *pmask = lay->fit->mask;
+            gchar *mname = g_strdup_printf("%s Processing Mask",
+                           lay->layer_name ? lay->layer_name : "Layer");
+            int pmask_id = flis_layer_pmask_id(lay);
+            size_t npix = lay->fit->rx * lay->fit->ry;
+
+            float *float_data = NULL;
+            void  *write_data = pmask->data;
+            if (pmask->bitpix != 32) {
+                float_data = malloc(npix * sizeof(float));
+                if (!float_data) {
+                    /* Without the conversion buffer we would write 8/16-bit
+                     * bytes labelled as float32 — a buffer over-read.  Skip
+                     * this mask instead. */
+                    PRINT_ALLOC_ERR;
+                    siril_log_warning(_("FLIS: out of memory converting processing mask for '%s', mask not saved\n"),
+                                      lay->layer_name ? lay->layer_name : "?");
+                    g_free(mname);
+                    continue;
+                }
+                if (pmask->bitpix == 8) {
+                    const uint8_t *src = (const uint8_t *)pmask->data;
+                    for (size_t i = 0; i < npix; i++)
+                        float_data[i] = src[i] * (1.0f / 255.0f);
+                } else { /* 16 */
+                    const uint16_t *src = (const uint16_t *)pmask->data;
+                    for (size_t i = 0; i < npix; i++)
+                        float_data[i] = src[i] * (1.0f / 65535.0f);
+                }
+                write_data = float_data;
+            }
+
+            layermask_t tmp_lm = {
+                .w      = lay->fit->rx,
+                .h      = lay->fit->ry,
+                .bitpix = 32,
+                .data   = write_data
+            };
+            if (write_mask_hdu(fptr, &tmp_lm, pmask_id,
+                               FLIS_TYPE_MASK, mname,
+                               FLOAT_IMG, TFLOAT, lay->fit->mask_active)) {
+                siril_log_warning(_("FLIS: failed writing processing mask for '%s'\n"), lay->layer_name ? lay->layer_name : "?");
+            }
+            free(float_data);
+            g_free(mname);
+        }
+    }
+
+    /* FLIS_HIST rides after the data HDUs (located by EXTNAME on load).  A
+     * failure here is a warning, not a save failure — the pixels are
+     * intact; the loader treats FLISNDE=T without a table as "warn, empty
+     * history". */
+    if (saved_ok && nde_records) {
+        if (write_flis_hist_hdu(fptr, nde_records, nde_next_id))
+            siril_log_warning(_("FLIS: failed to write the NDE history table\n"));
+        /* NDE baselines ride after FLIS_HIST (plan P2.C), one lossless image
+         * HDU per item that has a live record and a captured baseline. */
+        write_nde_base_hdus(fptr, nde_records);
+        /* NDE output checkpoints ride after NDE_BASE (plan P4.3), one lossless
+         * image HDU per live barrier record that has an in-session checkpoint. */
+        write_nde_ckpt_hdus(fptr, nde_records);
+        /* Embedded star catalogues (nde_cat.h), one binary table per live
+         * photometric record that registered one — the file replays PCC/SPCC
+         * offline, on any machine. */
+        write_flis_nde_cat_hdus(fptr, nde_records);
+    }
+    if (nde_records)
+        g_ptr_array_unref(nde_records);
+
+    status = 0;
+    fits_close_file(fptr, &status);
+    g_slist_free(sorted);
+
+    if (!status && saved_ok) {
+        siril_log_message(_("FLIS: saved %d layer(s) to %s\n"),
+                          g_slist_length(com.uniq->layers), outpath);
+    } else if (status) {
+        report_fits_error(status);
+    }
+
+    g_free(outpath);
+    return (!saved_ok || status) ? 1 : 0;
+}
+
+/* ===================================================================== */
+/* Public API — load_flis                                                */
+/* ===================================================================== */
+
+/* Lightweight probe: TRUE when @filename is a FLIS file (primary HDU carries
+ * the FLIS=T marker).  Used by the open path to route FLIS files to the
+ * gfit-targeting loader (load_flis / readfits FLIS dispatch) rather than the
+ * threaded decode-into-a-private-fits worker, which cannot build the layer
+ * stack.  Returns FALSE on any open/read error so callers fall back to the
+ * normal reader (which then reports the real problem). */
+gboolean is_flis_file(const gchar *filename) {
+    int status = 0;
+    fitsfile *fptr = NULL;
+    fits_open_diskfile(&fptr, filename, READONLY, &status);
+    if (status)
+        return FALSE;
+    int is_flis = 0;
+    fits_movabs_hdu(fptr, 1, NULL, &status);
+    fits_read_key(fptr, TLOGICAL, "FLIS", &is_flis, NULL, &status);
+    int close_status = 0;
+    fits_close_file(fptr, &close_status);
+    return (status == 0 && is_flis);
+}
+
+int load_flis(const gchar *filename) {
+    int status = 0;
+    fitsfile *fptr = NULL;
+
+    /* Open the file without jumping to first image (we need HDU 1 = thumbnail) */
+    fits_open_diskfile(&fptr, filename, READONLY, &status);
+    if (status) {
+        report_fits_error(status);
+        return 1;
+    }
+
+    /* ----------------------------------------------------------------
+     * HDU 1: validate FLIS identification
+     * ---------------------------------------------------------------- */
+    fits_movabs_hdu(fptr, 1, NULL, &status);
+    if (status) { report_fits_error(status); fits_close_file(fptr, &status); return 1; }
+
+    int is_flis = 0;
+    fits_read_key(fptr, TLOGICAL, "FLIS", &is_flis, NULL, &status);
+    if (status || !is_flis) {
+        siril_log_error(_("FLIS: file %s is not a valid FLIS file (no FLIS=T keyword)\n"), filename);
+        fits_close_file(fptr, &status);
+        return 1;
+    }
+    status = 0;
+
+    char ver[FLEN_VALUE] = { 0 };
+    fits_read_key(fptr, TSTRING, "FLISVER", ver, NULL, &status);
+    if (!status && strcmp(ver, FLIS_VERSION_STRING)) {
+        siril_log_message(_("FLIS: file version %s differs from implementation version %s\n"),
+                          ver, FLIS_VERSION_STRING);
+    }
+    status = 0;
+
+    /* §7: read canvas dimensions from CANVASW/H (the post-decoupling
+     * spelling).  Fall back to FLISSIZX/Y for files written by earlier
+     * builds of this branch — those values were derived from the base
+     * layer so the geometry is identical, only the keyword names
+     * changed.  If neither is present (genuinely pre-canvas-stage
+     * file), default-fill from the base layer's dims after the layer
+     * loads further down. */
+    int canvas_w = 0, canvas_h = 0;
+    int s_cw = 0, s_ch = 0;
+    fits_read_key(fptr, TINT, "CANVASW", &canvas_w, NULL, &s_cw);
+    fits_read_key(fptr, TINT, "CANVASH", &canvas_h, NULL, &s_ch);
+    if (s_cw || s_ch || !canvas_w || !canvas_h) {
+        canvas_w = canvas_h = 0;
+        int s2x = 0, s2y = 0;
+        fits_read_key(fptr, TINT, "FLISSIZX", &canvas_w, NULL, &s2x);
+        fits_read_key(fptr, TINT, "FLISSIZY", &canvas_h, NULL, &s2y);
+        if (s2x || s2y) { canvas_w = 0; canvas_h = 0; }
+    }
+    /* Header values come from the file: a negative value would wrap to a
+     * ~4G canvas via the guint cast, and an absurd positive one drives a
+     * giant composite allocation.  Clamp to sane bounds and fall back to
+     * the base-layer default-fill when out of range. */
+    if (canvas_w < 0 || canvas_h < 0 ||
+        canvas_w > (1 << 20) || canvas_h > (1 << 20)) {
+        siril_log_warning(_("FLIS: implausible canvas dimensions %dx%d in header, "
+                            "using base layer dimensions instead\n"),
+                          canvas_w, canvas_h);
+        canvas_w = canvas_h = 0;
+    }
+    /* Optional CANVASBG: "r g b" floats in [0,1].  Default (0,0,0). */
+    double canvas_bg_r = 0.0, canvas_bg_g = 0.0, canvas_bg_b = 0.0;
+    {
+        char bg_str[FLEN_VALUE] = { 0 };
+        int s_bg = 0;
+        fits_read_key(fptr, TSTRING, "CANVASBG", bg_str, NULL, &s_bg);
+        if (!s_bg && bg_str[0]) {
+            double r = 0.0, g = 0.0, b = 0.0;
+            if (sscanf(bg_str, "%lf %lf %lf", &r, &g, &b) == 3) {
+                canvas_bg_r = r; canvas_bg_g = g; canvas_bg_b = b;
+            } else {
+                siril_log_warning(_("FLIS: malformed CANVASBG '%s'; defaulting to black\n"), bg_str);
+            }
+        }
+    }
+    status = 0;
+
+    /* Check ICC flag */
+    int icc_present = 0;
+    fits_read_key(fptr, TLOGICAL, "FLISICC", &icc_present, NULL, &status);
+    status = 0;
+
+    /* NDE history presence flag (nde sketch §14.2); absent == false. */
+    int nde_flag = 0;
+    fits_read_key(fptr, TLOGICAL, "FLISNDE", &nde_flag, NULL, &status);
+    status = 0;
+
+    /* ----------------------------------------------------------------
+     * Locate the FLIS_META table.  It is at HDU 2 (no ICC) or HDU 3.
+     * Verify by EXTNAME in case HDU layout shifted.
+     * ---------------------------------------------------------------- */
+    int meta_hdu = icc_present ? 3 : 2;
+    int nhdus = 0;
+    fits_get_num_hdus(fptr, &nhdus, &status);
+
+    /* Verify expected position; fall back to scanning if wrong */
+    fits_movabs_hdu(fptr, meta_hdu, NULL, &status);
+    if (status) {
+        siril_log_error(_("FLIS: cannot locate FLIS_META table\n"));
+        fits_close_file(fptr, &status);
+        return 1;
+    }
+    status = 0;
+
+    char extname[FLEN_VALUE] = { 0 };
+    fits_read_key(fptr, TSTRING, "EXTNAME", extname, NULL, &status);
+    status = 0;
+    if (g_ascii_strcasecmp(extname, "FLIS_META")) {
+        /* Scan remaining HDUs for FLIS_META */
+        gboolean found = FALSE;
+        for (int h = 2; h <= nhdus; h++) {
+            fits_movabs_hdu(fptr, h, NULL, &status); status = 0;
+            fits_read_key(fptr, TSTRING, "EXTNAME", extname, NULL, &status); status = 0;
+            if (!g_ascii_strcasecmp(extname, "FLIS_META")) {
+                meta_hdu = h;
+                found = TRUE;
+                break;
+            }
+        }
+        if (!found) {
+            siril_log_error(_("FLIS: FLIS_META table not found\n"));
+            fits_close_file(fptr, &status);
+            return 1;
+        }
+        fits_movabs_hdu(fptr, meta_hdu, NULL, &status);
+    }
+
+    /* ----------------------------------------------------------------
+     * Read the FLIS_META table
+     * ---------------------------------------------------------------- */
+    long nrows = 0;
+    flis_meta_row_t *meta_rows = read_flis_meta(fptr, &nrows);
+    if (!meta_rows) {
+        fits_close_file(fptr, &status);
+        return 1;
+    }
+
+    /* NDE provenance table (nde sketch §14.3): located by EXTNAME scan, like
+     * FLIS_META itself.  Unknown OP_IDs load fine; a declared-but-missing
+     * table degrades to a warning and an empty history. */
+    nde_history *nde_hist = read_flis_hist(fptr, nhdus);
+    if (nde_flag && !nde_hist)
+        siril_log_warning(_("FLIS: file declares an NDE history (FLISNDE) but no readable FLIS_HIST table was found\n"));
+    /* NDE baselines (plan P2.C): read the NDE_BASE HDUs while the file is
+     * open, for item_ids that carry a live record.  Adopted into the
+     * checkpoint store AFTER nde_history_attach() (attach purges the store).
+     * Pre-phase-2 files simply have no NDE_BASE HDUs → chains not replayable. */
+    GPtrArray *nde_baselines = read_nde_base_hdus(fptr, nhdus, nde_hist);
+    /* NDE output checkpoints (plan P4.3): read the NDE_CKPT HDUs while the file
+     * is open, for record_ids present in the loaded history.  Adopted into the
+     * store AFTER nde_history_attach() (attach purges the store).  Pre-phase-4
+     * files simply have no NDE_CKPT HDUs → barriers stay full blockers. */
+    GPtrArray *nde_ckpts = read_nde_ckpt_hdus(fptr, nhdus, nde_hist);
+    /* Embedded star catalogues, registered AFTER nde_history_attach() (the
+     * attach purges the registry along with the other NDE stores). */
+    GPtrArray *nde_cats = read_flis_nde_cat_hdus(fptr, nhdus, nde_hist);
+    guint nde_hash_scope = 0, nde_hash_present = 0;
+    gboolean nde_hash_mismatch = FALSE;
+
+    /* ----------------------------------------------------------------
+     * Read ICC profile if present
+     * ---------------------------------------------------------------- */
+    cmsHPROFILE file_icc = NULL;
+    if (icc_present) {
+        fits_movabs_hdu(fptr, 2, NULL, &status); status = 0;
+        file_icc = read_icc_profile_from_fptr(fptr);
+    }
+
+    /* ----------------------------------------------------------------
+     * Build the layer list from the metadata table rows.
+     *
+     * Pass 1: create flis_layer_t for every LAYER row, loading pixel data.
+     * Pass 2: attach LMASK and MASK items to their parent layers.
+     * ---------------------------------------------------------------- */
+
+    /* Map from item_id -> flis_layer_t* for parent lookup */
+    GHashTable *id_map = g_hash_table_new(g_direct_hash, g_direct_equal);
+    GSList *layers = NULL;
+    GSList *groups = NULL;
+
+    /* Pass 0: GROUP rows — build group objects first so layers can reference them */
+    for (long r = 0; r < nrows; r++) {
+        flis_meta_row_t *row = &meta_rows[r];
+        if (g_ascii_strcasecmp(row->item_type, FLIS_TYPE_GROUP))
+            continue;
+        flis_group_t *grp = flis_group_new(row->layer_name);
+        if (!grp) continue;
+        grp->item_id    = row->item_id;
+        grp->opacity    = row->opacity;
+        grp->visible    = row->visible;
+        grp->blend_mode = str_to_blend_mode(row->blend_mode);
+        /* §6.3: route through the shared parser so unrecognised keys
+         * are captured for re-emit on save. */
+        parse_group_metadata_string(row->metadata, grp);
+        groups = g_slist_append(groups, grp);
+    }
+
+    /* Pass 1: LAYER rows */
+    for (long r = 0; r < nrows; r++) {
+        flis_meta_row_t *row = &meta_rows[r];
+        if (g_ascii_strcasecmp(row->item_type, FLIS_TYPE_LAYER))
+            continue; /* not a LAYER row */
+
+        fits *f = load_layer_from_hdu(fptr, row->hdu_index);
+        if (!f) {
+            siril_log_warning(
+                _("FLIS: failed to load layer '%s' (HDU %d), skipping\n"), row->layer_name, row->hdu_index);
+            continue;
+        }
+
+        flis_layer_t *layer = flis_layer_new(f, row->layer_name);
+        if (!layer) { clearfits(f); free(f); continue; }
+
+        layer->item_id     = row->item_id;
+        layer->layer_order = row->layer_order;
+        layer->blend_mode  = str_to_blend_mode(row->blend_mode);
+        layer->opacity     = row->opacity;
+        layer->visible     = row->visible;
+        layer->position_x  = row->position_x;
+        layer->position_y  = row->position_y;
+        parse_metadata_string(row->metadata, layer);
+        layer->group_id = row->group_id;
+
+        layers = g_slist_insert_sorted(layers, layer,
+                                       (GCompareFunc)layer_order_cmp);
+        g_hash_table_insert(id_map,
+                            GINT_TO_POINTER(row->item_id), layer);
+
+        /* PIXHASH external-edit check (nde sketch §14.4) — only meaningful
+         * when the file carries a history.  Absent hashes are legal
+         * (compressed saves skip them); mixed presence or a mismatch marks
+         * the history stale. */
+        if (nde_hist) {
+            nde_hash_scope++;
+            int s2 = 0;
+            char stored_hash[FLEN_VALUE] = { 0 };
+            fits_movabs_hdu(fptr, row->hdu_index, NULL, &s2);
+            fits_read_key(fptr, TSTRING, "PIXHASH", stored_hash, NULL, &s2);
+            if (!s2 && stored_hash[0]) {
+                nde_hash_present++;
+                gchar *actual = flis_pixel_sha256(f);
+                if (!actual || g_ascii_strcasecmp(actual, stored_hash))
+                    nde_hash_mismatch = TRUE;
+                g_free(actual);
+            }
+        }
+    }
+
+    /* Assign the file-level ICC profile to the base layer only.
+     * The base layer is the first element of the sorted list (lowest
+     * layer_order).  For any non-base layer whose HDU happened to carry
+     * an embedded ICC profile, warn and discard it — ICC profiles are
+     * an image-level concept in FLIS, not a per-layer one. */
+    /* Per-fits ICC fields removed.  Any embedded profile that the
+     * per-HDU loader picked up was already discarded by the load helper
+     * (it only honours profiles when fit == gfit).  ICC state for the
+     * FLIS lives on com.uniq and is set further down from file_icc. */
+
+    /* Pass 2: LMASK and MASK rows */
+    for (long r = 0; r < nrows; r++) {
+        flis_meta_row_t *row = &meta_rows[r];
+        gboolean is_lmask = !g_ascii_strcasecmp(row->item_type, FLIS_TYPE_LMASK);
+        gboolean is_mask  = !g_ascii_strcasecmp(row->item_type, FLIS_TYPE_MASK);
+        if (!is_lmask && !is_mask) continue;
+
+        flis_layer_t *parent = g_hash_table_lookup(id_map,
+                                    GINT_TO_POINTER(row->parent_id));
+        if (!parent) {
+            siril_log_warning(
+                _("FLIS: mask '%s' references unknown parent ID %d, skipping\n"), row->layer_name, row->parent_id);
+            continue;
+        }
+
+        /* The compose kernel and the display overlay index masks with
+         * layer-local indices and carry no per-pixel bounds check, so a
+         * wrong-size mask HDU in a corrupt or crafted file would cause
+         * out-of-bounds reads.  Enforce the same dimension contract as
+         * flis_layer_set_lmask() here. */
+        if (is_lmask) {
+            layermask_t *lm = load_mask_from_hdu(fptr, row->hdu_index, FALSE);
+            if (lm && parent->fit &&
+                (lm->w != (size_t)parent->fit->rx ||
+                 lm->h != (size_t)parent->fit->ry)) {
+                siril_log_warning(
+                    _("FLIS: layer mask '%s' is %zux%zu but its layer is %ux%u, skipping\n"),
+                    row->layer_name, lm->w, lm->h,
+                    parent->fit->rx, parent->fit->ry);
+                layermask_free(lm);
+                lm = NULL;
+            }
+            if (lm) {
+                layermask_free(parent->lmask); /* replace any existing */
+                parent->lmask        = lm;
+                parent->lmask_active = read_mask_act_from_hdu(fptr, row->hdu_index);
+                /* Adopt the on-disk item id, unless it is the pre-allocation
+                 * convention (parent + 10000), which was never an allocation
+                 * and would push next_item_id past 10000 for nothing.  Left
+                 * at 0 it is renumbered on the next save. */
+                parent->lmask_item_id =
+                    (row->item_id == parent->item_id + 10000) ? 0 : row->item_id;
+            }
+        } else { /* MASK — processing mask, float */
+            layermask_t *pm = load_mask_from_hdu(fptr, row->hdu_index, TRUE);
+            if (pm && parent->fit &&
+                (pm->w != (size_t)parent->fit->rx ||
+                 pm->h != (size_t)parent->fit->ry)) {
+                siril_log_warning(
+                    _("FLIS: processing mask '%s' is %zux%zu but its layer is %ux%u, skipping\n"),
+                    row->layer_name, pm->w, pm->h,
+                    parent->fit->rx, parent->fit->ry);
+                layermask_free(pm);
+                pm = NULL;
+            }
+            if (pm && parent->fit) {
+                /* Wrap into mask_t (Siril's existing processing mask struct) */
+                if (parent->fit->mask) {
+                    free_mask(parent->fit->mask);
+                    parent->fit->mask = NULL;
+                }
+                mask_t *siril_mask = calloc(1, sizeof(mask_t));
+                if (siril_mask) {
+                    siril_mask->bitpix   = 32;
+                    siril_mask->data     = pm->data;
+                    pm->data             = NULL; /* transfer ownership */
+                    parent->fit->mask    = siril_mask;
+                    parent->pmask_item_id =
+                        (row->item_id == parent->item_id + 20000) ? 0 : row->item_id;
+                }
+                parent->fit->mask_active = read_mask_act_from_hdu(fptr, row->hdu_index);
+                layermask_free(pm);
+            } else {
+                layermask_free(pm);
+            }
+        }
+    }
+
+    g_hash_table_destroy(id_map);
+    for (long r = 0; r < nrows; r++)
+        g_free(meta_rows[r].metadata);
+    free(meta_rows);
+    fits_close_file(fptr, &status);
+
+    if (!layers) {
+        siril_log_error(_("FLIS: no layers loaded from %s\n"), filename);
+        if (file_icc) cmsCloseProfile(file_icc);
+        /* Group rows may have parsed even though every layer HDU
+         * failed — free them or they leak on this path. */
+        g_slist_free_full(groups, (GDestroyNotify)flis_group_free);
+        nde_history_free(nde_hist);
+        if (nde_baselines) g_ptr_array_unref(nde_baselines);
+        if (nde_ckpts) g_ptr_array_unref(nde_ckpts);
+        if (nde_cats) g_ptr_array_unref(nde_cats);
+        return 1;
+    }
+
+    /* ----------------------------------------------------------------
+     * Populate com.uniq
+     * ---------------------------------------------------------------- */
+    if (!com.uniq)
+        com.uniq = g_new0(single, 1);
+    else
+        flis_free_layers(com.uniq);
+
+    g_free(com.uniq->filename);
+    com.uniq->filename  = g_strdup(filename);
+    com.uniq->fileexist = TRUE;
+    com.uniq->layers    = layers;
+    com.uniq->groups    = groups;
+    com.uniq->next_item_id = 1; /* will be set properly below */
+
+    /* ICC profile (image-level — see icc_profile.h accessors) lives
+     * on com.uniq; no fits carries ICC state. */
+    if (com.uniq->icc_profile) {
+        cmsCloseProfile(com.uniq->icc_profile);
+        com.uniq->icc_profile = NULL;
+    }
+    if (file_icc) {
+        com.uniq->icc_profile  = copyICCProfile(file_icc);
+        com.uniq->color_managed = TRUE;
+        cmsCloseProfile(file_icc);
+        file_icc = NULL;
+    } else {
+        com.uniq->color_managed = FALSE;
+    }
+
+    /* Find the highest item_id to seed next_item_id */
+    gint max_id = 0;
+    for (GSList *l = layers; l; l = l->next) {
+        flis_layer_t *lay = (flis_layer_t *)l->data;
+        if (lay->item_id > max_id) max_id = lay->item_id;
+        /* Mask ids come from the same counter, so they bound it too. */
+        if (lay->lmask_item_id > max_id) max_id = lay->lmask_item_id;
+        if (lay->pmask_item_id > max_id) max_id = lay->pmask_item_id;
+    }
+    for (GSList *g = groups; g; g = g->next) {
+        flis_group_t *grp = (flis_group_t *)g->data;
+        if (grp->item_id > max_id) max_id = grp->item_id;
+    }
+    /* The history bounds it too, and it must: an item a composite consumed
+     * has no layer left to be found among the above, so seeding from the live
+     * document alone would hand its id out again and let a new layer inherit
+     * a dead one's provenance.  Read before nde_history_attach() below. */
+    gint hist_max = nde_history_max_item_id(nde_hist);
+    if (hist_max > max_id) max_id = hist_max;
+    com.uniq->next_item_id = max_id + 1;
+
+    /* Set active layer to the base (index 0 = lowest layer_order after sort) */
+    uniq_set_active_layer(com.uniq, 0);
+
+    /* §7: commit canvas dimensions and background to com.uniq.  If neither
+     * CANVASW/H nor FLISSIZX/Y was found on disk (pre-canvas-stage file)
+     * default-fill from the base layer's pixel dims, matching the
+     * historical implicit canvas == base convention. */
+    if (!canvas_w || !canvas_h) {
+        flis_layer_t *base = (flis_layer_t *)com.uniq->layers->data;
+        if (base && base->fit) {
+            canvas_w = (int)base->fit->rx;
+            canvas_h = (int)base->fit->ry;
+        }
+    }
+    com.uniq->canvas_w    = (guint)canvas_w;
+    com.uniq->canvas_h    = (guint)canvas_h;
+    com.uniq->canvas_bg_r = canvas_bg_r;
+    com.uniq->canvas_bg_g = canvas_bg_g;
+    com.uniq->canvas_bg_b = canvas_bg_b;
+
+    /* Install the loaded provenance (also clears any previous document's
+     * log when nde_hist is NULL — this load path reuses com.uniq). */
+    if (nde_hist) {
+        nde_hist->stale = nde_hash_mismatch ||
+                          (nde_hash_present > 0 && nde_hash_present < nde_hash_scope);
+        if (nde_hist->stale)
+            siril_log_warning(_("FLIS: layer pixels were modified outside the recorded history\n"));
+    }
+    nde_history_attach(nde_hist);
+
+    /* Adopt the persisted baselines into the (freshly purged) checkpoint
+     * store — AFTER attach, since attach purges it.  Only baselines for
+     * item_ids with a live record were read (read_nde_base_hdus). */
+    if (nde_baselines) {
+        for (guint i = 0; i < nde_baselines->len; i++) {
+            nde_base_load_t *b = g_ptr_array_index(nde_baselines, i);
+            nde_state st = { .pix = b->fit, .pos_x = b->pos_x,
+                             .pos_y = b->pos_y, .has_pos = b->has_pos };
+            nde_checkpoint_baseline_adopt(&st, b->item_id);
+        }
+        g_ptr_array_unref(nde_baselines);
+    }
+
+    /* Adopt the persisted output checkpoints (plan P4.3) — also AFTER attach,
+     * since attach purges the store.  Only checkpoints for record_ids present
+     * in the loaded history were read (read_nde_ckpt_hdus). */
+    if (nde_ckpts) {
+        for (guint i = 0; i < nde_ckpts->len; i++) {
+            nde_ckpt_load_t *c = g_ptr_array_index(nde_ckpts, i);
+            nde_state st = { .pix = c->fit, .pos_x = c->pos_x,
+                             .pos_y = c->pos_y, .has_pos = c->has_pos };
+            nde_checkpoint_output_adopt(&st, c->record_id, c->item_id);
+        }
+        g_ptr_array_unref(nde_ckpts);
+    }
+
+    /* Register the embedded star catalogues — after attach for the same
+     * reason (attach purges the registry). */
+    if (nde_cats) {
+        for (guint i = 0; i < nde_cats->len; i++) {
+            nde_cat_load_t *c = g_ptr_array_index(nde_cats, i);
+            nde_cat_register(c->record_id, c->cat);
+            c->cat = NULL;   /* ownership moved to the registry */
+        }
+        g_ptr_array_unref(nde_cats);
+    }
+
+    siril_log_message(_("FLIS: loaded %d layer(s) from %s (%dx%d canvas)\n"),
+                      g_slist_length(layers), filename, canvas_w, canvas_h);
+    return 0;
+}
+
+/* ===================================================================== */
+/* Internal helpers shared by layer management functions                 */
+/* ===================================================================== */
+
+/*
+ * Emit an ISO 8601 UTC timestamp string into a heap-allocated gchar*.
+ * Returns a g_malloc'd string; caller must g_free().
+ */
+static gchar *flis_now_iso8601(void) {
+    GDateTime *now = g_date_time_new_now_utc();
+    gchar *s = g_date_time_format_iso8601(now);
+    g_date_time_unref(now);
+    return s;
+}
+
+/*
+ * Return TRUE and log a warning if the layer is locked.
+ * @op: short operation name for the log message.
+ */
+static gboolean flis_check_locked(const flis_layer_t *layer, const char *op) {
+    if (layer->locked) {
+        siril_log_warning(
+            _("FLIS: cannot %s — layer '%s' is locked\n"),
+            op, layer->layer_name ? layer->layer_name : "?");
+        return TRUE;
+    }
+    return FALSE;
+}
+
+/*
+ * Re-sort com.uniq->layers by layer_order and re-sync the active_layer
+ * index so it still points at the same flis_layer_t* after sorting.
+ * Must be called after any operation that modifies layer_order values.
+ */
+static void flis_resort_layers(flis_layer_t *keep_active) {
+    com.uniq->layers = g_slist_sort(com.uniq->layers,
+                                    (GCompareFunc)layer_order_cmp);
+    if (keep_active) {
+        gint idx = flis_layer_get_index(keep_active);
+        if (idx >= 0)
+            uniq_set_active_layer(com.uniq, idx);
+    }
+}
+
+/* Public wrapper used by the undo mechanism to re-sort after restoring
+ * layer_order values directly. */
+void flis_sort_layer_stack(void) {
+    if (!com.uniq || !com.uniq->layers) return;
+    flis_layer_t *active = flis_active_layer();
+    flis_resort_layers(active);
+}
+
+/*
+ * Return the maximum layer_order value currently in the stack, or 0 if
+ * the stack is empty.  Used when appending a new layer at the top.
+ */
+static gint flis_max_layer_order(void) {
+    gint max = 0;
+    for (GSList *l = com.uniq->layers; l; l = l->next) {
+        flis_layer_t *lay = (flis_layer_t *)l->data;
+        if (lay->layer_order > max)
+            max = lay->layer_order;
+    }
+    return max;
+}
+
+/* ===================================================================== */
+/* Layer lookup helpers                                                  */
+/* ===================================================================== */
+
+flis_layer_t *flis_active_layer(void) {
+    if (!com.uniq || !com.uniq->layers)
+        return NULL;
+    return (flis_layer_t *)g_slist_nth_data(com.uniq->layers,
+                                             com.uniq->active_layer);
+}
+
+fits *flis_active_layer_fit(void) {
+    flis_layer_t *lay = flis_active_layer();
+    return lay ? lay->fit : NULL;
+}
+
+guint flis_composite_naxes2(void) {
+    /* The FLIS display composite is always built as RGB (3 channels),
+     * regardless of whether the individual layers are mono.  Return 3 for
+     * any FLIS image so that ICC profile channel-count checks are performed
+     * against the composite rather than the (potentially mono) base layer. */
+    if (is_current_image_flis())
+        return 3;
+    return gfit ? (guint)gfit->naxes[2] : 1;
+}
+
+gboolean flis_composite_is_chromatic(void) {
+    /* "Chromatic" = the displayed composite is not equivalent to a mono
+     * image broadcast to three channels.  An all-mono, no-tint (or only
+     * greyscale-tint) FLIS produces R=G=B everywhere and so should still
+     * present mono-style GUI controls (single-channel histogram, mono
+     * vport tab) even though the composite buffer happens to be 3-channel.
+     *
+     * Any RGB layer brings chromaticity unconditionally.  A mono layer
+     * with LAYER_COLOR tint contributes chroma only when the tint vector
+     * is not greyscale (i.e. R != G or G != B) — a (0.5, 0.5, 0.5) tint
+     * is just a brightness scalar. */
+    if (!is_current_image_flis() || !com.uniq) return FALSE;
+    for (GSList *l = com.uniq->layers; l; l = l->next) {
+        flis_layer_t *lay = (flis_layer_t *)l->data;
+        if (!lay || !lay->fit) continue;
+        if (lay->fit->naxes[2] >= 3)
+            return TRUE;
+        if (lay->has_tint &&
+            (lay->layer_tint.r != lay->layer_tint.g ||
+             lay->layer_tint.g != lay->layer_tint.b))
+            return TRUE;
+    }
+    return FALSE;
+}
+
+/* Luminance-weighted collapse of three planar channels into one.
+ * Uses Rec. 709 coefficients (0.2126 R + 0.7152 G + 0.0722 B). */
+static void collapse_rgb_to_mono_float(float *r, float *g, float *b,
+                                       float *out, size_t npixels) {
+    for (size_t i = 0; i < npixels; i++)
+        out[i] = 0.2126f * r[i] + 0.7152f * g[i] + 0.0722f * b[i];
+}
+
+static void collapse_rgb_to_mono_word(WORD *r, WORD *g, WORD *b,
+                                      WORD *out, size_t npixels) {
+    for (size_t i = 0; i < npixels; i++)
+        out[i] = (WORD)(0.2126f * r[i] + 0.7152f * g[i] + 0.0722f * b[i] + 0.5f);
+}
+
+void flis_convert_layers_icc(cmsHPROFILE old_profile, cmsHPROFILE new_profile) {
+    if (!is_current_image_flis() || !com.uniq || !com.uniq->layers) return;
+    if (!old_profile || !new_profile) return;
+
+    gboolean threaded = !processing_is_job_active();
+    cmsUInt32Number intent = com.pref.icc.processing_intent;
+
+    cmsUInt32Number rgb_float_type = get_planar_formatter_type(cmsSigRgbData, DATA_FLOAT, FALSE);
+    cmsUInt32Number rgb_word_type  = get_planar_formatter_type(cmsSigRgbData, DATA_USHORT, FALSE);
+
+    /* Build a single RGB→RGB transform, reused for every layer. */
+    cmsHTRANSFORM xform_float = cmsCreateTransformTHR(
+        threaded ? com.icc.context_threaded : com.icc.context_single,
+        old_profile, rgb_float_type, new_profile, rgb_float_type,
+        intent, com.icc.rendering_flags);
+    cmsHTRANSFORM xform_word = cmsCreateTransformTHR(
+        threaded ? com.icc.context_threaded : com.icc.context_single,
+        old_profile, rgb_word_type, new_profile, rgb_word_type,
+        intent, com.icc.rendering_flags);
+    /* Packed interleaved transform for tint vectors (3 floats, single pixel).
+     * The tint is defined as linear-light values, but we feed it through the
+     * same ICC transform as the image data.  For values at 0.0 and 1.0 this
+     * is exact; for intermediate values the TRC error is small and acceptable
+     * for typical narrowband tint ratios. */
+    cmsHTRANSFORM xform_tint = cmsCreateTransformTHR(
+        threaded ? com.icc.context_threaded : com.icc.context_single,
+        old_profile, TYPE_RGB_FLT, new_profile, TYPE_RGB_FLT,
+        intent, com.icc.rendering_flags);
+
+    for (GSList *l = com.uniq->layers; l; l = l->next) {
+        flis_layer_t *lay = (flis_layer_t *)l->data;
+        if (!lay || !lay->fit) continue;
+        fits *fit = lay->fit;
+        size_t npixels = (size_t)fit->rx * fit->ry;
+        cmsHTRANSFORM xform = (fit->type == DATA_FLOAT) ? xform_float : xform_word;
+        if (!xform) continue;
+
+        cmsUInt32Number dsize       = (fit->type == DATA_FLOAT) ? sizeof(float) : sizeof(WORD);
+        cmsUInt32Number bytesperline  = fit->rx * dsize;
+        cmsUInt32Number bytesperplane = npixels * dsize;
+
+        if (fit->naxes[2] >= 3) {
+            /* RGB layer: transform in-place. */
+            void *data = (fit->type == DATA_FLOAT) ? (void *)fit->fdata : (void *)fit->data;
+            cmsDoTransformLineStride(xform, data, data, fit->rx, fit->ry,
+                                     bytesperline, bytesperline,
+                                     bytesperplane, bytesperplane);
+        } else {
+            /* Mono layer: broadcast to 3 RGB planes, transform, collapse. */
+            void *tmp = g_malloc(npixels * 3 * dsize);
+            if (fit->type == DATA_FLOAT) {
+                float *mono  = fit->fdata;
+                float *tr    = (float *)tmp;
+                float *tg    = tr + npixels;
+                float *tb    = tg + npixels;
+                for (size_t i = 0; i < npixels; i++)
+                    tr[i] = tg[i] = tb[i] = mono[i];
+                cmsDoTransformLineStride(xform, tmp, tmp, fit->rx, fit->ry,
+                                         bytesperline, bytesperline,
+                                         bytesperplane, bytesperplane);
+                collapse_rgb_to_mono_float(tr, tg, tb, mono, npixels);
+            } else {
+                WORD *mono = fit->data;
+                WORD *tr   = (WORD *)tmp;
+                WORD *tg   = tr + npixels;
+                WORD *tb   = tg + npixels;
+                for (size_t i = 0; i < npixels; i++)
+                    tr[i] = tg[i] = tb[i] = mono[i];
+                cmsDoTransformLineStride(xform, tmp, tmp, fit->rx, fit->ry,
+                                         bytesperline, bytesperline,
+                                         bytesperplane, bytesperplane);
+                collapse_rgb_to_mono_word(tr, tg, tb, mono, npixels);
+            }
+            g_free(tmp);
+
+            /* Convert the tint to the new colorspace.  The tint encodes the
+             * colour direction of the layer in the source space; leaving it
+             * unchanged after an ICC conversion would produce the wrong hue
+             * (e.g. an sRGB-green tint rendered as Rec2020-green is far
+             * outside sRGB gamut and appears very wrong on a standard display).
+             *
+             * The relative-colorimetric transform can produce out-of-gamut
+             * values when the source-space tint sits outside the destination
+             * gamut (e.g. Rec2020 green (0,1,0) → sRGB ≈ (-0.59, 1.13, -0.10)).
+             * Those values break the SCREEN/blend math downstream — the
+             * (1 - source) factor inverts sign and the composite picks up a
+             * cyan/teal cast instead of the green the user expects.  Clamp
+             * into [0, 1]: a no-op for in-gamut tints, and for out-of-gamut
+             * tints it lands on the same primary the monitor would have
+             * displayed via the proofing transform anyway. */
+            if (lay->has_tint && xform_tint) {
+                float tint_in[3]  = { (float)lay->layer_tint.r,
+                                      (float)lay->layer_tint.g,
+                                      (float)lay->layer_tint.b };
+                float tint_out[3] = { 0.f, 0.f, 0.f };
+                cmsDoTransform(xform_tint, tint_in, tint_out, 1);
+                lay->layer_tint.r = (double)CLAMP(tint_out[0], 0.0f, 1.0f);
+                lay->layer_tint.g = (double)CLAMP(tint_out[1], 0.0f, 1.0f);
+                lay->layer_tint.b = (double)CLAMP(tint_out[2], 0.0f, 1.0f);
+            }
+        }
+    }
+
+    if (xform_float) cmsDeleteTransform(xform_float);
+    if (xform_word)  cmsDeleteTransform(xform_word);
+    if (xform_tint)  cmsDeleteTransform(xform_tint);
+
+    /* Profile bookkeeping is now on com.uniq, not per-layer.  The caller
+     * (icc_convert_to_hook) calls siril_colorspace_transform after this
+     * which lands the new profile via current_image_set_icc_profile. */
+}
+
+/* flis_update_layer_offset_after_crop:
+ *
+ * Must be called immediately after a crop operation has been applied to gfit
+ * (i.e. after the pixel data has been trimmed and gfit->rx/ry updated) when
+ * a FLIS image is loaded.
+ *
+ * @sel_x, @sel_y: top-left of the crop selection in canvas coordinates
+ *                 (i.e. com.selection.x and com.selection.y before the crop)
+ *
+ * §7 canvas decoupling: every layer is equivalent — no special case for the
+ * base.  Cropping a layer leaves the data sitting at the selection top-left
+ * in canvas coords; set position_x = sel_x, position_y = sel_y.  To shrink
+ * the canvas to a region, use the separate flis_canvas_crop operation.
+ */
+void flis_layer_offset_after_crop(gint *pos_x, gint *pos_y, gint sel_x, gint sel_y) {
+    if (!pos_x || !pos_y) return;
+    *pos_x = sel_x;
+    *pos_y = sel_y;
+}
+
+void flis_layer_offset_recentre(gint *pos_x, gint *pos_y,
+                                gint old_rx, gint old_ry,
+                                gint new_rx, gint new_ry) {
+    if (!pos_x || !pos_y) return;
+    *pos_x += (old_rx - new_rx) / 2;
+    *pos_y += (old_ry - new_ry) / 2;
+}
+
+void flis_update_layer_offset_after_crop(gint sel_x, gint sel_y) {
+    if (!is_current_image_flis() || !com.uniq || !com.uniq->layers) return;
+
+    flis_layer_t *active = flis_active_layer();
+    if (!active) return;
+
+    flis_layer_offset_after_crop(&active->position_x, &active->position_y,
+                                 sel_x, sel_y);
+
+    gui_iface.flis_invalidate_composite();
+    siril_debug_print("FLIS: layer offset updated after crop (sel %d,%d)\n",
+                      sel_x, sel_y);
+}
+
+/* flis_update_layer_offset_after_resize:
+ *
+ * Must be called immediately after a resize operation has been applied to gfit
+ * (i.e. after the pixel data has been scaled and gfit->rx/ry updated) when
+ * a FLIS image is loaded.
+ *
+ * @old_rx, @old_ry: layer dimensions before the resize
+ * @new_rx, @new_ry: layer dimensions after the resize
+ *
+ * §7: the layer's pixel data changes size but its centre on the canvas
+ * stays fixed.  position_x/y are adjusted by half the dimension delta so
+ * the centre is preserved.  Use flis_canvas_resize for canvas-scoped
+ * resizing.
+ */
+void flis_update_layer_offset_after_resize(gint old_rx, gint old_ry,
+                                           gint new_rx, gint new_ry) {
+    if (!is_current_image_flis() || !com.uniq || !com.uniq->layers) return;
+
+    flis_layer_t *active = flis_active_layer();
+    if (!active) return;
+
+    flis_layer_offset_recentre(&active->position_x, &active->position_y,
+                               old_rx, old_ry, new_rx, new_ry);
+
+    gui_iface.flis_invalidate_composite();
+    siril_debug_print("FLIS: layer offset updated after resize (%dx%d -> %dx%d)\n",
+                      old_rx, old_ry, new_rx, new_ry);
+}
+
+/* flis_update_layer_offset_after_rotate:
+ *
+ * Must be called immediately after a rotation operation has been applied to
+ * gfit (i.e. after the pixel data has been transformed and gfit->rx/ry
+ * updated) when a FLIS image is loaded.
+ *
+ * @old_rx, @old_ry: layer dimensions before the rotation
+ * @new_rx, @new_ry: layer dimensions after the rotation
+ * @angle:           rotation angle in degrees (positive = CCW in Siril convention)
+ *
+ * §7: the layer's pixel data is rotated but its centre on the canvas stays
+ * fixed.  position_x/y are adjusted by half the dimension delta so the
+ * centre is preserved.  @angle is unused for this per-layer helper (the
+ * pixel transform itself has already happened); it is retained in the
+ * signature so callers don't have to change.  Use flis_canvas_rotate for
+ * canvas-scoped rotation that re-anchors every layer.
+ */
+void flis_update_layer_offset_after_rotate(gint old_rx, gint old_ry,
+                                           gint new_rx, gint new_ry,
+                                           double angle) {
+    (void)angle;
+    if (!is_current_image_flis() || !com.uniq || !com.uniq->layers) return;
+
+    flis_layer_t *active = flis_active_layer();
+    if (!active) return;
+
+    flis_layer_offset_recentre(&active->position_x, &active->position_y,
+                               old_rx, old_ry, new_rx, new_ry);
+
+    gui_iface.flis_invalidate_composite();
+    siril_debug_print("FLIS: layer offset updated after rotate (%dx%d -> %dx%d)\n",
+                      old_rx, old_ry, new_rx, new_ry);
+}
+
+/* flis_update_all_layer_offsets_after_rotate:
+ *
+ * Group-rotation variant: rotates the centre of EVERY non-base layer around
+ * the old canvas centre and maps it onto the new canvas.  Used when an entire
+ * layer group (which may include the base layer) has been rotated, so the
+ * "active layer" reported by flis_active_layer() is the group node rather than
+ * any individual layer.
+ *
+ * Non-group members that are NOT in the rotated set also need their canvas
+ * positions updated here because the canvas itself has rotated.
+ */
+void flis_update_all_layer_offsets_after_rotate(gint old_rx, gint old_ry,
+                                                gint new_rx, gint new_ry,
+                                                double angle) {
+    if (!is_current_image_flis() || !com.uniq || !com.uniq->layers) return;
+    if (old_rx == new_rx && old_ry == new_ry && angle == 0.0) return;
+
+    double rad   = angle * M_PI / 180.0;
+    double cos_a = cos(rad);
+    double sin_a = sin(rad);
+    double ocx   = old_rx / 2.0;
+    double ocy   = old_ry / 2.0;
+
+    for (GSList *l = com.uniq->layers->next; l; l = l->next) {
+        flis_layer_t *lay = (flis_layer_t *)l->data;
+        if (!lay || !lay->fit) continue;
+        double cx  = lay->position_x + lay->fit->rx / 2.0;
+        double cy  = lay->position_y + lay->fit->ry / 2.0;
+        double dx  = cx - ocx;
+        double dy  = cy - ocy;
+        double new_cx = new_rx / 2.0 + dx * cos_a - dy * sin_a;
+        double new_cy = new_ry / 2.0 + dx * sin_a + dy * cos_a;
+        lay->position_x = (gint)round(new_cx - lay->fit->rx / 2.0);
+        lay->position_y = (gint)round(new_cy - lay->fit->ry / 2.0);
+    }
+    gui_iface.flis_invalidate_composite();
+    siril_debug_print("FLIS: all layer offsets updated after group rotate (%.2f deg, %dx%d -> %dx%d)\n",
+                      angle, old_rx, old_ry, new_rx, new_ry);
+}
+
+/* §7: mirroring a layer about its own centre doesn't change the layer's
+ * canvas position, since the centre is invariant under reflection.  These
+ * helpers just invalidate the composite so the next redraw picks up the
+ * new pixel data; use flis_canvas_mirrorx / _mirrory for canvas-scoped
+ * mirroring that flips every layer's position too. */
+void flis_update_layer_offset_after_mirrorx(void) {
+    if (!is_current_image_flis() || !com.uniq) return;
+    gui_iface.flis_invalidate_composite();
+}
+
+void flis_update_layer_offset_after_mirrory(void) {
+    if (!is_current_image_flis() || !com.uniq) return;
+    gui_iface.flis_invalidate_composite();
+}
+
+/* =====================================================================
+ * §7 canvas-scoped operations.
+ *
+ * Each updates com.uniq->canvas_w/h AND every layer's position_x/y
+ * (layer pixel data is not touched).  Composite invalidated; layers
+ * touched-modified for save bookkeeping.
+ * ===================================================================== */
+
+/* Internal canvas-resize primitive.  @record gates the NDE capture so that
+ * flis_canvas_fit_to_layers (which calls this internally) does not
+ * double-record — it captures its own canvas.fit record instead
+ * (sketch §13.2 canvas double-record resolution). */
+static int flis_canvas_resize_impl(guint new_w, guint new_h, gint dx, gint dy,
+                                   gboolean record) {
+    if (!is_current_image_flis() || !com.uniq) return 1;
+    if (new_w == 0 || new_h == 0) {
+        siril_log_error(_("FLIS: canvas dimensions must be positive (got %ux%u)\n"),
+                        new_w, new_h);
+        return 1;
+    }
+    com.uniq->canvas_w = new_w;
+    com.uniq->canvas_h = new_h;
+    if (dx != 0 || dy != 0) {
+        for (GSList *l = com.uniq->layers; l; l = l->next) {
+            flis_layer_t *lay = (flis_layer_t *)l->data;
+            if (!lay) continue;
+            lay->position_x += dx;
+            lay->position_y += dy;
+            flis_layer_touch_modified(lay);
+        }
+    }
+    gui_iface.flis_invalidate_composite();
+    siril_debug_print("FLIS: canvas resized to %ux%u (layer shift %d,%d)\n",
+                      new_w, new_h, dx, dy);
+
+    /* NDE provenance (sketch §13.2): canvas geometry change (no undo entry,
+     * uncoupled record). */
+    if (record) {
+        GString *kv = nde_kv_start();
+        nde_kv_add_int(kv, "w", new_w);
+        nde_kv_add_int(kv, "h", new_h);
+        nde_kv_add_int(kv, "dx", dx);
+        nde_kv_add_int(kv, "dy", dy);
+        nde_capture_structural("canvas.resize", NDE_SCOPE_CANVAS, -1,
+                               nde_kv_end(kv), _("Resize canvas"));
+    }
+    return 0;
+}
+
+int flis_canvas_resize(guint new_w, guint new_h, gint dx, gint dy) {
+    if (nde_edit_at_refuses_op(_("Resizing the canvas"))) return 1;
+    return flis_canvas_resize_impl(new_w, new_h, dx, dy, TRUE);
+}
+
+int flis_canvas_fit_to_layers(gboolean include_invisible) {
+    if (nde_edit_at_refuses_op(_("Fitting the canvas to the layers"))) return 1;
+    if (!is_current_image_flis() || !com.uniq || !com.uniq->layers) return 1;
+
+    gboolean any = FALSE;
+    gint min_x = 0, min_y = 0, max_x = 0, max_y = 0;
+    for (GSList *l = com.uniq->layers; l; l = l->next) {
+        flis_layer_t *lay = (flis_layer_t *)l->data;
+        if (!lay || !lay->fit) continue;
+        if (!include_invisible && !lay->visible) continue;
+        gint x0 = lay->position_x;
+        gint y0 = lay->position_y;
+        gint x1 = x0 + (gint)lay->fit->rx;
+        gint y1 = y0 + (gint)lay->fit->ry;
+        if (!any) {
+            min_x = x0; min_y = y0; max_x = x1; max_y = y1; any = TRUE;
+        } else {
+            if (x0 < min_x) min_x = x0;
+            if (y0 < min_y) min_y = y0;
+            if (x1 > max_x) max_x = x1;
+            if (y1 > max_y) max_y = y1;
+        }
+    }
+    if (!any) {
+        siril_log_warning(_("FLIS: canvas_fit_to_layers — no eligible layers\n"));
+        return 1;
+    }
+    gint new_w = max_x - min_x;
+    gint new_h = max_y - min_y;
+    if (new_w <= 0 || new_h <= 0) {
+        siril_log_warning(_("FLIS: canvas_fit_to_layers — empty bounding box\n"));
+        return 1;
+    }
+    /* Shift every layer so the bbox sits at the new canvas origin.  Suppress
+     * the resize's own record (record=FALSE) and emit a single canvas.fit
+     * record instead, so a fit does not double-record (sketch §13.2). */
+    int rv = flis_canvas_resize_impl((guint)new_w, (guint)new_h,
+                                     -min_x, -min_y, FALSE);
+    if (rv == 0) {
+        GString *kv = nde_kv_start();
+        nde_kv_add_int(kv, "w", new_w);
+        nde_kv_add_int(kv, "h", new_h);
+        nde_capture_structural("canvas.fit", NDE_SCOPE_CANVAS, -1,
+                               nde_kv_end(kv), _("Fit canvas to layers"));
+    }
+    return rv;
+}
+
+int flis_canvas_rotate(double angle) {
+    if (nde_edit_at_refuses_op(_("Rotating the canvas"))) return 1;
+    if (!is_current_image_flis() || !com.uniq || !com.uniq->layers) return 1;
+    if (com.uniq->canvas_w == 0 || com.uniq->canvas_h == 0) return 1;
+
+    const gint old_w = (gint)com.uniq->canvas_w;
+    const gint old_h = (gint)com.uniq->canvas_h;
+    const double rad   = angle * M_PI / 180.0;
+    const double cos_a = cos(rad);
+    const double sin_a = sin(rad);
+
+    /* New canvas dims = bounding box of the rotated old canvas. */
+    const double abs_cos = fabs(cos_a);
+    const double abs_sin = fabs(sin_a);
+    const gint new_w = (gint)round(old_w * abs_cos + old_h * abs_sin);
+    const gint new_h = (gint)round(old_w * abs_sin + old_h * abs_cos);
+    if (new_w <= 0 || new_h <= 0) return 1;
+
+    const double ocx = old_w / 2.0;
+    const double ocy = old_h / 2.0;
+    const double ncx = new_w / 2.0;
+    const double ncy = new_h / 2.0;
+
+    for (GSList *l = com.uniq->layers; l; l = l->next) {
+        flis_layer_t *lay = (flis_layer_t *)l->data;
+        if (!lay || !lay->fit) continue;
+        double cx = lay->position_x + lay->fit->rx / 2.0;
+        double cy = lay->position_y + lay->fit->ry / 2.0;
+        double dx = cx - ocx;
+        double dy = cy - ocy;
+        double new_cx = ncx + dx * cos_a - dy * sin_a;
+        double new_cy = ncy + dx * sin_a + dy * cos_a;
+        lay->position_x = (gint)round(new_cx - lay->fit->rx / 2.0);
+        lay->position_y = (gint)round(new_cy - lay->fit->ry / 2.0);
+        flis_layer_touch_modified(lay);
+    }
+    com.uniq->canvas_w = (guint)new_w;
+    com.uniq->canvas_h = (guint)new_h;
+    gui_iface.flis_invalidate_composite();
+    siril_debug_print("FLIS: canvas rotated %.2f° (%dx%d -> %dx%d)\n",
+                      angle, old_w, old_h, new_w, new_h);
+    return 0;
+}
+
+static int flis_canvas_mirror_axis(gboolean vertical, gboolean horizontal) {
+    if (nde_edit_at_refuses_op(_("Mirroring the canvas"))) return 1;
+    if (!is_current_image_flis() || !com.uniq || !com.uniq->layers) return 1;
+    if (com.uniq->canvas_w == 0 || com.uniq->canvas_h == 0) return 1;
+    const gint cw = (gint)com.uniq->canvas_w;
+    const gint ch = (gint)com.uniq->canvas_h;
+    for (GSList *l = com.uniq->layers; l; l = l->next) {
+        flis_layer_t *lay = (flis_layer_t *)l->data;
+        if (!lay || !lay->fit) continue;
+        if (vertical)
+            lay->position_y = ch - lay->position_y - (gint)lay->fit->ry;
+        if (horizontal)
+            lay->position_x = cw - lay->position_x - (gint)lay->fit->rx;
+        flis_layer_touch_modified(lay);
+    }
+    gui_iface.flis_invalidate_composite();
+    return 0;
+}
+
+int flis_canvas_mirrorx(void) { return flis_canvas_mirror_axis(TRUE, FALSE); }
+int flis_canvas_mirrory(void) { return flis_canvas_mirror_axis(FALSE, TRUE); }
+
+guint flis_canvas_rx(void) {
+    if (!is_current_image_flis() || !com.uniq) return gfit ? gfit->rx : 0;
+    if (com.uniq->canvas_w) return com.uniq->canvas_w;
+    /* Fallback for an in-flight FLIS where the canvas hasn't been
+     * initialised yet (mid-promote / mid-load).  Prefer base dims. */
+    if (com.uniq->layers) {
+        flis_layer_t *base = (flis_layer_t *)com.uniq->layers->data;
+        if (base && base->fit) return (guint)base->fit->rx;
+    }
+    return gfit ? gfit->rx : 0;
+}
+
+guint flis_canvas_ry(void) {
+    if (!is_current_image_flis() || !com.uniq) return gfit ? gfit->ry : 0;
+    if (com.uniq->canvas_h) return com.uniq->canvas_h;
+    if (com.uniq->layers) {
+        flis_layer_t *base = (flis_layer_t *)com.uniq->layers->data;
+        if (base && base->fit) return (guint)base->fit->ry;
+    }
+    return gfit ? gfit->ry : 0;
+}
+
+gboolean flis_canvas_to_pixel_index(gint cx, gint cy_disp, guint canvas_ry,
+                                    size_t *out_idx) {
+    (void)canvas_ry;  /* unused — kept for API stability */
+    gint pos_x = 0, pos_y = 0;
+
+    /* §7: every layer (including the base) sits at its own position_x/y
+     * on the canvas.  No special-case for the base layer. */
+    if (is_current_image_flis() && com.uniq && com.uniq->layers) {
+        flis_layer_t *active = flis_active_layer();
+        if (active) {
+            pos_x = active->position_x;
+            pos_y = active->position_y;
+        }
+    }
+
+    gint layer_rx = (gint)gfit->rx;
+    gint layer_ry = (gint)gfit->ry;
+
+    /* Coordinate convention (matches flis_compose.c, the display oracle):
+     * a layer with position_y / lh occupies display top-down rows
+     * [position_y, position_y + lh).  Within that range:
+     *
+     *   local_display_y = cy_disp - position_y       (0 = layer's top edge)
+     *   local_fits_y    = lh - 1 - local_display_y   (flip to FITS bottom-up
+     *                                                  within the layer)
+     *
+     * For the base layer (position_y == 0, lh == canvas_ry) this degenerates
+     * to the standard `canvas_ry - 1 - cy_disp` formula.
+     *
+     * Earlier versions of this function treated position_y as FITS bottom-up
+     * (matching the FLIS spec comment) but that disagreed with the compose
+     * kernel and would have returned the wrong layer pixel for any sparse
+     * upper layer.  The compose's interpretation wins because that's what
+     * the user sees on screen. */
+    gint local_x        = cx - pos_x;
+    gint local_disp_y   = cy_disp - pos_y;
+    gint local_fits_y   = layer_ry - 1 - local_disp_y;
+
+    if (local_x < 0 || local_x >= layer_rx ||
+        local_disp_y < 0 || local_disp_y >= layer_ry)
+        return FALSE;
+
+    *out_idx = (size_t)layer_rx * local_fits_y + local_x;
+    return TRUE;
+}
+
+int flis_promote_from_gfit(const gchar *name) {
+    if (!com.uniq) {
+        siril_log_message(_("FLIS: flis_promote_from_gfit — no image loaded\n"));
+        return 1;
+    }
+    if (is_current_image_flis()) {
+        siril_log_message(_("FLIS: flis_promote_from_gfit — image is already a FLIS\n"));
+        return 1;
+    }
+    if (!gfit || (!gfit->fdata && !gfit->data)) {
+        siril_log_message(_("FLIS: flis_promote_from_gfit — gfit has no pixel data\n"));
+        return 1;
+    }
+
+    /* Seed the item ID counter.  calloc in create_uniq_from_gfit() leaves
+     * it at 0; FLIS item IDs must be >= 1. */
+    com.uniq->next_item_id = 1;
+
+    /* Wrap gfit as the base layer.  Ownership of the fits* transfers to
+     * the layer; flis_layer_free() will clearfits()+free() it.
+     * The caller must ensure gfit is heap-allocated. */
+    flis_layer_t *base = flis_layer_new(gfit, name ? name : _("Background"));
+    if (!base) return 1;
+
+    base->item_id     = com.uniq->next_item_id++;
+    base->layer_order = FLIS_ORDER_STEP;   /* first slot: 10 */
+    base->created     = flis_now_iso8601();
+    base->modified    = g_strdup(base->created);
+
+    com.uniq->layers = g_slist_prepend(NULL, base);
+    uniq_set_active_layer(com.uniq, 0);
+
+    /* §7: canvas dimensions = the promoted fits's dims; bg = black.  Every
+     * subsequent layer is positioned on this canvas. */
+    com.uniq->canvas_w    = (guint)gfit->rx;
+    com.uniq->canvas_h    = (guint)gfit->ry;
+    com.uniq->canvas_bg_r = 0.0;
+    com.uniq->canvas_bg_g = 0.0;
+    com.uniq->canvas_bg_b = 0.0;
+
+    /* The whole plain-image history now describes the base layer: rebind
+     * records, baselines and barrier checkpoints from the plain-image item
+     * (-1) onto the new layer so the chain stays ONE editable lineage
+     * across the promote instead of splitting at the save point.  Cached
+     * pool states for the old item are dropped (cache only). */
+    nde_history_rebind_item(NDE_ITEM_IMAGE, base->item_id);
+    nde_checkpoint_rebind_item(NDE_ITEM_IMAGE, base->item_id);
+    nde_snapstore_invalidate_from(NDE_ITEM_IMAGE, 0);
+    /* Same move for the processing mask: gfit's mask travelled into the base
+     * layer with its pixels, so the records describing how it was built now
+     * belong to that layer's mask item.  Allocating the id here is the first
+     * use, which is what makes the rebind land somewhere real. */
+    if (base->fit && base->fit->mask) {
+        gint pmask = flis_layer_pmask_id(base);
+        nde_history_rebind_item(NDE_ITEM_PLAIN_MASK, pmask);
+        nde_checkpoint_rebind_item(NDE_ITEM_PLAIN_MASK, pmask);
+        nde_snapstore_invalidate_from(NDE_ITEM_PLAIN_MASK, 0);
+    }
+
+    /* com.uniq->filename and fileexist are already correct from
+     * create_uniq_from_gfit().  Mark the composite dirty. */
+    gui_iface.flis_invalidate_composite();
+
+    siril_debug_print("FLIS: promoted loaded image to single-layer FLIS\n");
+    return 0;
+}
+
+flis_layer_t *flis_layer_get_by_id(gint item_id) {
+    if (!com.uniq) return NULL;
+    for (GSList *l = com.uniq->layers; l; l = l->next) {
+        flis_layer_t *lay = (flis_layer_t *)l->data;
+        if (lay->item_id == item_id)
+            return lay;
+    }
+    return NULL;
+}
+
+/* Lazy allocation of a mask's item id.  @slot is the layer field to fill;
+ * @present says whether that mask actually exists right now — an absent mask
+ * is not an item, and asking for its id must not burn a number. */
+static gint mask_item_id(flis_layer_t *layer, gint *slot, gboolean present) {
+    if (!layer || !com.uniq)
+        return 0;
+    if (!present) {
+        *slot = 0;          /* the slot emptied since the id was handed out */
+        return 0;
+    }
+    if (*slot <= 0)
+        *slot = com.uniq->next_item_id++;
+    return *slot;
+}
+
+gint flis_layer_lmask_id(flis_layer_t *layer) {
+    return layer ? mask_item_id(layer, &layer->lmask_item_id,
+                                layer->lmask != NULL) : 0;
+}
+
+gint flis_layer_pmask_id(flis_layer_t *layer) {
+    return layer ? mask_item_id(layer, &layer->pmask_item_id,
+                                layer->fit && layer->fit->mask) : 0;
+}
+
+flis_item_kind flis_item_lookup(gint item_id, flis_layer_t **owner_out) {
+    if (owner_out)
+        *owner_out = NULL;
+    if (!com.uniq || item_id <= 0)
+        return FLIS_ITEM_NONE;
+    for (GSList *l = com.uniq->layers; l; l = l->next) {
+        flis_layer_t *lay = (flis_layer_t *)l->data;
+        if (lay->item_id == item_id) {
+            if (owner_out) *owner_out = lay;
+            return FLIS_ITEM_LAYER;
+        }
+        if (lay->lmask && lay->lmask_item_id == item_id) {
+            if (owner_out) *owner_out = lay;
+            return FLIS_ITEM_LMASK;
+        }
+        if (lay->fit && lay->fit->mask && lay->pmask_item_id == item_id) {
+            if (owner_out) *owner_out = lay;
+            return FLIS_ITEM_MASK;
+        }
+    }
+    for (GSList *g = com.uniq->groups; g; g = g->next) {
+        flis_group_t *grp = (flis_group_t *)g->data;
+        if (grp->item_id == item_id)
+            return FLIS_ITEM_GROUP;
+    }
+    return FLIS_ITEM_NONE;
+}
+
+flis_layer_t *flis_layer_get_by_name(const gchar *name) {
+    if (!com.uniq || !name) return NULL;
+    for (GSList *l = com.uniq->layers; l; l = l->next) {
+        flis_layer_t *lay = (flis_layer_t *)l->data;
+        if (lay->layer_name && !g_strcmp0(lay->layer_name, name))
+            return lay;
+    }
+    return NULL;
+}
+
+gint flis_layer_get_index(const flis_layer_t *layer) {
+    if (!com.uniq || !layer) return -1;
+    gint i = 0;
+    for (GSList *l = com.uniq->layers; l; l = l->next, i++) {
+        if ((flis_layer_t *)l->data == layer)
+            return i;
+    }
+    return -1;
+}
+
+flis_layer_t *flis_layer_get_by_fit(const fits *fit) {
+    if (!com.uniq || !com.uniq->layers || !fit) return NULL;
+    for (GSList *l = com.uniq->layers; l; l = l->next) {
+        flis_layer_t *lay = (flis_layer_t *)l->data;
+        if (lay && lay->fit == fit) return lay;
+    }
+    return NULL;
+}
+
+gint flis_layer_count(void) {
+    if (!com.uniq) return 0;
+    return (gint)g_slist_length(com.uniq->layers);
+}
+
+/* ===================================================================== */
+/* Group management                                                      */
+/* ===================================================================== */
+
+flis_group_t *flis_group_new(const gchar *name) {
+    flis_group_t *grp = g_new0(flis_group_t, 1);
+    if (!grp) { PRINT_ALLOC_ERR; return NULL; }
+    grp->name       = g_strdup(name ? name : _("Group"));
+    grp->visible    = TRUE;
+    grp->opacity    = 1.0f;
+    grp->blend_mode = FLIS_BLEND_PASS_THROUGH;
+    grp->collapsed  = FALSE;
+    return grp;
+}
+
+void flis_group_free(flis_group_t *group) {
+    if (!group) return;
+    g_free(group->name);
+    g_free(group->created);
+    g_free(group->modified);
+    g_free(group->unknown_metadata);
+    g_free(group);
+}
+
+void flis_free_groups(single *uniq) {
+    if (!uniq || !uniq->groups) return;
+    for (GSList *g = uniq->groups; g; g = g->next)
+        flis_group_free((flis_group_t *)g->data);
+    g_slist_free(uniq->groups);
+    uniq->groups = NULL;
+}
+
+flis_group_t *flis_group_add(const gchar *name) {
+    if (!com.uniq) return NULL;
+    flis_group_t *grp = flis_group_new(name);
+    if (!grp) return NULL;
+    grp->item_id  = com.uniq->next_item_id++;
+    grp->created  = flis_now_iso8601();
+    grp->modified = g_strdup(grp->created);
+    com.uniq->groups = g_slist_append(com.uniq->groups, grp);
+    siril_log_message(_("FLIS: created group '%s' (id=%d)\n"),
+                      grp->name, grp->item_id);
+    return grp;
+}
+
+int flis_group_remove(flis_group_t *group) {
+    if (!com.uniq || !group) return 1;
+    /* Unassign all member layers */
+    for (GSList *l = com.uniq->layers; l; l = l->next) {
+        flis_layer_t *lay = (flis_layer_t *)l->data;
+        if (lay && lay->group_id == group->item_id)
+            lay->group_id = 0;
+    }
+    com.uniq->groups = g_slist_remove(com.uniq->groups, group);
+    siril_log_message(_("FLIS: removed group '%s' (layers unassigned)\n"),
+                      group->name ? group->name : "?");
+    flis_group_free(group);
+    return 0;
+}
+
+int flis_group_delete_with_layers(flis_group_t *group) {
+    if (!com.uniq || !group) return 1;
+    /* Collect members first (flis_layer_remove modifies the list) */
+    GSList *members = flis_group_get_layers(group);
+    int err = 0;
+    for (GSList *m = members; m; m = m->next) {
+        flis_layer_t *lay = (flis_layer_t *)m->data;
+        lay->group_id = 0;  /* unassign before removal so flis_layer_remove works */
+        if (flis_layer_count() > 1) {
+            flis_undo_purge_layer(lay->item_id);
+            if (flis_layer_remove(lay)) err = 1;
+        } else {
+            siril_log_warning(
+                _("FLIS: cannot delete last layer — keeping it\n"));
+            err = 1;
+        }
+    }
+    g_slist_free(members);
+    /* Remove the group itself */
+    com.uniq->groups = g_slist_remove(com.uniq->groups, group);
+    flis_group_free(group);
+    return err;
+}
+
+flis_group_t *flis_group_get_by_id(gint item_id) {
+    if (!com.uniq || !com.uniq->groups) return NULL;
+    for (GSList *g = com.uniq->groups; g; g = g->next) {
+        flis_group_t *grp = (flis_group_t *)g->data;
+        if (grp && grp->item_id == item_id) return grp;
+    }
+    return NULL;
+}
+
+GSList *flis_group_get_layers(const flis_group_t *group) {
+    if (!com.uniq || !group) return NULL;
+    GSList *result = NULL;
+    for (GSList *l = com.uniq->layers; l; l = l->next) {
+        flis_layer_t *lay = (flis_layer_t *)l->data;
+        if (lay && lay->group_id == group->item_id)
+            result = g_slist_insert_sorted(result, lay,
+                                           (GCompareFunc)layer_order_cmp);
+    }
+    return result;
+}
+
+gint flis_group_count(void) {
+    if (!com.uniq) return 0;
+    return (gint)g_slist_length(com.uniq->groups);
+}
+
+int flis_layer_set_group(flis_layer_t *layer, gint group_id) {
+    if (!layer) return 1;
+    layer->group_id = group_id;
+    flis_layer_touch_modified(layer);
+    return 0;
+}
+
+int flis_group_set_name(flis_group_t *group, const gchar *name) {
+    if (!group) return 1;
+    g_free(group->name);
+    group->name = g_strdup(name ? name : "");
+    flis_group_touch_modified(group);
+    return 0;
+}
+
+int flis_group_set_visible(flis_group_t *group, gboolean visible) {
+    if (!group) return 1;
+    group->visible = visible;
+    flis_group_touch_modified(group);
+    return 0;
+}
+
+int flis_group_set_opacity(flis_group_t *group, gfloat opacity) {
+    if (!group) return 1;
+    group->opacity = CLAMP(opacity, 0.0f, 1.0f);
+    flis_group_touch_modified(group);
+    return 0;
+}
+
+int flis_group_set_blend_mode(flis_group_t *group, flis_blend_mode_t mode) {
+    if (!group) return 1;
+    group->blend_mode = mode;
+    flis_group_touch_modified(group);
+    return 0;
+}
+
+void flis_group_touch_modified(flis_group_t *group) {
+    if (!group) return;
+    g_free(group->modified);
+    group->modified = flis_now_iso8601();
+}
+
+gboolean is_current_image_flis(void) {
+    /* A FLIS file is loaded when com.uniq->layers is non-NULL.
+     * This list is populated exclusively by load_flis() and cleared by
+     * flis_free_layers().  A regular FITS image loaded via readfits()
+     * never touches com.uniq->layers, so this test is unambiguous.
+     * Layer count is intentionally not checked: a single-layer FLIS is
+     * still a FLIS and must go through the composite path. */
+    return com.uniq != NULL && com.uniq->layers != NULL;
+}
+
+/* ===================================================================== */
+/* Timestamp                                                             */
+/* ===================================================================== */
+
+void flis_layer_touch_modified(flis_layer_t *layer) {
+    g_free(layer->modified);
+    layer->modified = flis_now_iso8601();
+}
+
+/* ===================================================================== */
+/* Stack management                                                      */
+/* ===================================================================== */
+
+flis_layer_t *flis_layer_add(fits *fit, const gchar *name) {
+    if (!com.uniq) {
+        siril_log_message(_("FLIS: flis_layer_add — com.uniq is NULL\n"));
+        return NULL;
+    }
+
+    flis_layer_t *layer = flis_layer_new(fit, name);
+    if (!layer) return NULL;
+
+    layer->item_id     = com.uniq->next_item_id++;
+    layer->layer_order = flis_max_layer_order() + FLIS_ORDER_STEP;
+    layer->created     = flis_now_iso8601();
+    layer->modified    = g_strdup(layer->created);
+
+    /* g_slist_insert_sorted keeps the list sorted by layer_order */
+    com.uniq->layers = g_slist_insert_sorted(com.uniq->layers, layer,
+                                              (GCompareFunc)layer_order_cmp);
+
+    /* Per-fits ICC fields removed.  A new non-base layer's pixels are
+     * assumed to already be in the FLIS's colour space (the on-disk
+     * profile, if any, was discarded by the load helper since fit !=
+     * gfit).  Colour-space conversion at flis_layer_add time is no
+     * longer supported — convert before calling, or use Convert from
+     * the Image → Color Management dialog after adding. */
+
+    /* Activate the newly added layer */
+    gint idx = flis_layer_get_index(layer);
+    uniq_set_active_layer(com.uniq, idx);
+
+    siril_log_message(_("FLIS: added layer '%s' (id=%d, order=%d)\n"),
+                      layer->layer_name, layer->item_id, layer->layer_order);
+    return layer;
+}
+
+/* -----------------------------------------------------------------------
+ * flis_addlayer_hook — shared by the panel's Add Layer toolbar handler
+ * and the flis_addlayer command (§4.3 parity contract).  Reads the FITS
+ * file named in args->user, derives the layer name from the basename if
+ * one wasn't supplied, transfers ownership to flis_layer_add.  Returns
+ * 0 on success, non-zero on failure (file read / alloc / flis_layer_add).
+ * ----------------------------------------------------------------------- */
+
+void flis_addlayer_args_free(gpointer p) {
+    struct flis_addlayer_args *a = p;
+    if (!a) return;
+    g_free(a->filename);
+    g_free(a->name);
+    g_free(a);
+}
+
+int flis_addlayer_hook(struct generic_layer_args *args) {
+    struct flis_addlayer_args *a = (struct flis_addlayer_args *)args->user;
+    if (!a || !a->filename || !*a->filename) {
+        siril_log_error(_("flis_addlayer: no filename\n"));
+        return 1;
+    }
+    fits *f = calloc(1, sizeof(fits));
+    if (!f) { PRINT_ALLOC_ERR; return 1; }
+    if (readfits(a->filename, f, NULL, com.pref.force_16bit ? FALSE : TRUE)) {
+        siril_log_error(_("flis_addlayer: could not read '%s'\n"), a->filename);
+        free(f);
+        return 1;
+    }
+    /* Adding a layer to a plain FITS can only mean one thing, so do it rather
+     * than refuse: the image becomes the base layer and the new one lands on
+     * top.  On the worker, where the stack writer lock is already held — and
+     * after the read, so a filename that turns out to be unreadable leaves a
+     * plain image plain rather than promoting it for nothing. */
+    if (!is_current_image_flis() && flis_promote_from_gfit(NULL)) {
+        siril_log_error(_("flis_addlayer: could not make this image a layered document\n"));
+        clearfits(f);
+        free(f);
+        return 1;
+    }
+    gchar *name = a->name;
+    gchar *derived = NULL;
+    if (!name || !*name) {
+        gchar *base = g_path_get_basename(a->filename);
+        gchar *dot  = base ? strrchr(base, '.') : NULL;
+        if (dot) *dot = '\0';
+        derived = base;
+        name = derived;
+    }
+    flis_layer_t *added = flis_layer_add(f, name);
+    g_free(derived);
+    if (!added) {
+        /* flis_layer_add already logged the failure; clear the fits we
+         * tried to transfer ownership of. */
+        clearfits(f);
+        free(f);
+        return 1;
+    }
+    /* args->invalidate_item_id lets end_generic_layer route the cache
+     * invalidation precisely.  Even though we used FLIS_INV_ALL here
+     * (stack changed), capturing the id lets the panel select the new
+     * layer after refresh, which is the natural UX. */
+    args->invalidate_item_id = added->item_id;
+
+    /* NDE provenance (sketch §13.2): this backend funnel is reached only
+     * from user intent — the panel Add-Layer handler and the flis_addlayer
+     * command both route here; load and the flis_test_add_layer fixture use
+     * the lower-level flis_layer_add primitive instead — so capture here.
+     * No undo entry is saved for add, so the record is uncoupled. */
+    GString *kv = nde_kv_start();
+    nde_kv_add_str(kv, "name", added->layer_name ? added->layer_name : "");
+    gchar *base = g_path_get_basename(a->filename);
+    nde_kv_add_str(kv, "src", base ? base : "");
+    g_free(base);
+    nde_capture_structural("layer.add", NDE_SCOPE_DOCUMENT, added->item_id,
+                           nde_kv_end(kv), _("Add layer"));
+    /* NDE baseline (phase 2): a new layer's baseline is its pixels at add. */
+    if (added->fit)
+        nde_checkpoint_baseline_ensure(added->fit, added->item_id);
+    return 0;
+}
+
+/* -----------------------------------------------------------------------
+ * Shared helper: build a layermask_t from a standalone FITS file.
+ *
+ * The file is read via readfits (handles all the format conversions).
+ * The first channel is downsampled / converted into the requested
+ * @bitpix (8 or 32).  Caller takes ownership of the returned struct.
+ * Returns NULL on read failure or bad bitpix.
+ *
+ * For bitpix=8: pixel→byte via (WORD >> 8) or (float * 255).
+ * For bitpix=32: pixel→float in [0,1].
+ * ----------------------------------------------------------------------- */
+static layermask_t *flis_layermask_from_fits_file(const char *path, int bitpix) {
+    if (bitpix != 8 && bitpix != 32) return NULL;
+    fits *f = calloc(1, sizeof(fits));
+    if (!f) { PRINT_ALLOC_ERR; return NULL; }
+    if (readfits(path, f, NULL, TRUE)) {
+        siril_log_error(_("flis: could not read mask file '%s'\n"), path);
+        free(f);
+        return NULL;
+    }
+    const size_t w = (size_t)f->rx;
+    const size_t h = (size_t)f->ry;
+    const size_t n = w * h;
+    layermask_t *m = calloc(1, sizeof(layermask_t));
+    if (!m) { PRINT_ALLOC_ERR; clearfits(f); free(f); return NULL; }
+    m->w = w; m->h = h; m->bitpix = (guint8)bitpix;
+    m->data = malloc(n * (bitpix / 8));
+    if (!m->data) { PRINT_ALLOC_ERR; free(m); clearfits(f); free(f); return NULL; }
+
+    const gboolean is_float = (f->type == DATA_FLOAT);
+    if (bitpix == 8) {
+        uint8_t *out = m->data;
+        if (is_float) {
+            const float *src = f->fpdata[0];
+            for (size_t i = 0; i < n; i++) {
+                float v = src[i] * 255.f;
+                out[i] = (uint8_t)(v < 0.f ? 0 : v > 255.f ? 255 : (int)v);
+            }
+        } else {
+            const WORD *src = f->pdata[0];
+            for (size_t i = 0; i < n; i++) out[i] = (uint8_t)(src[i] >> 8);
+        }
+    } else {  /* bitpix == 32 */
+        float *out = m->data;
+        if (is_float) {
+            memcpy(out, f->fpdata[0], n * sizeof(float));
+        } else {
+            const WORD *src = f->pdata[0];
+            for (size_t i = 0; i < n; i++)
+                out[i] = (float)src[i] * INV_USHRT_MAX_SINGLE;
+        }
+    }
+    clearfits(f);
+    free(f);
+    return m;
+}
+
+/* -----------------------------------------------------------------------
+ * flis_setmask_hook / flis_clearmask_hook — shared by the panel's mask
+ * Add… / Remove… buttons and the matching flis_setmask / flis_clearmask
+ * commands.  The target layer's id is in args->invalidate_item_id;
+ * setmask additionally reads filename + bitpix from a flis_setmask_args
+ * payload in args->user.  Both wrap flis_layer_set_lmask /
+ * flis_layer_remove_lmask, which honour the layer-lock check.
+ * ----------------------------------------------------------------------- */
+
+void flis_setmask_args_free(gpointer p) {
+    struct flis_setmask_args *a = p;
+    if (!a) return;
+    g_free(a->filename);
+    g_free(a);
+}
+
+int flis_setmask_hook(struct generic_layer_args *args) {
+    struct flis_setmask_args *a = (struct flis_setmask_args *)args->user;
+    if (!a || !a->filename || !*a->filename) {
+        siril_log_error(_("flis_setmask: no mask filename\n"));
+        return 1;
+    }
+    flis_layer_t *lay = flis_layer_get_by_id(args->invalidate_item_id);
+    if (!lay) {
+        siril_log_error(_("flis_setmask: no layer with id %d\n"),
+                        args->invalidate_item_id);
+        return 1;
+    }
+    int bitpix = a->bitpix > 0 ? a->bitpix : 8;
+    if (bitpix != 8 && bitpix != 32) {
+        siril_log_error(_("flis_setmask: bitpix must be 8 or 32 (got %d)\n"), bitpix);
+        return 1;
+    }
+    layermask_t *m = flis_layermask_from_fits_file(a->filename, bitpix);
+    if (!m) return 1;
+    /* Reject if mask dimensions don't match the layer. */
+    if ((size_t)lay->fit->rx != m->w || (size_t)lay->fit->ry != m->h) {
+        siril_log_error(_("flis_setmask: mask size %zux%zu does not match layer "
+                          "'%s' size %ux%u\n"),
+                        m->w, m->h,
+                        lay->layer_name ? lay->layer_name : "?",
+                        lay->fit->rx, lay->fit->ry);
+        layermask_free(m);
+        return 1;
+    }
+    /* Pre-op undo: captures the current mask (or its absence) so the
+     * overwrite/add can be reverted.  No-op when scripted. */
+    undo_save_flis_lmask(lay, _("Set layer mask"));
+    /* flis_layer_set_lmask transfers ownership of the mask. */
+    if (flis_layer_set_lmask(lay, m)) {
+        layermask_free(m);
+        return 1;
+    }
+    siril_log_message(_("flis_setmask: layer '%s' mask loaded from '%s'\n"),
+                      lay->layer_name ? lay->layer_name : "?",
+                      a->filename);
+    return 0;
+}
+
+/* -----------------------------------------------------------------------
+ * flis_addgroup_hook / flis_setgroup_hook (§4.3 slice 3).  Shared by the
+ * panel's Create Group / Move-to-group entries and the matching
+ * flis_addgroup / flis_setgroup commands.  Both produce identical state
+ * changes via the existing flis_group_add / flis_layer_set_group
+ * primitives.
+ * ----------------------------------------------------------------------- */
+
+void flis_addgroup_args_free(gpointer p) {
+    struct flis_addgroup_args *a = p;
+    if (!a) return;
+    g_free(a->name);
+    g_free(a);
+}
+
+int flis_addgroup_hook(struct generic_layer_args *args) {
+    struct flis_addgroup_args *a = (struct flis_addgroup_args *)args->user;
+    /* If no name was supplied, pick "Group N" for the smallest N not
+     * currently in use.  Cheap O(N²) on group count which is tiny. */
+    gchar *auto_name = NULL;
+    const char *name = (a && a->name && *a->name) ? a->name : NULL;
+    if (!name) {
+        for (int n = 1; ; n++) {
+            auto_name = g_strdup_printf(_("Group %d"), n);
+            gboolean taken = FALSE;
+            for (GSList *g = com.uniq ? com.uniq->groups : NULL; g; g = g->next) {
+                flis_group_t *gg = (flis_group_t *)g->data;
+                if (gg && gg->name && !g_strcmp0(gg->name, auto_name)) {
+                    taken = TRUE; break;
+                }
+            }
+            if (!taken) break;
+            g_free(auto_name);
+        }
+        name = auto_name;
+    }
+    flis_group_t *grp = flis_group_add(name);
+    g_free(auto_name);
+    if (!grp) return 1;
+    args->invalidate_item_id = grp->item_id;   /* for downstream selection */
+    return 0;
+}
+
+void flis_setgroup_args_free(gpointer p) {
+    struct flis_setgroup_args *a = p;
+    if (!a) return;
+    if (a->extra_ids)
+        g_array_unref(a->extra_ids);
+    g_free(a);
+}
+
+int flis_setgroup_hook(struct generic_layer_args *args) {
+    struct flis_setgroup_args *a = (struct flis_setgroup_args *)args->user;
+    if (!a) return 1;
+    flis_layer_t *lay = flis_layer_get_by_id(args->invalidate_item_id);
+    if (!lay) {
+        siril_log_error(_("flis_setgroup: no layer with id %d\n"),
+                        args->invalidate_item_id);
+        return 1;
+    }
+    if (a->group_id != 0) {
+        flis_group_t *grp = flis_group_get_by_id(a->group_id);
+        if (!grp) {
+            siril_log_error(_("flis_setgroup: no group with id %d\n"), a->group_id);
+            return 1;
+        }
+    }
+    int rc = flis_layer_set_group(lay, a->group_id);
+    /* Multi-select: move the remaining layers in the same worker op (a
+     * dispatch per layer would trip start_in_new_thread's busy guard).
+     * Best-effort per layer — a locked or vanished member is reported
+     * and skipped rather than failing the batch halfway. */
+    if (a->extra_ids) {
+        for (guint i = 0; i < a->extra_ids->len; i++) {
+            gint id = g_array_index(a->extra_ids, gint, i);
+            flis_layer_t *l2 = flis_layer_get_by_id(id);
+            if (!l2) {
+                siril_log_warning(_("flis_setgroup: no layer with id %d — skipped\n"), id);
+                continue;
+            }
+            if (flis_layer_set_group(l2, a->group_id))
+                rc = 1;
+        }
+    }
+    return rc;
+}
+
+/* -----------------------------------------------------------------------
+ * flis_reorder_hook (§4.3 slice 4) — drag-to-reorder.  Moves the source
+ * layer to sit immediately above (or below) the target layer in the
+ * stack.  Avoids layer_order collisions by sweeping the target slot
+ * and bumping any layer already there one step up.  Re-sorts.
+ * ----------------------------------------------------------------------- */
+
+void flis_reorder_args_free(gpointer p) {
+    struct flis_reorder_args *a = p;
+    if (!a) return;
+    g_free(a);
+}
+
+int flis_reorder_hook(struct generic_layer_args *args) {
+    struct flis_reorder_args *a = (struct flis_reorder_args *)args->user;
+    if (!a) return 1;
+    flis_layer_t *src = flis_layer_get_by_id(args->invalidate_item_id);
+    flis_layer_t *tgt = flis_layer_get_by_id(a->target_id);
+    if (!src || !tgt) return 1;
+    if (src == tgt) return 0;            /* no-op */
+    if (flis_check_locked(src, "reorder layer")) return 1;
+
+    /* Compute the new layer_order: just above or just below target.
+     * To make room, bump any layer already sitting at that order
+     * (and any chain of consecutive layers from there) by 1 in the
+     * direction of growth. */
+    const gint new_order = a->place_above ? tgt->layer_order + 1
+                                          : tgt->layer_order - 1;
+    /* Detach src first so the bump pass doesn't include it. */
+    com.uniq->layers = g_slist_remove(com.uniq->layers, src);
+
+    /* Bump any layer whose layer_order collides.  Simple sweep: walk
+     * the sorted list and shift contiguous-order layers along. */
+    if (a->place_above) {
+        gint sweep = new_order;
+        for (GSList *l = com.uniq->layers; l; l = l->next) {
+            flis_layer_t *lay = (flis_layer_t *)l->data;
+            if (!lay) continue;
+            if (lay->layer_order < sweep) continue;
+            if (lay->layer_order > sweep) break;
+            lay->layer_order += 1;
+            sweep += 1;
+        }
+    } else {
+        gint sweep = new_order;
+        /* Walk in descending order: g_slist_sort + reverse, or just
+         * iterate twice.  Cheaper: traverse in forward order
+         * skipping anything above new_order, then handle the
+         * contiguous-descending chain backwards. */
+        GSList *rev = g_slist_copy(com.uniq->layers);
+        rev = g_slist_reverse(rev);
+        for (GSList *l = rev; l; l = l->next) {
+            flis_layer_t *lay = (flis_layer_t *)l->data;
+            if (!lay) continue;
+            if (lay->layer_order > sweep) continue;
+            if (lay->layer_order < sweep) break;
+            lay->layer_order -= 1;
+            sweep -= 1;
+        }
+        g_slist_free(rev);
+    }
+
+    src->layer_order = new_order;
+    /* Inherit the target's group membership.  Without this, dropping a
+     * layer into the middle of a group's row range leaves the source
+     * outside the group, producing a confusing interleaved visual
+     * (group rows + a non-group row mixed together).  Dropping a layer
+     * onto a row with group_id == 0 also clears the source's group_id,
+     * which is the expected "drag out of the group" semantics.
+     *
+     * Override: if force_ungroup is set the source is unconditionally
+     * removed from any group regardless of the target's group_id.
+     * Used by the panel's edge drop zones (drag to top/bottom of list)
+     * which are conceptually "place outside any group". */
+    src->group_id = a->force_ungroup ? 0 : tgt->group_id;
+    com.uniq->layers = g_slist_insert_sorted(com.uniq->layers, src,
+                                              (GCompareFunc)layer_order_cmp);
+    flis_layer_touch_modified(src);
+
+    /* NDE provenance (sketch §13.2): the drag-to-reorder path is DISTINCT
+     * from flis_layer_move_up/_down (verified: it computes new_order
+     * directly rather than calling those primitives), so it captures its own
+     * layer.reorder record with the resulting order.  No undo entry is saved
+     * on this path, so the record is uncoupled — consistent with the other
+     * add/remove/canvas structural ops. */
+    GString *kv = nde_kv_start();
+    nde_kv_add_int(kv, "to_order", src->layer_order);
+    nde_capture_structural("layer.reorder", NDE_SCOPE_DOCUMENT, src->item_id,
+                           nde_kv_end(kv), _("Reorder layer"));
+    return 0;
+}
+
+/* -----------------------------------------------------------------------
+ * flis_setposition_hook (§4.3 slice 6) — set a layer's position_x/y for
+ * sparse-layer placement.  Bypasses flis_check_locked because position
+ * is a display attribute, not pixel content (matches the existing
+ * panel convention for "drag layer in canvas" which the user may want
+ * to do even on a layer they've locked against pixel edits).
+ * ----------------------------------------------------------------------- */
+
+void flis_setposition_args_free(gpointer p) {
+    struct flis_setposition_args *a = p;
+    if (!a) return;
+    g_free(a);
+}
+
+int flis_setposition_hook(struct generic_layer_args *args) {
+    struct flis_setposition_args *a = (struct flis_setposition_args *)args->user;
+    if (!a) return 1;
+    flis_layer_t *lay = flis_layer_get_by_id(args->invalidate_item_id);
+    if (!lay) {
+        siril_log_error(_("flis_setposition: no layer with id %d\n"),
+                        args->invalidate_item_id);
+        return 1;
+    }
+    /* §7 canvas decoupling: every layer (including the base) carries its
+     * own position on the canvas — no special-case for the base. */
+    lay->position_x = a->x;
+    lay->position_y = a->y;
+    flis_layer_touch_modified(lay);
+    return 0;
+}
+
+/* -----------------------------------------------------------------------
+ * flis_exportlayer_hook (§4.3 slice 7) — write a layer's fits* to a
+ * standalone FITS file via savefits.  No mutation of the FLIS state.
+ * ----------------------------------------------------------------------- */
+
+void flis_exportlayer_args_free(gpointer p) {
+    struct flis_exportlayer_args *a = p;
+    if (!a) return;
+    g_free(a->filename);
+    g_free(a);
+}
+
+int flis_exportlayer_hook(struct generic_layer_args *args) {
+    struct flis_exportlayer_args *a = (struct flis_exportlayer_args *)args->user;
+    if (!a || !a->filename || !*a->filename) {
+        siril_log_error(_("flis_exportlayer: no filename\n"));
+        return 1;
+    }
+    flis_layer_t *lay = flis_layer_get_by_id(args->invalidate_item_id);
+    if (!lay || !lay->fit) {
+        siril_log_error(_("flis_exportlayer: no layer with id %d\n"),
+                        args->invalidate_item_id);
+        return 1;
+    }
+    if (savefits(a->filename, lay->fit)) {
+        siril_log_error(_("flis_exportlayer: could not write '%s'\n"), a->filename);
+        return 1;
+    }
+    siril_log_message(_("flis_exportlayer: layer '%s' written to '%s'\n"),
+                      lay->layer_name ? lay->layer_name : "?", a->filename);
+    return 0;
+}
+
+/* -----------------------------------------------------------------------
+ * flis_group_reorder_hook — move a group as a whole up or down in the
+ * stack.  Preserves the group's internal layer order.  No-op when the
+ * group is already at the requested edge of the stack.
+ *
+ * Approach: find the immediate "external" layer adjacent to the group
+ * in the requested direction (i.e. the layer with layer_order just
+ * above the group's highest member, or just below the group's lowest
+ * — that is NOT itself a group member).  Then swap that external
+ * layer's slot with the entire group block by shifting layer_order
+ * values.  Group cohesion is preserved because we only swap with one
+ * external layer at a time; group members move as a contiguous run.
+ * ----------------------------------------------------------------------- */
+
+void flis_group_reorder_args_free(gpointer p) {
+    struct flis_group_reorder_args *a = p;
+    if (!a) return;
+    g_free(a);
+}
+
+int flis_group_reorder_hook(struct generic_layer_args *args) {
+    struct flis_group_reorder_args *a = (struct flis_group_reorder_args *)args->user;
+    if (!a) return 1;
+    flis_group_t *grp = flis_group_get_by_id(args->invalidate_item_id);
+    if (!grp) return 1;
+    GSList *members = flis_group_get_layers(grp);  /* sorted ascending */
+    if (!members) return 1;
+
+    flis_layer_t *first_member = (flis_layer_t *)members->data;
+    flis_layer_t *last_member  = (flis_layer_t *)g_slist_last(members)->data;
+    g_slist_free(members);
+
+    /* Find the immediate external neighbour above (if up) or below
+     * (if down) the group's range.  com.uniq->layers is sorted
+     * ascending by layer_order. */
+    flis_layer_t *external = NULL;
+    for (GSList *l = com.uniq->layers; l; l = l->next) {
+        flis_layer_t *cand = (flis_layer_t *)l->data;
+        if (!cand || cand->group_id == grp->item_id) continue;
+        if (a->direction_up) {
+            /* Smallest layer_order > last_member's order */
+            if (cand->layer_order <= last_member->layer_order) continue;
+            if (!external || cand->layer_order < external->layer_order)
+                external = cand;
+        } else {
+            /* Largest layer_order < first_member's order */
+            if (cand->layer_order >= first_member->layer_order) continue;
+            if (!external || cand->layer_order > external->layer_order)
+                external = cand;
+        }
+    }
+    if (!external) return 0;   /* already at top/bottom edge, no-op success */
+
+    /* Swap the external layer with the entire group block via a slot-
+     * shift.  In the "up" case we want the external layer (currently
+     * above the group) to sit BELOW the group; the group shifts up by
+     * one position.  Implementation: swap external->layer_order with
+     * first_member->layer_order; the gap moves to where external used
+     * to be, then we slide every member up by 1 to fill it. */
+    if (a->direction_up) {
+        /* External sits at order E, just above group's last (order L).
+         * After: group occupies orders [old first + 1, old last + 1],
+         * external occupies old first.
+         * Implementation: external.order = first_member.order;
+         * each member.order += 1.  Then re-sort. */
+        gint new_external_order = first_member->layer_order;
+        GSList *ms = flis_group_get_layers(grp);
+        for (GSList *l = ms; l; l = l->next) {
+            flis_layer_t *m = (flis_layer_t *)l->data;
+            if (m) m->layer_order += 1;
+        }
+        g_slist_free(ms);
+        /* The external was at E (= last_member's old order + 1 at minimum,
+         * but could be higher if there was a gap).  We want external
+         * just below group's new bottom = first_member's new order = old_first+1.
+         * So external.order = old_first. */
+        external->layer_order = new_external_order;
+    } else {
+        /* External sits at order E, just below group's first (order F).
+         * After: group occupies [old first - 1, old last - 1], external
+         * sits at old last. */
+        gint new_external_order = last_member->layer_order;
+        GSList *ms = flis_group_get_layers(grp);
+        for (GSList *l = ms; l; l = l->next) {
+            flis_layer_t *m = (flis_layer_t *)l->data;
+            if (m) m->layer_order -= 1;
+        }
+        g_slist_free(ms);
+        external->layer_order = new_external_order;
+    }
+    com.uniq->layers = g_slist_sort(com.uniq->layers,
+                                     (GCompareFunc)layer_order_cmp);
+    flis_group_touch_modified(grp);
+    return 0;
+}
+
+/* flis_movemask_hook — move an lmask from source (invalidate_item_id)
+ * to target (payload->to_layer_id). */
+
+void flis_movemask_args_free(gpointer p) {
+    struct flis_movemask_args *a = p;
+    if (!a) return;
+    g_free(a);
+}
+
+int flis_movemask_hook(struct generic_layer_args *args) {
+    struct flis_movemask_args *a = (struct flis_movemask_args *)args->user;
+    if (!a) return 1;
+    flis_layer_t *from = flis_layer_get_by_id(args->invalidate_item_id);
+    flis_layer_t *to   = flis_layer_get_by_id(a->to_layer_id);
+    if (!from || !to) return 1;
+    if (from == to) return 0;     /* trivially no-op */
+    /* Pre-op undo (no-ops when scripted): the atomic move entry reverses
+     * the transfer.  When the destination already holds a mask — which
+     * the move destroys — a content entry is pushed first, so undo #1
+     * moves the mask back and undo #2 recovers the destination's old
+     * mask. */
+    if (to->lmask)
+        undo_save_flis_lmask(to, _("Move layer mask (destination mask)"));
+    undo_save_flis_lmask_move(from, to, _("Move layer mask"));
+    return flis_layer_move_lmask(from, to);
+}
+
+int flis_clearmask_hook(struct generic_layer_args *args) {
+    flis_layer_t *lay = flis_layer_get_by_id(args->invalidate_item_id);
+    if (!lay) {
+        siril_log_error(_("flis_clearmask: no layer with id %d\n"),
+                        args->invalidate_item_id);
+        return 1;
+    }
+    if (!lay->lmask) {
+        siril_log_message(_("flis_clearmask: layer '%s' has no mask\n"),
+                          lay->layer_name ? lay->layer_name : "?");
+        return 0;
+    }
+    /* Pre-op undo: the mask is about to be destroyed irreversibly
+     * otherwise.  No-op when scripted. */
+    undo_save_flis_lmask(lay, _("Remove layer mask"));
+    return flis_layer_remove_lmask(lay);
+}
+
+int flis_layer_remove(flis_layer_t *layer) {
+    if (!com.uniq || !layer) return 1;
+    if (flis_check_locked(layer, "remove layer")) return 1;
+
+    gint count = flis_layer_count();
+    if (count <= 1) {
+        siril_log_warning(
+            _("FLIS: cannot remove the last remaining layer\n"));
+        return 1;
+    }
+
+    gint idx = flis_layer_get_index(layer);
+    if (idx < 0) {
+        siril_log_message(_("FLIS: flis_layer_remove — layer not found in stack\n"));
+        return 1;
+    }
+
+    com.uniq->layers = g_slist_remove(com.uniq->layers, layer);
+
+    /* Choose a sensible new active layer: prefer the one that was below;
+     * if the removed layer was the base, use the new base. */
+    gint new_idx = (idx > 0) ? idx - 1 : 0;
+    uniq_set_active_layer(com.uniq, new_idx);
+
+    siril_log_message(_("FLIS: removed layer '%s'\n"),
+                      layer->layer_name ? layer->layer_name : "?");
+    /* NDE baseline (phase 2): drop the removed layer's baseline checkpoint. */
+    nde_checkpoint_drop(layer->item_id);
+    flis_layer_free(layer);
+    return 0;
+}
+
+/* -------------------------------------------------------------------------
+ * flis_layer_install_render
+ *
+ * Transfers ownership of all pixel data from @rendered (a float RGB fits*
+ * returned by flis_render_layers) into @lay->fit.  The layer's existing
+ * pixel buffers are freed.  ICC profile, keywords, mask, and all other
+ * metadata fields already on the layer's fit are preserved.  The @rendered
+ * shell is freed after the transfer.
+ * ------------------------------------------------------------------------- */
+static void flis_layer_install_render(flis_layer_t *lay, fits *rendered) {
+    fits *f = lay->fit;
+
+    /* Free existing pixel buffers */
+    if (f->fdata) { free(f->fdata); f->fdata = NULL; }
+    if (f->data)  { free(f->data);  f->data  = NULL; }
+    for (int i = 0; i < 3; i++) {
+        f->fpdata[i] = NULL;
+        f->pdata[i]  = NULL;
+    }
+
+    /* Transfer float RGB data ownership */
+    f->fdata       = rendered->fdata;
+    f->fpdata[0]   = rendered->fpdata[0];
+    f->fpdata[1]   = rendered->fpdata[1];
+    f->fpdata[2]   = rendered->fpdata[2];
+    f->type        = DATA_FLOAT;
+    f->bitpix      = FLOAT_IMG;
+    f->orig_bitpix = FLOAT_IMG;
+    f->naxis       = rendered->naxis;
+    f->naxes[0]    = rendered->naxes[0];
+    f->naxes[1]    = rendered->naxes[1];
+    f->naxes[2]    = rendered->naxes[2];
+    f->rx          = rendered->rx;
+    f->ry          = rendered->ry;
+
+    /* ICC profile transfer.  rendered's profile was copied from com.uniq
+     * (by flis_render_layers) — after flatten the FLIS is collapsing to
+     * a plain FITS, so we keep the profile on com.uniq (it's still the
+     * current image's profile) and just mirror onto f via the legacy
+     * path until the post-flatten sequencing clears the layer stack. */
+    /* Per-fits ICC fields removed.  The composite rendered by
+     * flis_render_layers also no longer carries an icc_profile.  The
+     * post-flatten image's ICC state continues to live on com.uniq
+     * unchanged. */
+
+    invalidate_stats_from_fit(f);
+
+    /* Null rendered's pointers before freeing to prevent double-free */
+    rendered->fdata = NULL;
+    rendered->fpdata[0] = rendered->fpdata[1] = rendered->fpdata[2] = NULL;
+    free(rendered);
+}
+
+/* -------------------------------------------------------------------------
+ * flis_merge_down_layer
+ *
+ * Merges @top onto the layer directly below it in the stack.  The top
+ * layer's compositing parameters (blend mode, opacity, layer mask) are
+ * applied during rendering and then the layer is deleted.  The target
+ * layer retains its own blend mode, opacity, and masks.
+ *
+ * This operation is destructive and purges the undo history for both layers.
+ * Returns 0 on success, 1 on failure.
+ * ------------------------------------------------------------------------- */
+int flis_merge_down_layer(flis_layer_t *top) {
+    if (nde_edit_at_refuses_op(_("Merging layers down"))) return 1;
+    if (!com.uniq || !top) return 1;
+    if (flis_check_locked(top, _("merge down"))) return 1;
+
+    /* Find the layer with the highest layer_order below top */
+    flis_layer_t *bottom = NULL;
+    for (GSList *l = com.uniq->layers; l; l = l->next) {
+        flis_layer_t *lay = (flis_layer_t *)l->data;
+        if (!lay || lay == top) continue;
+        if (lay->layer_order < top->layer_order) {
+            if (!bottom || lay->layer_order > bottom->layer_order)
+                bottom = lay;
+        }
+    }
+    if (!bottom) {
+        siril_log_warning(_("Merge Down: no layer below the current layer.\n"));
+        return 1;
+    }
+
+    /* Render [bottom, top] as a 2-layer composite.  The merge variant
+     * paints the bottom layer raw (tint baked, but no blend mode /
+     * opacity / mask) — those parameters are RETAINED on the surviving
+     * layer, so rendering them here would apply them twice (and a
+     * MULTIPLY bottom would merge against the background to black). */
+    GSList *tmp = g_slist_append(NULL, bottom);
+    tmp = g_slist_append(tmp, top);
+    fits *merged = flis_render_layers_merge(tmp);
+    g_slist_free(tmp);
+    if (!merged) {
+        siril_log_error(_("Merge Down: rendering failed.\n"));
+        return 1;
+    }
+
+    /* Capture names for the closing log line BEFORE flis_layer_free(top)
+     * dangling-pointers top->layer_name (use-after-free otherwise). */
+    gchar *top_name_copy = g_strdup(top->layer_name ? top->layer_name : "?");
+    const char *bottom_name = bottom->layer_name ? bottom->layer_name : "?";
+
+    /* NDE composite node (design note §3): everything the merge consumes has
+     * to be recoverable afterwards, and this is the last moment at which it
+     * all still exists — the state, the pins and a baseline per input.  See
+     * nde_composite.h; the record itself is appended once the mutation is
+     * done. */
+    GSList *nde_inputs = g_slist_append(NULL, bottom);
+    nde_inputs = g_slist_append(nde_inputs, top);
+    nde_composite_capture *nde_cap =
+            nde_composite_capture_begin(nde_inputs, TRUE /* merge paints raw */);
+    g_slist_free(nde_inputs);
+
+    /* Destructive operation: purge undo history for both layers */
+    flis_undo_purge_layer(top->item_id);
+    flis_undo_purge_layer(bottom->item_id);
+
+    /* Clear the bottom layer's masks (consumed by the merge) */
+    if (bottom->fit->mask) { free_mask(bottom->fit->mask); bottom->fit->mask = NULL; }
+    layermask_free_deferred(bottom->lmask);
+    bottom->lmask = NULL;
+    bottom->lmask_item_id = 0;   /* the mask items are gone, not merely empty */
+    bottom->pmask_item_id = 0;
+
+    /* Install merged pixels into the bottom layer */
+    flis_layer_install_render(bottom, merged);
+
+    /* The merged render is canvas-sized and canvas-aligned, and any mono
+     * tint was baked into the (now RGB) pixels: reset the offset and the
+     * tint or they would be applied a second time. */
+    bottom->position_x = 0;
+    bottom->position_y = 0;
+    bottom->has_tint   = FALSE;
+    bottom->layer_tint = (flis_tint_t){ 1.0, 1.0, 1.0 };
+
+    /* Make bottom the active layer BEFORE freeing top: if top was the
+     * active layer, gfit would otherwise point at freed memory until the
+     * repoint a few statements later — a window in which an unlocked
+     * gfit reader (lazy tile materialise, python thread) could load the
+     * dangling pointer.  Repoint-first keeps gfit valid at every
+     * instant.  (bottom sits below top, so its index is unaffected by
+     * top still being in the list.) */
+    gint idx = flis_layer_get_index(bottom);
+    if (idx >= 0)
+        uniq_set_active_layer(com.uniq, idx);
+
+    /* Remove the top layer from the stack (flis_layer_free handles its masks) */
+    com.uniq->layers = g_slist_remove(com.uniq->layers, top);
+    flis_layer_free(top);
+
+    gui_iface.flis_invalidate_composite();
+
+    siril_log_message(_("FLIS: merged '%s' down into '%s'\n"),
+                      top_name_copy, bottom_name);
+
+    /* NDE (sketch §13.2, design note §3): merge purges per-layer undo (records
+     * are KEPT — provenance).  No undo entry survives, so the record is
+     * uncoupled.  The merge CONSUMES both inputs and produces a new item: the
+     * result is not the bottom layer with more steps on it, it is a new thing
+     * derived from two.  Saying so makes both inputs retained inputs alike,
+     * lets the composite resolve every input through a pin, and keeps the
+     * merge step out of a chain whose verdict is about one of its own
+     * inputs.  The layer object, its name and its position are unchanged —
+     * only its identity is new. */
+    bottom->item_id = com.uniq->next_item_id++;
+    nde_composite_capture_commit(nde_cap, "layer.merge_down", bottom->item_id,
+                                 _("Merge down"));
+
+    g_free(top_name_copy);
+    return 0;
+}
+
+/* -------------------------------------------------------------------------
+ * flis_flatten_all
+ *
+ * Composites all visible layers into a single base layer.  All non-base
+ * layers are deleted; the base layer's blend mode is reset to Normal and
+ * all masks are cleared.
+ *
+ * This operation is destructive and purges the entire undo history.
+ * Returns 0 on success, 1 on failure.
+ * ------------------------------------------------------------------------- */
+int flis_flatten_all(void) {
+    if (nde_edit_at_refuses_op(_("Flattening the image"))) return 1;
+    if (!com.uniq || !com.uniq->layers) return 1;
+    gint n_before = flis_layer_count();
+    if (n_before <= 1) return 0; /* already flat — no mutation, no record */
+
+    /* Render all visible layers */
+    fits *flat = flis_render_layers(com.uniq->layers);
+    if (!flat) {
+        siril_log_error(_("Flatten: rendering failed.\n"));
+        return 1;
+    }
+
+    /* Base layer is the first in the sorted list (lowest layer_order) */
+    flis_layer_t *base = (flis_layer_t *)com.uniq->layers->data;
+
+    /* NDE composite node: the same node as merge-down with every layer as an
+     * input, and without the raw-first contract — flatten blends the bottom
+     * layer too, over the canvas background, and then resets the survivor's
+     * compositing properties.  Taken here, while every input still exists;
+     * appended after the mutation (nde_composite.h). */
+    nde_composite_capture *nde_cap =
+            nde_composite_capture_begin(com.uniq->layers, FALSE);
+
+    /* Repoint gfit at the (surviving) base BEFORE freeing the other
+     * layers: if a non-base layer was active, gfit would otherwise
+     * dangle from its free until the repoint at the end of this
+     * function (see the matching comment in flis_merge_down_layer). */
+    uniq_set_active_layer(com.uniq, 0);
+
+    /* Remove and free all layers except the base, purging their undo entries */
+    GSList *rest = g_slist_copy(com.uniq->layers->next);
+    for (GSList *l = rest; l; l = l->next) {
+        flis_layer_t *lay = (flis_layer_t *)l->data;
+        flis_undo_purge_layer(lay->item_id);
+        com.uniq->layers = g_slist_remove(com.uniq->layers, lay);
+        flis_layer_free(lay);
+    }
+    g_slist_free(rest);
+
+    /* Purge base's undo history too */
+    flis_undo_purge_layer(base->item_id);
+
+    /* Clear the base layer's masks */
+    if (base->fit->mask) { free_mask(base->fit->mask); base->fit->mask = NULL; }
+    layermask_free_deferred(base->lmask);
+    base->lmask = NULL;
+    base->lmask_item_id = 0;
+    base->pmask_item_id = 0;
+
+    /* Reset compositing parameters: base is now the sole layer */
+    base->blend_mode = FLIS_BLEND_NORMAL;
+    base->opacity    = 1.0f;
+    base->has_tint   = FALSE;
+    base->visible    = TRUE;
+
+    /* Install the flattened pixels */
+    flis_layer_install_render(base, flat);
+
+    /* The flattened render is canvas-sized and canvas-aligned; a previous
+     * base offset must not shift it. */
+    base->position_x = 0;
+    base->position_y = 0;
+
+    /* Refresh uniq->chans / gfit for the (possibly re-dimensioned)
+     * flattened base — gfit already points at base->fit from the
+     * early repoint above; install_render preserved pointer identity. */
+    uniq_set_active_layer(com.uniq, 0);
+    gui_iface.flis_invalidate_composite();
+
+    siril_log_message(_("FLIS: image flattened to single layer '%s'\n"),
+                      base->layer_name ? base->layer_name : "?");
+
+    /* NDE (sketch §13.2, design note §3): flatten purges all per-layer undo
+     * (records are KEPT — provenance), so the record is uncoupled.  As with
+     * merge down, every layer is CONSUMED and the flattened result is a NEW
+     * item — the base layer is among the inputs, not the survivor of them. */
+    base->item_id = com.uniq->next_item_id++;
+    nde_composite_capture_commit(nde_cap, "document.flatten", base->item_id,
+                                 _("Flatten image"));
+    return 0;
+}
+
+int flis_flatten_hook(struct generic_layer_args *args) {
+    (void)args;
+    return flis_flatten_all();
+}
+
+flis_layer_t *flis_layer_duplicate(const flis_layer_t *src) {
+    if (!com.uniq || !src) return NULL;
+
+    /* Deep-copy the pixel data */
+    fits *new_fit = calloc(1, sizeof(fits));
+    if (!new_fit) { PRINT_ALLOC_ERR; return NULL; }
+
+    if (copyfits((fits *)src->fit, new_fit,
+                 CP_ALLOC | CP_COPYA | CP_FORMAT | CP_COPYMASK, 0)) {
+        free(new_fit);
+        return NULL;
+    }
+
+    /* copyfits(CP_FORMAT) NULLs out pointer-typed header fields (date_obs,
+     * wcslib, unknown_keys) to avoid double-free.  Re-populate them with
+     * deep copies so the duplicate carries complete metadata, including the
+     * plate-solve solution needed for future co-registration. */
+    copy_fits_metadata(src->fit, new_fit);
+
+    gchar *new_name = g_strdup_printf("%s copy",
+                      src->layer_name ? src->layer_name : "Layer");
+    flis_layer_t *dup = flis_layer_new(new_fit, new_name);
+    g_free(new_name);
+    if (!dup) { clearfits(new_fit); free(new_fit); return NULL; }
+
+    /* Copy compositing and metadata fields */
+    dup->blend_mode  = src->blend_mode;
+    dup->opacity     = src->opacity;
+    dup->visible     = src->visible;
+    dup->has_tint    = src->has_tint;
+    dup->layer_tint  = src->layer_tint;
+    dup->position_x  = src->position_x;
+    dup->position_y  = src->position_y;
+    dup->locked      = FALSE; /* duplicates start unlocked */
+    dup->group_id    = src->group_id;
+
+    /* Deep-copy the layer mask if present */
+    if (src->lmask) {
+        size_t nbytes = src->lmask->w * src->lmask->h
+                        * (src->lmask->bitpix / 8);
+        dup->lmask = calloc(1, sizeof(layermask_t));
+        if (dup->lmask) {
+            dup->lmask->w      = src->lmask->w;
+            dup->lmask->h      = src->lmask->h;
+            dup->lmask->bitpix = src->lmask->bitpix;
+            dup->lmask->data   = malloc(nbytes);
+            if (dup->lmask->data) {
+                memcpy(dup->lmask->data, src->lmask->data, nbytes);
+            } else {
+                PRINT_ALLOC_ERR;
+                layermask_free(dup->lmask);
+                dup->lmask = NULL;
+            }
+        }
+    }
+
+    /* Assign identity and position above the source layer */
+    dup->item_id     = com.uniq->next_item_id++;
+    dup->layer_order = src->layer_order + FLIS_ORDER_STEP;
+    dup->created     = flis_now_iso8601();
+    dup->modified    = g_strdup(dup->created);
+
+    /* §6.3: forward-compat metadata travels with the duplicate so a
+     * future-Siril attribute on the source isn't dropped on a copy. */
+    if (src->unknown_metadata)
+        dup->unknown_metadata = g_strdup(src->unknown_metadata);
+
+    com.uniq->layers = g_slist_insert_sorted(com.uniq->layers, dup,
+                                              (GCompareFunc)layer_order_cmp);
+
+    gint idx = flis_layer_get_index(dup);
+    uniq_set_active_layer(com.uniq, idx);
+
+    siril_log_message(_("FLIS: duplicated layer '%s' → '%s' (id=%d)\n"),
+                      src->layer_name ? src->layer_name : "?",
+                      dup->layer_name, dup->item_id);
+    return dup;
+}
+
+/* No-op: profile state lives on com.uniq and is invariant under reorders
+ * that change which layer is the base.  Kept as a stub so call sites
+ * documented by the previous architecture still compile and have a place
+ * to be removed in a follow-up sweep. */
+static void flis_transfer_icc_to_new_base(flis_layer_t *old_base,
+                                           flis_layer_t *new_base) {
+    (void)old_base;
+    (void)new_base;
+}
+
+int flis_layer_move_up(flis_layer_t *layer) {
+    if (!com.uniq || !layer) return -1;
+    if (flis_check_locked(layer, "move layer up")) return -1;
+
+    /* The list is sorted ascending by layer_order; "up" = towards end */
+    GSList *node = g_slist_find(com.uniq->layers, layer);
+    if (!node) return -1;
+    GSList *next = node->next;
+    if (!next) return 1;  /* already at top */
+
+    flis_layer_t *neighbour = (flis_layer_t *)next->data;
+    if (!neighbour) return -1;
+
+    /* Layers to jump past: just the neighbour, or — when the neighbour
+     * belongs to a group — every member of that group, in ascending
+     * stack order.  The block's internal order must be preserved, so
+     * the order values are ROTATED through the block rather than the
+     * moving layer being swapped with the far member (a swap would
+     * invert the group's internal z-order). */
+    GSList *jump = NULL;
+    if (neighbour->group_id != 0) {
+        flis_group_t *_grp = flis_group_get_by_id(neighbour->group_id);
+        if (_grp)
+            jump = flis_group_get_layers(_grp);  /* sorted ascending */
+    }
+    if (!jump)
+        jump = g_slist_append(NULL, neighbour);
+
+    for (GSList *l = jump; l; l = l->next) {
+        if (flis_check_locked((flis_layer_t *)l->data,
+                              "swap with locked layer above")) {
+            g_slist_free(jump);
+            return -1;
+        }
+    }
+
+    /* Pre-op undo covering every layer whose order changes.  Keep the
+     * return value: 0 means an entry was actually pushed (undo_save_* returns
+     * 0 WITHOUT pushing when com.script — see sketch §13.3), so we only tag
+     * the top entry below when both !com.script and undo_ok == 0. */
+    GSList *affected = g_slist_copy(jump);
+    affected = g_slist_prepend(affected, layer);
+    int undo_ok = undo_save_flis_multi_layer_props(affected, _("Move layer up"));
+    g_slist_free(affected);
+
+    flis_layer_t *old_base = (flis_layer_t *)com.uniq->layers->data;
+
+    /* Rotate: the moving layer takes the topmost jumped order; each
+     * jumped member takes the order of its predecessor in the block. */
+    gint prev_order = layer->layer_order;
+    for (GSList *l = jump; l; l = l->next) {
+        flis_layer_t *m = (flis_layer_t *)l->data;
+        gint t = m->layer_order;
+        m->layer_order = prev_order;
+        prev_order = t;
+    }
+    layer->layer_order = prev_order;
+    g_slist_free(jump);
+
+    flis_resort_layers(layer);
+
+    flis_layer_t *new_base = (flis_layer_t *)com.uniq->layers->data;
+    if (new_base != old_base)
+        flis_transfer_icc_to_new_base(old_base, new_base);
+
+    flis_layer_touch_modified(layer);
+
+    /* NDE provenance (sketch §13.2): reachable only from user intent
+     * (panel move-up, drag reorder uses flis_reorder_hook instead).  Couple
+     * to the undo entry saved above so Ctrl-Z retires this record too. */
+    GString *kv = nde_kv_start();
+    nde_kv_add_int(kv, "dir", 1);
+    gint64 rid = nde_capture_structural("layer.reorder", NDE_SCOPE_DOCUMENT,
+                                        layer->item_id, nde_kv_end(kv),
+                                        _("Move layer up"));
+    if (!com.script && undo_ok == 0)
+        undo_tag_top_nde_record(rid);
+    return 0;
+}
+
+int flis_layer_move_down(flis_layer_t *layer) {
+    if (!com.uniq || !layer) return -1;
+    if (flis_check_locked(layer, "move layer down")) return -1;
+
+    gint idx = flis_layer_get_index(layer);
+    if (idx < 0) return -1;
+    if (idx == 0) return 1;  /* already at bottom */
+
+    flis_layer_t *neighbour = (flis_layer_t *)g_slist_nth_data(
+                                  com.uniq->layers, idx - 1);
+    if (!neighbour) return -1;
+
+    /* See flis_layer_move_up: rotate the order values through the whole
+     * jumped block (single neighbour, or every member of its group) so
+     * the block's internal z-order is preserved. */
+    GSList *jump = NULL;
+    if (neighbour->group_id != 0) {
+        flis_group_t *_grp = flis_group_get_by_id(neighbour->group_id);
+        if (_grp)
+            jump = flis_group_get_layers(_grp);  /* sorted ascending */
+    }
+    if (!jump)
+        jump = g_slist_append(NULL, neighbour);
+
+    for (GSList *l = jump; l; l = l->next) {
+        if (flis_check_locked((flis_layer_t *)l->data,
+                              "swap with locked layer below")) {
+            g_slist_free(jump);
+            return -1;
+        }
+    }
+
+    /* Pre-op undo covering every layer whose order changes.  See move_up:
+     * keep the return so we only couple when an entry was actually pushed. */
+    GSList *affected = g_slist_copy(jump);
+    affected = g_slist_prepend(affected, layer);
+    int undo_ok = undo_save_flis_multi_layer_props(affected, _("Move layer down"));
+    g_slist_free(affected);
+
+    flis_layer_t *old_base = (flis_layer_t *)com.uniq->layers->data;
+
+    /* Rotate downwards: the moving layer takes the bottommost jumped
+     * order; each jumped member takes the order of its successor.
+     * Iterate the block top-down so each member picks up the value the
+     * previous iteration displaced. */
+    GSList *rev = g_slist_reverse(g_slist_copy(jump));
+    gint prev_order = layer->layer_order;
+    for (GSList *l = rev; l; l = l->next) {
+        flis_layer_t *m = (flis_layer_t *)l->data;
+        gint t = m->layer_order;
+        m->layer_order = prev_order;
+        prev_order = t;
+    }
+    layer->layer_order = prev_order;
+    g_slist_free(rev);
+    g_slist_free(jump);
+
+    flis_resort_layers(layer);
+
+    flis_layer_t *new_base = (flis_layer_t *)com.uniq->layers->data;
+    if (new_base != old_base)
+        flis_transfer_icc_to_new_base(old_base, new_base);
+
+    flis_layer_touch_modified(layer);
+
+    /* NDE provenance (sketch §13.2): see flis_layer_move_up. */
+    GString *kv = nde_kv_start();
+    nde_kv_add_int(kv, "dir", -1);
+    gint64 rid = nde_capture_structural("layer.reorder", NDE_SCOPE_DOCUMENT,
+                                        layer->item_id, nde_kv_end(kv),
+                                        _("Move layer down"));
+    if (!com.script && undo_ok == 0)
+        undo_tag_top_nde_record(rid);
+    return 0;
+}
+
+/* ===================================================================== */
+/* Compositing properties                                                */
+/* ===================================================================== */
+
+int flis_layer_set_blend_mode(flis_layer_t *layer, flis_blend_mode_t mode) {
+    if (!layer) return 1;
+    if (flis_check_locked(layer, "set blend mode")) return 1;
+    layer->blend_mode = mode;
+    flis_layer_touch_modified(layer);
+    return 0;
+}
+
+int flis_layer_set_opacity(flis_layer_t *layer, gfloat opacity) {
+    if (!layer) return 1;
+    if (flis_check_locked(layer, "set opacity")) return 1;
+    if (opacity < 0.0f) opacity = 0.0f;
+    if (opacity > 1.0f) opacity = 1.0f;
+    layer->opacity = opacity;
+    flis_layer_touch_modified(layer);
+    return 0;
+}
+
+int flis_layer_set_visible(flis_layer_t *layer, gboolean visible) {
+    if (!layer) return 1;
+    /* Visibility is a display toggle; allowed even on locked layers */
+    layer->visible = visible;
+    return 0;
+}
+
+/* ===================================================================== */
+/* Layer name and lock                                                   */
+/* ===================================================================== */
+
+int flis_layer_set_name(flis_layer_t *layer, const gchar *name) {
+    if (!layer) return 1;
+    if (flis_check_locked(layer, "rename layer")) return 1;
+    g_free(layer->layer_name);
+    layer->layer_name = g_strdup(name ? name : "Layer");
+    flis_layer_touch_modified(layer);
+    return 0;
+}
+
+int flis_layer_set_locked(flis_layer_t *layer, gboolean locked) {
+    if (!layer) return 1;
+    layer->locked = locked;
+    /* Deliberately does not update the modified timestamp: locking is
+     * an editorial state, not a data change. */
+    return 0;
+}
+
+/* ===================================================================== */
+/* Layer mask (LMASK) operations                                         */
+/* ===================================================================== */
+
+int flis_layer_set_lmask(flis_layer_t *layer, layermask_t *lmask) {
+    if (!layer) return 1;
+    if (flis_check_locked(layer, "set layer mask")) return 1;
+
+    if (lmask) {
+        /* Dimensions must match the layer's pixel data */
+        if ((size_t)layer->fit->rx != lmask->w ||
+            (size_t)layer->fit->ry != lmask->h) {
+            siril_log_warning(
+                _("FLIS: layer mask size %zux%zu does not match layer "
+                  "'%s' size %ux%u\n"),
+                lmask->w, lmask->h,
+                layer->layer_name ? layer->layer_name : "?",
+                layer->fit->rx, layer->fit->ry);
+            return 1;
+        }
+    }
+
+    layermask_free_deferred(layer->lmask);
+    layer->lmask = lmask;   /* NULL is valid: removes the mask */
+    /* Emptying the slot ends the mask item; replacing one mask with another
+     * keeps it, so an edited mask stays the same item across the swap. */
+    if (!lmask)
+        layer->lmask_item_id = 0;
+    flis_layer_touch_modified(layer);
+    return 0;
+}
+
+int flis_layer_remove_lmask(flis_layer_t *layer) {
+    return flis_layer_set_lmask(layer, NULL);
+}
+
+int flis_layer_move_lmask(flis_layer_t *from, flis_layer_t *to) {
+    if (!from || !to) return 1;
+
+    if (!from->lmask) {
+        siril_log_warning(
+            _("FLIS: flis_layer_move_lmask — source layer '%s' has no "
+              "layer mask\n"),
+            from->layer_name ? from->layer_name : "?");
+        return 1;
+    }
+    if (flis_check_locked(from, "detach layer mask")) return 1;
+    if (flis_check_locked(to,   "attach layer mask")) return 1;
+
+    /* Size check against destination */
+    if ((size_t)to->fit->rx != from->lmask->w ||
+        (size_t)to->fit->ry != from->lmask->h) {
+        siril_log_warning(
+            _("FLIS: cannot move layer mask — mask size %zux%zu does not "
+              "match destination layer '%s' size %ux%u\n"),
+            from->lmask->w, from->lmask->h,
+            to->layer_name ? to->layer_name : "?",
+            to->fit->rx, to->fit->ry);
+        return 1;
+    }
+
+    /* Transfer ownership */
+    layermask_free(to->lmask);
+    to->lmask   = from->lmask;
+    from->lmask = NULL;
+    /* The same mask, on a different layer: its item id travels with it. */
+    to->lmask_item_id   = from->lmask_item_id;
+    from->lmask_item_id = 0;
+
+    flis_layer_touch_modified(from);
+    flis_layer_touch_modified(to);
+    return 0;
+}
+
+/* ===================================================================== */
+/* Mono layer tinting                                                    */
+/* ===================================================================== */
+
+int flis_layer_set_tint(flis_layer_t *layer, double r, double g, double b) {
+    if (!layer) return 1;
+    if (flis_check_locked(layer, "set tint")) return 1;
+
+    if (!layer->fit || layer->fit->naxes[2] != 1) {
+        siril_log_warning(
+            _("FLIS: flis_layer_set_tint — layer '%s' is not a mono layer\n"), layer->layer_name ? layer->layer_name : "?");
+        return 1;
+    }
+
+    /* Clamp each component to [0.0, 1.0] */
+    layer->layer_tint.r = CLAMP(r, 0.0, 1.0);
+    layer->layer_tint.g = CLAMP(g, 0.0, 1.0);
+    layer->layer_tint.b = CLAMP(b, 0.0, 1.0);
+    layer->has_tint     = TRUE;
+    flis_layer_touch_modified(layer);
+    return 0;
+}
+
+int flis_layer_clear_tint(flis_layer_t *layer) {
+    if (!layer) return 1;
+    if (flis_check_locked(layer, "clear tint")) return 1;
+    layer->has_tint   = FALSE;
+    layer->layer_tint = (flis_tint_t){ 1.0, 1.0, 1.0 };
+    flis_layer_touch_modified(layer);
+    return 0;
+}
+
+/* ===================================================================== */
+/* Background neutralisation across tinted mono layers                   */
+/* ===================================================================== */
+
+/*
+ * Solve T * a = b via the Moore-Penrose pseudoinverse.
+ *
+ * T is (3 × N) stored row-major: T_data[channel * N + layer].
+ * b is a 3-vector (the target, typically (1,1,1)).
+ * out_a receives the N-vector solution.
+ *
+ * Case N <= 3: SVD of T directly (3×N, M >= N).
+ * Case N >  3: SVD of T^T (N×3) — gives minimum-norm solution.
+ *
+ * Returns 0 on success, non-zero if the matrix is rank-deficient.
+ */
+static int pseudoinverse_solve(const double *T_data, int N,
+                                const double b[3], double *out_a) {
+    const double EPS_REL = 1e-9;
+    int ret = 0;
+
+    if (N <= 3) {
+        /* --- SVD of T (3×N) --- */
+        gsl_matrix *A    = gsl_matrix_alloc(3, N);
+        gsl_matrix *V    = gsl_matrix_alloc(N, N);
+        gsl_vector *S    = gsl_vector_alloc(N);
+        gsl_vector *work = gsl_vector_alloc(N);
+        gsl_vector *bv   = gsl_vector_alloc(3);
+        gsl_vector *tmp  = gsl_vector_alloc(N);
+        gsl_vector *av   = gsl_vector_alloc(N);
+
+        for (int r = 0; r < 3; r++)
+            for (int c = 0; c < N; c++)
+                gsl_matrix_set(A, r, c, T_data[r * N + c]);
+        for (int r = 0; r < 3; r++)
+            gsl_vector_set(bv, r, b[r]);
+
+        gsl_linalg_SV_decomp(A, V, S, work);   /* A becomes U */
+
+        double s_max = gsl_vector_get(S, 0);
+        if (s_max < 1e-15) { ret = 1; goto cleanup_le3; }
+        double eps = EPS_REL * s_max;
+
+        /* tmp = U^T * b */
+        gsl_blas_dgemv(CblasTrans, 1.0, A, bv, 0.0, tmp);
+        /* apply S^+ */
+        for (int k = 0; k < N; k++) {
+            double sv = gsl_vector_get(S, k);
+            double t  = gsl_vector_get(tmp, k);
+            gsl_vector_set(tmp, k, (sv > eps) ? t / sv : 0.0);
+        }
+        /* a = V * tmp */
+        gsl_blas_dgemv(CblasNoTrans, 1.0, V, tmp, 0.0, av);
+
+        for (int i = 0; i < N; i++)
+            out_a[i] = gsl_vector_get(av, i);
+
+cleanup_le3:
+        gsl_matrix_free(A); gsl_matrix_free(V);
+        gsl_vector_free(S); gsl_vector_free(work);
+        gsl_vector_free(bv); gsl_vector_free(tmp); gsl_vector_free(av);
+
+    } else {
+        /* --- SVD of T^T (N×3) for minimum-norm solution --- */
+        gsl_matrix *A    = gsl_matrix_alloc(N, 3);
+        gsl_matrix *V    = gsl_matrix_alloc(3, 3);
+        gsl_vector *S    = gsl_vector_alloc(3);
+        gsl_vector *work = gsl_vector_alloc(3);
+        gsl_vector *bv   = gsl_vector_alloc(3);
+        gsl_vector *tmp  = gsl_vector_alloc(3);
+        gsl_vector *av   = gsl_vector_alloc(N);
+
+        /* A = T^T: A[i][c] = T[c][i] */
+        for (int r = 0; r < N; r++)
+            for (int c = 0; c < 3; c++)
+                gsl_matrix_set(A, r, c, T_data[c * N + r]);
+        for (int r = 0; r < 3; r++)
+            gsl_vector_set(bv, r, b[r]);
+
+        gsl_linalg_SV_decomp(A, V, S, work);   /* A becomes U_t */
+
+        double s_max = gsl_vector_get(S, 0);
+        if (s_max < 1e-15) { ret = 1; goto cleanup_gt3; }
+        double eps = EPS_REL * s_max;
+
+        /* tmp = V^T * b */
+        gsl_blas_dgemv(CblasTrans, 1.0, V, bv, 0.0, tmp);
+        /* apply S^+ */
+        for (int k = 0; k < 3; k++) {
+            double sv = gsl_vector_get(S, k);
+            double t  = gsl_vector_get(tmp, k);
+            gsl_vector_set(tmp, k, (sv > eps) ? t / sv : 0.0);
+        }
+        /* a = U_t * tmp */
+        gsl_blas_dgemv(CblasNoTrans, 1.0, A, tmp, 0.0, av);
+
+        for (int i = 0; i < N; i++)
+            out_a[i] = gsl_vector_get(av, i);
+
+cleanup_gt3:
+        gsl_matrix_free(A); gsl_matrix_free(V);
+        gsl_vector_free(S); gsl_vector_free(work);
+        gsl_vector_free(bv); gsl_vector_free(tmp); gsl_vector_free(av);
+    }
+
+    return ret;
+}
+
+/*
+ * Scale every pixel in a mono layer by the given factor, clamping to [0, 1]
+ * for float data or [0, USHRT_MAX] for uint16.
+ */
+static void scale_layer_pixels(fits *fit, double scale) {
+    size_t n = fit->rx * fit->ry;
+    if (fit->type == DATA_FLOAT && fit->fdata) {
+        float s = (float)scale;
+        float *p = fit->fpdata[0];
+        for (size_t i = 0; i < n; i++)
+            p[i] = CLAMP(p[i] * s, 0.0f, 1.0f);
+    } else if (fit->type == DATA_USHORT && fit->data) {
+        WORD *p = fit->pdata[0];
+        for (size_t i = 0; i < n; i++) {
+            double v = p[i] * scale;
+            p[i] = (WORD)(v >= USHRT_MAX ? USHRT_MAX : (v < 0.0 ? 0 : (WORD)v));
+        }
+    }
+}
+
+/* Apply x' = clamp(scale*x + offset) to every pixel of a layer fits.
+ * @offset is in [0,1] normalised units for both storage types. */
+static void affine_layer_pixels(fits *fit, double scale, double offset) {
+    size_t n = fit->rx * fit->ry * fit->naxes[2];
+    if (fit->type == DATA_FLOAT && fit->fdata) {
+        float s = (float)scale, o = (float)offset;
+        float *p = fit->fdata;
+        for (size_t i = 0; i < n; i++)
+            p[i] = CLAMP(p[i] * s + o, 0.0f, 1.0f);
+    } else if (fit->type == DATA_USHORT && fit->data) {
+        double o = offset * USHRT_MAX_DOUBLE;
+        WORD *p = fit->data;
+        for (size_t i = 0; i < n; i++) {
+            double v = p[i] * scale + o;
+            p[i] = (WORD)(v >= USHRT_MAX ? USHRT_MAX : (v < 0.0 ? 0 : (WORD)v));
+        }
+    }
+}
+
+void flis_affine_layer_pixels(fits *fit, double scale, double offset) {
+    affine_layer_pixels(fit, scale, offset);
+}
+
+/* ---- op "flis.layer_scale": params + hooks + NDE serializers ------------
+ *
+ * The NDE-facing factorisation of the multi-layer colour operations.  The
+ * joint solves (layers match, group colour calibration) only determine
+ * per-layer factors; the application is an independent per-layer affine
+ * x' = scale*x + offset, so each affected layer gets one Tier-A record of
+ * this op and the ordinary per-layer chain machinery can replay, amend and
+ * delete it. */
+
+void free_flis_layer_scale_data(void *p) {
+    free(p);
+}
+
+struct flis_layer_scale_data *new_flis_layer_scale_data(void) {
+    struct flis_layer_scale_data *p = calloc(1, sizeof(*p));
+    if (p) {
+        p->destroy_fn = free_flis_layer_scale_data;
+        p->scale = 1.0;
+    }
+    return p;
+}
+
+int flis_layer_scale_image_hook(struct generic_img_args *args, fits *fit, int nb_threads) {
+    (void)nb_threads;
+    const struct flis_layer_scale_data *p = args->user;
+    if (!p || p->scale < 0.0)
+        return 1;
+    affine_layer_pixels(fit, p->scale, p->offset);
+    invalidate_stats_from_fit(fit);
+    return 0;
+}
+
+static gchar *flis_layer_scale_log_hook(gpointer user, log_hook_detail detail) {
+    const struct flis_layer_scale_data *p = user;
+    (void)detail;
+    if (!p)
+        return g_strdup(_("Per-layer scale"));
+    if (p->offset != 0.0)
+        return g_strdup_printf(_("Per-layer scale (x%.4f %+.5f)"), p->scale, p->offset);
+    return g_strdup_printf(_("Per-layer scale (x%.4f)"), p->scale);
+}
+
+static gchar *flis_layer_scale_serialize(gconstpointer user) {
+    const struct flis_layer_scale_data *p = user;
+    GString *kv = nde_kv_start();
+    nde_kv_add_double(kv, "scale", p->scale);
+    if (p->offset != 0.0)
+        nde_kv_add_double(kv, "offset", p->offset);
+    return nde_kv_end(kv);
+}
+
+static gpointer flis_layer_scale_deserialize(const gchar *blob, int version) {
+    if (version > op_desc_flis_layer_scale.version)
+        return NULL;
+    GHashTable *kv = nde_kv_parse(blob);
+    double scale = 0.0, offset = 0.0;
+    if (!nde_kv_get_double(kv, "scale", &scale) || scale < 0.0) {
+        g_hash_table_unref(kv);
+        return NULL;
+    }
+    nde_kv_get_double(kv, "offset", &offset);
+    g_hash_table_unref(kv);
+    struct flis_layer_scale_data *p = new_flis_layer_scale_data();
+    if (p) {
+        p->scale = scale;
+        p->offset = offset;
+    }
+    return p;
+}
+
+const op_descriptor op_desc_flis_layer_scale = {
+    .id = "flis.layer_scale", .version = 1,
+    .image_hook = flis_layer_scale_image_hook,
+    .log_hook = flis_layer_scale_log_hook,
+    .description = N_("Per-layer scale"),
+    .mem_ratio = 1.0f,
+    .flags = 0,
+    .serialize = flis_layer_scale_serialize,
+    .deserialize = flis_layer_scale_deserialize,
+};
+
+/* NB: op_desc_flis_layer_scale itself stays registered even though nothing
+ * captures one any more — documents recorded before the joint records
+ * (nde_joint.h) still carry per-layer "flis.layer_scale" steps, and those
+ * must go on deserializing and replaying. */
+
+/*
+ * flis_background_neutralise — scale each mono layer so that the screen-blend
+ * composite has a neutral (equal-RGB) background.
+ *
+ * The algorithm (from the linear approximation for small background values):
+ *   M^c = Σ_i  s_i · m_i · T_i^c   (composite background in channel c)
+ *
+ * Setting M^R = M^G = M^B = M_target gives the 3×N linear system T·a = 1
+ * where a_i = s_i·m_i and T_i^c is the normalised tint of layer i.
+ * Solved via SVD pseudoinverse; normalised so that the overall composite
+ * brightness is preserved.
+ *
+ * Only mono (single-channel) layers participate; RGB layers are skipped.
+ *
+ * Returns 0 on success, non-zero on failure.
+ */
+int flis_background_neutralise(void) {
+    return flis_background_neutralise_layers(NULL);
+}
+
+/* Solve T · a = (1,1,1)^T for ALL eligible layers simultaneously.
+ * a_i = s_i · m_i is the target composite contribution of layer i;
+ * the actual scale factor is then s_i = old_bg · a_i / m_i.
+ *
+ * Key insight: even when a layer requires a_i < 0 (infeasible with
+ * positive scaling), the OTHER layers' coefficients from this global
+ * solve still correctly balance the channels where the infeasible
+ * layer has zero tint.  Re-solving after removing the infeasible
+ * layer destroys that balance, so the coefficients from the single
+ * global solve are always applied and any infeasible layer is merely
+ * left unscaled (s = 1). */
+int flis_layers_match_solve(const double *tints, const double *medians, int N,
+                            double *s_out, guint8 *infeasible_out, gchar **why) {
+    if (why)
+        *why = NULL;
+    if (N <= 0 || !tints || !medians || !s_out) {
+        if (why) *why = g_strdup(_("there are no layers to match"));
+        return 2;
+    }
+    double *T = calloc(3 * N, sizeof(double));
+    double *a = calloc(N, sizeof(double));
+    if (!T || !a) {
+        PRINT_ALLOC_ERR;
+        free(T); free(a);
+        if (why) *why = g_strdup(_("out of memory"));
+        return 2;
+    }
+    for (int c = 0; c < 3; c++)
+        for (int i = 0; i < N; i++)
+            T[c * N + i] = tints[i * 3 + c];
+
+    double old_bg = 0.0;
+    for (int i = 0; i < N; i++)
+        old_bg += medians[i] * (T[0*N+i] + T[1*N+i] + T[2*N+i]);
+    old_bg /= 3.0;
+    if (old_bg <= 0.0) {
+        free(T); free(a);
+        if (why) *why = g_strdup(_("the composite background level is zero"));
+        return 1;
+    }
+
+    /* Rescaling a layer moves the composite along that layer's tint direction,
+     * so if every tint points the SAME way the composite's colour is fixed
+     * whatever the scales and there is no neutralisation to perform.  The
+     * pseudoinverse does not say so: for a neutral direction — which is what
+     * every untinted layer gets, 1/1/1 — the system is consistent, and the
+     * minimum-norm answer would silently equalise the medians and call it a
+     * colour match.  Check the directions before trusting the solve. */
+    double ref[3] = { 0.0, 0.0, 0.0 };
+    gboolean have_ref = FALSE, spans = FALSE;
+    for (int i = 0; i < N && !spans; i++) {
+        double v[3] = { T[i], T[N + i], T[2*N + i] };
+        double nrm = sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
+        if (nrm <= 0.0)
+            continue;   /* a zero tint adds nothing to the composite */
+        for (int c = 0; c < 3; c++)
+            v[c] /= nrm;
+        if (!have_ref) {
+            ref[0] = v[0]; ref[1] = v[1]; ref[2] = v[2];
+            have_ref = TRUE;
+        } else if (fabs(v[0] - ref[0]) > 1e-6 || fabs(v[1] - ref[1]) > 1e-6 ||
+                   fabs(v[2] - ref[2]) > 1e-6) {
+            spans = TRUE;
+        }
+    }
+    if (!spans) {
+        free(T); free(a);
+        if (why)
+            *why = g_strdup(_("every layer carries the same tint, so rescaling "
+                    "them cannot change the composite's colour — assign "
+                    "different tints to the layers first"));
+        return 2;
+    }
+
+    const double b_unit[3] = { 1.0, 1.0, 1.0 };
+    if (pseudoinverse_solve(T, N, b_unit, a)) {
+        free(T); free(a);
+        if (why) *why = g_strdup(_("the tint matrix is degenerate"));
+        return 2;
+    }
+
+    for (int i = 0; i < N; i++) {
+        gboolean infeasible = a[i] <= 0.0 || medians[i] <= 0.0;
+        if (infeasible_out)
+            infeasible_out[i] = infeasible ? 1 : 0;
+        s_out[i] = infeasible ? 1.0 : (old_bg * a[i]) / medians[i];
+    }
+    free(T); free(a);
+    return 0;
+}
+
+/*
+ * flis_background_neutralise_layers — same as flis_background_neutralise but
+ * operates only on the specified layer subset (a GSList of flis_layer_t*).
+ * If @layer_subset is NULL, falls back to operating on all layers.
+ */
+int flis_background_neutralise_layers(GSList *layer_subset) {
+    if (!is_current_image_flis() || !com.uniq || !com.uniq->layers) return 1;
+    /* One record across several layers' lineages cannot join an insertion
+     * point armed on one of them (nde_op_class.c).  A replay is exempt: it is
+     * reproducing a record that already exists and captures nothing. */
+    if (!processing_is_reserved_for_replay() &&
+        nde_edit_at_refuses_op(_("Matching layers"))) return 1;
+    GSList *target = layer_subset ? layer_subset : com.uniq->layers;
+
+    int total = g_slist_length(target);
+    flis_layer_t **layers_arr = calloc(total, sizeof(flis_layer_t *));
+    double *medians = calloc(total, sizeof(double));
+    double *tints   = calloc(3 * total, sizeof(double));
+    if (!layers_arr || !medians || !tints) {
+        PRINT_ALLOC_ERR;
+        free(layers_arr); free(medians); free(tints);
+        return 1;
+    }
+
+    int N = 0, n_skipped = 0;
+    for (GSList *l = target; l; l = l->next) {
+        flis_layer_t *lay = (flis_layer_t *)l->data;
+        if (!lay || !lay->fit) continue;
+        /* The analysis is defined over tinted mono layers: an RGB layer
+         * carries its own colour and there is no single tint to scale it
+         * along.  Say so — it still lights the composite this is trying to
+         * neutralise, so the prediction below cannot account for it. */
+        if (lay->fit->naxes[2] != 1) {
+            siril_log_warning(_("FLIS: layers match — skipping RGB layer '%s' "
+                    "(only tinted mono layers are matched)\n"),
+                    lay->layer_name ? lay->layer_name : "?");
+            n_skipped++;
+            continue;
+        }
+        if (!lay->fit->fdata && !lay->fit->data) continue;
+        if (!lay->has_tint)
+            siril_log_warning(_("FLIS: layers match — layer '%s' has no tint "
+                    "and is treated as neutral white\n"),
+                    lay->layer_name ? lay->layer_name : "?");
+
+        tints[N * 3 + 0] = lay->has_tint ? lay->layer_tint.r : 1.0;
+        tints[N * 3 + 1] = lay->has_tint ? lay->layer_tint.g : 1.0;
+        tints[N * 3 + 2] = lay->has_tint ? lay->layer_tint.b : 1.0;
+
+        imstats *st = statistics(NULL, -1, lay->fit, 0, NULL, STATS_BASIC, SINGLE_THREADED);
+        if (!st) { free(layers_arr); free(medians); free(tints); return 1; }
+        double med = st->median;
+        free_stats(st);
+        if (lay->fit->type == DATA_USHORT)
+            med /= USHRT_MAX_DOUBLE;
+        medians[N] = med;
+        layers_arr[N] = lay;
+        N++;
+    }
+
+    if (N == 0) {
+        siril_log_warning(_("FLIS: background neutralise — no eligible mono layers found\n"));
+        free(layers_arr); free(medians); free(tints);
+        return 1;
+    }
+
+    double *s = calloc(N, sizeof(double));
+    guint8 *infeasible = calloc(N, sizeof(guint8));
+    if (!s || !infeasible) {
+        PRINT_ALLOC_ERR;
+        free(layers_arr); free(medians); free(tints); free(s); free(infeasible);
+        return 1;
+    }
+    gchar *why = NULL;
+    int rc = flis_layers_match_solve(tints, medians, N, s, infeasible, &why);
+    if (rc) {
+        siril_log_warning(_("FLIS: layers match — %s\n"), why ? why : "?");
+        g_free(why);
+        free(layers_arr); free(medians); free(tints); free(s); free(infeasible);
+        return 1;
+    }
+
+    double old_bg = 0.0;
+    for (int i = 0; i < N; i++)
+        old_bg += medians[i] * (tints[i*3] + tints[i*3+1] + tints[i*3+2]);
+    old_bg /= 3.0;
+
+    siril_log_info(_("FLIS: background neutralise scale factors:\n"));
+    double new_bg[3] = { 0.0, 0.0, 0.0 };
+    /* NDE provenance: ONE Tier-A "flis.layers_match" JOINT record for the
+     * whole operation (nde_joint.h) — a member of every participant's chain,
+     * recomputing this very analysis at replay so it adapts to upstream
+     * changes (a re-assigned tint) instead of replaying frozen factors.
+     * Suppressed during replay (a Tier-C script re-run must not grow the log
+     * it is reproducing) and coalesced into the script scope for python-
+     * driven runs. */
+    gboolean replaying = processing_is_reserved_for_replay();
+    gboolean script_scope = nde_script_scope_active();
+    for (int i = 0; i < N; i++) {
+        const char *name = layers_arr[i]->layer_name ? layers_arr[i]->layer_name : "?";
+        /* Every participant's chain gains the joint record, so every
+         * participant needs a replay starting point — the infeasible ones
+         * included (their factor recomputes at replay and may become
+         * feasible after a tint edit). */
+        if (!replaying)
+            nde_checkpoint_baseline_ensure(layers_arr[i]->fit,
+                                           layers_arr[i]->item_id);
+        if (infeasible[i]) {
+            double tr = tints[i*3], tg = tints[i*3+1], tb = tints[i*3+2];
+            const char *dom = (tr >= tg && tr >= tb) ? "R" : (tg >= tr && tg >= tb) ? "G" : "B";
+            const char *low = (tr <= tg && tr <= tb) ? "R" : (tg <= tr && tg <= tb) ? "G" : "B";
+            siril_log_warning(
+                _("  %-24s  x1.0000  (left unscaled — %s-dominant tint infeasible, increase %s component)\n"),
+                name, dom, low);
+        } else {
+            siril_log_info("  %-24s  x%.4f  (median %.5f -> %.5f)\n",
+                name, s[i], medians[i], medians[i] * s[i]);
+            scale_layer_pixels(layers_arr[i]->fit, s[i]);
+            invalidate_stats_from_fit(layers_arr[i]->fit);
+        }
+        for (int c = 0; c < 3; c++)
+            new_bg[c] += s[i] * medians[i] * tints[i * 3 + c];
+    }
+    if (replaying) {
+        /* no capture */
+    } else if (script_scope) {
+        nde_script_scope_mark_pixels_dirty();
+    } else {
+        struct nde_joint_layers_match_data *p = nde_joint_layers_match_data_new(N);
+        nde_pin_spec *pins = g_new0(nde_pin_spec, N);
+        gchar **roles = g_new0(gchar *, N);
+        GString *summary = g_string_new(_("Layers match"));
+        const char *sep = " — ";
+        for (int i = 0; i < N; i++) {
+            flis_layer_t *lay = layers_arr[i];
+            p->parts[i].item_id = lay->item_id;
+            p->parts[i].name = g_strdup(lay->layer_name ? lay->layer_name : "");
+            p->parts[i].tinted = lay->has_tint;
+            p->parts[i].tint[0] = lay->has_tint ? lay->layer_tint.r : 1.0;
+            p->parts[i].tint[1] = lay->has_tint ? lay->layer_tint.g : 1.0;
+            p->parts[i].tint[2] = lay->has_tint ? lay->layer_tint.b : 1.0;
+            p->parts[i].diag_scale = s[i];
+            p->parts[i].diag_offset = 0.0;
+            roles[i] = g_strdup_printf("in%d", i);
+            pins[i].role = roles[i];
+            pins[i].item_id = lay->item_id;
+            pins[i].record_id = nde_history_last_record_for_item(lay->item_id);
+            if (lay->layer_name && *lay->layer_name) {
+                g_string_append(summary, sep);
+                g_string_append(summary, lay->layer_name);
+                sep = ", ";
+            }
+        }
+        gint64 rid = nde_capture_from_descriptor_pinned(&op_desc_flis_layers_match,
+                p, summary->str, NULL, layers_arr[0]->item_id, pins, N);
+        for (int i = 0; i < N; i++)
+            g_free(roles[i]);
+        g_free(roles);
+        g_free(pins);
+        g_string_free(summary, TRUE);
+        nde_joint_layers_match_data_free(p);
+        /* Couple the caller's compound undo entry to the record so one
+         * Ctrl-Z moves live_count across it — which reverts ALL the layers,
+         * the record being a member of each of their chains (same com.script
+         * gate the undo save used). */
+        if (rid > 0 && !com.script)
+            undo_tag_top_nde_record(rid);
+    }
+    siril_log_info(
+        _("FLIS: predicted composite background  R:%.5f  G:%.5f  B:%.5f  (target %.5f each)\n"), new_bg[0], new_bg[1], new_bg[2], old_bg);
+    if (n_skipped)
+        siril_log_warning(_("FLIS: layers match — the prediction covers the %d "
+                "matched layer(s) only; %d RGB layer(s) also light the "
+                "composite and were left alone\n"), N, n_skipped);
+    /* The tints span a plane, not necessarily all three channels: with no blue
+     * anywhere the solve balances what it can reach and leaves B where it is.
+     * The numbers above already show that; name it, so it reads as a property
+     * of the tints rather than as a failed match.  (An infeasible layer left
+     * unscaled lands here too, and has said so per-layer already.) */
+    for (int c = 0; c < 3; c++) {
+        if (fabs(new_bg[c] - old_bg) > 1e-4 * MAX(old_bg, 1e-6)) {
+            siril_log_warning(_("FLIS: layers match — the assigned tints could "
+                    "not carry the background to neutral in every channel; "
+                    "diversify the tints for a closer match\n"));
+            break;
+        }
+    }
+
+    free(layers_arr); free(medians); free(tints); free(s); free(infeasible);
+    gui_iface.flis_invalidate_composite();
+    return 0;
+}
+
+/* =======================================================================
+ * Group colour calibration (CC / PCC / SPCC on a layer group)
+ *
+ * The three calibration algorithms all reduce to a per-channel affine
+ * transform of the RGB image they run on:  C_c' = K_c*C_c + O_c.  For a
+ * layer group whose tinted mono layers composite to colour (screen-linear
+ * approximation, as layers match), that transform is distributed into
+ * per-layer affine factors  x_i' = a_i*x_i + b_i  such that
+ *   - the signal scaling is matched per layer in the tint-weighted
+ *     least-squares sense (exact for pure tints):
+ *       a_i = sum_c K_c*(T_i^c)^2 / sum_c (T_i^c)^2
+ *   - the composite BACKGROUND transforms exactly per channel:
+ *       sum_i T_i^c * b_i = K_c*B_c + O_c - sum_i T_i^c*a_i*m_i
+ *     solved via the same SVD pseudoinverse layers match uses; the tint
+ *     matrix must span RGB (the "sufficient colour diversity" caveat).
+ *
+ * Each affected layer then gets one Tier-A "flis.layer_scale" NDE record
+ * so the operation appears in the history per layer, replayable,
+ * amendable and deletable, with one compound undo entry coupled to the
+ * whole record range.
+ * ======================================================================= */
+
+/*
+ * flis_group_composites_to_colour — cheap sensitivity predicate: does the
+ * group plausibly composite to a COLOUR image the calibration tools can
+ * work on?  TRUE when it has at least two calibratable mono members and at
+ * least one carries a non-neutral tint.  The strict tint-diversity check
+ * (rank of the tint matrix) happens at apply time with a clear error;
+ * this only drives menu sensitivity.
+ */
+gboolean flis_group_composites_to_colour(const flis_group_t *grp) {
+    if (!grp || !com.uniq)
+        return FALSE;
+    int n_mono = 0;
+    gboolean tinted = FALSE;
+    for (GSList *l = com.uniq->layers; l; l = l->next) {
+        flis_layer_t *lay = l->data;
+        if (!lay || lay->group_id != grp->item_id || !lay->fit)
+            continue;
+        if (lay->fit->naxes[2] != 1)
+            continue;
+        if (!lay->fit->fdata && !lay->fit->data)
+            continue;
+        n_mono++;
+        if (lay->has_tint && (lay->layer_tint.r != lay->layer_tint.g ||
+                              lay->layer_tint.g != lay->layer_tint.b))
+            tinted = TRUE;
+    }
+    return n_mono >= 2 && tinted;
+}
+
+/*
+ * flis_document_has_wcs_donor — TRUE when some layer can donate a plate
+ * solve to the group composite (canvas geometry, canvas origin, solved).
+ * Drives PCC/SPCC sensitivity for the group-calibration path; mirrors the
+ * donor search in flis_group_render_calib_composite.
+ */
+gboolean flis_document_has_wcs_donor(void) {
+    if (!com.uniq)
+        return FALSE;
+    for (GSList *l = com.uniq->layers; l; l = l->next) {
+        flis_layer_t *lay = l->data;
+        if (lay && lay->fit && lay->fit->keywords.wcslib &&
+                lay->fit->rx == com.uniq->canvas_w &&
+                lay->fit->ry == com.uniq->canvas_h &&
+                lay->position_x == 0 && lay->position_y == 0)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+/* Filter @members down to the calibratable set (mono layers with pixel
+ * data), warning about anything skipped.  Returns a new GSList. */
+static GSList *group_calib_eligible(GSList *members) {
+    GSList *out = NULL;
+    for (GSList *l = members; l; l = l->next) {
+        flis_layer_t *lay = l->data;
+        if (!lay || !lay->fit)
+            continue;
+        if (lay->fit->naxes[2] != 1) {
+            siril_log_warning(_("Group calibration: skipping RGB layer '%s' "
+                    "(only tinted mono layers are calibrated)\n"),
+                    lay->layer_name ? lay->layer_name : "?");
+            continue;
+        }
+        if (!lay->fit->fdata && !lay->fit->data)
+            continue;
+        out = g_slist_append(out, lay);
+    }
+    return out;
+}
+
+/* Render the colour composite of @members (group sub-composite: screen
+ * stack over black, no canvas background) and transplant WCS metadata
+ * from the first plate-solved layer whose geometry matches, so PCC/SPCC
+ * can run photometry on it.  Caller owns the returned fits. */
+static fits *flis_group_render_calib_composite(GSList *members, gchar **err) {
+    flis_render_ctx ctx = { 0 };
+    ctx.canvas_w = com.uniq->canvas_w;
+    ctx.canvas_h = com.uniq->canvas_h;
+    ctx.groups   = com.uniq->groups;
+    fits *composite = flis_render_layers_ctx(members, &ctx, TRUE, FALSE);
+    if (!composite) {
+        if (err) *err = g_strdup(_("could not render the group composite"));
+        return NULL;
+    }
+    if (composite->naxes[2] != 3) {
+        if (err) *err = g_strdup(_("the group does not composite to a colour image"));
+        clearfits(composite);
+        free(composite);
+        return NULL;
+    }
+    /* WCS donor: a solved member first, then any solved document layer at
+     * the canvas origin with matching geometry. */
+    flis_layer_t *donor = NULL;
+    for (GSList *l = members; l && !donor; l = l->next) {
+        flis_layer_t *lay = l->data;
+        if (lay && lay->fit && lay->fit->keywords.wcslib &&
+                lay->fit->rx == composite->rx && lay->fit->ry == composite->ry &&
+                lay->position_x == 0 && lay->position_y == 0)
+            donor = lay;
+    }
+    for (GSList *l = com.uniq->layers; l && !donor; l = l->next) {
+        flis_layer_t *lay = l->data;
+        if (lay && lay->fit && lay->fit->keywords.wcslib &&
+                lay->fit->rx == composite->rx && lay->fit->ry == composite->ry &&
+                lay->position_x == 0 && lay->position_y == 0)
+            donor = lay;
+    }
+    if (donor)
+        copy_fits_metadata(donor->fit, composite);
+    return composite;
+}
+
+/* The PURE distribution, shared by the live apply and the joint-record
+ * replay (nde_joint.c): map the composite-level per-channel affine (@K, @O)
+ * onto per-layer factors given @N layers' tints (@tints, N RGB triples) and
+ * background medians.  Returns 0 with @a_out/@b_out filled; non-zero with a
+ * heap reason in @why on a degenerate/unreachable/negative solution (nothing
+ * partial is usable then).  No logging, no layer access. */
+int flis_group_distribute(const double *tints, const double *medians, int N,
+                          const double K[3], const double O[3],
+                          double *a_out, double *b_out, gchar **why) {
+    if (why)
+        *why = NULL;
+    double *T = calloc(3 * N, sizeof(double));
+    if (!T) {
+        PRINT_ALLOC_ERR;
+        return 1;
+    }
+    for (int c = 0; c < 3; c++)
+        for (int i = 0; i < N; i++)
+            T[c * N + i] = tints[i * 3 + c];
+
+    /* Per-layer signal scaling: tint-weighted least squares over channels.
+     * A zero-tint layer contributes nothing to the composite: untouched. */
+    for (int i = 0; i < N; i++) {
+        double num = 0.0, den = 0.0;
+        for (int c = 0; c < 3; c++) {
+            double t = T[c * N + i];
+            num += K[c] * t * t;
+            den += t * t;
+        }
+        a_out[i] = den <= 0.0 ? 1.0 : num / den;
+    }
+
+    /* Exact background transform: solve T*b = r with
+     * r_c = K_c*B_c + O_c - sum_i T_i^c*a_i*m_i. */
+    double r[3];
+    for (int c = 0; c < 3; c++) {
+        double B_c = 0.0, scaled_c = 0.0;
+        for (int i = 0; i < N; i++) {
+            B_c      += T[c * N + i] * medians[i];
+            scaled_c += T[c * N + i] * a_out[i] * medians[i];
+        }
+        r[c] = K[c] * B_c + O[c] - scaled_c;
+    }
+    if (pseudoinverse_solve(T, N, r, b_out)) {
+        if (why)
+            *why = g_strdup(_("the tint matrix is degenerate"));
+        free(T);
+        return 1;
+    }
+    /* The pseudoinverse returns a least-squares answer even for a
+     * rank-deficient tint matrix; verify the background system actually
+     * closed, or the calibration silently misses a channel. */
+    for (int c = 0; c < 3; c++) {
+        double got = 0.0;
+        for (int i = 0; i < N; i++)
+            got += T[c * N + i] * b_out[i];
+        if (fabs(got - r[c]) > 1e-6) {
+            if (why)
+                *why = g_strdup_printf(_("the layer tints do not span enough "
+                        "colours to carry the calibration (channel %c "
+                        "unreachable) — diversify the assigned tints"), "RGB"[c]);
+            free(T);
+            return 1;
+        }
+    }
+    for (int i = 0; i < N; i++) {
+        if (a_out[i] < 0.0) {
+            if (why)
+                *why = g_strdup_printf(_("layer %d would need a negative scale"), i);
+            free(T);
+            return 1;
+        }
+    }
+    free(T);
+    return 0;
+}
+
+/*
+ * Distribute the per-channel affine calibration (@K, @O) of the group
+ * composite into per-layer factors and apply them to @members, capturing
+ * NDE provenance: ONE Tier-A "flis.group_calibration" JOINT record
+ * (nde_joint.h) whose params carry the operation's own inputs — @calib when
+ * the caller has them (the group-calibration hook), or just the direct
+ * K/O affine (kind NDE_JOINT_GROUP_DIRECT) when it does not.  Called under
+ * the FLIS stack writer lock (layer-worker hook context).  Returns 0 on
+ * success; on failure nothing was mutated.
+ */
+int flis_group_apply_channel_calibration_full(GSList *members, const double K[3],
+                                              const double O[3], const char *label,
+                                              const struct flis_group_calib_args *calib) {
+    GSList *eligible = group_calib_eligible(members);
+    int N = g_slist_length(eligible);
+    if (N == 0) {
+        siril_log_error(_("Group calibration: no eligible mono layers in the group\n"));
+        g_slist_free(eligible);
+        return 1;
+    }
+
+    flis_layer_t **layers_arr = calloc(N, sizeof(flis_layer_t *));
+    double *medians = calloc(N, sizeof(double));
+    double *tints = calloc(3 * N, sizeof(double));
+    double *a = calloc(N, sizeof(double));
+    double *b = calloc(N, sizeof(double));
+    if (!layers_arr || !medians || !tints || !a || !b) {
+        PRINT_ALLOC_ERR;
+        goto fail;
+    }
+
+    int i = 0;
+    for (GSList *l = eligible; l; l = l->next, i++) {
+        flis_layer_t *lay = l->data;
+        layers_arr[i] = lay;
+        tints[i * 3 + 0] = lay->has_tint ? lay->layer_tint.r : 1.0;
+        tints[i * 3 + 1] = lay->has_tint ? lay->layer_tint.g : 1.0;
+        tints[i * 3 + 2] = lay->has_tint ? lay->layer_tint.b : 1.0;
+        if (!lay->has_tint)
+            siril_log_warning(_("Group calibration: layer '%s' has no tint and "
+                    "is treated as neutral white\n"),
+                    lay->layer_name ? lay->layer_name : "?");
+        else if (lay->layer_tint.r <= 0 && lay->layer_tint.g <= 0 &&
+                 lay->layer_tint.b <= 0)
+            siril_log_warning(_("Group calibration: layer '%s' has a zero "
+                    "tint — left unscaled\n"),
+                    lay->layer_name ? lay->layer_name : "?");
+        imstats *st = statistics(NULL, -1, lay->fit, 0, NULL, STATS_BASIC,
+                                 SINGLE_THREADED);
+        if (!st)
+            goto fail;
+        double med = st->median;
+        free_stats(st);
+        if (lay->fit->type == DATA_USHORT)
+            med /= USHRT_MAX_DOUBLE;
+        medians[i] = med;
+    }
+
+    gchar *why = NULL;
+    if (flis_group_distribute(tints, medians, N, K, O, a, b, &why)) {
+        siril_log_error(_("Group calibration: %s\n"), why ? why : "?");
+        g_free(why);
+        goto fail;
+    }
+
+    /* Apply + provenance, mirroring flis_background_neutralise_layers. */
+    gboolean replaying = processing_is_reserved_for_replay();
+    gboolean script_scope = nde_script_scope_active();
+    siril_log_info(_("Group calibration per-layer factors:\n"));
+    for (i = 0; i < N; i++) {
+        const char *name = layers_arr[i]->layer_name ? layers_arr[i]->layer_name : "?";
+        siril_log_info("  %-24s  x%.4f %+.5f\n", name, a[i], b[i]);
+        /* Every participant needs a replay starting point, factors of 1
+         * included — the recompute may derive something else for it. */
+        if (!replaying)
+            nde_checkpoint_baseline_ensure(layers_arr[i]->fit,
+                                           layers_arr[i]->item_id);
+        if (a[i] == 1.0 && b[i] == 0.0)
+            continue;
+        affine_layer_pixels(layers_arr[i]->fit, a[i], b[i]);
+        invalidate_stats_from_fit(layers_arr[i]->fit);
+    }
+    if (replaying) {
+        /* no capture */
+    } else if (script_scope) {
+        nde_script_scope_mark_pixels_dirty();
+    } else {
+        struct nde_joint_group_calib_data *p = nde_joint_group_calib_data_new(N);
+        nde_pin_spec *pins = g_new0(nde_pin_spec, N);
+        gchar **roles = g_new0(gchar *, N);
+        for (i = 0; i < N; i++) {
+            flis_layer_t *lay = layers_arr[i];
+            p->parts[i].item_id = lay->item_id;
+            p->parts[i].name = g_strdup(lay->layer_name ? lay->layer_name : "");
+            p->parts[i].tinted = lay->has_tint;
+            p->parts[i].tint[0] = lay->has_tint ? lay->layer_tint.r : 1.0;
+            p->parts[i].tint[1] = lay->has_tint ? lay->layer_tint.g : 1.0;
+            p->parts[i].tint[2] = lay->has_tint ? lay->layer_tint.b : 1.0;
+            p->parts[i].diag_scale = a[i];
+            p->parts[i].diag_offset = b[i];
+            roles[i] = g_strdup_printf("in%d", i);
+            pins[i].role = roles[i];
+            pins[i].item_id = lay->item_id;
+            pins[i].record_id = nde_history_last_record_for_item(lay->item_id);
+        }
+        for (int c = 0; c < 3; c++) {
+            p->diag_K[c] = K[c];
+            p->diag_O[c] = O[c];
+        }
+        if (calib) {
+            p->kind = (gint)calib->kind;
+            p->group_id = calib->group_id;
+            p->manual = calib->manual;
+            memcpy(p->manual_kw, calib->manual_kw, sizeof(p->manual_kw));
+            p->white_sel = calib->white_sel;
+            p->black_sel = calib->black_sel;
+            p->low = calib->low;
+            p->high = calib->high;
+            if (calib->pcc) {
+                const op_descriptor *pop = op_descriptor_by_id("color.photometric_cc");
+                if (pop && pop->serialize)
+                    p->pcc_blob = pop->serialize(calib->pcc);
+            }
+        } else {
+            p->kind = NDE_JOINT_GROUP_DIRECT;
+        }
+        gchar *summary = g_strdup_printf("%s (%d %s)", label, N, _("layers"));
+        gint64 rid = nde_capture_from_descriptor_pinned(&op_desc_flis_group_calibration,
+                p, summary, NULL, layers_arr[0]->item_id, pins, N);
+        for (i = 0; i < N; i++)
+            g_free(roles[i]);
+        g_free(roles);
+        g_free(pins);
+        g_free(summary);
+        nde_joint_group_calib_data_free(p);
+        if (rid > 0 && !com.script)
+            undo_tag_top_nde_record(rid);
+    }
+
+    free(layers_arr); free(medians); free(tints); free(a); free(b);
+    g_slist_free(eligible);
+    gui_iface.flis_invalidate_composite();
+    return 0;
+
+fail:
+    free(layers_arr); free(medians); free(tints); free(a); free(b);
+    g_slist_free(eligible);
+    return 1;
+}
+
+int flis_group_apply_channel_calibration(GSList *members, const double K[3],
+                                         const double O[3], const char *label) {
+    return flis_group_apply_channel_calibration_full(members, K, O, label, NULL);
+}
+
+void free_flis_group_calib_args(void *p) {
+    struct flis_group_calib_args *args = p;
+    if (!args)
+        return;
+    if (args->pcc) {
+        if (args->pcc->destroy_fn)
+            args->pcc->destroy_fn(args->pcc);
+        else
+            free(args->pcc);
+    }
+    free(args);
+}
+
+struct flis_group_calib_args *new_flis_group_calib_args(void) {
+    struct flis_group_calib_args *p = calloc(1, sizeof(*p));
+    if (p)
+        p->destroy_fn = free_flis_group_calib_args;
+    return p;
+}
+
+/*
+ * generic_layer_worker hook: run one of the colour-calibration algorithms
+ * against the composite of a layer group and distribute the result into
+ * the group's layers.  args->user is a struct flis_group_calib_args.
+ */
+int flis_group_calibration_hook(struct generic_layer_args *args) {
+    struct flis_group_calib_args *p = args->user;
+    if (!p)
+        return 1;
+    /* One record across several layers' lineages cannot join an insertion
+     * point armed on one of them (nde_op_class.c).  Refused here rather than
+     * in the distribution step so a PCC run does not do its photometry first.
+     * A replay is exempt: it captures nothing. */
+    if (!processing_is_reserved_for_replay() &&
+        nde_edit_at_refuses_op(_("Calibrating a layer group")))
+        return 1;
+    flis_group_t *grp = flis_group_get_by_id(p->group_id);
+    if (!grp) {
+        siril_log_error(_("Group calibration: group no longer exists\n"));
+        return 1;
+    }
+    GSList *members = flis_group_get_layers(grp);
+    if (!members) {
+        siril_log_error(_("Group calibration: the group has no layers\n"));
+        return 1;
+    }
+    /* Measure exactly what will be corrected.  The composite is what the
+     * algorithm derives K/O from, and the distribution below reaches only the
+     * tinted mono layers — so rendering it from the whole group would let an
+     * RGB member's light set a correction the mono layers then absorb on its
+     * behalf, over-correcting them by that member's share. */
+    GSList *members_owned = members;
+    members = group_calib_eligible(members_owned);
+    g_slist_free(members_owned);
+    if (!members) {
+        siril_log_error(_("Group calibration: no eligible mono layers in the group\n"));
+        return 1;
+    }
+
+    double K[3], O[3];
+    int rv = 1;
+
+    if (p->kind == FLIS_GROUP_CALIB_CC && p->manual) {
+        /* Manual white balance: per-channel multipliers, no offset. */
+        for (int c = 0; c < 3; c++) {
+            K[c] = p->manual_kw[c];
+            O[c] = 0.0;
+        }
+        rv = 0;
+    } else {
+        gchar *err = NULL;
+        fits *composite = flis_group_render_calib_composite(members, &err);
+        if (!composite) {
+            siril_log_error(_("Group calibration: %s\n"), err ? err : "?");
+            g_free(err);
+            g_slist_free(members);
+            return 1;
+        }
+        if (p->kind == FLIS_GROUP_CALIB_CC) {
+            double kw[3] = { 0 }, bg[3] = { 0 };
+            get_coeff_for_wb(composite, p->white_sel, p->black_sel, kw, bg,
+                             get_normalized_value(composite), p->low, p->high);
+            if (kw[0] > 0.0 && kw[1] > 0.0 && kw[2] > 0.0) {
+                /* calibrate(): C' = (C - bg)*kw + bg  ==  kw*C + bg*(1-kw) */
+                for (int c = 0; c < 3; c++) {
+                    K[c] = kw[c];
+                    O[c] = bg[c] * (1.0 - kw[c]);
+                }
+                rv = 0;
+            } else {
+                siril_log_error(_("Group calibration: could not compute white "
+                        "balance from the selections\n"));
+            }
+        } else {
+            /* PCC / SPCC need a plate solve on the composite (transplanted
+             * from a solved layer by the renderer). */
+            if (!composite->keywords.wcslib) {
+                siril_log_error(_("Group calibration: no plate-solved layer "
+                        "with canvas geometry to take the WCS from — solve a "
+                        "layer first\n"));
+            } else {
+                /* Run the FULL single-image pipeline via the descriptor's
+                 * image hook — it measures the FWHM, fetches and projects
+                 * the star catalogue into pcc->ref_stars, and only then
+                 * calls photometric_cc().  Calling photometric_cc()
+                 * directly crashes on the NULL ref_stars. */
+                struct generic_img_args ia = { 0 };
+                ia.user = p->pcc;
+                rv = photometric_cc_image_hook(&ia, composite, com.max_thread);
+                p->pcc->fit = NULL;
+                if (!rv && p->pcc->have_effective) {
+                    /* apply_photometric_color_correction():
+                     * C' = kw*C + (bg_mean - bg*kw) */
+                    double bg_mean = (p->pcc->eff_bg[0] + p->pcc->eff_bg[1] +
+                                      p->pcc->eff_bg[2]) / 3.0;
+                    for (int c = 0; c < 3; c++) {
+                        K[c] = p->pcc->eff_kw[c];
+                        O[c] = bg_mean - p->pcc->eff_bg[c] * K[c];
+                    }
+                } else {
+                    rv = 1;
+                }
+            }
+        }
+        clearfits(composite);
+        free(composite);
+    }
+
+    if (!rv) {
+        const char *label =
+            p->kind == FLIS_GROUP_CALIB_CC  ? _("Colour calibration (group)") :
+            p->kind == FLIS_GROUP_CALIB_PCC ? _("Photometric CC (group)") :
+                                              _("Spectrophotometric CC (group)");
+        rv = flis_group_apply_channel_calibration_full(members, K, O, label, p);
+    }
+    g_slist_free(members);
+    return rv;
+}
+

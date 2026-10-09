@@ -34,6 +34,7 @@
 #include "core/command_line_processor.h"
 #include "core/command_list.h"
 #include "core/processing.h"
+#include "io/image_format_flis.h"
 #include "io/sequence.h"
 #include "io/ser.h"
 #include "io/single_image.h"
@@ -70,6 +71,8 @@ const char *cmd_err_to_str(cmd_errors err) {
 			return _("load an image or sequence first");
 		case CMD_ONLY_SINGLE_IMAGE:
 			return _("command is only for a loaded single image");
+		case CMD_ONLY_FLIS_IMAGE:
+			return _("command requires a FLIS layered image to be loaded");
 		case CMD_NOT_FOR_SINGLE:
 			return _("command is only for a sequence");
 		case CMD_NOT_FOR_MONO:
@@ -113,6 +116,15 @@ void parse_line(char *myline, int len, int *nb) {
 				string_starter = '\0';
 				break;
 			}
+			/* Support -opt="value with spaces": a quote immediately
+			 * following '=' inside a word opens string mode, so the
+			 * quoted value (spaces included) stays in one word.  The
+			 * opening quote remains embedded in the word; option
+			 * parsers strip it from the extracted value. */
+			if (string_starter == '\0'
+					&& (myline[i] == '"' || myline[i] == '\'')
+					&& myline[i - 1] == '=')
+				string_starter = myline[i];
 		} while (i < len && (!isblank(myline[i]) || string_starter != '\0')
 				&& myline[i] != '\r' && myline[i] != '\n');
 		if (myline[i] == '\0')	// the end of the word and line (i == len)
@@ -171,6 +183,17 @@ int execute_command(int wordnb) {
 		}
 	}
 
+	/* REQ_CMD_FLIS_IMAGE: the command needs a FLIS file loaded.  Implies
+	 * REQ_CMD_SINGLE_IMAGE — we additionally require that single is FLIS. */
+	if ((commands[i].prerequires & REQ_CMD_FLIS_IMAGE) == REQ_CMD_FLIS_IMAGE) {
+		if (!single_image_is_loaded()) {
+			return CMD_ONLY_SINGLE_IMAGE;
+		}
+		if (!is_current_image_flis()) {
+			return CMD_ONLY_FLIS_IMAGE;
+		}
+	}
+
 	if ((commands[i].prerequires & REQ_CMD_FOR_CFA) == REQ_CMD_FOR_CFA) {
 		if (isrgb(gfit)) {
 			return CMD_FOR_CFA_IMAGE;
@@ -195,8 +218,6 @@ int execute_command(int wordnb) {
 	siril_log_warning(_("Running command: %s\n"), word[0]);
 	fprintf(stdout, "%lu: running command %s\n", time(NULL), word[0]);
 	int retval = commands[i].process(wordnb);
-	if (gui_iface.roi_is_active())
-		gui_iface.populate_roi();
 	if (retval & CMD_NOTIFY_GFIT_MODIFIED) {
 		waiting_for_thread(); // we can't proceed until the generic_image_Worker is done
 		if (!com.python_script) {

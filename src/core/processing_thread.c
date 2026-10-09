@@ -48,6 +48,12 @@ typedef struct _ProcessingJob {
 
     gboolean           fire_and_forget;
 
+    /* TRUE when the job was submitted from a python comm thread (a script's
+     * cmd() / IPC request).  Captured at submission time from the submitting
+     * thread's identity — never from com.python_command, which is a global
+     * that a concurrent GUI submission could misread. */
+    gboolean           from_python;
+
     /* Initialised only when fire_and_forget == FALSE. */
     GMutex             mutex;
     GCond              cond;
@@ -74,6 +80,16 @@ static gint      system_initialized = 0;
 /* Thread-local flag: non-NULL only on the worker thread itself. */
 static GPrivate  worker_tls = G_PRIVATE_INIT(NULL);
 
+/* Thread-local flag: non-NULL only on python comm threads (set by
+ * processing_mark_python_comm_thread at connection_worker start). */
+static GPrivate  python_comm_tls = G_PRIVATE_INIT(NULL);
+
+/* Origin of the job the worker is currently executing.  Written only by the
+ * worker thread around job->func; read only from the worker thread (via
+ * processing_current_job_from_python) by capture sites running inside the
+ * job, so no locking is needed. */
+static gboolean  current_job_from_python = FALSE;
+
 /* ── Cancellation and job-active ────────────────────────────────────────── */
 
 /*
@@ -95,13 +111,52 @@ static gint cancel_flag = 0;
 */
 static gint job_active_flag = 0;
 
-/* ── Python reservation ──────────────────────────────────────────────────
+/* ── Slot reservation (owner) ────────────────────────────────────────────
 *
-* When python_reserved is TRUE, processing_submit_job blocks (on queue_cond)
-* until python_releases_thread() clears it.
+* The active slot can be reserved by a non-worker actor that needs to gate
+* other submissions.  slot_owner names who holds it:
+*
+*   SLOT_FREE    — no reservation; submissions follow the normal path.
+*   SLOT_PYTHON  — a Python script has claimed the slot (claim_thread_for_python).
+*                  processing_submit_job blocks background callers (on
+*                  queue_cond) and rejects GTK-main callers until
+*                  python_releases_thread() clears it.  Behaviour is identical
+*                  to the historic python_reserved bool.
+*   SLOT_REPLAY  — the NDE replay conductor owns the slot (see nde_replay.c).
+*                  Reserved for a later commit; the enum value is defined now so
+*                  the reservation surface has a single owner concept.
+*
 * Protected by queue_mutex.
 */
-static gboolean python_reserved = FALSE;
+typedef enum {
+    SLOT_FREE = 0,
+    SLOT_PYTHON,
+    SLOT_REPLAY,
+} slot_owner_t;
+static slot_owner_t slot_owner = SLOT_FREE;
+
+/* ── Replay owner identity (SLOT_REPLAY) ─────────────────────────────────
+*
+* While SLOT_REPLAY is held, background submissions are admitted only from the
+* replay's own threads: the conductor (which runs the chain, see nde_replay.c)
+* and the single Python script it launched to re-run a Tier-C step.  Identity
+* is the calling GThread itself — intrinsic and race-free, so a *different*
+* resident script issuing an unrelated cmd() mid-replay is correctly made to
+* wait rather than mistaken for ours.  Both protected by queue_mutex.
+*/
+static GThread *replay_conductor_thread = NULL;
+static GThread *replay_script_thread    = NULL;
+
+/* Caller must hold queue_mutex.  TRUE when the current thread is admitted to
+ * use the reserved slot without waiting — the replay conductor or the single
+ * script it launched.  Used both by the submit gate and by start_in_new_thread
+ * to treat these as re-entrant callers of the reservation. */
+static gboolean replay_admits_self_locked(void) {
+    if (slot_owner != SLOT_REPLAY)
+        return FALSE;
+    GThread *self = g_thread_self();
+    return self == replay_conductor_thread || self == replay_script_thread;
+}
 
 /* ── Pending-result cache ────────────────────────────────────────────────
 *
@@ -213,7 +268,9 @@ static gpointer worker_thread_main(gpointer user_data G_GNUC_UNUSED) {
 
         /* ── Execute ─────────────────────────────────────────────────── */
 
+        current_job_from_python = job->from_python;
         job->result = job->func(job->data);
+        current_job_from_python = FALSE;
 
         /* ── Publish result ──────────────────────────────────────────── */
 
@@ -303,7 +360,8 @@ void processing_system_shutdown(void) {
 
         g_mutex_lock(&queue_mutex);
         g_queue_push_tail(&job_queue, quit);
-        g_cond_signal(&queue_cond);
+        g_cond_broadcast(&queue_cond);   /* wake the worker even if strangers
+                                            are parked on queue_cond */
         g_mutex_unlock(&queue_mutex);
 
         g_thread_join(worker_thread);
@@ -325,7 +383,8 @@ void processing_system_shutdown(void) {
          */
         g_mutex_lock(&queue_mutex);
         worker_running = FALSE;
-        g_cond_signal(&queue_cond);
+        g_cond_broadcast(&queue_cond);   /* wake the worker even if strangers
+                                            are parked on queue_cond */
         g_mutex_unlock(&queue_mutex);
 
         /* Do NOT join and do NOT clear queue_mutex/queue_cond: the worker
@@ -367,30 +426,47 @@ gboolean processing_submit_job(ProcessingFunc func, gpointer data) {
         return TRUE;
     }
 
-    /* ── Python-reservation gate ─────────────────────────────────────── */
+    /* ── Slot-reservation gate ───────────────────────────────────────── */
     /*
-    * If Python has reserved the slot, block until it is released — unless
-    * we are on the GTK main thread, where blocking would prevent idles from
-    * dispatching and deadlock the worker.  In that case return FALSE and
-    * let the caller handle the rejection.
+    * If the slot is reserved, block until it is released — unless we are on
+    * the GTK main thread, where blocking would prevent idles from dispatching
+    * and deadlock the worker.  In that case return FALSE and let the caller
+    * handle the rejection (any owner blocks a GTK-main submission).
     *
-    * Non-GTK background threads (script thread, Python thread, etc.) simply
-    * wait here; this is safe because none of them run the GTK main loop.
+    * Non-GTK background threads (script thread, Python thread, etc.) wait
+    * here while SLOT_PYTHON holds the slot; this is safe because none of them
+    * run the GTK main loop.  SLOT_REPLAY has an owner-aware admission rule
+    * (background submissions from the replay's own conductor / launched script
+    * pass through) added with the replay conductor.
     */
     if (g_main_context_is_owner(g_main_context_default())) {
         g_mutex_lock(&queue_mutex);
-        gboolean reserved = python_reserved;
+        gboolean reserved = (slot_owner != SLOT_FREE);
         g_mutex_unlock(&queue_mutex);
         if (reserved) {
             siril_log_warning(
-                _("Processing thread is reserved by Python; "
+                _("Processing thread is reserved; "
                   "cannot submit from GTK main thread.\n"));
             return FALSE;
         }
     } else {
         g_mutex_lock(&queue_mutex);
-        while (python_reserved)
-            g_cond_wait(&queue_cond, &queue_mutex);
+        for (;;) {
+            if (slot_owner == SLOT_PYTHON) {
+                g_cond_wait(&queue_cond, &queue_mutex);
+                continue;
+            }
+            if (slot_owner == SLOT_REPLAY) {
+                /* Admit the replay's own conductor and the one script it
+                 * launched; every other background caller waits until the
+                 * conductor releases (per-thread identity, no shared global). */
+                if (replay_admits_self_locked())
+                    break;
+                g_cond_wait(&queue_cond, &queue_mutex);
+                continue;
+            }
+            break;   /* SLOT_FREE */
+        }
         g_mutex_unlock(&queue_mutex);
     }
 
@@ -403,6 +479,7 @@ gboolean processing_submit_job(ProcessingFunc func, gpointer data) {
     job->func           = func;
     job->data           = data;
     job->fire_and_forget = !must_wait;
+    job->from_python    = (g_private_get(&python_comm_tls) != NULL);
 
     if (must_wait) {
         g_mutex_init(&job->mutex);
@@ -411,7 +488,13 @@ gboolean processing_submit_job(ProcessingFunc func, gpointer data) {
 
     g_mutex_lock(&queue_mutex);
     g_queue_push_tail(&job_queue, job);
-    g_cond_signal(&queue_cond);
+    /* Broadcast, not signal: queue_cond has heterogeneous waiters.  Besides the
+     * worker, background callers park here in the reservation gate (a resident
+     * script's cmd() while SLOT_REPLAY is held).  g_cond_signal could wake such
+     * a parked stranger — which just re-checks and re-waits — leaving the worker
+     * asleep and the job unprocessed, hanging the submitter.  All waiters
+     * re-test their condition in a loop, so waking extras is harmless. */
+    g_cond_broadcast(&queue_cond);
     g_mutex_unlock(&queue_mutex);
 
     /* ── Blocking path (script / python-command context) ─────────────── */
@@ -463,6 +546,18 @@ gboolean processing_in_worker_thread(void) {
     return g_private_get(&worker_tls) != NULL;
 }
 
+void processing_mark_python_comm_thread(void) {
+    g_private_set(&python_comm_tls, GINT_TO_POINTER(1));
+}
+
+gboolean processing_current_job_from_python(void) {
+    /* Meaningful only inside a job.  Outside the worker thread there is no
+     * "current job", so answer FALSE rather than exposing a stale value. */
+    if (!processing_in_worker_thread())
+        return FALSE;
+    return current_job_from_python;
+}
+
 /*****************************************************************************
 *    P Y T H O N   R E S E R V A T I O N
 *****************************************************************************/
@@ -482,8 +577,17 @@ int claim_thread_for_python(void) {
 
     g_mutex_lock(&queue_mutex);
 
-    if (python_reserved) {
-        siril_log_warning(_("Processing thread is already reserved by Python.\n"));
+    /* The replay conductor already holds the slot exclusively on this
+     * script's behalf, so a claim from the replayed script is a no-op success:
+     * exclusivity is guaranteed and slot_owner stays SLOT_REPLAY (only the
+     * conductor releases it).  Its matching release is likewise a no-op. */
+    if (slot_owner == SLOT_REPLAY && g_thread_self() == replay_script_thread) {
+        g_mutex_unlock(&queue_mutex);
+        return 0;
+    }
+
+    if (slot_owner != SLOT_FREE) {
+        siril_log_warning(_("Processing thread is already reserved.\n"));
         g_mutex_unlock(&queue_mutex);
         return 1;
     }
@@ -498,24 +602,108 @@ int claim_thread_for_python(void) {
         g_cond_wait(&queue_cond, &queue_mutex);
     }
 
-    python_reserved = TRUE;
+    slot_owner = SLOT_PYTHON;
     g_mutex_unlock(&queue_mutex);
     gui_iface.set_busy(TRUE);
     return 0;
 }
 
 void python_releases_thread(void) {
+    gboolean released = FALSE;
     g_mutex_lock(&queue_mutex);
-    python_reserved = FALSE;
+    if (slot_owner == SLOT_PYTHON) {
+        slot_owner = SLOT_FREE;
+        released = TRUE;
+    }
+    /* A release from the replay's script (slot_owner == SLOT_REPLAY) is the
+     * no-op counterpart to its no-op claim: leave the reservation and the busy
+     * state to the conductor. */
     g_cond_broadcast(&queue_cond);   /* unblock any threads waiting in
                                         processing_submit_job              */
     g_mutex_unlock(&queue_mutex);
-    gui_iface.set_busy(FALSE);
+    if (released)
+        gui_iface.set_busy(FALSE);
 }
 
 gboolean processing_is_reserved_for_python(void) {
     g_mutex_lock(&queue_mutex);
-    gboolean reserved = python_reserved;
+    gboolean reserved = (slot_owner == SLOT_PYTHON);
+    g_mutex_unlock(&queue_mutex);
+    return reserved;
+}
+
+/*****************************************************************************
+*    N D E   R E P L A Y   R E S E R V A T I O N
+*****************************************************************************/
+
+gboolean replay_reserve_slot(void) {
+    /*
+    * Atomically reserve the slot for an NDE replay if — and only if — nothing
+    * else holds or is running it.  Unlike claim_thread_for_python this does
+    * not wait: an edit issued while a job or another reservation is active is
+    * refused (matching the historic start_in_new_thread busy guard), and the
+    * caller reports "stop it first".  Identity is bound separately by the
+    * conductor thread via replay_bind_conductor().
+    */
+    g_mutex_lock(&queue_mutex);
+    if (slot_owner != SLOT_FREE ||
+        g_atomic_int_get(&job_active_flag) ||
+        !g_queue_is_empty(&job_queue)) {
+        g_mutex_unlock(&queue_mutex);
+        return FALSE;
+    }
+    slot_owner = SLOT_REPLAY;
+    replay_conductor_thread = NULL;   /* bound by the conductor */
+    replay_script_thread = NULL;
+    g_mutex_unlock(&queue_mutex);
+    /* The off-worker conductor never passes through the worker's per-job
+     * cancel_flag reset, so clear it here (as reserve_thread does): a stale
+     * cancel from a prior aborted op would otherwise abort the replay on its
+     * first processing_should_continue() check. */
+    g_atomic_int_set(&cancel_flag, 0);
+    gui_iface.set_busy(TRUE);
+    return TRUE;
+}
+
+void replay_bind_conductor(void) {
+    /* Called by the conductor thread as its first action, before it runs any
+     * chain work, so its own re-entrant submissions (should a Tier-A op submit
+     * a sub-job) are admitted by the SLOT_REPLAY gate. */
+    g_mutex_lock(&queue_mutex);
+    replay_conductor_thread = g_thread_self();
+    g_mutex_unlock(&queue_mutex);
+}
+
+void replay_release_slot(void) {
+    g_mutex_lock(&queue_mutex);
+    if (slot_owner == SLOT_REPLAY) {
+        slot_owner = SLOT_FREE;
+        replay_conductor_thread = NULL;
+        replay_script_thread = NULL;
+    }
+    g_cond_broadcast(&queue_cond);   /* wake GUI / other-script waiters */
+    g_mutex_unlock(&queue_mutex);
+    gui_iface.set_busy(FALSE);
+}
+
+void processing_register_replay_script(GThread *comm_thread) {
+    g_mutex_lock(&queue_mutex);
+    replay_script_thread = comm_thread;
+    g_mutex_unlock(&queue_mutex);
+}
+
+void processing_unregister_replay_script(void) {
+    g_mutex_lock(&queue_mutex);
+    replay_script_thread = NULL;
+    /* The joined comm GThread's address must never match a future thread's;
+     * cleared here, before the join in the launch path frees it. */
+    g_cond_broadcast(&queue_cond);
+    g_mutex_unlock(&queue_mutex);
+}
+
+gboolean processing_is_reserved_for_replay(void) {
+    g_mutex_lock(&queue_mutex);
+    gboolean reserved = (slot_owner == SLOT_REPLAY);
     g_mutex_unlock(&queue_mutex);
     return reserved;
 }
@@ -528,8 +716,21 @@ gboolean start_in_new_thread(ProcessingFunc func, gpointer data) {
     /*
     * Re-entrant submissions (from within a running job) bypass all guards:
     * processing_submit_job will run func() synchronously in that case.
+    *
+    * An admitted replay identity (the off-worker conductor or the one script
+    * it launched, while SLOT_REPLAY is held) is likewise a re-entrant caller of
+    * the reserved slot: it must NOT trip the busy guard nor pre-claim
+    * job_active_flag.  A *stranger* (an unrelated resident script's cmd())
+    * parks in the submit gate holding job_active_flag; without this bypass its
+    * held flag would refuse the replay's own submission — a deadlock-class
+    * hole.  The gate admits the identity and the worker sets the flag on
+    * pickup, so the claim here is both unnecessary and harmful.
     */
-    if (!processing_in_worker_thread()) {
+    g_mutex_lock(&queue_mutex);
+    gboolean replay_admitted = replay_admits_self_locked();
+    g_mutex_unlock(&queue_mutex);
+
+    if (!processing_in_worker_thread() && !replay_admitted) {
 
         /* ── Busy guard ──────────────────────────────────────────────────
         *
@@ -569,16 +770,16 @@ gboolean start_in_new_thread(ProcessingFunc func, gpointer data) {
         siril_log_warning(_("Warning: failed to add processing thread to child list\n"));
 
     /*
-    * Submit the job.  processing_submit_job handles the Python-reservation
+    * Submit the job.  processing_submit_job handles the slot-reservation
     * gate internally — we do NOT duplicate that check here to avoid a
-    * TOCTOU race (checking python_reserved, releasing the mutex, then
-    * having processing_submit_job re-check under the same mutex).
+    * TOCTOU race (checking slot_owner, releasing the mutex, then having
+    * processing_submit_job re-check under the same mutex).
     *
     * If submission fails, we must clean up the state we just acquired so
     * that the processing system is not left in a permanently broken state.
     */
     if (!processing_submit_job(func, data)) {
-        if (!processing_in_worker_thread())
+        if (!processing_in_worker_thread() && !replay_admitted)
             g_atomic_int_set(&job_active_flag, 0);
         if (!com.headless)
             gui_iface.set_busy(FALSE);
@@ -598,7 +799,7 @@ gboolean start_in_reserved_thread(ProcessingFunc func, gpointer data) {
     * busy" — even though the reservation was made legitimately.
     *
     * Instead we reproduce the submission path from start_in_new_thread while
-    * skipping only that guard.  The Python-reservation gate is handled
+    * skipping only that guard.  The slot-reservation gate is handled
     * inside processing_submit_job, avoiding a TOCTOU race.
     */
 

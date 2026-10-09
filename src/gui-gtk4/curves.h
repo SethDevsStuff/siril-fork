@@ -21,6 +21,11 @@ void curves_histogram_change_between_roi_and_image();
 void update_gfit_curves_histogram_if_needed();
 void curves_reset_after_undo();
 void apply_curves_cancel();
+
+/* Open the dialog in amend mode for history record @record_id
+ * (nde_editors registry, convergence C5). */
+gboolean curves_open_amend(gint64 record_id);
+
 void toggle_curves_window_visibility();
 void on_curves_close_button_clicked(GtkButton *button, gpointer user_data);
 void on_curves_display_toggle(GtkToggleButton *togglebutton, gpointer user_data);

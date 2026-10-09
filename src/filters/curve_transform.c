@@ -24,6 +24,7 @@
 
 #include <glib.h>
 
+#include "core/nde/nde_history.h"
 #include "core/op_descriptors.h"
 #include "core/processing.h"
 #include "core/proto.h"
@@ -33,15 +34,186 @@
 #define M_PI 3.14159265358979323846
 #endif
 
+/* NDE serializers (flis-nde-sketch.md §11, §14).  apply_curve reads the
+ * algorithm and, per channel, the points list plus its luminance range mask
+ * (range_enabled / lum_min / lum_max / feather).  channels[].active is NOT
+ * serialized: apply_curve derives it from the points list itself.  Nor are
+ * target_channel and show_mask, which only steer the dialog's mask preview.
+ *
+ * Points are encoded as ch<i>_points=x1,y1:x2,y2:... with %.17g via
+ * g_ascii_formatd so the value is locale-independent; ',' and ':' are not
+ * codec metacharacters so no escaping interaction.  A channel left at the
+ * identity curve writes no keys at all, which keeps the common single-channel
+ * record small; on deserialize a missing channel means "untouched", i.e. the
+ * new_curve_params() defaults.  fit/verbose/for_preview are runtime. */
+static void curves_serialize_points(GString *kv, const char *key, GList *points) {
+	GString *pts = g_string_new(NULL);
+	char bx[G_ASCII_DTOSTR_BUF_SIZE], by[G_ASCII_DTOSTR_BUF_SIZE];
+	gboolean first = TRUE;
+	for (GList *l = points; l; l = l->next) {
+		const point *pt = l->data;
+		g_ascii_formatd(bx, sizeof bx, "%.17g", pt->x);
+		g_ascii_formatd(by, sizeof by, "%.17g", pt->y);
+		g_string_append_printf(pts, "%s%s,%s", first ? "" : ":", bx, by);
+		first = FALSE;
+	}
+	nde_kv_add_str(kv, key, pts->str);
+	g_string_free(pts, TRUE);
+}
+
+/* TRUE when the channel would be a no-op: the same test apply_curve applies
+ * to decide whether to build a LUT for it. */
+static gboolean curves_channel_is_identity(const curve_channel_config *cfg) {
+	if (!cfg->points || g_list_length(cfg->points) < 2)
+		return TRUE;
+	if (g_list_length(cfg->points) > 2)
+		return FALSE;
+	const point *p1 = (const point *) cfg->points->data;
+	const point *p2 = (const point *) cfg->points->next->data;
+	return fabs(p1->x) <= 1e-5 && fabs(p1->y) <= 1e-5 &&
+	       fabs(p2->x - 1.0) <= 1e-5 && fabs(p2->y - 1.0) <= 1e-5;
+}
+
+static gchar *curves_serialize(gconstpointer user) {
+	const struct curve_params *p = user;
+	GString *kv = nde_kv_start();
+	/* on-disk value: enum order is frozen by the NDE format — do not reorder */
+	nde_kv_add_int(kv, "algorithm", p->algorithm);
+	for (int c = 0; c < CHAN_COUNT; c++) {
+		const curve_channel_config *cfg = &p->channels[c];
+		if (curves_channel_is_identity(cfg))
+			continue;
+		gchar *key = g_strdup_printf("ch%d_points", c);
+		curves_serialize_points(kv, key, cfg->points);
+		g_free(key);
+		if (cfg->range_enabled) {
+			key = g_strdup_printf("ch%d_range", c);
+			nde_kv_add_bool(kv, key, TRUE);
+			g_free(key);
+			key = g_strdup_printf("ch%d_min", c);
+			nde_kv_add_float(kv, key, cfg->lum_min);
+			g_free(key);
+			key = g_strdup_printf("ch%d_max", c);
+			nde_kv_add_float(kv, key, cfg->lum_max);
+			g_free(key);
+			key = g_strdup_printf("ch%d_feather", c);
+			nde_kv_add_float(kv, key, cfg->feather);
+			g_free(key);
+		}
+	}
+	return nde_kv_end(kv);
+}
+
+/* Parse "x1,y1:x2,y2:..." into a fresh GList of g_new'd point.  Returns FALSE
+ * (leaving *out untouched) on any malformed token. */
+static gboolean curves_parse_points(const char *pts, GList **out) {
+	GList *points = NULL;
+	gboolean parse_ok = TRUE;
+	gchar **tokens = g_strsplit(pts, ":", -1);
+	for (int i = 0; tokens[i] && parse_ok; i++) {
+		gchar **xy = g_strsplit(tokens[i], ",", 2);
+		if (xy[0] && xy[1]) {
+			char *ex = NULL, *ey = NULL;
+			double x = g_ascii_strtod(xy[0], &ex);
+			double y = g_ascii_strtod(xy[1], &ey);
+			if (ex != xy[0] && ey != xy[1]) {
+				point *pt = g_new(point, 1);
+				pt->x = x; pt->y = y;
+				points = g_list_append(points, pt);
+			} else {
+				parse_ok = FALSE;
+			}
+		} else {
+			parse_ok = FALSE;
+		}
+		g_strfreev(xy);
+	}
+	g_strfreev(tokens);
+	if (!parse_ok) {
+		g_list_free_full(points, g_free);
+		return FALSE;
+	}
+	*out = points;
+	return TRUE;
+}
+
+static gpointer curves_deserialize(const gchar *blob, int version) {
+	/* Version 1 was the pre-VeraLux single-curve blob (points= + ch0..ch2=);
+	 * its keys are all gone, so it would parse as "algorithm only, every
+	 * channel identity" — a silent no-op.  Reject it instead. */
+	if (version != op_desc_curves.version)
+		return NULL;
+	GHashTable *kv = nde_kv_parse(blob);
+	gint64 algorithm;
+	NDE_KV_REQUIRE(kv, nde_kv_get_int(kv, "algorithm", &algorithm));
+
+	GList *points[CHAN_COUNT] = { NULL };
+	curve_channel_config masks[CHAN_COUNT] = { { 0 } };
+	gboolean parse_ok = TRUE;
+	for (int c = 0; c < CHAN_COUNT && parse_ok; c++) {
+		gchar *key = g_strdup_printf("ch%d_points", c);
+		const char *pts = nde_kv_get_str(kv, key);   /* absent → untouched */
+		g_free(key);
+		if (!pts)
+			continue;
+		if (!*pts || !curves_parse_points(pts, &points[c])) {
+			parse_ok = FALSE;
+			break;
+		}
+		key = g_strdup_printf("ch%d_range", c);
+		gboolean range = FALSE;
+		gboolean have_range = nde_kv_get_bool(kv, key, &range);
+		g_free(key);
+		if (!have_range || !range)
+			continue;
+		masks[c].range_enabled = TRUE;
+		key = g_strdup_printf("ch%d_min", c);
+		parse_ok = nde_kv_get_float(kv, key, &masks[c].lum_min);
+		g_free(key);
+		if (!parse_ok) break;
+		key = g_strdup_printf("ch%d_max", c);
+		parse_ok = nde_kv_get_float(kv, key, &masks[c].lum_max);
+		g_free(key);
+		if (!parse_ok) break;
+		key = g_strdup_printf("ch%d_feather", c);
+		parse_ok = nde_kv_get_float(kv, key, &masks[c].feather);
+		g_free(key);
+	}
+	g_hash_table_unref(kv);
+
+	struct curve_params *p = parse_ok ? new_curve_params() : NULL;
+	if (!p) {
+		for (int c = 0; c < CHAN_COUNT; c++)
+			g_list_free_full(points[c], g_free);
+		return NULL;
+	}
+	/* free_curve_params (the default destroy_fn) frees the points lists, so
+	 * the freshly parsed lists are owned by the returned struct. */
+	p->algorithm = (enum curve_algorithm)algorithm;
+	for (int c = 0; c < CHAN_COUNT; c++) {
+		p->channels[c].points = points[c];
+		if (masks[c].range_enabled) {
+			p->channels[c].range_enabled = TRUE;
+			p->channels[c].lum_min = masks[c].lum_min;
+			p->channels[c].lum_max = masks[c].lum_max;
+			p->channels[c].feather = masks[c].feather;
+		}
+	}
+	return p;
+}
+
 /* Op descriptor — single source of truth for this operation (op_descriptor.h).
  * curve_transform.h (included above) declares the hooks referenced here. */
 const op_descriptor op_desc_curves = {
-	.id = "stretch.curves", .version = 1,
+	.id = "stretch.curves", .version = 2,   /* v2: VeraLux per-channel curves */
 	.image_hook = curve_image_hook,
 	.log_hook = curves_log_hook,
 	.description = N_("Curve Transformation"),
 	.mem_ratio = 2.0f,
-	.flags = 0,
+	/* apply_curve is pointwise, so blending its result through the processing
+	 * mask is well defined — curves_process_with_worker asks for it. */
+	.flags = OP_MASK_CAPABLE | OP_ROI_CAPABLE,
+	.serialize = curves_serialize, .deserialize = curves_deserialize,
 };
 
 /*****************************************************************************

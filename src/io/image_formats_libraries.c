@@ -736,11 +736,11 @@ int savetif(const char *name, fits *fit, uint16_t bitspersample,
 	void *dest = NULL;
 	cmsHTRANSFORM save_transform = NULL;
 	gboolean threaded = !processing_in_worker_thread();
-	if (fit->color_managed && fit->icc_profile) {
+	if (fit_get_color_managed(fit) && fit_get_icc_profile(fit)) {
 		// Transform the data
 		buf = src_is_float ? (void *) fit->fdata : (void *) fit->data;
 		size_t npixels = fit->rx * fit->ry;
-		cmsColorSpaceSignature sig = cmsGetColorSpace(fit->icc_profile);
+		cmsColorSpaceSignature sig = cmsGetColorSpace(fit_get_icc_profile(fit));
 		cmsUInt32Number trans_type = get_planar_formatter_type(sig, fit->type, FALSE);
 		if (src_is_float) {
 			dest = malloc(fit->rx * fit->ry * fit->naxes[2] * sizeof(float));
@@ -757,16 +757,16 @@ int savetif(const char *name, fits *fit, uint16_t bitspersample,
 				switch (com.pref.icc.export_8bit_method) {
 					case EXPORT_SRGB:
 						srgb_mono_out = gray_srgbtrc();
-						save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit->icc_profile, trans_type, srgb_mono_out, trans_type, com.pref.icc.export_intent, 0);
+						save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit_get_icc_profile(fit), trans_type, srgb_mono_out, trans_type, com.pref.icc.export_intent, 0);
 						profile = get_icc_profile_data(srgb_mono_out, &profile_len);
 						cmsCloseProfile(srgb_mono_out);
 						break;
 					case EXPORT_WORKING:
-						save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit->icc_profile, trans_type, com.icc.mono_out, trans_type, com.pref.icc.export_intent, 0);
+						save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit_get_icc_profile(fit), trans_type, com.icc.mono_out, trans_type, com.pref.icc.export_intent, 0);
 						profile = get_icc_profile_data(com.icc.mono_out, &profile_len);
 						break;
 					case EXPORT_IMAGE_ICC:
-						profile = get_icc_profile_data(fit->icc_profile, &profile_len);
+						profile = get_icc_profile_data(fit_get_icc_profile(fit), &profile_len);
 						break;
 					default:
 						free(dest);
@@ -776,15 +776,15 @@ int savetif(const char *name, fits *fit, uint16_t bitspersample,
 			} else { // rgb
 				switch (com.pref.icc.export_8bit_method) {
 					case EXPORT_SRGB:
-						save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit->icc_profile, trans_type, com.icc.srgb_out, trans_type, com.pref.icc.export_intent, 0);
+						save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit_get_icc_profile(fit), trans_type, com.icc.srgb_out, trans_type, com.pref.icc.export_intent, 0);
 						profile = get_icc_profile_data(com.icc.srgb_out, &profile_len);
 						break;
 					case EXPORT_WORKING:
-						save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit->icc_profile, trans_type, com.icc.working_out, trans_type, com.pref.icc.export_intent, 0);
+						save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit_get_icc_profile(fit), trans_type, com.icc.working_out, trans_type, com.pref.icc.export_intent, 0);
 						profile = get_icc_profile_data(com.icc.working_out, &profile_len);
 						break;
 					case EXPORT_IMAGE_ICC:
-						profile = get_icc_profile_data(fit->icc_profile, &profile_len);
+						profile = get_icc_profile_data(fit_get_icc_profile(fit), &profile_len);
 						break;
 					default:
 						free(dest);
@@ -798,16 +798,16 @@ int savetif(const char *name, fits *fit, uint16_t bitspersample,
 				switch (com.pref.icc.export_16bit_method) {
 					case EXPORT_SRGB:
 						srgb_mono_out = gray_srgbtrc();
-						save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit->icc_profile, trans_type, srgb_mono_out, trans_type, com.pref.icc.export_intent, 0);
+						save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit_get_icc_profile(fit), trans_type, srgb_mono_out, trans_type, com.pref.icc.export_intent, 0);
 						profile = get_icc_profile_data(srgb_mono_out, &profile_len);
 						cmsCloseProfile(srgb_mono_out);
 						break;
 					case EXPORT_WORKING:
-						save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit->icc_profile, trans_type, com.icc.mono_out, trans_type, com.pref.icc.export_intent, 0);
+						save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit_get_icc_profile(fit), trans_type, com.icc.mono_out, trans_type, com.pref.icc.export_intent, 0);
 						profile = get_icc_profile_data(com.icc.mono_out, &profile_len);
 						break;
 					case EXPORT_IMAGE_ICC:
-						profile = get_icc_profile_data(fit->icc_profile, &profile_len);
+						profile = get_icc_profile_data(fit_get_icc_profile(fit), &profile_len);
 						break;
 					default:
 						free(dest);
@@ -817,15 +817,15 @@ int savetif(const char *name, fits *fit, uint16_t bitspersample,
 			} else { // rgb
 				switch (com.pref.icc.export_16bit_method) {
 					case EXPORT_SRGB:
-						save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit->icc_profile, trans_type, com.icc.srgb_out, trans_type, com.pref.icc.export_intent, 0);
+						save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit_get_icc_profile(fit), trans_type, com.icc.srgb_out, trans_type, com.pref.icc.export_intent, 0);
 						profile = get_icc_profile_data(com.icc.srgb_out, &profile_len);
 						break;
 					case EXPORT_WORKING:
-						save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit->icc_profile, trans_type, com.icc.working_out, trans_type, com.pref.icc.export_intent, 0);
+						save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit_get_icc_profile(fit), trans_type, com.icc.working_out, trans_type, com.pref.icc.export_intent, 0);
 						profile = get_icc_profile_data(com.icc.working_out, &profile_len);
 						break;
 					case EXPORT_IMAGE_ICC:
-						profile = get_icc_profile_data(fit->icc_profile, &profile_len);
+						profile = get_icc_profile_data(fit_get_icc_profile(fit), &profile_len);
 						break;
 					default:
 						free(dest);
@@ -835,7 +835,7 @@ int savetif(const char *name, fits *fit, uint16_t bitspersample,
 			}
 		} else {
 			// 32-bit images are always saved with the image profile
-			profile = get_icc_profile_data(fit->icc_profile, &profile_len);
+			profile = get_icc_profile_data(fit_get_icc_profile(fit), &profile_len);
 		}
 		cmsUInt32Number datasize = fit->type == DATA_FLOAT ? sizeof(float) : sizeof(WORD);
 		cmsUInt32Number bytesperline = width * datasize;
@@ -1271,12 +1271,15 @@ int readxisf(const char* name, fits *fit, gboolean force_float) {
 		return -1;
 	}
 
-	/* Assign the ICC profile, if there is one */
-	if (xdata->icc_buffer && xdata->icc_length > 0) {
-		fit->icc_profile = cmsOpenProfileFromMem(xdata->icc_buffer, xdata->icc_length);
-		color_manage(fit, TRUE);
-	} else {
-		color_manage(fit, FALSE);
+	/* Assign the ICC profile if this load is destined for the current
+	 * image (gfit) or the pending fits of a threaded open.  Sequence-frame
+	 * / intermediate loads carry no profile. */
+	if (icc_fit_is_load_target(fit)) {
+		if (xdata->icc_buffer && xdata->icc_length > 0)
+			icc_profile_attach_from_load(fit,
+					cmsOpenProfileFromMem(xdata->icc_buffer, xdata->icc_length));
+		else if (fit == gfit)
+			current_image_clear_icc_profile();
 	}
 	free(xdata->icc_buffer);
 
@@ -1486,14 +1489,14 @@ int savejpg(const char *name, fits *fit, int quality, gboolean verbose) {
 	JOCTET *profile = NULL;
 	unsigned int profile_len = 0;
 	cmsHTRANSFORM save_transform = NULL;
-	if (fit->color_managed && fit->icc_profile) {
+	if (fit_get_color_managed(fit) && fit_get_icc_profile(fit)) {
 		void *buf = NULL;
 		gboolean threaded = !processing_in_worker_thread();
 		gboolean src_is_float = (fit->type == DATA_FLOAT);
 		buf = src_is_float ? (void *) fit->fdata : (void *) fit->data;
 		size_t npixels = fit->rx * fit->ry;
 		size_t nchans = fit->naxes[2];
-		cmsColorSpaceSignature sig = cmsGetColorSpace(fit->icc_profile);
+		cmsColorSpaceSignature sig = cmsGetColorSpace(fit_get_icc_profile(fit));
 		cmsUInt32Number trans_type = get_planar_formatter_type(sig, fit->type, FALSE);
 		if (src_is_float) {
 			dest = (float*) malloc(fit->rx * fit->ry * fit->naxes[2] * sizeof(float));
@@ -1507,16 +1510,16 @@ int savejpg(const char *name, fits *fit, int quality, gboolean verbose) {
 			switch (com.pref.icc.export_8bit_method) {
 				case EXPORT_SRGB:
 					srgb_mono_out = gray_srgbtrc();
-					save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit->icc_profile, trans_type, srgb_mono_out, trans_type, com.pref.icc.export_intent, 0);
+					save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit_get_icc_profile(fit), trans_type, srgb_mono_out, trans_type, com.pref.icc.export_intent, 0);
 					profile = get_icc_profile_data(srgb_mono_out, &profile_len);
 					cmsCloseProfile(srgb_mono_out);
 					break;
 				case EXPORT_WORKING:
-					save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit->icc_profile, trans_type, com.icc.mono_out, trans_type, com.pref.icc.export_intent, 0);
+					save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit_get_icc_profile(fit), trans_type, com.icc.mono_out, trans_type, com.pref.icc.export_intent, 0);
 					profile = get_icc_profile_data(com.icc.mono_out, &profile_len);
 					break;
 				case EXPORT_IMAGE_ICC:
-					profile = get_icc_profile_data(fit->icc_profile, &profile_len);
+					profile = get_icc_profile_data(fit_get_icc_profile(fit), &profile_len);
 					break;
 				default:
 					free(dest);
@@ -1526,15 +1529,15 @@ int savejpg(const char *name, fits *fit, int quality, gboolean verbose) {
 		} else { // rgb
 			switch (com.pref.icc.export_8bit_method) {
 				case EXPORT_SRGB:
-					save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit->icc_profile, trans_type, com.icc.srgb_out, trans_type, com.pref.icc.export_intent, 0);
+					save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit_get_icc_profile(fit), trans_type, com.icc.srgb_out, trans_type, com.pref.icc.export_intent, 0);
 					profile = get_icc_profile_data(com.icc.srgb_out, &profile_len);
 					break;
 				case EXPORT_WORKING:
-					save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit->icc_profile, trans_type, com.icc.working_out, trans_type, com.pref.icc.export_intent, 0);
+					save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit_get_icc_profile(fit), trans_type, com.icc.working_out, trans_type, com.pref.icc.export_intent, 0);
 					profile = get_icc_profile_data(com.icc.working_out, &profile_len);
 					break;
 				case EXPORT_IMAGE_ICC:
-					profile = get_icc_profile_data(fit->icc_profile, &profile_len);
+					profile = get_icc_profile_data(fit_get_icc_profile(fit), &profile_len);
 					break;
 				default:
 					free(dest);
@@ -1545,10 +1548,10 @@ int savejpg(const char *name, fits *fit, int quality, gboolean verbose) {
 #else
 		if (nchans == 1) {
 			cmsHPROFILE srgb_mono_out = gray_srgbtrc();
-			save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit->icc_profile, trans_type, srgb_mono_out, trans_type, com.pref.icc.export_intent, 0);
+			save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit_get_icc_profile(fit), trans_type, srgb_mono_out, trans_type, com.pref.icc.export_intent, 0);
 			cmsCloseProfile(srgb_mono_out);
 		} else {
-			save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit->icc_profile, trans_type, com.icc.srgb_out, trans_type, com.pref.icc.export_intent, 0);
+			save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit_get_icc_profile(fit), trans_type, com.icc.srgb_out, trans_type, com.pref.icc.export_intent, 0);
 		}
 #endif
 		cmsUInt32Number datasize = fit->type == DATA_FLOAT ? sizeof(float) : sizeof(WORD);
@@ -2016,7 +2019,7 @@ int savepng(const char *name, fits *fit, uint32_t bytes_per_sample,
 	gboolean threaded = processing_in_worker_thread();
 	cmsHTRANSFORM save_transform = NULL;
 	cmsUInt32Number trans_type;
-	if (fit->color_managed && fit->icc_profile) {
+	if (fit_get_color_managed(fit) && fit_get_icc_profile(fit)) {
 		// Check what is the appropriate color space to save in
 		// Covers 8- and high-bitdepth files
 		if (bytes_per_sample == 1) { // 8-bit
@@ -2026,16 +2029,16 @@ int savepng(const char *name, fits *fit, uint32_t bytes_per_sample,
 				switch (com.pref.icc.export_8bit_method) {
 					case EXPORT_SRGB:
 						srgb_mono_out = gray_srgbtrc();
-						save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit->icc_profile, trans_type, srgb_mono_out, trans_type, com.pref.icc.export_intent, 0);
+						save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit_get_icc_profile(fit), trans_type, srgb_mono_out, trans_type, com.pref.icc.export_intent, 0);
 						profile = get_icc_profile_data(srgb_mono_out, &profile_len);
 						cmsCloseProfile(srgb_mono_out);
 						break;
 					case EXPORT_WORKING:
-						save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit->icc_profile, trans_type, com.icc.mono_out, trans_type, com.pref.icc.export_intent, 0);
+						save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit_get_icc_profile(fit), trans_type, com.icc.mono_out, trans_type, com.pref.icc.export_intent, 0);
 						profile = get_icc_profile_data(com.icc.mono_out, &profile_len);
 						break;
 					case EXPORT_IMAGE_ICC:
-						profile = get_icc_profile_data(fit->icc_profile, &profile_len);
+						profile = get_icc_profile_data(fit_get_icc_profile(fit), &profile_len);
 						break;
 					default:
 						free(filename);
@@ -2044,15 +2047,15 @@ int savepng(const char *name, fits *fit, uint32_t bytes_per_sample,
 			} else { // rgb
 				switch (com.pref.icc.export_8bit_method) {
 					case EXPORT_SRGB:
-						save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit->icc_profile, trans_type, com.icc.srgb_out, trans_type, com.pref.icc.export_intent, 0);
+						save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit_get_icc_profile(fit), trans_type, com.icc.srgb_out, trans_type, com.pref.icc.export_intent, 0);
 						profile = get_icc_profile_data(com.icc.srgb_out, &profile_len);
 						break;
 					case EXPORT_WORKING:
-						save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit->icc_profile, trans_type, com.icc.working_out, trans_type, com.pref.icc.export_intent, 0);
+						save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit_get_icc_profile(fit), trans_type, com.icc.working_out, trans_type, com.pref.icc.export_intent, 0);
 						profile = get_icc_profile_data(com.icc.working_out, &profile_len);
 						break;
 					case EXPORT_IMAGE_ICC:
-						profile = get_icc_profile_data(fit->icc_profile, &profile_len);
+						profile = get_icc_profile_data(fit_get_icc_profile(fit), &profile_len);
 						break;
 					default:
 						free(filename);
@@ -2066,16 +2069,16 @@ int savepng(const char *name, fits *fit, uint32_t bytes_per_sample,
 				switch (com.pref.icc.export_16bit_method) {
 					case EXPORT_SRGB:
 						srgb_mono_out = gray_srgbtrc();
-						save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit->icc_profile, trans_type, srgb_mono_out, trans_type, com.pref.icc.export_intent, 0);
+						save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit_get_icc_profile(fit), trans_type, srgb_mono_out, trans_type, com.pref.icc.export_intent, 0);
 						profile = get_icc_profile_data(srgb_mono_out, &profile_len);
 						cmsCloseProfile(srgb_mono_out);
 						break;
 					case EXPORT_WORKING:
-						save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit->icc_profile, trans_type, com.icc.mono_out, trans_type, com.pref.icc.export_intent, 0);
+						save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit_get_icc_profile(fit), trans_type, com.icc.mono_out, trans_type, com.pref.icc.export_intent, 0);
 						profile = get_icc_profile_data(com.icc.mono_out, &profile_len);
 						break;
 					case EXPORT_IMAGE_ICC:
-						profile = get_icc_profile_data(fit->icc_profile, &profile_len);
+						profile = get_icc_profile_data(fit_get_icc_profile(fit), &profile_len);
 						break;
 					default:
 						free(filename);
@@ -2084,15 +2087,15 @@ int savepng(const char *name, fits *fit, uint32_t bytes_per_sample,
 			} else { // rgb
 				switch (com.pref.icc.export_16bit_method) {
 					case EXPORT_SRGB:
-						save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit->icc_profile, trans_type, com.icc.srgb_out, trans_type, com.pref.icc.export_intent, 0);
+						save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit_get_icc_profile(fit), trans_type, com.icc.srgb_out, trans_type, com.pref.icc.export_intent, 0);
 						profile = get_icc_profile_data(com.icc.srgb_out, &profile_len);
 						break;
 					case EXPORT_WORKING:
-						save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit->icc_profile, trans_type, com.icc.working_out, trans_type, com.pref.icc.export_intent, 0);
+						save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit_get_icc_profile(fit), trans_type, com.icc.working_out, trans_type, com.pref.icc.export_intent, 0);
 						profile = get_icc_profile_data(com.icc.working_out, &profile_len);
 						break;
 					case EXPORT_IMAGE_ICC:
-						profile = get_icc_profile_data(fit->icc_profile, &profile_len);
+						profile = get_icc_profile_data(fit_get_icc_profile(fit), &profile_len);
 						break;
 					default:
 						free(filename);
@@ -2120,7 +2123,7 @@ int savepng(const char *name, fits *fit, uint32_t bytes_per_sample,
 		png_set_swap(png_ptr);
 		data = convert_data(fit);
 		// Apply ICC transform (only for color managed images)
-		if (fit->color_managed && fit->icc_profile && save_transform) {
+		if (fit_get_color_managed(fit) && fit_get_icc_profile(fit) && save_transform) {
 			cmsUInt32Number datasize = sizeof(WORD);
 			cmsUInt32Number bytesperline = fit->rx * datasize * fit->naxes[2];
 			cmsUInt32Number bytesperplane = fit->rx * fit->ry * datasize;
@@ -2132,7 +2135,7 @@ int savepng(const char *name, fits *fit, uint32_t bytes_per_sample,
 	} else {
 		data8 = convert_data8(fit);
 		// Apply ICC transform
-		if (fit->color_managed && fit->icc_profile && save_transform) {
+		if (fit_get_color_managed(fit) && fit_get_icc_profile(fit) && save_transform) {
 			cmsUInt32Number datasize = sizeof(BYTE);
 			cmsUInt32Number bytesperline = fit->rx * datasize;
 			cmsUInt32Number bytesperplane = fit->rx * fit->ry * datasize;
@@ -2870,7 +2873,7 @@ int readheif(const char* name, fits *fit, gboolean interactive){
 	mirrorx(fit, FALSE);
 
 	fits_initialize_icc(fit, icc_buffer, icc_length);
-	color_manage(fit, (fit->icc_profile != NULL));
+	color_manage(fit, (fit_get_icc_profile(fit) != NULL));
 	free(icc_buffer);
 
 	heif_image_handle_release(handle);
@@ -2974,21 +2977,25 @@ int readjxl(const char* name, fits *fit) {
 	free(pixels);
 	cmsHPROFILE internal = cmsOpenProfileFromMem(internal_icc_profile, internal_icc_profile_length);
 	cmsHPROFILE original = cmsOpenProfileFromMem(icc_profile, icc_profile_length);
-	if (internal && original) {
-		fit->icc_profile = copyICCProfile(internal);
-		fit->color_managed = TRUE; // Don't use color_manage() here as we don't want the GUI updated yet
-		gchar* orig_desc = siril_color_profile_get_description(original);
-		gchar* int_desc = siril_color_profile_get_description(internal);
-		siril_log_debug("Transforming from %s to %s\n", int_desc, orig_desc);
-		g_free(orig_desc);
-		g_free(int_desc);
-		siril_colorspace_transform(fit, original);
-		if (fit->icc_profile) cmsCloseProfile(fit->icc_profile);
-		fit->icc_profile = copyICCProfile(original);
-	} else if (internal) {
-		fit->icc_profile = copyICCProfile(internal);
+	if (icc_fit_is_load_target(fit)) {
+		if (internal && original) {
+			/* Attach the internal profile then convert to original.  The
+			 * accessor pipeline routes the state to com.uniq (gfit) or to
+			 * the ICC staging area (pending threaded-open fits), and
+			 * siril_colorspace_transform resolves its source profile the
+			 * same way, so the pixel conversion runs on both paths. */
+			icc_profile_attach_from_load(fit, copyICCProfile(internal));
+			gchar* orig_desc = siril_color_profile_get_description(original);
+			gchar* int_desc = siril_color_profile_get_description(internal);
+			siril_log_debug("Transforming from %s to %s\n", int_desc, orig_desc);
+			g_free(orig_desc);
+			g_free(int_desc);
+			siril_colorspace_transform(fit, original);
+			icc_profile_attach_from_load(fit, copyICCProfile(original));
+		} else if (internal) {
+			icc_profile_attach_from_load(fit, copyICCProfile(internal));
+		}
 	}
-	color_manage(fit, (fit->icc_profile != NULL));
 	if (original) cmsCloseProfile(original);
 	if (internal) cmsCloseProfile(internal);
 	free(icc_profile);
@@ -3025,7 +3032,7 @@ int savejxl(const char *name, fits *fit, int effort, double quality, gboolean fo
 	cmsUInt32Number trans_type;
 	cmsHTRANSFORM save_transform = NULL;
 
-	if (fit->color_managed && fit->icc_profile) {
+	if (fit_get_color_managed(fit) && fit_get_icc_profile(fit)) {
 		// Check what is the appropriate color space to save in
 		// Covers 8- and high-bitdepth files
 		if (max_bitdepth == 8) { // 8-bit
@@ -3035,16 +3042,16 @@ int savejxl(const char *name, fits *fit, int effort, double quality, gboolean fo
 				switch (com.pref.icc.export_8bit_method) {
 					case EXPORT_SRGB:
 						srgb_mono_out = gray_srgbtrc();
-						save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit->icc_profile, trans_type, srgb_mono_out, trans_type, com.pref.icc.export_intent, 0);
+						save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit_get_icc_profile(fit), trans_type, srgb_mono_out, trans_type, com.pref.icc.export_intent, 0);
 						profile = get_icc_profile_data(srgb_mono_out, &profile_len);
 						cmsCloseProfile(srgb_mono_out);
 						break;
 					case EXPORT_WORKING:
-						save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit->icc_profile, trans_type, com.icc.mono_standard, trans_type, com.pref.icc.export_intent, 0);
+						save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit_get_icc_profile(fit), trans_type, com.icc.mono_standard, trans_type, com.pref.icc.export_intent, 0);
 						profile = get_icc_profile_data(com.icc.mono_standard, &profile_len);
 						break;
 					case EXPORT_IMAGE_ICC:
-						profile = get_icc_profile_data(fit->icc_profile, &profile_len);
+						profile = get_icc_profile_data(fit_get_icc_profile(fit), &profile_len);
 						break;
 					default:
 						free(filename);
@@ -3053,15 +3060,15 @@ int savejxl(const char *name, fits *fit, int effort, double quality, gboolean fo
 			} else { // rgb
 				switch (com.pref.icc.export_8bit_method) {
 					case EXPORT_SRGB:
-						save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit->icc_profile, trans_type, com.icc.srgb_profile, trans_type, com.pref.icc.export_intent, 0);
+						save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit_get_icc_profile(fit), trans_type, com.icc.srgb_profile, trans_type, com.pref.icc.export_intent, 0);
 						profile = get_icc_profile_data(com.icc.srgb_profile, &profile_len);
 						break;
 					case EXPORT_WORKING:
-						save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit->icc_profile, trans_type, com.icc.working_standard, trans_type, com.pref.icc.export_intent, 0);
+						save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit_get_icc_profile(fit), trans_type, com.icc.working_standard, trans_type, com.pref.icc.export_intent, 0);
 						profile = get_icc_profile_data(com.icc.working_standard, &profile_len);
 						break;
 					case EXPORT_IMAGE_ICC:
-						profile = get_icc_profile_data(fit->icc_profile, &profile_len);
+						profile = get_icc_profile_data(fit_get_icc_profile(fit), &profile_len);
 						break;
 					default:
 						free(filename);
@@ -3078,16 +3085,16 @@ int savejxl(const char *name, fits *fit, int effort, double quality, gboolean fo
 				switch (com.pref.icc.export_16bit_method) {
 					case EXPORT_SRGB:
 						srgb_mono_out = gray_srgbtrc();
-						save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit->icc_profile, trans_type, srgb_mono_out, trans_type, com.pref.icc.export_intent, 0);
+						save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit_get_icc_profile(fit), trans_type, srgb_mono_out, trans_type, com.pref.icc.export_intent, 0);
 						profile = get_icc_profile_data(srgb_mono_out, &profile_len);
 						cmsCloseProfile(srgb_mono_out);
 						break;
 					case EXPORT_WORKING:
-						save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit->icc_profile, trans_type, com.icc.mono_standard, trans_type, com.pref.icc.export_intent, 0);
+						save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit_get_icc_profile(fit), trans_type, com.icc.mono_standard, trans_type, com.pref.icc.export_intent, 0);
 						profile = get_icc_profile_data(com.icc.mono_standard, &profile_len);
 						break;
 					case EXPORT_IMAGE_ICC:
-						profile = get_icc_profile_data(fit->icc_profile, &profile_len);
+						profile = get_icc_profile_data(fit_get_icc_profile(fit), &profile_len);
 						break;
 					default:
 						free(filename);
@@ -3096,15 +3103,15 @@ int savejxl(const char *name, fits *fit, int effort, double quality, gboolean fo
 			} else { // rgb
 				switch (com.pref.icc.export_16bit_method) {
 					case EXPORT_SRGB:
-						save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit->icc_profile, trans_type, com.icc.srgb_profile, trans_type, com.pref.icc.export_intent, 0);
+						save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit_get_icc_profile(fit), trans_type, com.icc.srgb_profile, trans_type, com.pref.icc.export_intent, 0);
 						profile = get_icc_profile_data(com.icc.srgb_profile, &profile_len);
 						break;
 					case EXPORT_WORKING:
-						save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit->icc_profile, trans_type, com.icc.working_standard, trans_type, com.pref.icc.export_intent, 0);
+						save_transform = sirilCreateTransformTHR((threaded ? com.icc.context_threaded : com.icc.context_single), fit_get_icc_profile(fit), trans_type, com.icc.working_standard, trans_type, com.pref.icc.export_intent, 0);
 						profile = get_icc_profile_data(com.icc.working_standard, &profile_len);
 						break;
 					case EXPORT_IMAGE_ICC:
-						profile = get_icc_profile_data(fit->icc_profile, &profile_len);
+						profile = get_icc_profile_data(fit_get_icc_profile(fit), &profile_len);
 						break;
 					default:
 						free(filename);

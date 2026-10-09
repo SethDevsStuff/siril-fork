@@ -46,6 +46,7 @@
 #include "gui-gtk4/user_polygons.h"
 #include "gui-gtk4/utils.h"
 #include "io/image_format_fits.h"
+#include "io/image_format_flis.h"
 #include "io/sequence.h"
 #include "io/single_image.h"
 #include "registration/mpp.h"
@@ -301,13 +302,22 @@ static void show_drawingarea_popover(const char *popover_id,
 		g_hash_table_insert(cache, (gpointer) popover_id, popover);
 	}
 
+	/* Always detach and re-attach the popover before popping up.  A
+	 * GtkPopoverMenu that was open when a dialog seized the grab — e.g.
+	 * picking a mask-creation item from this very menu opens its dialog
+	 * while the popover is still popping down — can be left wedged: on
+	 * the SAME parent, popdown() + popup() silently fails to map it
+	 * again.  The user-visible symptom was the context menu refusing to
+	 * reopen after closing the dialog until the viewport changed — which
+	 * "fixed" it precisely because switching drawingareas reparents the
+	 * popover and resets its internal state.  Unconditional reparenting
+	 * takes that known-good path every time; the cached menu model is
+	 * unaffected. */
 	gtk_popover_popdown(popover);
 	GtkWidget *cur_parent = gtk_widget_get_parent(GTK_WIDGET(popover));
-	if (cur_parent != anchor) {
-		if (cur_parent)
-			gtk_widget_unparent(GTK_WIDGET(popover));
-		gtk_widget_set_parent(GTK_WIDGET(popover), anchor);
-	}
+	if (cur_parent)
+		gtk_widget_unparent(GTK_WIDGET(popover));
+	gtk_widget_set_parent(GTK_WIDGET(popover), anchor);
 
 	/* Mirror the GTK3 do_popup_graymenu_unused() behaviour: refresh the
 	 * radio actions for menugray's Selection submenu from the current
@@ -516,6 +526,47 @@ static gboolean drag_release(mouse_data *data) {
 	return TRUE;
 }
 
+/* Canvas-drag release: commit the final layer position through the
+ * worker.  The motion handler has been mutating layer->position_x/y
+ * in place for live feedback; we now stage the final value through
+ * flis_setposition_hook so undo metadata is recorded and the panel
+ * refreshes.  The hook will overwrite the position we already set
+ * directly, but with the same value — net no-op except for the
+ * undo bookkeeping. */
+static gboolean flis_drag_layer_release(mouse_data *data) {
+	(void)data;
+	if (!gui.flis_layer_dragging) return TRUE;
+	gui.flis_layer_dragging = FALSE;
+	flis_layer_t *lay = flis_layer_get_by_id(gui.flis_drag_layer_id);
+	if (!lay) return TRUE;
+	/* If the layer didn't actually move, skip the worker round-trip. */
+	if (lay->position_x == gui.flis_drag_start_layer.x &&
+	    lay->position_y == gui.flis_drag_start_layer.y)
+		return TRUE;
+	const gint final_x = lay->position_x;
+	const gint final_y = lay->position_y;
+	/* Restore the start position so the worker sees a real change
+	 * (matches the opacity drag-end pattern in flis_gui.c). */
+	lay->position_x = gui.flis_drag_start_layer.x;
+	lay->position_y = gui.flis_drag_start_layer.y;
+	/* §C.1a: save undo BEFORE the mutation.  With the layer's position
+	 * restored to its pre-drag value, the props snapshot captures
+	 * exactly the state to revert to.  No-op when com.script is set. */
+	undo_save_flis_layer_props(lay, _("Drag layer to new canvas position"));
+	struct flis_setposition_args *payload = calloc(1, sizeof(*payload));
+	payload->destroy_fn = flis_setposition_args_free;
+	payload->x = final_x;
+	payload->y = final_y;
+	struct generic_layer_args *args = calloc(1, sizeof(*args));
+	args->layer_hook         = flis_setposition_hook;
+	args->user               = payload;
+	args->description        = g_strdup(_("Drag layer to new canvas position"));
+	args->invalidate_flags   = FLIS_INV_STACK;
+	args->invalidate_item_id = lay->item_id;
+	start_in_new_thread(generic_layer_worker, args);
+	return TRUE;
+}
+
 static gboolean measure_release (mouse_data *data) {
 	if (gui.measure_start.x != -1.) {
 		gui.measure_end.x = data->zoomed.x;
@@ -528,6 +579,24 @@ static gboolean measure_release (mouse_data *data) {
 		gui.measure_end.y = -1.;
 	}
 	return TRUE;
+}
+
+/* Mask polygons and colour picks are collected in display (canvas)
+ * coordinates but consumed against gfit — the active layer, which for a
+ * sparse FLIS layer sits at an offset.  Shift into layer-local
+ * coordinates so the operation lands where the cursor was.  position_x/y
+ * are display-convention (0 = canvas top-left), same as the collected
+ * points, so a plain subtraction is correct for both axes; the FITS
+ * bottom-up flip happens later in the consumers. */
+static void poly_to_active_layer_coords(UserPolygon *poly) {
+	if (!poly) return;
+	gint ox, oy;
+	flis_active_layer_offset(&ox, &oy);
+	if (ox == 0 && oy == 0) return;
+	for (int i = 0; i < poly->n_points; i++) {
+		poly->points[i].x -= ox;
+		poly->points[i].y -= oy;
+	}
 }
 
 static gboolean draw_poly_release(mouse_data *data) {
@@ -555,6 +624,7 @@ static gboolean mask_add_poly_release(mouse_data *data) {
 	if (!gfit->mask) { // we need something to add the polygon to, so create a zeroes-like mask
 		mask_create_zeroes_like(gfit, get_default_mask_bitpix());
 	}
+	poly_to_active_layer_coords(poly);
 	set_poly_in_mask(poly, gfit, TRUE);
 	free_user_polygon(poly);
 	gui.drawing_polypoints = NULL;
@@ -571,6 +641,7 @@ static gboolean mask_clear_poly_release(mouse_data *data) {
 	if (!gfit->mask) { // we need somthing to subtract the polygon from, so create a ones-like mask
 		mask_create_ones_like(gfit, get_default_mask_bitpix());
 	}
+	poly_to_active_layer_coords(poly);
 	set_poly_in_mask(poly, gfit, FALSE);
 	free_user_polygon(poly);
 	// Free and NULL gui.drawing_polypoints
@@ -581,7 +652,13 @@ static gboolean mask_clear_poly_release(mouse_data *data) {
 }
 
 static gboolean sample_mask_color_release(mouse_data *data) {
-	mask_color_handle_image_click(data->zoomed.x, data->zoomed.y);
+	/* Display → layer-local (see the coordinate model in
+	 * image_format_flis.h); picks outside the active layer are dropped
+	 * here rather than relying on the handler's bounds check. */
+	pointi local;
+	if (!flis_display_to_active_layer_pt(data->zoomed, &local))
+		return TRUE;
+	mask_color_handle_image_click(local.x, local.y);
 	return TRUE;
 }
 
@@ -690,6 +767,31 @@ mouse_function_metadata main_action = { main_action_click, NAME_MAIN_ACTION,
 	TRUE, MOUSE_REF_MAIN_ACTION};
 
 gboolean main_action_click(mouse_data *data) {
+	/* FLIS canvas-drag mode must work anywhere the cursor lands on
+	 * the cvport, not just inside the gfit area.  For FLIS, gfit is
+	 * the *active layer* — so clamp2image's "inside" is computed
+	 * against the layer's own bounds.  After dragging a layer far
+	 * from canvas origin its visible position may sit outside the
+	 * gfit bounds, and the user clicking on it would otherwise be
+	 * gated off by data->inside.  Handle before the inside gate. */
+	if (*data->mouse_status == MOUSE_ACTION_FLIS_DRAG_LAYER) {
+		/* §7 canvas decoupling: every layer (including the bottom layer
+		 * formerly known as the "base") carries its own canvas position
+		 * and is draggable. */
+		if (is_current_image_flis() && com.uniq && com.uniq->layers) {
+			flis_layer_t *act = flis_active_layer();
+			if (act) {
+				gui.flis_drag_layer_id      = act->item_id;
+				gui.flis_drag_start_image   = data->evpos;
+				gui.flis_drag_start_layer.x = act->position_x;
+				gui.flis_drag_start_layer.y = act->position_y;
+				gui.flis_layer_dragging     = TRUE;
+				register_release_callback(flis_drag_layer_release, data->button);
+			}
+		}
+		return TRUE;
+	}
+
 	if (data->inside) {
 		point pt;
 		int radius, s;

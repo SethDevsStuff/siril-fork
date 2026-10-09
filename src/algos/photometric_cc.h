@@ -49,6 +49,20 @@ struct photometric_cc_data {
 	double nb_center[3]; // for SPCC
 	double nb_bandwidth[3]; // for SPCC
 	cmsCIExyYTRIPLE primaries; // used for SPCC source profile
+	/* NDE (phase 4.5 Convention 3): the COMPUTED white-balance coefficients and
+	 * background factors actually applied.  Stashed in photometric_cc() right
+	 * before apply_photometric_color_correction (both PCC and SPCC paths) so
+	 * replay applies them directly — the catalog/network/FWHM pipeline never
+	 * runs at replay.  have_effective distinguishes a replay record (set by the
+	 * deserializer) from a fresh apply. */
+	gboolean have_effective;
+	float eff_kw[3];
+	float eff_bg[3];
+	/* v2 replay: eff_kw/eff_bg were present in the record and may be applied
+	 * as a FALLBACK when the recompute cannot run (no embedded catalogue, no
+	 * network).  Distinct from have_effective, which short-circuits the whole
+	 * pipeline — a v2 record wants the pipeline, with these as the net. */
+	gboolean have_fallback;
 };
 
 int apply_photometric_color_correction(fits *fit, const float *kw, const float *bg);

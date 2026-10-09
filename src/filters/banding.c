@@ -32,6 +32,7 @@
 #include "algos/sorting.h"
 #include "algos/statistics.h"
 #include "core/arithm.h"
+#include "core/nde/nde_history.h"
 #include "core/op_descriptors.h"
 #include "core/processing.h"
 #include "core/proto.h"
@@ -42,14 +43,53 @@
 #include "io/sequence.h"
 #include "opencv/opencv.h"
 
+/* NDE serializers for filters.banding.  BandingEngine reads sigma, amount,
+ * protect_highlights and vertical (kv key "applyRotation", kept for
+ * compatibility with existing history); seq/seqEntry/fit are runtime context
+ * and are skipped. */
+static gchar *banding_serialize(gconstpointer user) {
+	const struct banding_data *d = user;
+	GString *kv = nde_kv_start();
+	nde_kv_add_double(kv, "sigma", d->sigma);
+	nde_kv_add_double(kv, "amount", d->amount);
+	nde_kv_add_bool(kv, "protect_highlights", d->protect_highlights);
+	nde_kv_add_bool(kv, "applyRotation", d->vertical);
+	return nde_kv_end(kv);
+}
+
+static gpointer banding_deserialize(const gchar *blob, int version) {
+	if (version > op_desc_banding.version)
+		return NULL;
+	GHashTable *kv = nde_kv_parse(blob);
+	double sigma, amount;
+	gboolean protect_highlights, vertical;
+	NDE_KV_REQUIRE(kv, nde_kv_get_double(kv, "sigma", &sigma) &&
+	                   nde_kv_get_double(kv, "amount", &amount) &&
+	                   nde_kv_get_bool(kv, "protect_highlights", &protect_highlights) &&
+	                   nde_kv_get_bool(kv, "applyRotation", &vertical));
+	struct banding_data *d = calloc(1, sizeof(*d));
+	if (d) {
+		d->destroy_fn = free;
+		/* v1 stored 1/k (the engine computed reject = bg + sigma^-1 * MAD);
+		 * v2 stores the rejection factor k directly. */
+		d->sigma = (version < 2 && sigma != 0.0) ? 1.0 / sigma : sigma;
+		d->amount = amount;
+		d->protect_highlights = protect_highlights;
+		d->vertical = vertical;
+	}
+	g_hash_table_unref(kv);
+	return d;
+}
+
 /* Op descriptor — single source of truth for this operation (op_descriptor.h) */
 const op_descriptor op_desc_banding = {
-	.id = "filters.banding", .version = 1,
+	.id = "filters.banding", .version = 2,
 	.image_hook = banding_single_image_hook,
 	.log_hook = banding_log_hook,
 	.description = N_("Banding Reduction"),
 	.mem_ratio = 2.0f,
 	.flags = 0,
+	.serialize = banding_serialize, .deserialize = banding_deserialize,
 };
 
 static int BandingEngine(fits *fit, double sigma, double amount, gboolean protect_highlights, gboolean vertical, threading_type threading);

@@ -19,13 +19,16 @@
  */
 
 #include "algos/statistics.h"
+#include "core/nde/nde_replay.h"
 #include "core/op_descriptors.h"
 #include "core/processing.h"
 #include "core/siril_log.h"
 #include "core/undo.h"
 #include "filters/nlbayes/call_nlbayes.h"
 #include "gui-gtk4/callbacks.h"
+#include "gui-gtk4/denoisegui.h"
 #include "gui-gtk4/dialogs.h"
+#include "gui-gtk4/nde_editors.h"
 #include "gui-gtk4/progress_and_log.h"
 #include "gui-gtk4/siril_preview.h"
 #include "gui-gtk4/utils.h"
@@ -40,6 +43,15 @@ GtkCheckButton *radio_denoise_nosecondary = NULL, *radio_denoise_vst = NULL, *ra
 GtkScale *slide_denoise_modulation = NULL;
 GtkSpinButton *spin_sos_iters = NULL, *spin_rho = NULL, *spin_denoise_modulation = NULL;
 GtkCheckButton *check_denoise_cosmetic = NULL, *check_denoise_suppress_artefacts = NULL;
+static GtkWidget *denoise_amend_note = NULL;
+
+/* Amend mode (convergence C5b): the dialog edits an existing history record.
+ * gfit holds the pre-record state installed by nde_amend_preview_start; the
+ * backup is armed with it so the ROI-preview path still works.  Apply/Cancel
+ * route through nde_amend_preview_end instead of a worker run + undo save.
+ * There is no live full-image preview here (NL-Bayes is slow); the display
+ * shows the pre-record state until the user hits the ROI preview button. */
+static gboolean denoise_amend_mode = FALSE;
 
 // Statics init
 static void denoise_dialog_init_statics() {
@@ -71,7 +83,39 @@ static void denoise_dialog_init_statics() {
 		// GtkToggleButton
 		check_denoise_cosmetic = GTK_CHECK_BUTTON(gtk_builder_get_object(gui.builder, "check_denoise_cosmetic"));
 		check_denoise_suppress_artefacts = GTK_CHECK_BUTTON(gtk_builder_get_object(gui.builder, "check_denoise_suppress_artefacts"));
+		denoise_amend_note = GTK_WIDGET(gtk_builder_get_object(gui.builder, "denoise_amend_note"));
 	}
+}
+
+/* Fill the widgets from the amended record's current parameters through the
+ * op's own deserializer — the same struct get_denoise_values builds.  The
+ * mutually-exclusive secondary-stage radios are reverse-mapped from the
+ * da3d / sos / do_anscombe fields. */
+static void denoise_prefill_from_amend(void) {
+	struct denoise_args *p = op_desc_denoise.deserialize(nde_amend_preview_params(),
+	                                                    nde_amend_preview_op_version());
+	if (!p)
+		return;
+	gtk_spin_button_set_value(spin_denoise_modulation, p->modulation);
+	gtk_spin_button_set_value(spin_rho, p->rho);
+	gtk_spin_button_set_value(spin_sos_iters, p->sos > 1 ? p->sos : 1);
+	siril_toggle_set_active(GTK_WIDGET(check_denoise_cosmetic), p->do_cosme);
+	siril_toggle_set_active(GTK_WIDGET(check_denoise_suppress_artefacts), p->suppress_artefacts);
+	if (p->do_anscombe)
+		siril_toggle_set_active(GTK_WIDGET(radio_denoise_vst), TRUE);
+	else if (p->da3d)
+		siril_toggle_set_active(GTK_WIDGET(radio_denoise_da3d), TRUE);
+	else if (p->sos > 1)
+		siril_toggle_set_active(GTK_WIDGET(radio_denoise_sos), TRUE);
+	else
+		siril_toggle_set_active(GTK_WIDGET(radio_denoise_nosecondary), TRUE);
+	/* mirror update_sos: the SOS advanced options track the sos radio */
+	gtk_widget_set_visible(GTK_WIDGET(sos_advanced_options),
+			siril_toggle_get_active(GTK_WIDGET(radio_denoise_sos)));
+	if (p->destroy_fn)
+		p->destroy_fn(p);
+	else
+		free(p);
 }
 
 /* Helper function to get current widget values */
@@ -122,7 +166,7 @@ static gboolean validate_denoise_params(struct denoise_args *params) {
 }
 
 /* Create and launch denoising processing */
-static int denoise_process_with_worker(gboolean for_preview, gboolean for_roi) {
+static int denoise_process_with_worker(gboolean for_preview) {
 	// Allocate parameters
 	struct denoise_args *params = new_denoise_args();
 	if (!params) {
@@ -158,14 +202,13 @@ static int denoise_process_with_worker(gboolean for_preview, gboolean for_roi) {
 	}
 
 	// Set the fit based on whether ROI is active
-	args->fit = for_roi ? &gui.roi.fit : gfit;
+	args->fit = gfit;
 	args->op = &op_desc_denoise;
 	args->idle_function = for_preview ? denoise_preview_idle : denoise_apply_idle;
 	args->verbose = !for_preview;
 	args->user = params;
 	args->max_threads = com.max_thread;
 	args->for_preview = for_preview;
-	args->for_roi = for_roi;
 
 	if (!start_in_new_thread(generic_image_worker, args)) {
 		free_generic_img_args(args);
@@ -175,19 +218,16 @@ static int denoise_process_with_worker(gboolean for_preview, gboolean for_roi) {
 }
 
 void denoise_change_between_roi_and_image() {
-	gui.roi.operation_supports_roi = TRUE;
 	gtk_widget_set_visible(GTK_WIDGET(denoise_roi_preview), gui.roi.active);
 	// Restore original image first
 	copy_backup_to_gfit();
-	// If we are showing the preview, update it after the ROI change.
-	restore_roi();
 	gfit_modified_update_gui();
 }
 
 static void denoise_startup() {
 	copy_gfit_to_backup();
 	add_roi_callback(denoise_change_between_roi_and_image);
-	roi_supported(TRUE);
+	roi_declare_op(&op_desc_denoise);
 }
 
 static void denoise_close_internal(gboolean revert) {
@@ -199,20 +239,39 @@ static void denoise_close_internal(gboolean revert) {
 	} else {
 		invalidate_stats_from_fit(gfit);
 	}
-	roi_supported(FALSE);
+	roi_declare_op(NULL);
 	remove_roi_callback(denoise_change_between_roi_and_image);
 	clear_backup();
 	set_cursor_waiting(FALSE);
 }
 
 void denoise_roi_callback() {
-	gui.roi.operation_supports_roi = TRUE;
 	if (denoise_roi_preview)
 		gtk_widget_set_visible(GTK_WIDGET(denoise_roi_preview), gui.roi.active);
 }
 
 void on_denoise_dialog_show(GtkWidget *widget, gpointer user_data) {
 	denoise_dialog_init_statics();
+	nde_amend_note_update(denoise_amend_note, denoise_amend_mode,
+	                      &op_desc_denoise);
+
+	if (denoise_amend_mode) {
+		/* gfit already shows the pre-record state; denoise_startup() arms the
+		 * backup with it and keeps the ROI available.  No full-image preview
+		 * is forced — NL-Bayes is slow, the user tunes then applies — which
+		 * is exactly the case a region preview exists for, and the worker
+		 * replays the record's successors inside the rectangle
+		 * (nde_replay.h). */
+		denoise_startup();   /* ROI callback + descriptor + backup := pre-K */
+
+		set_notify_block(TRUE);
+		denoise_prefill_from_amend();
+		set_notify_block(FALSE);
+
+		gtk_widget_set_visible(GTK_WIDGET(denoise_artefact_control), (gfit->naxes[2] == 3));
+		gtk_widget_set_visible(GTK_WIDGET(denoise_roi_preview), gui.roi.active);
+		return;
+	}
 
 	denoise_startup();
 
@@ -230,12 +289,31 @@ void on_denoise_dialog_show(GtkWidget *widget, gpointer user_data) {
 	gtk_widget_set_visible(GTK_WIDGET(denoise_roi_preview), gui.roi.active);
 }
 
+/* Common amend-mode exit: tear down the backup without touching the pixels
+ * (preview_end restores the true pixels wholesale), then leave amend mode. */
+static void denoise_amend_exit(gboolean apply, gchar *blob) {
+	roi_declare_op(NULL);
+	remove_roi_callback(denoise_change_between_roi_and_image);
+	clear_backup();
+	nde_amend_preview_end(apply, blob);
+	denoise_amend_mode = FALSE;
+	siril_close_dialog("denoise_dialog");
+}
+
 void close_denoise() {
+	if (denoise_amend_mode) {
+		denoise_amend_exit(FALSE, NULL);
+		return;
+	}
 	denoise_close_internal(FALSE);
 	siril_close_dialog("denoise_dialog");
 }
 
 void on_denoise_cancel_clicked(GtkButton *button, gpointer user_data) {
+	if (denoise_amend_mode) {
+		denoise_amend_exit(FALSE, NULL);
+		return;
+	}
 	denoise_close_internal(TRUE);
 	siril_close_dialog("denoise_dialog");
 }
@@ -277,6 +355,31 @@ gboolean denoise_apply_idle(gpointer p) {
 }
 
 void on_denoise_apply_clicked(GtkButton *button, gpointer user_data) {
+	if (denoise_amend_mode && button != denoise_roi_preview) {
+		/* Serialize the widget state through the SAME struct and serializer
+		 * the normal apply uses (after the same validation), then route it
+		 * through the amend path.
+		 *
+		 * The button test is load-bearing: this handler serves Apply AND
+		 * "Preview ROI", and amend mode used to hide the latter.  Now that a
+		 * region preview replays the record's successors it is the whole
+		 * point of the mode here — NL-Bayes is far too slow to preview
+		 * full-image — so a preview click must fall through to the ordinary
+		 * path rather than commit the amend. */
+		struct denoise_args applied = { 0 };
+		get_denoise_values(&applied);
+		if (!validate_denoise_params(&applied))
+			return;
+		if (applied.modulation == 0.f) {
+			siril_log_message(_("Modulation is zero: doing nothing.\n"));
+			return;
+		}
+		gchar *blob = op_desc_denoise.serialize(&applied);
+		denoise_amend_exit(TRUE, blob);
+		g_free(blob);
+		return;
+	}
+
 	if (!check_ok_if_cfa())
 		return;
 
@@ -294,7 +397,7 @@ void on_denoise_apply_clicked(GtkButton *button, gpointer user_data) {
 
 	if (is_preview) {
 		// For ROI preview, just process the ROI
-		if (denoise_process_with_worker(TRUE, gui.roi.active)) {
+		if (denoise_process_with_worker(TRUE)) {
 			return; // Error occurred
 		}
 	} else {
@@ -303,14 +406,27 @@ void on_denoise_apply_clicked(GtkButton *button, gpointer user_data) {
 		undo_save_state(get_preview_gfit_backup(),
 				_("NL-Bayes denoising: (modulation=%.2f)"), mod);
 
-		// If ROI is active, restore to full image first
-		if (gui.roi.active)
-			restore_roi();
-
 		// Process the full image (not ROI, not preview)
-		if (denoise_process_with_worker(FALSE, FALSE)) {
+		if (denoise_process_with_worker(FALSE)) {
 			return; // Error occurred
 		}
 	}
+}
+
+/* ---- amend-mode entry (nde_editors registry) --------------------------- */
+
+static void denoise_amend_ready(gboolean ok, gpointer user) {
+	(void)user;
+	if (!ok)
+		return;   /* the core logged the reason; nothing was changed */
+	denoise_amend_mode = TRUE;
+	siril_open_dialog("denoise_dialog");
+}
+
+gboolean denoise_open_amend(gint64 record_id) {
+	/* The dialog opens from the ready callback, once the pre-record state
+	 * has been synthesized and installed. */
+	nde_amend_preview_start(record_id, denoise_amend_ready, NULL);
+	return TRUE;
 }
 

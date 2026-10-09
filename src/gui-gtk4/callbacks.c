@@ -26,8 +26,10 @@
 #include "compositing/compositing.h"
 #include "core/command.h"
 #include "core/command_line_processor.h"
+#include "core/fits_region.h"
 #include "core/icc_profile.h"
 #include "core/initfile.h"
+#include "core/op_descriptor.h"
 #include "core/op_descriptors.h"
 #include "core/OS_utils.h"
 #include "core/processing_thread.h"
@@ -39,6 +41,7 @@
 #include "core/undo.h"
 #include "gui-gtk4/conversion.h"
 #include "gui-gtk4/cut.h"
+#include "gui-gtk4/flis_gui.h"
 #include "gui-gtk4/icc_profile.h"
 #include "gui-gtk4/keywords_tree.h"
 #include "gui-gtk4/mpp_ap_editor.h"
@@ -79,6 +82,7 @@ void update_export_crop_label();
 #include "io/films.h"
 #include "io/healpix/fluxcache_cat.h"
 #include "io/image_format_fits.h"
+#include "io/image_format_flis.h"
 #include "io/sequence.h"
 #include "io/single_image.h"
 #include "io/siril_git.h"
@@ -301,136 +305,15 @@ void on_combo_theme_changed(GObject *obj, GParamSpec *pspec, gpointer user_data)
 	siril_set_theme(active);
 }
 
-int populate_roi() {
-	if (com.python_command)
-		return 1;
-	if (gui.roi.selection.w == 0 || gui.roi.selection.h == 0)
-		return 1;
-	int retval = 0;
-	size_t npixels_roi = gui.roi.selection.w * gui.roi.selection.h;
-	size_t npixels_gfit = gfit->rx * gfit->ry;
-	size_t nchans = gfit->naxes[2];
-	g_assert(nchans == 1 || nchans == 3);
-	gboolean rgb = (nchans == 3);
-
-	clearfits(&gui.roi.fit);
-	copyfits(gfit, &gui.roi.fit, CP_FORMAT, -1);
-
-	gui.roi.fit.rx = gui.roi.fit.naxes[0] = gui.roi.selection.w;
-	gui.roi.fit.ry = gui.roi.fit.naxes[1] = gui.roi.selection.h;
-	gui.roi.fit.naxes[2] = nchans;
-	gui.roi.fit.naxis = (nchans == 1 ? 2 : 3);
-
-	/* ---------------- IMAGE ROI COPY ---------------- */
-	if (gui.roi.fit.type == DATA_FLOAT) {
-		gui.roi.fit.fdata = malloc(npixels_roi * nchans * sizeof(float));
-		if (!gui.roi.fit.fdata)
-			retval = 1;
-
-		gui.roi.fit.fpdata[0] = gui.roi.fit.fdata;
-		gui.roi.fit.fpdata[1] = rgb ? gui.roi.fit.fdata + npixels_roi : gui.roi.fit.fdata;
-		gui.roi.fit.fpdata[2] = rgb ? gui.roi.fit.fdata + 2 * npixels_roi : gui.roi.fit.fdata;
-
-		for (uint32_t c = 0; c < nchans; c++) {
-			for (uint32_t y = 0; y < gui.roi.selection.h; y++) {
-				float *srcindex =
-					gfit->fdata +
-					(npixels_gfit * c) +
-					((gfit->ry - y - (gui.roi.selection.y + 1)) * gfit->rx) +
-					gui.roi.selection.x;
-
-				float *destindex =
-					gui.roi.fit.fdata +
-					(npixels_roi * c) +
-					(gui.roi.fit.rx * y);
-
-				memcpy(destindex, srcindex, gui.roi.selection.w * sizeof(float));
-			}
-		}
-	} else {
-		gui.roi.fit.data = malloc(npixels_roi * nchans * sizeof(WORD));
-		if (!gui.roi.fit.data)
-			retval = 1;
-
-		gui.roi.fit.pdata[0] = gui.roi.fit.data;
-		gui.roi.fit.pdata[1] = rgb ? gui.roi.fit.data + npixels_roi : gui.roi.fit.data;
-		gui.roi.fit.pdata[2] = rgb ? gui.roi.fit.data + 2 * npixels_roi : gui.roi.fit.data;
-
-		for (uint32_t c = 0; c < nchans; c++) {
-			for (uint32_t y = 0; y < gui.roi.selection.h; y++) {
-				WORD *srcindex =
-					gfit->data +
-					(npixels_gfit * c) +
-					((gfit->ry - y - (gui.roi.selection.y + 1)) * gfit->rx) +
-					gui.roi.selection.x;
-
-				WORD *destindex =
-					gui.roi.fit.data +
-					(npixels_roi * c) +
-					(y * gui.roi.fit.rx);
-
-				memcpy(destindex, srcindex, gui.roi.selection.w * sizeof(WORD));
-			}
-		}
-	}
-
-	/* ---------------- MASK ROI COPY ---------------- */
-	gui.roi.fit.mask_active = FALSE;
-	gui.roi.fit.mask = NULL;
-
-	if (gfit->mask && gfit->mask->data) {
-		size_t n = gui.roi.selection.w * gui.roi.selection.h;
-		size_t src_w = gfit->rx;
-		size_t src_h = gfit->ry;
-
-		gui.roi.fit.mask = malloc(sizeof(mask_t));
-		if (!gui.roi.fit.mask) {
-			retval = 1;
-			goto finalize;
-		}
-
-		gui.roi.fit.mask->bitpix = gfit->mask->bitpix;
-
-		size_t elem_size = 0;
-		switch (gfit->mask->bitpix) {
-		case 8:  elem_size = sizeof(uint8_t);  break;
-		case 16: elem_size = sizeof(uint16_t); break;
-		case 32: elem_size = sizeof(float);    break;
-		default:
-			free(gui.roi.fit.mask);
-			gui.roi.fit.mask = NULL;
-			goto finalize;
-		}
-
-		gui.roi.fit.mask->data = malloc(n * elem_size);
-		if (!gui.roi.fit.mask->data) {
-			free(gui.roi.fit.mask);
-			gui.roi.fit.mask = NULL;
-			retval = 1;
-			goto finalize;
-		}
-
-		/* Copy mask ROI with same flip logic as image */
-		for (uint32_t y = 0; y < gui.roi.selection.h; y++) {
-			size_t src_y = src_h - y - (gui.roi.selection.y + 1);
-			size_t src_x = gui.roi.selection.x;
-
-			void *src = (uint8_t*)gfit->mask->data +
-						(src_y * src_w + src_x) * elem_size;
-
-			void *dst = (uint8_t*)gui.roi.fit.mask->data +
-						(y * gui.roi.selection.w) * elem_size;
-
-			memcpy(dst, src, gui.roi.selection.w * elem_size);
-		}
-
-		gui.roi.fit.mask_active = gfit->mask_active;
-	}
-
-finalize:
-	backup_roi();
-	gui.roi.active = TRUE;
-	return retval;
+fits *roi_stats_source(fits *cache) {
+	if (!cache || !gui.roi.active)
+		return gfit;
+	rectangle lsel;
+	if (!flis_display_to_active_layer_rect(&gui.roi.selection, &lsel, TRUE))
+		return gfit;
+	if (crop_fits_region(gfit, &lsel, cache))
+		return gfit;
+	return cache;
 }
 
 static void call_roi_callbacks() {
@@ -471,10 +354,18 @@ static void roi_info_message_if_needed() {
 	com.pref.gui.enable_roi_warning = !dont_show_again;
 }
 
-void roi_supported(gboolean state) {
-	gui.roi.operation_supports_roi = state;
+void roi_declare_op(const op_descriptor *op) {
+	/* One declaration, one source of truth.  The dialog names the op it is
+	 * about to run and the DESCRIPTOR decides whether that op can be computed
+	 * on a sub-rectangle — the same OP_ROI_CAPABLE bit generic_image_worker
+	 * consults, so the outline colour and the behaviour cannot drift apart.
+	 * NULL means "no op, or not this session": a dialog withholds region
+	 * previews that way even for a capable op (amend mode previews full-image
+	 * against the pre-record backup; an apply-to-sequence run has no ROI). */
+	gui.roi.operation_supports_roi = op_descriptor_is_roi_capable(op);
 	// Provide a one-time notification about ROI support
-	if (state && gui.roi.active && com.pref.gui.enable_roi_warning)
+	if (gui.roi.operation_supports_roi && gui.roi.active
+	    && com.pref.gui.enable_roi_warning)
 		roi_info_message_if_needed();
 	redraw(REDRAW_OVERLAY);
 }
@@ -501,18 +392,22 @@ gpointer on_set_roi() {
 	cancel_pending_update();
 	if (gui.roi.operation_supports_roi && com.pref.gui.enable_roi_warning)
 		roi_info_message_if_needed();
-	// Ensure any pending ROI changes are overwritten by the backup
-	// Must copy the whole backup to gfit and gui.roi.fit to account
-	// for switching between full image and ROI
+	// Ensure any pending preview is overwritten by the backup, so the new
+	// rectangle previews against the pre-operation image
 	memcpy(&gui.roi.selection, &sel, sizeof(rectangle));
 	gui.roi.active = TRUE;
 	if (gui.roi.selection.w > 0 && gui.roi.selection.h > 0 && is_preview_active())
 		copy_backup_to_gfit();
-	populate_roi();
-	backup_roi();
-	// Call any callbacks that need calling
-	call_roi_callbacks();
 	g_mutex_unlock(&roi_mutex);
+	/* AFTER the unlock.  A ROI callback is a dialog re-running its preview at
+	 * the new rectangle, and that reaches dispatch_preview(), which takes this
+	 * same mutex — non-recursively, on this same thread.  Calling them inside
+	 * the lock froze the GTK main loop outright whenever no preview happened
+	 * to be in flight (with one in flight, notify_update() coalesces and
+	 * returns before reaching dispatch_preview, which is why this survived).
+	 * The ROI state the callbacks read is fully written by now, so there is
+	 * nothing left for the lock to protect. */
+	call_roi_callbacks();
 	return GINT_TO_POINTER(0);
 }
 
@@ -521,12 +416,15 @@ gpointer on_clear_roi() {
 		g_mutex_lock(&roi_mutex); // Wait until any thread previews are finished
 		cancel_pending_update();
 		copy_backup_to_gfit();
-		clearfits(&gui.roi.fit);
+		/* Keep the declaration: it says what the OPEN DIALOG can do, which
+		 * clearing a rectangle does not change.  Wiping it here is why every
+		 * dialog's ROI callback used to re-assert it. */
+		const gboolean supports = gui.roi.operation_supports_roi;
 		memset(&gui.roi, 0, sizeof(roi_t));
+		gui.roi.operation_supports_roi = supports;
 		redraw(REDRAW_OVERLAY);
-		// Call any callbacks that need calling
-		call_roi_callbacks();
 		g_mutex_unlock(&roi_mutex);
+		call_roi_callbacks();   /* see on_set_roi: must not hold roi_mutex */
 	}
 	return GINT_TO_POINTER(0);
 }
@@ -694,7 +592,7 @@ void on_display_item_toggled(GtkCheckButton *checkmenuitem, gpointer user_data) 
 	GtkApplicationWindow *app_win = GTK_APPLICATION_WINDOW(lookup_widget("control_window"));
 	siril_window_autostretch_actions(app_win, gui.rendering_mode == STF_DISPLAY, gfit->naxes[2] == 3);
 
-	com.gui_icc.same_primaries = same_primaries(gfit->icc_profile, com.gui_icc.monitor, com.gui_icc.soft_proof ? com.gui_icc.soft_proof : NULL);
+	com.gui_icc.same_primaries = same_primaries(current_icc_profile(), com.gui_icc.monitor, com.gui_icc.soft_proof ? com.gui_icc.soft_proof : NULL);
 
 	/* same as when a stretch dialog is opened in linear mode */
 	if (gui.rendering_mode == LINEAR_DISPLAY && stretch_dialog_is_open())
@@ -1106,6 +1004,9 @@ gboolean update_MenuItem(gpointer user_data) {
 	/* some toolbar buttons */
 	gtk_widget_set_sensitive(lookup_widget("toolbarbox"), any_image_is_loaded);
 
+	/* The pinned history popover closes when its image goes away. */
+	flis_gui_history_notify_image_state(is_a_single_image_loaded);
+
 	gboolean wcs_ok = any_image_is_loaded && has_wcs(gfit);
 	GAction *action_annotate = g_action_map_lookup_action(G_ACTION_MAP(app_win), "annotate-object");
 	GAction *action_grid = g_action_map_lookup_action(G_ACTION_MAP(app_win), "wcs-grid");
@@ -1197,6 +1098,16 @@ gboolean update_MenuItem(gpointer user_data) {
 	siril_window_enable_rgb_proc_actions(app_win, is_a_singleRGB_image_loaded);
 	/* single RGB image with wcs information is needed */
 	siril_window_enable_rgb_wcs_proc_actions(app_win, is_a_singleRGB_image_loaded && has_wcs(gfit));
+	/* FLIS group-calibration override: with an effectively-colour layer
+	 * group selected, the colour-calibration tools run on the group's
+	 * composite, so they must be sensitive even though the active layer
+	 * (gfit) is mono.  PCC/SPCC additionally need a solved layer that can
+	 * donate its WCS to the composite. */
+	if (is_a_single_image_loaded && is_current_image_flis()
+			&& flis_panel_selected_colour_group()) {
+		siril_window_enable_group_calib_actions(app_win, TRUE,
+				flis_document_has_wcs_donor());
+	}
 	/* single or sequence RGB is needed */
 	siril_window_enable_any_rgb_proc_actions(app_win, is_a_singleRGB_image_loaded|| sequence_is_loaded());
 	/* any image is needed */
@@ -1421,27 +1332,22 @@ void update_display_selection() {
 }
 
 static void update_roi_from_selection() {
-	if (gui.roi.active) {
-		restore_roi();
-		copy_roi_into_gfit();
-	}
 	memcpy(&gui.roi.selection, &com.selection, sizeof(rectangle));
 	gboolean active = (gui.roi.selection.w > 0 && gui.roi.selection.h > 0);
 	if (active)
 		on_set_roi();
 	else
 		on_clear_roi();
-	/* The steps above modify gfit pixels (restore_roi+copy_roi_into_gfit
-	 * write the OLD-ROI restoration; on_set_roi's copy_backup_to_gfit and
-	 * any registered ROI callback restore further state).  None of that
-	 * by itself re-remaps the Cairo display buffers — the call chain
-	 * gfit_modified_update_gui → end_gfit_operation → redraw_image_async
-	 * only queues a GTK paint, which then renders from whatever's already
-	 * cached in the per-vport buffers (still showing the previous preview
-	 * at the OLD ROI position).  notify_gfit_data_modified() is the one
-	 * that calls remap_all_vports() — mirror what siril_preview_hide()
-	 * does at siril_preview.c:189.  Cheap enough to call on every ROI
-	 * change; populate_roi/etc. above already touched gfit. */
+	/* The steps above modify gfit pixels: on_set_roi/on_clear_roi restore
+	 * the preview backup, and any registered ROI callback re-runs the
+	 * dialog's preview at the new rectangle.  Neither by itself re-remaps
+	 * the Cairo display buffers — the call chain gfit_modified_update_gui →
+	 * end_gfit_operation → redraw_image_async only queues a GTK paint,
+	 * which then renders from whatever's already cached in the per-vport
+	 * buffers (still showing the previous preview at the OLD ROI
+	 * position).  notify_gfit_data_modified() is the one that calls
+	 * remap_all_vports() — mirror what siril_preview_hide() does.  Cheap
+	 * enough to call on every ROI change. */
 	if (!com.script && !com.python_command && !com.headless)
 		notify_gfit_data_modified();
 }
@@ -1493,7 +1399,7 @@ void display_filename() {
 	if (single_image_is_loaded() && com.uniq->filename && com.uniq->filename[0] != '\0') {	// unique image
 		filename = com.uniq->filename;
 		orig_filename = g_file_read_link(filename, &error);
-		nb_layers = com.uniq->nb_layers;
+		nb_layers = com.uniq->chans;
 	} else if (sequence_is_loaded()) {	// sequence
 		filename = malloc(256);
 		strcpy(filename, " ");
@@ -1810,6 +1716,14 @@ gboolean show_or_hide_mask_tab_idle(gpointer p) {
 		return FALSE;
 	gboolean has_mask = (gfit->mask != NULL);
 	g_rw_lock_reader_unlock(&gfit->rwlock);
+	/* FLIS: the tab can also display the active layer's layer mask (the
+	 * mask-view radios switch between the two sources), so it must show
+	 * when either exists — checking only gfit->mask kept the tab hidden
+	 * after routing a freshly created mask to a layer's lmask. */
+	if (!has_mask && is_current_image_flis()) {
+		flis_layer_t *act = flis_active_layer();
+		has_mask = (act && act->lmask && act->lmask->data);
+	}
 	GtkNotebook* Color_Layers = GTK_NOTEBOOK(lookup_widget("notebook1"));
 	GtkWidget *page = gtk_notebook_get_nth_page(Color_Layers, MASK_VPORT);
 	if (has_mask) {
@@ -1825,21 +1739,36 @@ void show_or_hide_mask_tab() {
 	return;
 }
 
+/* Which viewport set close_tab() last applied, so that a document which
+ * CHANGES colour can be told from one that merely redrew.  -1 until the first
+ * call: sync_colour_vports() then has nothing to compare against and defers to
+ * the load path, which is about to run close_tab() itself. */
+static int vports_are_mono = -1;
+
 gboolean close_tab(gpointer user_data) {
 	GtkNotebook* Color_Layers = GTK_NOTEBOOK(lookup_widget("notebook1"));
 	GtkWidget* page;
 
-	/* When a single image is loaded (incl. the stacking result), the
-	 * displayed image is gfit, which may have a different channel count
+	/* FLIS: a mono base layer (gfit->naxes[2] == 1) does NOT mean the
+	 * displayed image is mono — the composite is chromatic if any layer
+	 * is RGB or any mono layer carries a non-greyscale LAYER_COLOR tint
+	 * (e.g. a 1-mono-base + 3-tinted-mono SHO stack).  Consult the layer
+	 * stack instead of the active layer for FLIS images.
+	 *
+	 * Plain FITS: when a single image is loaded (incl. the stacking result),
+	 * the displayed image is gfit, which may have a different channel count
 	 * than com.seq — Bayer-drizzle/multipoint in particular produces a
 	 * 3-channel result from a mono Bayer SER sequence. Otherwise (sequence
 	 * load before gfit is updated to a frame), com.seq.nb_layers is the
 	 * authoritative count. Keying off com.seq.nb_layers here would force the
 	 * mono viewport for an RGB result whose source sequence is mono. */
-	const int displayed_layers = single_image_is_loaded()
-		? (int) gfit->naxes[2]
-		: com.seq.nb_layers;
-	if (displayed_layers == 1) {
+	gboolean is_mono = is_current_image_flis()
+	    ? !flis_composite_is_chromatic()
+	    : (single_image_is_loaded()
+	        ? (int) gfit->naxes[2] == 1
+	        : com.seq.nb_layers == 1);
+
+	if (is_mono) {
 		/* Leave the colour pages BEFORE hiding them: hiding the current page
 		 * makes GtkNotebook pick an adjacent visible page itself, which can
 		 * transiently land on another colour viewport — its switch-page
@@ -1866,7 +1795,34 @@ gboolean close_tab(gpointer user_data) {
 		page = gtk_notebook_get_nth_page(Color_Layers, RGB_VPORT);
 		gtk_widget_set_visible(page, TRUE);
 	}
+	vports_are_mono = is_mono;
 	show_or_hide_mask_tab_idle(NULL);
+	return FALSE;
+}
+
+/* A FLIS document can BECOME chromatic, or stop being so, long after it was
+ * opened: tinting a mono layer is the plainest case — one command, and a stack
+ * that displayed as black-and-white now has colour in it.  close_tab() knows
+ * how to decide the viewport set, but only the load path ever asked it, so the
+ * tabs kept whatever they were told at open time and a freshly tinted stack
+ * stayed resolutely mono.
+ *
+ * Called whenever the document changes, and deliberately does nothing unless
+ * the answer moved: init_right_tab() switches the active viewport, and running
+ * that on every layer edit would yank the user off the Green channel each time
+ * they nudged an opacity.
+ *
+ * FLIS only.  A plain image's channel count is gfit's own and changes just
+ * where an op changed it, which those ops already announce; a FLIS composite's
+ * is a property of the whole stack, and no single edit owns it. */
+gboolean sync_colour_vports(gpointer user_data) {
+	(void)user_data;
+	if (!is_current_image_flis() || vports_are_mono < 0)
+		return FALSE;
+	if ((int)!flis_composite_is_chromatic() == vports_are_mono)
+		return FALSE;
+	close_tab(NULL);        /* re-decides, and records the new answer */
+	init_right_tab(NULL);
 	return FALSE;
 }
 
@@ -1878,7 +1834,15 @@ void activate_tab(int vport) {
 }
 
 gboolean init_right_tab(gpointer user_data) {
-	activate_tab(isrgb(gfit) ? RGB_VPORT : RED_VPORT);
+	/* FLIS: gfit is the active layer, which may be mono even when the
+	 * composite is chromatic (e.g. a mono-base FLIS with a tinted mono
+	 * narrowband layer on top).  Read the composite's chromaticity from
+	 * the layer stack so the user gets RGB viewports for anything that
+	 * displays in colour. */
+	gboolean rgb = is_current_image_flis()
+	    ? flis_composite_is_chromatic()
+	    : isrgb(gfit);
+	activate_tab(rgb ? RGB_VPORT : RED_VPORT);
 	return FALSE;
 }
 
@@ -2094,6 +2058,7 @@ static void load_accels() {
 		"win.mirrory-processing",     "<Primary>Down", NULL,
 
 		"win.regframe",               "<Primary>r", NULL,
+		"win.show-layers",            "<Primary>l", NULL,
 
 		NULL /* Terminating NULL */
 	};
@@ -2179,17 +2144,52 @@ gboolean set_GUI_CWD(gpointer user_data) {
 		return FALSE;
 	/* GTK4: gtk_header_bar_set_title / set_subtitle were removed.  The
 	 * replacement is set_title_widget with a custom GtkLabel containing
-	 * markup for the two lines (title + dimmed subtitle). */
+	 * markup for the two lines (title + dimmed subtitle).
+	 *
+	 * For a FLIS image the subtitle becomes "name.flis — layer 'X' [n/N]"
+	 * so the active layer and stack position are visible at a glance.
+	 * For sequence / plain-FITS / no-image we keep the working directory. */
 	GtkHeaderBar *bar = GTK_HEADER_BAR(lookup_widget("headerbar"));
-	gchar *truncated_wd = siril_truncate_str(com.wd, 50);
+	gchar *subtitle = NULL;
+	if (single_image_is_loaded() && is_current_image_flis() && com.uniq) {
+		guint n_layers = g_slist_length(com.uniq->layers);
+		flis_layer_t *active = flis_active_layer();
+		const gchar *basename = NULL;
+		gchar *bn = NULL;
+		if (com.uniq->filename && *com.uniq->filename) {
+			bn = g_path_get_basename(com.uniq->filename);
+			basename = bn;
+		} else {
+			basename = _("(untitled FLIS)");
+		}
+		if (active && n_layers > 0) {
+			/* §7: canvas is a first-class document property; surface its
+			 * dimensions alongside the active-layer indicator so users
+			 * can tell at a glance whether the canvas matches a given
+			 * layer's pixel dims. */
+			subtitle = g_strdup_printf(
+				/* Translators: header-bar subtitle for a layered image:
+				 * filename — canvas WxH — layer 'name' [index/count] */
+				_("%s — canvas %ux%u — layer '%s' [%d/%u]"),
+				basename,
+				flis_canvas_rx(), flis_canvas_ry(),
+				active->layer_name ? active->layer_name : "?",
+				com.uniq->active_layer + 1, n_layers);
+		} else {
+			subtitle = g_strdup_printf("%s — FLIS", basename);
+		}
+		g_free(bn);
+	}
+	if (!subtitle)
+		subtitle = siril_truncate_str(com.wd, 50);
 	gchar *markup = g_markup_printf_escaped(
-		"<b>Siril-%s</b>\n<small>%s</small>", VERSION, truncated_wd);
+		"<b>Siril-%s</b>\n<small>%s</small>", VERSION, subtitle);
 	GtkWidget *title = gtk_label_new(NULL);
 	gtk_label_set_markup(GTK_LABEL(title), markup);
 	gtk_label_set_justify(GTK_LABEL(title), GTK_JUSTIFY_CENTER);
 	gtk_header_bar_set_title_widget(bar, title);
 	g_free(markup);
-	g_free(truncated_wd);
+	g_free(subtitle);
 	return FALSE;
 }
 
@@ -2832,6 +2832,9 @@ void initialize_all_GUI(gchar *supported_files) {
 	/* secondary-click popover for undo/redo history navigation */
 	setup_undo_redo_long_press();
 
+	/* Nondestructive History popover under the header-bar clock button. */
+	flis_gui_history_popover_init();
+
 	/* initialize menu gui */
 	gui_function(update_MenuItem, NULL);
 
@@ -3088,7 +3091,7 @@ void on_gamutcheck_toggled(GtkCheckButton *togglebutton, gpointer user_data) {
 	/* Cache the toggle for the transform builders, which run on worker
 	 * threads and must not read the widget themselves (see struct gui_icc). */
 	com.gui_icc.gamut_check = gtk_check_button_get_active(togglebutton);
-	if (gfit->color_managed) {
+	if (current_image_color_managed()) {
 		lock_display_transform();
 		clear_proofing_transforms();
 		com.gui_icc.proofing_transform = initialize_proofing_transform();

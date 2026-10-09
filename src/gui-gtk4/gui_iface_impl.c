@@ -30,6 +30,7 @@
 
 #include "algos/background_extraction.h"
 #include "algos/ccd-inspector.h"
+#include "algos/siril_wcs.h"
 #include "core/gui_iface.h"
 #include "core/icc_profile.h"
 #include "core/processing.h"
@@ -67,8 +68,10 @@
 #include "gui-gtk4/stacking.h"
 #include "gui-gtk4/user_polygons.h"
 #include "gui-gtk4/utils.h"
+#include "gui-gtk4/wavelets.h"
 #include "io/annotation_catalogues.h"
 #include "io/image_format_fits.h"
+#include "io/image_format_flis.h"
 #include "io/sequence.h"
 #include "io/single_image.h"
 #include "livestacking/gui.h"
@@ -226,6 +229,8 @@ static void impl_queue_redraw_mask(gboolean remap_tints) {
 
 /* ── Groups E, F: no-op placeholders (filled in by 6.1/6.2 impls below) ── */
 
+static void impl_set_suppress_redraws(gboolean suppress);   /* defined below */
+
 /* Called after stacking completes successfully on the GTK main thread.
  * Consolidates all display-state update calls that were previously scattered
  * through end_stacking() in stacking.c. */
@@ -237,7 +242,11 @@ static void impl_on_stack_complete(void) {
 	 * reads gfit->type/orig_bitpix) and also writes it (the hi/lo assignment).
 	 * The lock must be acquired and released as a writer on both counts -
 	 * mixing reader_lock with writer_unlock corrupts the lock on platforms
-	 * where the two unlock primitives differ (e.g. Windows SRWLOCK). */
+	 * where the two unlock primitives differ (e.g. Windows SRWLOCK).
+	 * Quiesce the materialise pool first — the freshly stacked result may
+	 * already have the pool churning reader-locked tile fills, which would
+	 * starve this writer (writer-starvation protocol, counting suppression). */
+	impl_set_suppress_redraws(TRUE);
 	g_rw_lock_writer_lock(&gfit->rwlock);
 	display_filename();
 	gui_function(set_precision_switch, NULL);
@@ -254,6 +263,7 @@ static void impl_on_stack_complete(void) {
 	gfit->keywords.hi = gui.hi;
 	gfit->keywords.lo = gui.lo;
 	g_rw_lock_writer_unlock(&gfit->rwlock);
+	impl_set_suppress_redraws(FALSE);
 	gfit_modified_update_gui();
 	set_display_mode();
 	gui_function(update_MenuItem, NULL);
@@ -318,18 +328,41 @@ static gboolean set_display_mode_menu_sensitive_idle(gpointer p) {
 	return FALSE;
 }
 
+/* Suppression is COUNTING: several independent sections bracket
+ * gfit-writer-lock acquisitions with suppress(TRUE)/suppress(FALSE) to
+ * quiesce the lazy-tile materialise pool (GRWLock has no writer
+ * preference, so an unquiesced writer starves behind the pool's
+ * back-to-back reader-locked tile fills on a large image).  Those
+ * sections nest — e.g. a preview hook inside the generic worker's
+ * swap-path suppression — so a plain boolean would be cleared by the
+ * inner section's exit.  The visible flag the pool workers poll
+ * (gui.suppress_drawarea_redraw) flips only on 0↔1 transitions. */
+static gint suppress_redraw_count = 0;
+
 static void impl_set_suppress_redraws(gboolean suppress) {
 	if (suppress) {
-		g_atomic_int_set(&gui.suppress_drawarea_redraw, 1);
-		siril_add_idle(set_display_mode_menu_sensitive_idle, GINT_TO_POINTER(FALSE));
+		if (g_atomic_int_add(&suppress_redraw_count, 1) == 0) {
+			g_atomic_int_set(&gui.suppress_drawarea_redraw, 1);
+			siril_add_idle(set_display_mode_menu_sensitive_idle, GINT_TO_POINTER(FALSE));
+		}
 	} else {
-		g_atomic_int_set(&gui.suppress_drawarea_redraw, 0);
-		/* Symmetrically re-enable the display-mode menu: the matching
-		 * re-enable in end_gfit_operation() does not run for every op
-		 * that suppressed redraws (e.g. a command with argfit == gfit but
-		 * command_updates_gfit == FALSE completes via end_generic_image()),
-		 * which would otherwise leave the menu permanently insensitive. */
-		siril_add_idle(set_display_mode_menu_sensitive_idle, GINT_TO_POINTER(TRUE));
+		gint prev = g_atomic_int_add(&suppress_redraw_count, -1);
+		if (prev <= 0) {
+			/* Unbalanced release — repair and complain rather than
+			 * leaving the count negative (which would make the next
+			 * suppress(TRUE) a no-op and re-expose the starvation). */
+			g_atomic_int_set(&suppress_redraw_count, 0);
+			siril_log_debug("unbalanced set_suppress_redraws(FALSE)\n");
+		}
+		if (prev == 1) {
+			g_atomic_int_set(&gui.suppress_drawarea_redraw, 0);
+			/* Symmetrically re-enable the display-mode menu: the matching
+			 * re-enable in end_gfit_operation() does not run for every op
+			 * that suppressed redraws (e.g. a command with argfit == gfit but
+			 * command_updates_gfit == FALSE completes via end_generic_image()),
+			 * which would otherwise leave the menu permanently insensitive. */
+			siril_add_idle(set_display_mode_menu_sensitive_idle, GINT_TO_POINTER(TRUE));
+		}
 	}
 }
 
@@ -337,8 +370,10 @@ static gboolean impl_get_suppress_redraws(void) {
 	return g_atomic_int_get(&gui.suppress_drawarea_redraw) != 0;
 }
 
-static void impl_populate_roi(void) {
-	populate_roi();
+extern void materialise_pool_drain(void);  /* image_display.c */
+
+static void impl_drain_tile_workers(void) {
+	materialise_pool_drain();
 }
 
 /* ── Group H: Geometry / ROI / Mask state ────────────────────────────────── */
@@ -907,6 +942,108 @@ static void impl_redraw_mask_idle(gboolean remap_tints) {
 		queue_redraw_mask(remap_tints);
 }
 
+/* FLIS composite invalidation — stage 1.2 no-op stub.  Replaced in
+ * stage 3.4 with a real implementation that drops per-layer GdkTexture
+ * tile caches and queues a snapshot redraw via flis_display_invalidate(). */
+/* Stage 3.1 — the FLIS display composite cache lives in image_display.c
+ * as static state.  These wrappers expose only the cache-management
+ * operations to gui_iface so non-GUI code (image_format_flis primitives,
+ * single_image close path) can invalidate / release without including
+ * image_display.h. */
+extern void flis_display_invalidate_composite(void);
+extern void flis_display_composite_free(void);
+extern void flis_display_invalidate(int flags, int item_id);
+extern fits *flis_display_get_composite(void);
+
+static void impl_flis_invalidate_composite(void) {
+	flis_display_invalidate_composite();
+}
+
+static void impl_flis_composite_free(void) {
+	flis_display_composite_free();
+}
+
+static void impl_flis_display_invalidate(int flags, int item_id) {
+	flis_display_invalidate(flags, item_id);
+}
+
+static void *impl_flis_get_composite(void) {
+	return flis_display_get_composite();
+}
+
+
+extern void flis_gui_update_from_idle(void);  /* flis_gui.h, stage 4 */
+
+/* ── Active-layer-change reconciler ──────────────────────────────────────
+ *
+ * Single chokepoint for everything keyed to WHICH layer gfit points at.
+ * uniq_set_active_layer() fires gui_iface.on_active_layer_changed() on
+ * every retarget; this queues one coalesced main-thread idle (async by
+ * contract — the caller may hold the FLIS stack writer lock, so nothing
+ * here may take locks or block).  The idle then:
+ *
+ *   - re-arms a live preview whose backup was taken from another layer
+ *     (identity-checked; restores and preview ticks are blocked by the
+ *     owner gate in siril_preview.c until this runs);
+ *   - retests mask-tab visibility (lmask presence differs per layer);
+ *   - refreshes the layers panel / header / canvas dialog.
+ */
+static gint active_layer_reconcile_pending = 0;
+
+static gboolean active_layer_reconcile_idle(gpointer p) {
+	(void)p;
+	g_atomic_int_set(&active_layer_reconcile_pending, 0);
+	if (is_preview_active() && get_preview_backup_owner() != gfit) {
+		clear_backup();
+		copy_gfit_to_backup();
+	}
+	/* The wavelets tool's decomposition (held transform + .wave files) is
+	 * keyed to gfit's pixels but guarded only by geometry — another layer of
+	 * the same size would pass the guard and reconstruct the OLD layer's
+	 * pixels into the new one.  Invalidate the tool: it must recompute. */
+	wavelets_active_layer_changed();
+	show_or_hide_mask_tab();
+	flis_gui_update_from_idle();
+	/* Action sensitivity is keyed to gfit (has_wcs & co) and would
+	 * otherwise go stale when the active layer changes; this also
+	 * untoggles the WCS overlays if the new layer carries no solve. */
+	update_MenuItem(NULL);
+	/* The found-objects overlay was computed from the outgoing layer's
+	 * WCS; recompute it against the incoming one while the annotate
+	 * toggle stays on (update_MenuItem has already cleared it if the
+	 * new layer has no solve). */
+	GActionMap *map = G_ACTION_MAP(gtk_builder_get_object(gui.builder, "control_window"));
+	GAction *annotate = g_action_map_lookup_action(map, "annotate-object");
+	if (annotate) {
+		GVariant *st = g_action_get_state(annotate);
+		if (g_variant_get_boolean(st) && has_wcs(gfit))
+			refresh_found_objects();
+		g_variant_unref(st);
+	}
+	redraw(REDRAW_OVERLAY);
+	return G_SOURCE_REMOVE;
+}
+
+static void impl_on_active_layer_changed(void) {
+	if (!g_atomic_int_compare_and_exchange(&active_layer_reconcile_pending, 0, 1))
+		return;
+	g_idle_add(active_layer_reconcile_idle, NULL);
+}
+extern gboolean flis_panel_group_is_selected(void);  /* flis_gui.h */
+extern gboolean flis_panel_multi_is_selected(void);  /* flis_gui.h */
+extern void flis_gui_present_if_flis(void);
+extern void flis_gui_history_update_from_idle(void);
+
+static void impl_flis_gui_update(void) {
+	flis_gui_update_from_idle();
+}
+static void impl_flis_gui_present_if_flis(void) {
+	flis_gui_present_if_flis();
+}
+static void impl_nde_history_changed(void) {
+	flis_gui_history_update_from_idle();
+}
+
 /* ── Group G additions: Channel / precision display state ────────────────── */
 
 static void impl_on_channel_count_changed(void) {
@@ -927,10 +1064,6 @@ static gboolean impl_roi_operation_supports(void) {
 	return gui.roi.operation_supports_roi;
 }
 
-static gpointer impl_get_roi_fit(void) {
-	return (gpointer)&gui.roi.fit;
-}
-
 static void impl_get_roi_selection(rectangle *rect) {
 	memcpy(rect, &gui.roi.selection, sizeof(rectangle));
 }
@@ -939,9 +1072,10 @@ static void impl_clear_roi(void) {
 	clear_roi_threadsafe();
 }
 
-static void impl_restore_roi(const rectangle *rect) {
-	memcpy(&com.selection, rect, sizeof(rectangle));
-	on_set_roi();
+static gboolean impl_roi_active_layer_rect(rectangle *rect) {
+	if (!gui.roi.active || !rect)
+		return FALSE;
+	return flis_display_to_active_layer_rect(&gui.roi.selection, rect, TRUE);
 }
 
 static void impl_reset_display_transform(void) {
@@ -1023,15 +1157,19 @@ struct cm_struct {
 
 static gboolean cm_worker(gpointer user_data) {
 	struct cm_struct *data = (struct cm_struct *) user_data;
-	fits *fit = data->fit;
+	(void)data->fit;
 	gboolean active = data->active;
 	gchar *buffer = NULL, *monitor = NULL, *proof = NULL;
 	gchar *name = g_build_filename("/org/siril/ui/", "pixmaps",
 		active ? "color_management.svg" : "color_management_off.svg", NULL);
 	gchar *tooltip = NULL;
 	if (active) {
-		if (fit->icc_profile) {
-			buffer = siril_color_profile_get_description(fit->icc_profile);
+		/* Read the current image's profile from com.uniq (the fit
+		 * pointer the caller passed is no longer used — the accessors
+		 * own the profile state). */
+		cmsHPROFILE current = current_icc_profile();
+		if (current) {
+			buffer = siril_color_profile_get_description(current);
 			monitor = siril_color_profile_get_description(com.gui_icc.monitor);
 		}
 		if (com.gui_icc.soft_proof)
@@ -1295,6 +1433,10 @@ static void impl_close_tab(void) {
 	gui_function(close_tab, NULL);
 }
 
+static void impl_sync_colour_vports(void) {
+	gui_function(sync_colour_vports, NULL);
+}
+
 static void impl_init_right_tab(void) {
 	gui_function(init_right_tab, NULL);
 }
@@ -1384,9 +1526,6 @@ static void impl_ensure_seqlist_dialog_closed(void) {
 	ensure_seqlist_dialog_closed();
 }
 
-static void impl_copy_roi_into_gfit(void) {
-	copy_roi_into_gfit();
-}
 
 static void impl_lock_roi_mutex(void) {
 	lock_roi_mutex();
@@ -1457,6 +1596,8 @@ static void impl_reset_cut_gui_filedependent(gpointer u) {
 /* Preview */
 static int impl_copy_backup_to_gfit(void) { return copy_backup_to_gfit(); }
 static gpointer impl_get_preview_gfit_backup(void) { return (gpointer)get_preview_gfit_backup(); }
+static gpointer impl_get_preop_gfit(void) { return (gpointer)get_preop_gfit(); }
+static void impl_preview_note_gfit_change(const rectangle *r) { preview_note_gfit_change(r); }
 /* Registration */
 static gboolean update_reg_interface_idle(gpointer p) {
 	update_reg_interface(GPOINTER_TO_INT(p));
@@ -1534,7 +1675,7 @@ void siril_register_gui_iface(void) {
 	gui_iface.dismiss_autohide_popovers = close_open_autohide_popovers;
 	gui_iface.set_suppress_redraws   = impl_set_suppress_redraws;
 	gui_iface.get_suppress_redraws   = impl_get_suppress_redraws;
-	gui_iface.populate_roi           = impl_populate_roi;
+	gui_iface.drain_tile_workers     = impl_drain_tile_workers;
 	gui_iface.on_geometry_changed    = impl_on_geometry_changed;
 	gui_iface.on_mask_state_changed  = impl_on_mask_state_changed;
 	gui_iface.on_crop_complete       = impl_on_crop_complete;
@@ -1551,14 +1692,23 @@ void siril_register_gui_iface(void) {
 	gui_iface.invalidate_histogram        = impl_invalidate_histogram;
 	gui_iface.update_histogram            = impl_update_histogram;
 	gui_iface.redraw_mask_idle            = impl_redraw_mask_idle;
+	gui_iface.flis_invalidate_composite   = impl_flis_invalidate_composite;
+	gui_iface.flis_display_invalidate     = impl_flis_display_invalidate;
+	gui_iface.flis_get_composite          = impl_flis_get_composite;
+	gui_iface.flis_composite_free         = impl_flis_composite_free;
+	gui_iface.flis_gui_update             = impl_flis_gui_update;
+	gui_iface.on_active_layer_changed     = impl_on_active_layer_changed;
+	gui_iface.flis_group_is_selected      = flis_panel_group_is_selected;
+	gui_iface.flis_multi_is_selected      = flis_panel_multi_is_selected;
+	gui_iface.flis_gui_present_if_flis    = impl_flis_gui_present_if_flis;
+	gui_iface.nde_history_changed         = impl_nde_history_changed;
 	gui_iface.on_channel_count_changed    = impl_on_channel_count_changed;
 	gui_iface.on_precision_changed        = impl_on_precision_changed;
 	gui_iface.roi_is_active               = impl_roi_is_active;
 	gui_iface.roi_operation_supports      = impl_roi_operation_supports;
-	gui_iface.get_roi_fit                 = impl_get_roi_fit;
 	gui_iface.get_roi_selection           = impl_get_roi_selection;
 	gui_iface.clear_roi                   = impl_clear_roi;
-	gui_iface.restore_roi                 = impl_restore_roi;
+	gui_iface.roi_active_layer_rect       = impl_roi_active_layer_rect;
 	gui_iface.reset_display_transform     = impl_reset_display_transform;
 	gui_iface.is_preview_active           = impl_is_preview_active;
 	gui_iface.hide_preview                = impl_hide_preview;
@@ -1629,6 +1779,7 @@ void siril_register_gui_iface(void) {
 	gui_iface.enable_view_reference_checkbox  = impl_enable_view_reference_checkbox;
 	gui_iface.close_tab                       = impl_close_tab;
 	gui_iface.init_right_tab                  = impl_init_right_tab;
+	gui_iface.sync_colour_vports              = impl_sync_colour_vports;
 	gui_iface.initialize_display_mode         = impl_initialize_display_mode;
 	gui_iface.display_filename                = impl_display_filename;
 	gui_iface.update_display_fwhm             = impl_update_display_fwhm;
@@ -1643,7 +1794,6 @@ void siril_register_gui_iface(void) {
 	gui_iface.update_seqlist                  = impl_update_seqlist;
 	gui_iface.update_sequence_overlay_async   = impl_update_sequence_overlay_async;
 	gui_iface.ensure_seqlist_dialog_closed    = impl_ensure_seqlist_dialog_closed;
-	gui_iface.copy_roi_into_gfit              = impl_copy_roi_into_gfit;
 	gui_iface.lock_roi_mutex                  = impl_lock_roi_mutex;
 	gui_iface.unlock_roi_mutex                = impl_unlock_roi_mutex;
 	gui_iface.show_or_hide_mask_tab           = impl_show_or_hide_mask_tab;
@@ -1663,6 +1813,8 @@ void siril_register_gui_iface(void) {
 	/* Preview */
 	gui_iface.copy_backup_to_gfit            = impl_copy_backup_to_gfit;
 	gui_iface.get_preview_gfit_backup        = impl_get_preview_gfit_backup;
+	gui_iface.get_preop_gfit                 = impl_get_preop_gfit;
+	gui_iface.preview_note_gfit_change       = impl_preview_note_gfit_change;
 	/* Registration */
 	gui_iface.update_reg_interface           = impl_update_reg_interface;
 	gui_iface.reset_3stars_gui               = impl_reset_3stars_gui;
@@ -1674,6 +1826,10 @@ void siril_register_gui_iface(void) {
 	gui_iface.get_log_as_string              = impl_get_log_as_string;
 	/* CCD */
 	gui_iface.compute_aberration_inspector   = impl_compute_aberration_inspector;
+
+	/* Last: from here on there is a display, so code that must defer work to
+	 * the main loop rather than doing it inline can tell. */
+	gui_iface.gui_registered = TRUE;
 }
 
 static void impl_apply_display_icc_compensation(gpointer p) {
@@ -1690,13 +1846,14 @@ static void impl_apply_display_icc_compensation(gpointer p) {
 			memcpy(fit->pdata[2], fit->data, fit->rx * fit->ry * sizeof(WORD));
 		}
 	}
-	cmsHPROFILE temp = copyICCProfile(fit->icc_profile);
-	cmsCloseProfile(fit->icc_profile);
-	fit->icc_profile = copyICCProfile(com.gui_icc.monitor);
-	siril_colorspace_transform(fit, temp);
-	cmsCloseProfile(fit->icc_profile);
-	fit->icc_profile = copyICCProfile(temp);
-	cmsCloseProfile(temp);
+	/* Only the current image has profile state to compensate against
+	 * the monitor.  For non-current fits this operation is a no-op. */
+	if (fit == gfit) {
+		cmsHPROFILE temp = copyICCProfile(current_icc_profile());
+		current_image_set_icc_profile(copyICCProfile(com.gui_icc.monitor));
+		siril_colorspace_transform(fit, temp);
+		current_image_set_icc_profile(temp);  /* takes ownership */
+	}
 	if (depth == 1) {
 		size_t npixels = fit->rx * fit->ry;
 		if (fit->type == DATA_FLOAT) {

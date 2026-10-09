@@ -23,6 +23,10 @@
 #include "algos/colors.h"
 #include "algos/statistics.h"
 #include "core/icc_profile.h"
+#include "core/nde/nde_checkpoint.h"
+#include "core/nde/nde_history.h"
+#include "core/nde/nde_replay.h"
+#include "core/op_descriptors.h"
 #include "core/proto.h"
 #include "core/siril.h"
 #include "core/siril_log.h"
@@ -30,16 +34,30 @@
 #include "gui-gtk4/callbacks.h"
 #include "gui-gtk4/colors.h"
 #include "gui-gtk4/dialogs.h"
+#include "gui-gtk4/flis_gui.h"
 #include "gui-gtk4/histogram.h"
 #include "gui-gtk4/image_display.h"
 #include "gui-gtk4/image_interactions.h"
 #include "gui-gtk4/message_dialog.h"
+#include "gui-gtk4/nde_editors.h"
 #include "gui-gtk4/progress_and_log.h"
 #include "gui-gtk4/registration_preview.h"
+#include "gui-gtk4/siril_preview.h"
 #include "gui-gtk4/utils.h"
 #include "io/image_format_fits.h"
+#include "io/image_format_flis.h"
 #include "io/sequence.h"
 #include "io/single_image.h"
+
+/* Amend mode (convergence C5b): the CCM dialog edits a color.ccm history
+ * record.  gfit holds the pre-record state installed by
+ * nde_amend_preview_start.  CCM has no preview machinery (dialogs.c
+ * has_preview=FALSE), so there is no backup to arm or clear: the display shows
+ * the installed pre-record state while the form is open, and Apply/Cancel route
+ * through nde_amend_preview_end.  ICC is NOT touched in amend mode (skip-ICC
+ * rule): converting the installed pre-record pixels would make the preview
+ * diverge from the replayed commit. */
+static gboolean ccm_amend_mode = FALSE;
 
 void on_button_bkg_selection_clicked(GtkButton *button, gpointer user_data) {
 	static GtkSpinButton *selection_black_value[4] = { NULL, NULL, NULL, NULL };
@@ -112,6 +130,24 @@ void initialize_calibration_interface() {
 	gtk_adjustment_set_value(selection_white_adjustment[3], 0);
 }
 
+
+/* What the direct-apply path used to do inline after mutating gfit.  The
+ * worker already handles undo, the NDE record and
+ * notify_gfit_data_modified(); what is left is the dialog's own tidying. */
+static gboolean end_colour_tool(gpointer p) {
+	struct generic_img_args *args = (struct generic_img_args *) p;
+	stop_processing_thread();
+	gfit_modified_update_gui();
+	if (!args->retval)
+		delete_selected_area();
+	update_gfit_histogram_if_needed();
+	redraw(REDRAW_ALL);
+	gui_function(redraw_previews, NULL);
+	free_generic_img_args(args);
+	set_cursor_waiting(FALSE);
+	return FALSE;
+}
+
 void on_button_bkg_neutralization_clicked(GtkButton *button, gpointer user_data) {
 	static GtkSpinButton *selection_black_value[4] = { NULL, NULL, NULL, NULL };
 	rectangle black_selection;
@@ -140,18 +176,32 @@ void on_button_bkg_neutralization_clicked(GtkButton *button, gpointer user_data)
 	black_selection.w = gtk_spin_button_get_value(selection_black_value[2]);
 	black_selection.h = gtk_spin_button_get_value(selection_black_value[3]);
 
-	undo_save_state(gfit, _("Background neutralization"));
-
+	/* Through the generic worker, like every other pixel op.  This one used to
+	 * apply in place here and hand-roll its own undo, baseline and capture —
+	 * an oversight, and the reason its provenance was opaque: without a
+	 * descriptor there was nowhere to hang a serializer. */
+	struct generic_img_args *args = calloc(1, sizeof(struct generic_img_args));
+	if (!args) {
+		PRINT_ALLOC_ERR;
+		return;
+	}
+	struct bkg_neutral_data *p = new_bkg_neutral_data();
+	if (!p) {
+		free(args);
+		PRINT_ALLOC_ERR;
+		return;
+	}
+	p->black_selection = black_selection;
+	args->fit = gfit;
+	args->op = &op_desc_bkg_neutral;
+	args->user = p;
+	args->verbose = TRUE;
+	args->idle_function = end_colour_tool;
 	set_cursor_waiting(TRUE);
-	background_neutralize(gfit, black_selection);
-	populate_roi();
-	delete_selected_area();
-
-	update_gfit_histogram_if_needed();
-	notify_gfit_data_modified();
-	redraw(REDRAW_ALL);
-	gui_function(redraw_previews, NULL);
-	set_cursor_waiting(FALSE);
+	if (!start_in_new_thread(generic_image_worker, args)) {
+		free_generic_img_args(args);
+		set_cursor_waiting(FALSE);
+	}
 }
 
 void on_button_white_selection_clicked(GtkButton *button, gpointer user_data) {
@@ -176,12 +226,10 @@ void on_button_white_selection_clicked(GtkButton *button, gpointer user_data) {
 	gtk_spin_button_set_value(selection_white_value[3], com.selection.h);
 }
 
-static void white_balance(fits *fit, gboolean is_manual, rectangle white_selection,
-		rectangle black_selection) {
-	int chan;
-	double norm, low, high;
-	double kw[3] = { 0.0, 0.0, 0.0 };
-	double bg[3] = { 0.0, 0.0, 0.0 };
+/* Read the dialog into the op's params.  The pixel work moved to
+ * color_calib_image_hook (algos/colors.c) — it could not be serialized while it
+ * lived here reading GtkRanges mid-calculation. */
+static void fill_calib_params_from_widgets(struct color_calib_data *p) {
 	static GtkRange *scale_white_balance[3] = { NULL, NULL, NULL };
 	static GtkRange *scaleLimit[2] = { NULL, NULL };
 
@@ -194,40 +242,25 @@ static void white_balance(fits *fit, gboolean is_manual, rectangle white_selecti
 		scaleLimit[1] = GTK_RANGE(gtk_builder_get_object(gui.builder, "upWhiteColorCalibScale"));
 	}
 
-	assert(fit->naxes[2] == 3);
-	norm = get_normalized_value(fit);
-
-	if (is_manual) {
-		kw[RLAYER] = gtk_range_get_value(scale_white_balance[RLAYER]);
-		kw[GLAYER] = gtk_range_get_value(scale_white_balance[GLAYER]);
-		kw[BLAYER] = gtk_range_get_value(scale_white_balance[BLAYER]);
-
+	if (p->is_manual) {
+		p->kw[RLAYER] = gtk_range_get_value(scale_white_balance[RLAYER]);
+		p->kw[GLAYER] = gtk_range_get_value(scale_white_balance[GLAYER]);
+		p->kw[BLAYER] = gtk_range_get_value(scale_white_balance[BLAYER]);
+		/* Manual coefficients are the effective ones already; the hook has
+		 * nothing left to work out. */
+		p->have_effective = TRUE;
 	} else {
-		low = gtk_range_get_value(scaleLimit[0]);
-		high = gtk_range_get_value(scaleLimit[1]);
-		get_coeff_for_wb(fit, white_selection, black_selection, kw, bg, norm, low, high);
+		p->low = gtk_range_get_value(scaleLimit[0]);
+		p->high = gtk_range_get_value(scaleLimit[1]);
 	}
-#ifdef _OPENMP
-#pragma omp parallel for num_threads(com.max_thread) private(chan) schedule(static)
-#endif
-	for (chan = 0; chan < 3; chan++) {
-		if (kw[chan] == 1.0) continue;
-		calibrate(fit, chan, kw[chan], bg[chan], norm);
-	}
-
-	invalidate_stats_from_fit(fit);
-	invalidate_gfit_histogram();
 }
 
 void on_calibration_apply_button_clicked(GtkButton *button, gpointer user_data) {
 	rectangle black_selection, white_selection;
 	static GtkSpinButton *selection_black_value[4] = { NULL, NULL, NULL, NULL };
 	static GtkSpinButton *selection_white_value[4] = { NULL, NULL, NULL, NULL };
-	struct timeval t_start, t_end;
 
-	siril_log_info(_("Color Calibration: processing...\n"));
-	gettimeofday(&t_start, NULL);
-
+	/* The worker times and logs the operation itself (args->verbose). */
 	static GtkCheckButton *manual = NULL;
 	if (!manual) manual = GTK_CHECK_BUTTON(gtk_builder_get_object(gui.builder, "checkbutton_manual_calibration"));
 	gboolean is_manual = siril_toggle_get_active(GTK_WIDGET(manual));
@@ -268,22 +301,87 @@ void on_calibration_apply_button_clicked(GtkButton *button, gpointer user_data) 
 		return;
 	}
 
+	/* Group path: a selected layer group that composites to colour gets the
+	 * calibration applied to its composite and distributed into per-layer
+	 * factors (flis_group_calibration_hook), instead of the generic worker
+	 * refusing the group selection. */
+	gint gid = is_current_image_flis() ? flis_panel_selected_group_id() : 0;
+	if (gid) {
+		struct color_calib_data widget_vals = { 0 };
+		widget_vals.is_manual = is_manual;
+		fill_calib_params_from_widgets(&widget_vals);
+
+		flis_group_t *grp = flis_group_get_by_id(gid);
+		GSList *members = grp ? flis_group_get_layers(grp) : NULL;
+		if (!members) {
+			siril_log_error(_("Colour calibration: the selected group has no layers\n"));
+			return;
+		}
+		if (undo_save_flis_multi_layer(members, _("Colour calibration (group)")))
+			siril_log_warning(_("Colour calibration: could not save undo state\n"));
+		g_slist_free(members);
+
+		struct flis_group_calib_args *p = new_flis_group_calib_args();
+		if (!p) {
+			PRINT_ALLOC_ERR;
+			return;
+		}
+		p->kind = FLIS_GROUP_CALIB_CC;
+		p->group_id = gid;
+		p->manual = is_manual;
+		p->manual_kw[0] = widget_vals.kw[0];
+		p->manual_kw[1] = widget_vals.kw[1];
+		p->manual_kw[2] = widget_vals.kw[2];
+		p->white_sel = white_selection;
+		p->black_sel = black_selection;
+		p->low = widget_vals.low;
+		p->high = widget_vals.high;
+
+		struct generic_layer_args *gargs = calloc(1, sizeof(*gargs));
+		if (!gargs) {
+			free_flis_group_calib_args(p);
+			PRINT_ALLOC_ERR;
+			return;
+		}
+		gargs->layer = NULL;	/* multi-layer op */
+		gargs->layer_hook = flis_group_calibration_hook;
+		gargs->user = p;
+		gargs->description = g_strdup(_("Colour calibration (group)"));
+		gargs->invalidate_flags = FLIS_INV_ALL;
+		set_cursor_waiting(TRUE);
+		if (!start_in_new_thread(generic_layer_worker, gargs))
+			free_generic_layer_args(gargs);
+		set_cursor_waiting(FALSE);
+		return;
+	}
+
+	/* Through the generic worker, like every other pixel op — see the
+	 * background-neutralization button above. */
+	struct generic_img_args *args = calloc(1, sizeof(struct generic_img_args));
+	if (!args) {
+		PRINT_ALLOC_ERR;
+		return;
+	}
+	struct color_calib_data *p = new_color_calib_data();
+	if (!p) {
+		free(args);
+		PRINT_ALLOC_ERR;
+		return;
+	}
+	p->is_manual = is_manual;
+	p->white_selection = white_selection;
+	p->black_selection = black_selection;
+	fill_calib_params_from_widgets(p);
+	args->fit = gfit;
+	args->op = &op_desc_color_calib;
+	args->user = p;
+	args->verbose = TRUE;
+	args->idle_function = end_colour_tool;
 	set_cursor_waiting(TRUE);
-	undo_save_state(gfit, _("Color Calibration"));
-	white_balance(gfit, is_manual, white_selection, black_selection);
-
-	gettimeofday(&t_end, NULL);
-
-	show_time(t_start, t_end);
-
-	populate_roi();
-	delete_selected_area();
-
-	notify_gfit_data_modified();
-	redraw(REDRAW_ALL);
-	gui_function(redraw_previews, NULL);
-	update_gfit_histogram_if_needed();
-	set_cursor_waiting(FALSE);
+	if (!start_in_new_thread(generic_image_worker, args)) {
+		free_generic_img_args(args);
+		set_cursor_waiting(FALSE);
+	}
 }
 
 void on_calibration_close_button_clicked(GtkButton *button, gpointer user_data) {
@@ -317,9 +415,19 @@ void on_checkbutton_manual_calibration_toggled(GtkCheckButton *togglebutton,
 
 void negative_processing() {
 	set_cursor_waiting(TRUE);
-	undo_save_state(gfit, _("Negative Transformation"));
+	/* Direct-apply of the same op as the neg command's hook (arith.neg): no
+	 * worker runs here, so this is the sole commit point.  pos_to_neg is void
+	 * — capture after it and tag the entry saved just above.  The op is
+	 * serializer-less/paramless, so params NULL yields a Tier B record. */
+	int undo_err = undo_save_state(gfit, _("Negative Transformation"));
 	siril_log_info(_("Negative Transformation\n"));
+	/* NDE baseline (phase 2): direct-apply — snapshot pre-op pixels first. */
+	nde_checkpoint_baseline_ensure(gfit, nde_capture_target_item());
 	pos_to_neg(gfit);
+	gint64 rid = nde_capture_from_descriptor(&op_desc_neg, NULL,
+			_("Negative Transformation"), gfit, FALSE);
+	if (!undo_err)
+		undo_tag_top_nde_record(rid);
 	invalidate_stats_from_fit(gfit);
 	invalidate_gfit_histogram();
 	update_gfit_histogram_if_needed();
@@ -500,6 +608,20 @@ void on_ccm_apply_clicked(GtkButton* button, gpointer user_data) {
 		ccmSeqEntry = GTK_ENTRY(gtk_builder_get_object(gui.builder, "entryCCMSeq"));
 		ccm_restore_icc = GTK_WIDGET(gtk_builder_get_object(gui.builder, "ccm_restore_icc"));
 	}
+	if (ccm_amend_mode) {
+		/* Serialize the widget state through the SAME struct and serializer
+		 * the normal apply uses, then route it through the amend path.  No
+		 * ICC juggling and no sequence path in amend mode. */
+		struct ccm_data applied = { 0 };
+		get_ccm_values(applied.matrix, &applied.power);
+		gchar *blob = op_desc_ccm.serialize(&applied);
+		nde_amend_preview_end(TRUE, blob);
+		g_free(blob);
+		ccm_amend_mode = FALSE;
+		siril_close_dialog("ccm_dialog");
+		return;
+	}
+
 	struct ccm_data *args = new_ccm_data();
 	if (!args) {
 		PRINT_ALLOC_ERR;
@@ -522,7 +644,7 @@ void on_ccm_apply_clicked(GtkButton* button, gpointer user_data) {
 		}
 
 		// Check for ICC profile warning
-		if (gfit->icc_profile && gfit->color_managed) {
+		if (current_icc_profile() && current_image_color_managed()) {
 			siril_message_dialog(GTK_MESSAGE_WARNING, _("ICC Profile"),
 				_("This image has an attached ICC profile. Applying the CCM will invalidate the "
 				"ICC profile therefore color management will be disabled. When you have completed low-level color manipulation and returned the image "
@@ -551,7 +673,7 @@ void on_ccm_apply_clicked(GtkButton* button, gpointer user_data) {
 }
 
 void on_ccm_restore_icc_clicked(GtkButton *button, gpointer user_data) {
-	if (gfit->icc_profile) {
+	if (current_icc_profile()) {
 		color_manage(gfit, TRUE);
 		gtk_widget_set_sensitive(GTK_WIDGET(button), FALSE);
 	}
@@ -657,10 +779,83 @@ void on_combo_ccm_preset_changed(GObject *obj, GParamSpec *pspec, gpointer user_
 }
 
 void on_ccm_close_clicked(GtkButton* button, gpointer user_data) {
+	if (ccm_amend_mode) {
+		/* Close does not apply — leave amend mode without committing (restore
+		 * the true pixels). */
+		nde_amend_preview_end(FALSE, NULL);
+		ccm_amend_mode = FALSE;
+	}
 	siril_close_dialog("ccm_dialog");
 }
 
 gboolean ccm_hide_on_delete(GtkWidget *widget) {
+	if (ccm_amend_mode) {
+		nde_amend_preview_end(FALSE, NULL);
+		ccm_amend_mode = FALSE;
+	}
 	siril_close_dialog("ccm_dialog");
+	return TRUE;
+}
+
+/* Fill the widgets from the amended record's current parameters through the
+ * op's own deserializer — the same struct the normal apply reads. */
+static void ccm_prefill_from_amend(void) {
+	struct ccm_data *p = op_desc_ccm.deserialize(nde_amend_preview_params(),
+	                                            nde_amend_preview_op_version());
+	if (!p)
+		return;
+	static GtkSpinButton *spin_ccm_power = NULL;
+	if (!spin_ccm_power)
+		spin_ccm_power = GTK_SPIN_BUTTON(gtk_builder_get_object(gui.builder, "spin_ccm_power"));
+	update_ccm_matrix(p->matrix);
+	gtk_spin_button_set_value(spin_ccm_power, p->power);
+	if (p->destroy_fn)
+		p->destroy_fn(p);
+	else
+		free(p);
+}
+
+void on_ccm_dialog_show(GtkWidget *widget, gpointer user_data) {
+	static GtkWidget *ccm_seq_check = NULL, *ccm_seq_entry = NULL, *ccm_restore_icc = NULL;
+	static GtkWidget *ccm_amend_note = NULL;
+	if (!ccm_amend_note) {
+		ccm_amend_note = GTK_WIDGET(gtk_builder_get_object(gui.builder, "ccm_amend_note"));
+		ccm_seq_check = GTK_WIDGET(gtk_builder_get_object(gui.builder, "check_apply_seq_ccm"));
+		ccm_seq_entry = GTK_WIDGET(gtk_builder_get_object(gui.builder, "entryCCMSeq"));
+		ccm_restore_icc = GTK_WIDGET(gtk_builder_get_object(gui.builder, "ccm_restore_icc"));
+	}
+	nde_amend_note_update(ccm_amend_note, ccm_amend_mode,
+	                      NULL);
+	if (ccm_amend_mode) {
+		/* gfit already shows the pre-record state.  Sequence controls and the
+		 * ICC-restore affordance are meaningless in amend mode. */
+		if (gui.roi.active)
+			on_clear_roi();
+		gtk_widget_set_visible(ccm_seq_check, FALSE);
+		gtk_widget_set_visible(ccm_seq_entry, FALSE);
+		gtk_widget_set_sensitive(ccm_restore_icc, FALSE);
+		set_notify_block(TRUE);
+		ccm_prefill_from_amend();
+		set_notify_block(FALSE);
+	} else {
+		gtk_widget_set_visible(ccm_seq_check, TRUE);
+		gtk_widget_set_visible(ccm_seq_entry, TRUE);
+	}
+}
+
+/* ---- amend-mode entry (nde_editors registry) --------------------------- */
+
+static void ccm_amend_ready(gboolean ok, gpointer user) {
+	(void)user;
+	if (!ok)
+		return;   /* the core logged the reason; nothing was changed */
+	ccm_amend_mode = TRUE;
+	siril_open_dialog("ccm_dialog");
+}
+
+gboolean ccm_open_amend(gint64 record_id) {
+	/* The dialog opens from the ready callback, once the pre-record state
+	 * has been synthesized and installed. */
+	nde_amend_preview_start(record_id, ccm_amend_ready, NULL);
 	return TRUE;
 }

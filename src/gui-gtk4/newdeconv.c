@@ -174,12 +174,10 @@ estk_data *bdeconv_fill_estk_from_gui() {
 	estk_data *args = alloc_estk_data();
 	if (!args) return NULL;
 
-	// Image and Basic Parameters
-	if (!com.headless && gui.roi.active) {
-		args->fit = &gui.roi.fit;
-	} else {
-		args->fit = gfit;
-	}
+	/* Always the whole image.  A region preview is the worker's business:
+	 * it hands deconvolve_image_hook a crop and the hook retargets
+	 * estk_data->fit around the call. */
+	args->fit = gfit;
 
 	args->ks = gtk_spin_button_get_value_as_int(bdeconv_ks);
 	args->gamma = gtk_spin_button_get_value(bdeconv_gamma);
@@ -472,7 +470,7 @@ void on_airy_pixelsize_value_changed(GtkWidget *button, gpointer user_data) {
 
 static void initialize_airy_parameters() {
 	// Get initial stab at parameters for Airy function from FITS header. Not essential they be correct as they are user-editable in the UI.
-	fits *fit = (gui.roi.active && !com.headless) ? &gui.roi.fit : gfit;
+	fits *fit = gfit;
 	register_airy_css();
 
 	gtk_spin_button_set_value(airy_fl, fit->keywords.focal_length);
@@ -553,7 +551,7 @@ void calculate_parameters() {
 		gboolean unit_is_arcsec = FALSE;
 		int n = 0, layer = 0;
 		starprofile profiletype = PSF_GAUSSIAN;
-		fits *fit = (gui.roi.active && !com.headless) ? &gui.roi.fit : gfit;
+		fits *fit = gfit;
 
 		while (stars_snap[i]) {
 			double fwhmx, fwhmy;
@@ -639,7 +637,6 @@ void on_bdeconv_psfstars_toggled(GtkCheckButton *button, gpointer user_data) {
 }
 
 void deconv_roi_callback() {
-	gui.roi.operation_supports_roi = TRUE;
 	gtk_widget_set_visible(GTK_WIDGET(bdeconv_roi_preview), gui.roi.active);
 	// When operations are clicked, bdeconv_fill_estk_from_gui will check gui.roi.active.
 	copy_backup_to_gfit();
@@ -647,7 +644,7 @@ void deconv_roi_callback() {
 }
 
 void close_deconv() {
-	roi_supported(FALSE);
+	roi_declare_op(NULL);
 	siril_preview_hide();
 	remove_roi_callback(deconv_roi_callback);
 	siril_close_dialog("bdeconv_dialog");
@@ -659,7 +656,7 @@ void on_bdeconv_close_clicked(GtkButton *button, gpointer user_data) {
 
 void on_bdeconv_dialog_show(GtkWidget *widget, gpointer user_data) {
 	bdeconv_dialog_init_statics();
-	roi_supported(TRUE);
+	roi_declare_op(&op_desc_deconvolve);
 	deconv_roi_callback();
 	add_roi_callback(deconv_roi_callback);
 	copy_gfit_to_backup();
@@ -814,8 +811,6 @@ void on_bdeconv_roi_preview_clicked(GtkButton *button, gpointer user_data) {
 			return;
 		}
 		args->previewing = TRUE;
-		// Ensure we are using ROI if active
-		gboolean is_roi = (!com.headless && gui.roi.active);
 
 		// Allocate generic worker args
 		struct generic_img_args *worker_args = calloc(1, sizeof(struct generic_img_args));
@@ -827,16 +822,15 @@ void on_bdeconv_roi_preview_clicked(GtkButton *button, gpointer user_data) {
 			return;
 		}
 
-		worker_args->fit = args->fit;
+		worker_args->fit = gfit;
 		worker_args->op = &op_desc_deconvolve;
 		worker_args->idle_function = deconvolve_img_idle;
 		worker_args->description = _("Deconvolution Preview");  // override: variant label
 		worker_args->verbose = TRUE;
-		// worker_args->mask_aware = TRUE; // TODO: Need to implement mask setup in gui.roi.fit
+		// worker_args->mask_aware = TRUE; // TODO: check the mask blend against a region crop
 		worker_args->user = args; // Passed to deconvolve
 		worker_args->max_threads = com.max_thread;
 		worker_args->for_preview = TRUE;
-		worker_args->for_roi = is_roi;
 
 		start_in_new_thread(generic_image_worker, worker_args);
 	}
@@ -881,7 +875,7 @@ void on_bdeconv_apply_clicked(GtkButton *button, gpointer user_data) {
 			return;
 		}
 
-		worker_args->fit = gfit; // Apply always runs on gfit unless ROI is active
+		worker_args->fit = gfit; // Apply always runs on the whole image
 		args->fit = gfit;
 
 		worker_args->op = &op_desc_deconvolve;
@@ -891,7 +885,6 @@ void on_bdeconv_apply_clicked(GtkButton *button, gpointer user_data) {
 		worker_args->user = args;
 		worker_args->max_threads = com.max_thread;
 		worker_args->for_preview = FALSE;
-		worker_args->for_roi = FALSE;
 
 		start_in_new_thread(generic_image_worker, worker_args);
 	}

@@ -1,0 +1,381 @@
+/*
+ * This file is part of Siril, an astronomy image processor.
+ * Copyright (C) 2005-2011 Francois Meyer (dulle at free.fr)
+ * Copyright (C) 2012-2026 team free-astro (see more in AUTHORS file)
+ * Reference site is https://siril.org
+ *
+ * Siril is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ */
+
+/*
+ * test_flis_register_layers — surface tests for the §5.6
+ * `flis_register_layers` command and the underlying primitive in
+ * src/registration/flis_register.c.
+ *
+ * Pixel-level equivalence (offset detection on real star fixtures) is
+ * deferred to fixture-driven integration tests — the DFT cross-
+ * correlation primitive itself is already covered by the existing
+ * registration test suite.  This file focuses on:
+ *
+ *   • argument parsing (-ref=, -interp=, -noclamp);
+ *   • refusal paths (no FLIS, < 2 layers, unknown options);
+ *   • the primitive accepts a heterogeneous layer list and runs to
+ *     completion against trivial pixel content.
+ */
+
+#include <criterion/criterion.h>
+
+#include "algos/siril_wcs.h"
+#include "core/command.h"
+#include "core/command_line_processor.h"
+#include "core/processing.h"
+#include "io/image_format_flis.h"
+#include "registration/flis_register.h"
+#include "registration/registration.h"
+#include "tests/flis_test_helpers.h"
+
+cominfo com;
+fits *gfit;
+char *word[MAX_COMMAND_WORDS];
+
+extern int process_flis_register_layers(int nb);
+
+TestSuite(flis_register_layers, .init = flis_test_init_com, .fini = flis_test_cleanup_com);
+
+Test(flis_register_layers, refuses_when_no_flis) {
+	word[0] = "flis_register_layers";
+	word[1] = NULL;
+	cr_assert_eq(process_flis_register_layers(1), CMD_GENERIC_ERROR);
+}
+
+Test(flis_register_layers, refuses_single_layer) {
+	flis_test_add_layer(flis_test_make_mono_fits(16, 16, 0.5f), "only");
+	uniq_set_active_layer(com.uniq, 0);
+	gfit = flis_active_layer_fit();
+	word[0] = "flis_register_layers";
+	word[1] = NULL;
+	cr_assert_eq(process_flis_register_layers(1), CMD_GENERIC_ERROR);
+}
+
+Test(flis_register_layers, rejects_unknown_ref_layer) {
+	flis_test_add_layer(flis_test_make_mono_fits(16, 16, 0.5f), "base");
+	flis_test_add_layer(flis_test_make_mono_fits(16, 16, 0.5f), "top");
+	uniq_set_active_layer(com.uniq, 0);
+	gfit = flis_active_layer_fit();
+	word[0] = "flis_register_layers";
+	word[1] = "-ref=NoSuchLayer";
+	word[2] = NULL;
+	cr_assert_eq(process_flis_register_layers(2), CMD_ARG_ERROR);
+}
+
+Test(flis_register_layers, rejects_unknown_interp) {
+	flis_test_add_layer(flis_test_make_mono_fits(16, 16, 0.5f), "base");
+	flis_test_add_layer(flis_test_make_mono_fits(16, 16, 0.5f), "top");
+	uniq_set_active_layer(com.uniq, 0);
+	gfit = flis_active_layer_fit();
+	word[0] = "flis_register_layers";
+	word[1] = "-interp=fantasymode";
+	word[2] = NULL;
+	cr_assert_eq(process_flis_register_layers(2), CMD_ARG_ERROR);
+}
+
+/* "accepts_known_interp_names" was intentionally omitted: a successful
+ * -interp= parse leads into register_shift_dft / register_apply_reg which
+ * are not designed to run on the constant 16x16 mono fixtures available
+ * to a unit test (no DFT peak; the pipeline may dereference NULL stats
+ * or hit an internal assert).  Coverage for the parsing surface comes
+ * from the rejection tests above — a successful match path is exercised
+ * by integration tests against real star fixtures. */
+
+Test(flis_register_layers, rejects_unknown_option) {
+	flis_test_add_layer(flis_test_make_mono_fits(16, 16, 0.5f), "base");
+	flis_test_add_layer(flis_test_make_mono_fits(16, 16, 0.5f), "top");
+	uniq_set_active_layer(com.uniq, 0);
+	gfit = flis_active_layer_fit();
+	word[0] = "flis_register_layers";
+	word[1] = "-bogus=1";
+	word[2] = NULL;
+	cr_assert_eq(process_flis_register_layers(2), CMD_ARG_ERROR);
+}
+
+/* =====================================================================
+ * End-to-end alignment regression test.
+ *
+ * Guards against the flis-gtk4 double-apply regression: the GLOBAL
+ * method used to resolve to single-pass register_star_alignment, which
+ * resamples the layer pixels inline; the register_apply_reg() pass in
+ * flis_register_layers then warped them a second time and every layer
+ * came out misplaced (in both axes once rotation was involved).
+ *
+ * Uses the DFT shift method on a synthetic gaussian star field: fully
+ * deterministic, no star matching.  The assertion is content-anchored
+ * (composite peak positions), so it holds regardless of which position
+ * convention flis_register_layers stores internally.
+ * ===================================================================== */
+
+/* Deterministic star field: gaussian spots from an LCG, content offset
+ * by (sx, sy) in FITS buffer coordinates. */
+static fits *make_star_field(int w, int h, double sx, double sy) {
+	fits *f = flis_test_make_mono_fits(w, h, 0.02f);
+	if (!f) return NULL;
+	guint32 lcg = 42;
+	for (int s = 0; s < 40; s++) {
+		lcg = lcg * 1103515245u + 12345u;
+		double cx = 30.0 + (lcg >> 8) % (w - 60) + sx;
+		lcg = lcg * 1103515245u + 12345u;
+		double cy = 30.0 + (lcg >> 8) % (h - 60) + sy;
+		lcg = lcg * 1103515245u + 12345u;
+		double amp = 0.3 + 0.6 * ((lcg >> 8) % 1000) / 1000.0;
+		for (int y = (int)cy - 6; y <= (int)cy + 6; y++) {
+			if (y < 0 || y >= h) continue;
+			for (int x = (int)cx - 6; x <= (int)cx + 6; x++) {
+				if (x < 0 || x >= w) continue;
+				double d2 = (x - cx) * (x - cx) + (y - cy) * (y - cy);
+				float v = f->fdata[(size_t)y * w + x]
+				          + (float)(amp * exp(-d2 / (2.0 * 2.0 * 2.0)));
+				f->fdata[(size_t)y * w + x] = v > 1.f ? 1.f : v;
+			}
+		}
+	}
+	return f;
+}
+
+/* Composite with only @keep visible; return the buffer index of the
+ * brightest pixel of channel 0, or -1. */
+static gssize solo_composite_peak(flis_layer_t *keep, guint *out_w) {
+	for (GSList *l = com.uniq->layers; l; l = l->next) {
+		flis_layer_t *lay = (flis_layer_t *)l->data;
+		if (lay) lay->visible = (lay == keep);
+	}
+	fits *comp = flis_render_layers(com.uniq->layers);
+	for (GSList *l = com.uniq->layers; l; l = l->next) {
+		flis_layer_t *lay = (flis_layer_t *)l->data;
+		if (lay) lay->visible = TRUE;
+	}
+	if (!comp) return -1;
+	size_t n = (size_t)comp->rx * comp->ry;
+	size_t best = 0;
+	for (size_t i = 1; i < n; i++)
+		if (comp->fpdata[0][i] > comp->fpdata[0][best]) best = i;
+	if (out_w) *out_w = comp->rx;
+	gssize rv = (gssize)best;
+	clearfits(comp);
+	free(comp);
+	return rv;
+}
+
+Test(flis_register_layers, dft_aligns_content_shifted_layer) {
+	const int W = 400, H = 300;
+	flis_layer_t *base = flis_test_add_layer(make_star_field(W, H, 0, 0), "base");
+	flis_layer_t *top  = flis_test_add_layer(make_star_field(W, H, 15, 9), "shifted");
+	cr_assert_not_null(base);
+	cr_assert_not_null(top);
+	uniq_set_active_layer(com.uniq, 0);
+	gfit = flis_active_layer_fit();
+
+	/* The registration pipeline consults the memory limits. */
+	com.pref.mem_mode = RATIO;
+	com.pref.memory_ratio = 0.9;
+
+	/* DFT phase correlation on a square selection. */
+	com.selection = (rectangle){ 100, 50, 128, 128 };
+	selection_type sel;
+	transformation_type tx;
+	registration_function method =
+	    flis_register_resolve_method(FLIS_REG_DFT, &sel, &tx);
+	cr_assert_not_null(method);
+
+	int rv = flis_register_layers(NULL, NULL, method, sel, tx,
+	                              OPENCV_LANCZOS4, TRUE, FLIS_REG_DFT);
+	cr_assert_eq(rv, 0, "flis_register_layers failed (%d)", rv);
+
+	/* Content-anchored check: the brightest star must land on the same
+	 * canvas pixel whichever layer is composited. */
+	guint cw1 = 0, cw2 = 0;
+	gssize p_base = solo_composite_peak(base, &cw1);
+	gssize p_top  = solo_composite_peak(top, &cw2);
+	cr_assert(p_base >= 0 && p_top >= 0, "composite failed");
+	cr_assert_eq(cw1, cw2);
+	gint bx = (gint)(p_base % cw1), by = (gint)(p_base / cw1);
+	gint tx_ = (gint)(p_top % cw2),  ty = (gint)(p_top / cw2);
+	cr_assert(ABS(bx - tx_) <= 1 && ABS(by - ty) <= 1,
+	          "layers misaligned: base peak (%d,%d) vs shifted peak (%d,%d)",
+	          bx, by, tx_, ty);
+
+	/* Documented position convention for a pure (+15,+9) buffer-space
+	 * content shift; if these change, the compose convention changed
+	 * with them and the content check above is what matters. */
+	cr_assert_eq(top->position_x, -15, "position_x = %d", top->position_x);
+	cr_assert_eq(top->position_y, 9, "position_y = %d", top->position_y);
+}
+
+/* =====================================================================
+ * A layer that cannot be aligned must not take the others down with it.
+ *
+ * register_multi_step_global picks its own reference (global.c) and
+ * excludes the frames it cannot star-match, leaving their H all zeros.
+ * flis_register_layers used to hand register_apply_reg a stale
+ * regargs.reference_image pointing at such a frame, so compute_framing
+ * framed everything against a null matrix: cvTransfH inverted it to
+ * zeros, and a null homography maps every destination pixel onto the
+ * same source pixel — each layer came out a FLAT CONSTANT, with only
+ * the excluded layer (skipped by the apply) left intact.  Reported as
+ * "register all layers → uniform yellow tinge, every LRGB layer a
+ * constant small value".
+ *
+ * It also read regargs.regparam at the input slot index, but that array
+ * is indexed by position in the FILTERED output sequence, so one
+ * dropped layer shifted every later offset by one entry and ran off the
+ * end of the allocation.
+ * ===================================================================== */
+
+/* Star field with an unrelated random pattern: findstar sees plenty of
+ * stars, star_match_and_checks cannot pair them with make_star_field's. */
+static fits *make_unmatchable_field(int w, int h) {
+	fits *f = flis_test_make_mono_fits(w, h, 0.02f);
+	if (!f) return NULL;
+	guint32 lcg = 987654321u;
+	for (int s = 0; s < 60; s++) {
+		lcg = lcg * 1103515245u + 12345u;
+		double cx = 20.0 + (lcg >> 8) % (w - 40);
+		lcg = lcg * 1103515245u + 12345u;
+		double cy = 20.0 + (lcg >> 8) % (h - 40);
+		lcg = lcg * 1103515245u + 12345u;
+		double amp = 0.3 + 0.6 * ((lcg >> 8) % 1000) / 1000.0;
+		for (int y = (int)cy - 6; y <= (int)cy + 6; y++) {
+			if (y < 0 || y >= h) continue;
+			for (int x = (int)cx - 6; x <= (int)cx + 6; x++) {
+				if (x < 0 || x >= w) continue;
+				double d2 = (x - cx) * (x - cx) + (y - cy) * (y - cy);
+				float v = f->fdata[(size_t)y * w + x]
+				          + (float)(amp * exp(-d2 / (2.0 * 2.0 * 2.0)));
+				f->fdata[(size_t)y * w + x] = v > 1.f ? 1.f : v;
+			}
+		}
+	}
+	return f;
+}
+
+static gboolean layer_is_flat(const flis_layer_t *lay) {
+	if (!lay || !lay->fit || !lay->fit->fdata) return TRUE;
+	size_t n = (size_t)lay->fit->rx * lay->fit->ry;
+	for (size_t i = 1; i < n; i++)
+		if (lay->fit->fdata[i] != lay->fit->fdata[0])
+			return FALSE;
+	return TRUE;
+}
+
+Test(flis_register_layers, unmatchable_reference_does_not_flatten_others) {
+	const int W = 400, H = 300;
+	/* Base layer doubles as the requested reference — the reported case. */
+	flis_layer_t *base = flis_test_add_layer(make_unmatchable_field(W, H), "Background");
+	flis_layer_t *L    = flis_test_add_layer(make_star_field(W, H, 4, -3), "L");
+	flis_layer_t *R    = flis_test_add_layer(make_star_field(W, H, -6, 2), "R");
+	flis_layer_t *G    = flis_test_add_layer(make_star_field(W, H, 3, 5), "G");
+	cr_assert(base && L && R && G);
+	uniq_set_active_layer(com.uniq, 0);
+	gfit = flis_active_layer_fit();
+
+	com.pref.mem_mode = RATIO;
+	com.pref.memory_ratio = 0.9;
+	com.pref.starfinder_conf.radius = 10;
+	com.pref.starfinder_conf.sigma = 1.0;
+	com.pref.starfinder_conf.roundness = 0.5;
+	com.pref.starfinder_conf.convergence = 1;
+	com.pref.starfinder_conf.profile = PSF_GAUSSIAN;
+	com.pref.starfinder_conf.min_beta = 1.5;
+	com.pref.starfinder_conf.max_r = 1.0;
+	com.max_thread = 2;
+	/* 2-pass global writes its star lists next to the sequence. */
+	if (!com.wd) com.wd = g_strdup(g_get_tmp_dir());
+
+	selection_type sel;
+	transformation_type tx;
+	registration_function method =
+	    flis_register_resolve_method(FLIS_REG_GLOBAL, &sel, &tx);
+	int rv = flis_register_layers(base, NULL, method, sel, tx,
+	                              OPENCV_LANCZOS4, TRUE, FLIS_REG_GLOBAL);
+	cr_assert_eq(rv, 0, "flis_register_layers failed (%d)", rv);
+
+	/* The three matchable layers keep their content: a flat layer here is
+	 * the null-homography warp the fix exists to prevent. */
+	cr_assert(!layer_is_flat(L), "layer 'L' was flattened to a constant");
+	cr_assert(!layer_is_flat(R), "layer 'R' was flattened to a constant");
+	cr_assert(!layer_is_flat(G), "layer 'G' was flattened to a constant");
+
+	/* Content shifts are (4,-3), (-6,2), (3,5); the alignment references L,
+	 * so the others sit at the difference, in the position convention
+	 * documented by dft_aligns_content_shifted_layer. */
+	cr_assert_eq(L->position_x, 0, "L position_x = %d", L->position_x);
+	cr_assert_eq(L->position_y, 0, "L position_y = %d", L->position_y);
+	cr_assert_eq(R->position_x, 10, "R position_x = %d", R->position_x);
+	cr_assert_eq(R->position_y, 5,  "R position_y = %d", R->position_y);
+	cr_assert_eq(G->position_x, 1, "G position_x = %d", G->position_x);
+	cr_assert_eq(G->position_y, 8, "G position_y = %d", G->position_y);
+
+	/* The layer that could not be aligned is left exactly as it was. */
+	cr_assert_eq(base->fit->rx, (unsigned)W);
+	cr_assert_eq(base->fit->ry, (unsigned)H);
+	cr_assert_eq(base->position_x, 0);
+	cr_assert_eq(base->position_y, 0);
+}
+
+/* =====================================================================
+ * Registering layers must not un-solve the document.
+ *
+ * apply-existing-registration frees each frame's plate solve and puts
+ * back the REFERENCE frame's solution, reframed for the warp it just
+ * applied (applyreg.c).  It gets that reference solution from
+ * get_wcs_ref(), i.e. from a metadata read of the reference frame — and
+ * seq_read_frame_metadata() used to copy internal-sequence frames with
+ * CP_FORMAT alone, which deliberately drops the astrometry.  So every
+ * layer came out unsolved, flis_document_has_wcs_donor() found nobody to
+ * donate a solve to the group composite, and PCC/SPCC were insensitive
+ * with a colour layer group selected.  Reported as "after registering
+ * all 4 layers I cannot select SPCC".
+ * ===================================================================== */
+
+/* Give @fit a plausible plate solve, the way a solved image carries one. */
+static void give_wcs(fits *fit) {
+	fit->keywords.wcslib = calloc(1, sizeof(struct wcsprm));
+	cr_assert_not_null(fit->keywords.wcslib);
+	create_wcs(180.0, 45.0, 1.0 / 3600.0, 0.0, fit->rx, fit->ry,
+	           fit->keywords.wcslib);
+}
+
+Test(flis_register_layers, registration_keeps_the_plate_solve) {
+	const int W = 400, H = 300;
+	flis_layer_t *base = flis_test_add_layer(make_star_field(W, H, 0, 0), "base");
+	flis_layer_t *top  = flis_test_add_layer(make_star_field(W, H, 15, 9), "shifted");
+	cr_assert(base && top);
+	uniq_set_active_layer(com.uniq, 0);
+	gfit = flis_active_layer_fit();
+	give_wcs(base->fit);
+	give_wcs(top->fit);
+
+	com.pref.mem_mode = RATIO;
+	com.pref.memory_ratio = 0.9;
+	com.selection = (rectangle){ 100, 50, 128, 128 };
+
+	selection_type sel;
+	transformation_type tx;
+	registration_function method =
+	    flis_register_resolve_method(FLIS_REG_DFT, &sel, &tx);
+	cr_assert_not_null(method);
+	int rv = flis_register_layers(base, NULL, method, sel, tx,
+	                              OPENCV_LANCZOS4, TRUE, FLIS_REG_DFT);
+	cr_assert_eq(rv, 0, "flis_register_layers failed (%d)", rv);
+
+	cr_assert_not_null(base->fit->keywords.wcslib,
+	                   "registration dropped the reference layer's plate solve");
+	cr_assert_not_null(top->fit->keywords.wcslib,
+	                   "registration dropped the aligned layer's plate solve");
+	/* What the menu actually asks: is there a layer that can donate its
+	 * solve to the group composite?  PCC/SPCC sensitivity hangs on it. */
+	cr_assert(flis_document_has_wcs_donor(),
+	          "no layer can donate a WCS to the group composite, so PCC/SPCC "
+	          "stay insensitive after registering");
+}

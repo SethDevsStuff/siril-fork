@@ -19,6 +19,7 @@
  */
 
 #include "algos/statistics.h"
+#include "core/fits_region.h"
 #include "core/icc_profile.h"
 #include "core/OS_utils.h"
 #include "core/processing_thread.h"
@@ -56,8 +57,40 @@ static update_image *pending_preview   = NULL;
 static gboolean      preview_in_flight = FALSE;
 static gboolean      preview_job_active = FALSE;
 static cmsHPROFILE preview_icc_backup = NULL;
-static fits preview_roi_backup;
 static fits preview_gfit_backup = { 0 };
+/* How gfit differs from the live backup, so a restore can be scoped to it.
+ *
+ * Conservative by construction: UNKNOWN ("assume the whole image") is the
+ * default and every transition that is not a positive report puts it back
+ * there.  REGION is only ever reached from NONE — i.e. gfit provably matched
+ * the backup and then a single region preview wrote one rectangle — so a
+ * narrowed restore can never leave a foreign modification on screen.
+ *
+ * NONE still does a full copy.  It costs nothing (in the steady restore ->
+ * region-write -> restore loop the state at each restore is REGION) and it
+ * keeps the "restore always copies" property for any writer that does not
+ * report. */
+static enum { PREVIEW_DIFF_UNKNOWN, PREVIEW_DIFF_NONE, PREVIEW_DIFF_REGION }
+             preview_diff = PREVIEW_DIFF_UNKNOWN;
+static rectangle preview_diff_region = { 0 };
+
+void preview_note_gfit_change(const rectangle *region) {
+	if (region && preview_diff == PREVIEW_DIFF_NONE) {
+		preview_diff = PREVIEW_DIFF_REGION;
+		preview_diff_region = *region;
+		return;
+	}
+	if (region && preview_diff == PREVIEW_DIFF_REGION
+	    && !memcmp(region, &preview_diff_region, sizeof(rectangle)))
+		return;   /* same rectangle rewritten; still the only difference */
+	preview_diff = PREVIEW_DIFF_UNKNOWN;
+}
+
+/* Identity of the fits the backup was taken from.  gfit can be repointed
+ * at a DIFFERENT layer's fits (FLIS active-layer switch) between backup
+ * and restore; a dimensions check alone cannot detect that when layers
+ * share dimensions.  Restores and preview updates are gated on this. */
+static fits *preview_backup_owner = NULL;
 
 /* Forward declaration. */
 static void dispatch_preview(update_image *im);
@@ -101,9 +134,19 @@ static void dispatch_preview(update_image *im) {
 	}
 
 	if (im->show_preview) {
-		siril_log_debug("update preview\n");
-		set_cursor_waiting(TRUE);
-		im->update_preview_fn();
+		if (preview_is_active && preview_backup_owner != gfit) {
+			/* gfit was retargeted under this preview (FLIS layer
+			 * switch) and the reconciler idle has not re-armed the
+			 * backup yet.  Running the update would stretch another
+			 * layer's backup into gfit (or read it out of bounds).
+			 * Skip this tick; the reconciler re-arms and the next
+			 * tick works. */
+			siril_log_debug("preview skipped: backup belongs to another layer\n");
+		} else {
+			siril_log_debug("update preview\n");
+			set_cursor_waiting(TRUE);
+			im->update_preview_fn();
+		}
 	}
 
 	waiting_for_thread(); /* no-op on GTK main thread; kept for safety */
@@ -125,17 +168,16 @@ static void dispatch_preview(update_image *im) {
 }
 
 void copy_gfit_icc_to_backup() {
-	if (!gfit->icc_profile)
+	if (!current_icc_profile())
 		return;
 	if (preview_icc_backup)
 		cmsCloseProfile(preview_icc_backup);
-	preview_icc_backup = copyICCProfile(gfit->icc_profile);
+	preview_icc_backup = copyICCProfile(current_icc_profile());
 }
 
 static void copy_backup_icc_to_gfit() {
-	if (gfit->icc_profile)
-		cmsCloseProfile(gfit->icc_profile);
-	gfit->icc_profile = copyICCProfile(preview_icc_backup);
+	current_image_set_icc_profile(preview_icc_backup
+		? copyICCProfile(preview_icc_backup) : NULL);
 }
 
 static void clear_backup_icc() {
@@ -143,22 +185,6 @@ static void clear_backup_icc() {
 		cmsCloseProfile(preview_icc_backup);
 		preview_icc_backup = NULL;
 	}
-}
-
-int backup_roi() {
-	int retval;
-	if ((retval = copyfits(&gui.roi.fit, &preview_roi_backup, CP_ALLOC | CP_COPYA | CP_FORMAT | CP_COPYMASK, -1)))
-		siril_log_debug("Image copy error in ROI\n");
-
-	return retval;
-}
-
-int restore_roi() {
-	int retval;
-	if ((retval = copyfits(&preview_roi_backup, &gui.roi.fit, CP_ALLOC | CP_COPYA | CP_FORMAT | CP_COPYMASK, -1)))
-		siril_log_debug("Image copy error in ROI\n");
-
-	return retval;
 }
 
 void copy_gfit_to_backup() {
@@ -175,11 +201,13 @@ void copy_gfit_to_backup() {
 	copy_fits_metadata(gfit, &preview_gfit_backup);
 	if (!com.script)
 		copy_gfit_icc_to_backup();
-	if (gui.roi.active && backup_roi()) {
-		siril_log_debug("Image copy error in ROI\n");
-		return;
-	}
+	preview_backup_owner = gfit;
 	preview_is_active = TRUE;
+	preview_diff = PREVIEW_DIFF_NONE;   /* gfit == backup by construction */
+}
+
+fits *get_preview_backup_owner(void) {
+	return preview_is_active ? preview_backup_owner : NULL;
 }
 
 int copy_backup_to_gfit() {
@@ -210,12 +238,44 @@ int copy_backup_to_gfit() {
 	 * Deadlock-free: no caller holds gfit->rwlock or gui.cairo_mutex here, and
 	 * none of the helpers below re-acquire gfit->rwlock, so this non-recursive
 	 * lock is taken exactly once on the path. */
-	const gint prev_suppress = g_atomic_int_get(&gui.suppress_drawarea_redraw);
-	g_atomic_int_set(&gui.suppress_drawarea_redraw, 1);
+	/* Counting suppression (gui_iface_impl.c): safe to bracket even when an
+	 * outer section (generic worker swap path) already suppressed. */
+	gui_iface.set_suppress_redraws(TRUE);
 	g_rw_lock_writer_lock(&gfit->rwlock);
 	if (!gfit->data && !gfit->fdata)
 		retval = 1;
-	else {
+	else if (preview_backup_owner != gfit
+	         || preview_gfit_backup.rx != gfit->rx
+	         || preview_gfit_backup.ry != gfit->ry
+	         || preview_gfit_backup.naxes[2] != gfit->naxes[2]) {
+		/* The backup belongs to a different fits than gfit now points
+		 * at — the active FLIS layer was changed under a live preview
+		 * by a path that could not re-arm it (worker hooks).  Restoring
+		 * would write another layer's pixels into this one: silently
+		 * wrong for same-size layers (hence the identity check, not
+		 * just dimensions), junk for a smaller backup, and a heap
+		 * overflow for a larger one.  Skip; on-screen pixels stay. */
+		siril_log_debug("copy_backup_to_gfit: backup belongs to another image, skipping restore\n");
+		retval = 1;
+	} else if (preview_diff == PREVIEW_DIFF_REGION) {
+		/* Only one rectangle differs, so only that rectangle needs restoring.
+		 * On a large image the full copy below was the dominant cost of an
+		 * "ROI preview" — every tick copied the whole image back to undo a
+		 * change confined to a few hundred pixels square.  The mask is not
+		 * restored because a region preview never writes it (the worker pastes
+		 * pixels only). */
+		if (copy_fits_region(&preview_gfit_backup, gfit, &preview_diff_region)) {
+			siril_log_debug("Region restore failed, falling back to full\n");
+			if (copyfits(&preview_gfit_backup, gfit, CP_COPYA | CP_COPYMASK, -1))
+				retval = 1;
+		}
+		if (retval == 0) {
+			if (!com.script)
+				copy_backup_icc_to_gfit();
+			copy_fits_metadata(&preview_gfit_backup, gfit);
+			invalidate_stats_from_fit(gfit);
+		}
+	} else {
 		// Restore the mask state too
 		if (copyfits(&preview_gfit_backup, gfit, CP_COPYA | CP_COPYMASK, -1)) {
 			siril_log_debug("Image copy error in previews\n");
@@ -229,13 +289,10 @@ int copy_backup_to_gfit() {
 			 * so stale values are never saved back to the input sequence. */
 			invalidate_stats_from_fit(gfit);
 		}
-		if (gui.roi.active && restore_roi()) {
-			siril_log_debug("Image copy error in ROI\n");
-			retval = 1;
-		}
 	}
+	preview_diff = retval ? PREVIEW_DIFF_UNKNOWN : PREVIEW_DIFF_NONE;
 	g_rw_lock_writer_unlock(&gfit->rwlock);
-	g_atomic_int_set(&gui.suppress_drawarea_redraw, prev_suppress);
+	gui_iface.set_suppress_redraws(FALSE);
 	return retval;
 }
 
@@ -243,8 +300,16 @@ fits *get_preview_gfit_backup() {
 	return (is_preview_active()) ? &preview_gfit_backup : gfit;
 }
 
-fits *get_roi_backup() {
-	return (is_preview_active()) ? &preview_roi_backup : &gui.roi.fit;
+/* The PRE-OPERATION pixels of the displayed image.  Same intent as
+ * get_preview_gfit_backup(), but it also applies copy_backup_to_gfit's owner
+ * check: after a FLIS active-layer switch the live backup belongs to the
+ * OUTGOING layer, and handing it out as "the pixels behind gfit" would feed a
+ * region preview another layer's pixels (or read out of bounds if that layer
+ * was smaller).  gfit is the honest answer in that window; the reconciler
+ * re-arms the backup shortly afterwards. */
+fits *get_preop_gfit() {
+	return (preview_is_active && preview_backup_owner == gfit)
+	        ? &preview_gfit_backup : gfit;
 }
 
 gboolean is_preview_active() {
@@ -254,7 +319,9 @@ gboolean is_preview_active() {
 void clear_backup() {
 	clearfits(&preview_gfit_backup);
 	clear_backup_icc();
+	preview_backup_owner = NULL;
 	preview_is_active = FALSE;
+	preview_diff = PREVIEW_DIFF_UNKNOWN;
 }
 
 void set_notify_block(gboolean value) {

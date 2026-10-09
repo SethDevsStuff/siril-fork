@@ -17,6 +17,7 @@ typedef enum {
 	REQ_CMD_FOR_MONO = (1 << 4),
 	REQ_CMD_FOR_RGB = (1 << 5),
 	REQ_CMD_SELECTION = (1 << 6),
+	REQ_CMD_FLIS_IMAGE = (1 << 7),  /* requires a loaded FLIS file */
 	REQ_CMD_NO_THREAD = (1 << 10)
 } cmd_prerequires;
 
@@ -284,5 +285,51 @@ int process_livestack(int nb);
 int process_stop_ls(int nb);
 
 int	process_show(int nb);
+
+/* FLIS introspection commands (stage 1.6) */
+int process_flis_info(int nb);
+int process_flis_layer_list(int nb);
+int process_flis_group_list(int nb);
+int process_flis_layer_info(int nb);
+int process_flis_group_info(int nb);
+int process_flis_history(int nb);
+int process_flis_replay_check(int nb);
+int process_flis_amend(int nb);
+int process_flis_hist_delete(int nb);
+int process_flis_hist_move(int nb);
+int process_flis_editat(int nb);
+
+/* FLIS file operations (stage 2.3) */
+int process_flis_promote(int nb);
+
+/* FLIS active-layer get/set (stage 3.2 follow-up) */
+int process_flis_active_layer(int nb);
+
+/* FLIS layer-stack mutation commands (stage 4.3) */
+int process_flis_addlayer(int nb);
+int process_flis_setmask(int nb);
+int process_flis_clearmask(int nb);
+int process_flis_addgroup(int nb);
+int process_flis_setgroup(int nb);
+int process_flis_setposition(int nb);
+int process_flis_exportlayer(int nb);
+int process_flis_flatten(int nb);
+int process_flis_setname(int nb);
+int process_flis_setblend(int nb);
+int process_flis_setopacity(int nb);
+int process_flis_setvisible(int nb);
+int process_flis_setlocked(int nb);
+int process_flis_settint(int nb);
+
+/* FLIS multi-layer integration ops (stage 5.6 / 5.7) */
+int process_flis_layers_match(int nb);
+int process_flis_register_layers(int nb);
+
+/* FLIS canvas-scoped operations (stage 7) */
+int process_flis_canvas_resize(int nb);
+int process_flis_canvas_fit(int nb);
+int process_flis_canvas_rotate(int nb);
+int process_flis_canvas_mirrorx(int nb);
+int process_flis_canvas_mirrory(int nb);
 
 #endif

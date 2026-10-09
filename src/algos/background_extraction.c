@@ -33,6 +33,7 @@
 #include "algos/sorting.h"
 #include "algos/statistics.h"
 #include "core/gui_iface.h"
+#include "core/nde/nde_history.h"
 #include "core/op_descriptors.h"
 #include "core/processing.h"
 #include "core/proto.h"
@@ -43,17 +44,204 @@
 #include "io/sequence.h"
 #include "opencv/opencv.h"
 
+/* NDE serializers (flis-nde-sketch.md §11, §15).  remove_gradient_image_hook
+ * reads all the genuine params below plus the autograd sub-struct (flattened
+ * with an ag_ prefix).
+ *
+ * CRITICAL (§15): dither/randomize/grad_descent make param-only replay
+ * nondeterministic — the same nb_of_samples/tolerance would place different
+ * samples on a rerun.  To make the operation reproducible, serialize the
+ * EFFECTIVE sample positions from com.grad_samples (valid samples only) as
+ * samples=x1,y1:x2,y2:...  (%.17g, locale-independent).  There is no field in
+ * struct background_data to hold them, so for phase 1 the samples key lives in
+ * the blob ONLY: it round-trips through FLIS_HIST untouched and the
+ * deserializer parses-and-discards it.  Phase 2's replay driver will read the
+ * key back into com.grad_samples before invoking the hook.  Serialize tolerates
+ * com.grad_samples == NULL (key omitted).  mem_ratio and threads are
+ * per-invocation and are not serialized; fit/seq/seqEntry/from_ui are runtime. */
+/* Serialize the valid sample positions of @list ("x,y:x,y..."), NULL when
+ * none.  Shared by the serializer (GUI capture reads the live list) and the
+ * single-image hook (command path stashes the positions into the args before
+ * its !from_ui cleanup frees the list — the worker's NDE capture runs after
+ * the hook returns). */
+static gchar *samples_positions_string(GSList *list) {
+	if (!list)
+		return NULL;
+	GString *pts = g_string_new(NULL);
+	char bx[G_ASCII_DTOSTR_BUF_SIZE], by[G_ASCII_DTOSTR_BUF_SIZE];
+	gboolean first = TRUE;
+	for (GSList *l = list; l; l = l->next) {
+		const background_sample *s = l->data;
+		if (!s || !s->valid)
+			continue;
+		g_ascii_formatd(bx, sizeof bx, "%.17g", s->position.x);
+		g_ascii_formatd(by, sizeof by, "%.17g", s->position.y);
+		g_string_append_printf(pts, "%s%s,%s", first ? "" : ":", bx, by);
+		first = FALSE;
+	}
+	if (!pts->len) {
+		g_string_free(pts, TRUE);
+		return NULL;
+	}
+	return g_string_free(pts, FALSE);
+}
+
+static gchar *remove_gradient_serialize(gconstpointer user) {
+	const struct background_data *p = user;
+	GString *kv = nde_kv_start();
+	/* on-disk value: enum order is frozen by the NDE format — do not reorder */
+	nde_kv_add_int(kv, "method", p->method);
+	nde_kv_add_int(kv, "nb_of_samples", p->nb_of_samples);
+	nde_kv_add_double(kv, "tolerance", p->tolerance);
+	/* on-disk value: enum order is frozen by the NDE format — do not reorder */
+	nde_kv_add_int(kv, "correction", p->correction);
+	/* on-disk value: enum order is frozen by the NDE format — do not reorder */
+	nde_kv_add_int(kv, "interpolation_method", p->interpolation_method);
+	/* on-disk value: enum order is frozen by the NDE format — do not reorder */
+	nde_kv_add_int(kv, "degree", p->degree);
+	nde_kv_add_double(kv, "smoothing", p->smoothing);
+	nde_kv_add_bool(kv, "dither", p->dither);
+	nde_kv_add_bool(kv, "is_cfa", p->is_cfa);
+	nde_kv_add_bool(kv, "randomize", p->randomize);
+	nde_kv_add_bool(kv, "grad_descent", p->grad_descent);
+	nde_kv_add_double(kv, "border_value", p->border_value);
+	nde_kv_add_bool(kv, "border_is_percent", p->border_is_percent);
+	/* autograd sub-struct (ag_ prefix) */
+	nde_kv_add_double(kv, "ag_scale", p->autograd.scale);
+	nde_kv_add_double(kv, "ag_smoothness", p->autograd.smoothness);
+	nde_kv_add_bool(kv, "ag_protect", p->autograd.protect);
+	nde_kv_add_double(kv, "ag_protect_threshold", p->autograd.protect_threshold);
+	nde_kv_add_double(kv, "ag_protect_amount", p->autograd.protect_amount);
+	nde_kv_add_bool(kv, "ag_simplified", p->autograd.simplified);
+	nde_kv_add_int(kv, "ag_degree", p->autograd.degree);
+	nde_kv_add_int(kv, "ag_downsample", p->autograd.downsample);
+	/* effective sample positions (§15) — the hook stashes them for the
+	 * command path (whose cleanup frees com.grad_samples before capture
+	 * runs); the GUI capture path reads the live list.  Omitted when no
+	 * samples were placed (auto model). */
+	gchar *pts = p->effective_samples ? g_strdup(p->effective_samples)
+	                                  : samples_positions_string(com.grad_samples);
+	if (pts) {
+		nde_kv_add_str(kv, "samples", pts);
+		g_free(pts);
+	}
+	return nde_kv_end(kv);
+}
+
+static gpointer remove_gradient_deserialize(const gchar *blob, int version) {
+	if (version > op_desc_remove_gradient.version)
+		return NULL;
+	GHashTable *kv = nde_kv_parse(blob);
+	struct background_data tmp = { 0 };
+	gint64 method, nb_of_samples, correction, interpolation_method, degree,
+	       ag_degree, ag_downsample;
+	NDE_KV_REQUIRE(kv, nde_kv_get_int(kv, "method", &method) &&
+	                   nde_kv_get_int(kv, "nb_of_samples", &nb_of_samples) &&
+	                   nde_kv_get_double(kv, "tolerance", &tmp.tolerance) &&
+	                   nde_kv_get_int(kv, "correction", &correction) &&
+	                   nde_kv_get_int(kv, "interpolation_method", &interpolation_method) &&
+	                   nde_kv_get_int(kv, "degree", &degree) &&
+	                   nde_kv_get_double(kv, "smoothing", &tmp.smoothing) &&
+	                   nde_kv_get_bool(kv, "dither", &tmp.dither) &&
+	                   nde_kv_get_bool(kv, "is_cfa", &tmp.is_cfa) &&
+	                   nde_kv_get_bool(kv, "randomize", &tmp.randomize) &&
+	                   nde_kv_get_bool(kv, "grad_descent", &tmp.grad_descent) &&
+	                   nde_kv_get_double(kv, "border_value", &tmp.border_value) &&
+	                   nde_kv_get_bool(kv, "border_is_percent", &tmp.border_is_percent) &&
+	                   nde_kv_get_double(kv, "ag_scale", &tmp.autograd.scale) &&
+	                   nde_kv_get_double(kv, "ag_smoothness", &tmp.autograd.smoothness) &&
+	                   nde_kv_get_bool(kv, "ag_protect", &tmp.autograd.protect) &&
+	                   nde_kv_get_double(kv, "ag_protect_threshold", &tmp.autograd.protect_threshold) &&
+	                   nde_kv_get_double(kv, "ag_protect_amount", &tmp.autograd.protect_amount) &&
+	                   nde_kv_get_bool(kv, "ag_simplified", &tmp.autograd.simplified) &&
+	                   nde_kv_get_int(kv, "ag_degree", &ag_degree) &&
+	                   nde_kv_get_int(kv, "ag_downsample", &ag_downsample));
+	/* The "samples" key (§15) is intentionally ignored here: struct
+	 * background_data has no field for it.  It survives verbatim in the blob
+	 * and phase 2's replay driver will load it into com.grad_samples. */
+	tmp.method = (background_method)method;
+	tmp.nb_of_samples = (int)nb_of_samples;
+	tmp.correction = (background_correction)correction;
+	tmp.interpolation_method = (background_interpolation)interpolation_method;
+	tmp.degree = (poly_order)degree;
+	tmp.autograd.degree = (int)ag_degree;
+	tmp.autograd.downsample = (int)ag_downsample;
+	/* v1 -> v2: `ag_simplified` changed meaning under the same key.  In v1 it
+	 * selected a stiff polynomial INSTEAD of the multiscale surface, and
+	 * `ag_smoothness` applied to whichever of the two was fitted; from v2 the
+	 * polynomial is fitted and removed first, the multiscale surface is fitted
+	 * on what it leaves, the sum of the two is removed, and `ag_smoothness`
+	 * applies to the multiscale stage only.  Replaying a v1 record through the
+	 * v2 model reproduces different pixels from the ones it recorded, so refuse
+	 * it rather than diverge silently: the chain reports the record as
+	 * unreplayable and the document keeps its stored result.  Only the
+	 * automatic model fills `autograd`, and only `simplified` is affected, so
+	 * every other v1 record still replays unchanged. */
+	if (version < 2 && tmp.autograd.simplified
+			&& tmp.method == BACKGROUND_METHOD_AUTO) {
+		siril_log_warning(_("bkg.remove_gradient: this step was recorded with an "
+				"older, incompatible version of the simplified automatic model "
+				"and cannot be replayed by this build.\n"));
+		g_hash_table_unref(kv);
+		return NULL;
+	}
+	struct background_data *p = calloc(1, sizeof(*p));
+	if (p) {
+		*p = tmp;
+		p->destroy_fn = free_background_data;
+	}
+	g_hash_table_unref(kv);
+	return p;
+}
+
 /* Op descriptor — the automatic-gradient-removal and background-extraction
  * commands share remove_gradient_image_hook. Default label "Background
  * extraction"; the "Automatic gradient removal" sites and the GUI mem_ratios
  * are per-site overrides. mem_ratio default 0 (command sites do no mem check). */
+/* Replay preparation (nde-phase2-3-plan.md decision 6): the image hook reads
+ * com.grad_samples, an external input the params struct cannot carry, so the
+ * record's `samples=` key holds the EFFECTIVE positions that were used
+ * (dither/randomize/grad-descent make param-only re-placement
+ * nondeterministic).  Rebuild the global list from those positions against
+ * the replay input; statistics are recomputed by add_background_sample and
+ * no gradient descent is applied — the positions are already post-descent.
+ * NOTE: this replaces any live com.grad_samples (the hook's contract is
+ * global by design); replay runs in the exclusive job slot, so no concurrent
+ * Background Extraction can be mid-flight. */
+static int remove_gradient_replay_pre(gpointer user, GHashTable *kv, fits *target) {
+	(void)user;
+	free_background_sample_list(com.grad_samples);
+	com.grad_samples = NULL;
+	const char *samples = nde_kv_get_str(kv, "samples");
+	if (!samples || !*samples)
+		return 0;   /* no recorded samples (auto model): param-only replay */
+	gchar **pairs = g_strsplit(samples, ":", -1);
+	for (gchar **p = pairs; *p; p++) {
+		gchar **xy = g_strsplit(*p, ",", 2);
+		if (xy[0] && xy[1]) {
+			point pt = { g_ascii_strtod(xy[0], NULL),
+			             g_ascii_strtod(xy[1], NULL) };
+			com.grad_samples = add_background_sample(com.grad_samples,
+			                                         target, pt, FALSE);
+		}
+		g_strfreev(xy);
+	}
+	g_strfreev(pairs);
+	return 0;
+}
+
 const op_descriptor op_desc_remove_gradient = {
-	.id = "bkg.remove_gradient", .version = 1,
+	/* v2: the automatic model's `simplified` stage changed meaning — see the
+	 * version note in remove_gradient_deserialize, which refuses the v1
+	 * records that used it. */
+	.id = "bkg.remove_gradient", .version = 2,
 	.image_hook = remove_gradient_image_hook,
 	.log_hook = remove_gradient_log_hook,
 	.description = N_("Background extraction"),
 	.mem_ratio = 0.0f,
 	.flags = 0,
+	.serialize = remove_gradient_serialize, .deserialize = remove_gradient_deserialize,
+	.replay_pre = remove_gradient_replay_pre,
 };
 
 #define NPARAM_POLY4 15		// Number of parameters used with 4rd order
@@ -1218,6 +1406,7 @@ void free_background_data(void *p) {
 	struct background_data *args = (struct background_data *)p;
 	if (!args) return;
 	free(args->seqEntry);
+	g_free(args->effective_samples);
 	free(args);
 }
 
@@ -1845,12 +2034,17 @@ int remove_gradient_image_hook(struct generic_img_args *gargs, fits *fit, int th
 				(args->interpolation_method == BACKGROUND_INTER_POLY) ? "polynomial" : "RBF");
 		cfachans_cleanup(cfachans);
 		invalidate_stats_from_fit(fit);
+		g_mutex_lock(&bgsamples_mutex);
+		/* Stash the effective positions for NDE capture, which runs after
+		 * this hook returns — the !from_ui cleanup below would otherwise
+		 * erase them from the record (P2.E finding). */
+		if (!args->effective_samples)
+			args->effective_samples = samples_positions_string(com.grad_samples);
 		if (!args->from_ui) {
-			g_mutex_lock(&bgsamples_mutex);
 			free_background_sample_list(com.grad_samples);
 			com.grad_samples = NULL;
-			g_mutex_unlock(&bgsamples_mutex);
 		}
+		g_mutex_unlock(&bgsamples_mutex);
 	} else {
 		double *background = malloc(fit->ry * fit->rx * sizeof(double));
 		if (!background) {
@@ -1900,12 +2094,17 @@ int remove_gradient_image_hook(struct generic_img_args *gargs, fits *fit, int th
 		free(image);
 		free(background);
 		invalidate_stats_from_fit(fit);
+		g_mutex_lock(&bgsamples_mutex);
+		/* Stash the effective positions for NDE capture, which runs after
+		 * this hook returns — the !from_ui cleanup below would otherwise
+		 * erase them from the record (P2.E finding). */
+		if (!args->effective_samples)
+			args->effective_samples = samples_positions_string(com.grad_samples);
 		if (!args->from_ui) {
-			g_mutex_lock(&bgsamples_mutex);
 			free_background_sample_list(com.grad_samples);
 			com.grad_samples = NULL;
-			g_mutex_unlock(&bgsamples_mutex);
 		}
+		g_mutex_unlock(&bgsamples_mutex);
 	}
 	return 0;
 }

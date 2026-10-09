@@ -33,6 +33,9 @@
 #include "core/gui_iface.h"
 #include "core/icc_profile.h"
 #include "core/masks.h"
+#include "core/nde/nde_checkpoint.h"
+#include "core/nde/nde_history.h"
+#include "core/nde/nde_script_scope.h"
 #include "core/OS_utils.h"
 #include "core/processing.h"
 #include "core/proto.h"
@@ -43,6 +46,7 @@
 #include "filters/mtf.h"
 #include "gui-gtk4/user_polygons.h"
 #include "io/image_format_fits.h"
+#include "io/image_format_flis.h"
 #include "io/sequence.h"
 #include "io/single_image.h"
 #include "io/siril_git.h"
@@ -683,6 +687,15 @@ gboolean handle_set_pixeldata_request(Connection *conn, fits *fit, const char* p
 		}
 	#endif
 
+	/* NDE baseline (phase 2): a script is about to overwrite the document's
+	 * pixels — snapshot the pre-op pixels NOW, before the free below wipes
+	 * them.  Only for the document image (fit == gfit).  The record captured
+	 * further down is Tier B (opaque), so this baseline is never used for
+	 * replay of the python step itself, but it seeds the item's checkpoint
+	 * for any Tier-A op captured after it. */
+	if (fit == gfit)
+		nde_checkpoint_baseline_ensure(fit, nde_checkpoint_active_item_id());
+
 	// Allocate new image buffer
 	fit->type = DATA_UNSUPPORTED; // prevents a potential crash in on_drawingarea_motion_notify_event while we are messing with gfit
 	free(fit->data);
@@ -755,6 +768,32 @@ gboolean handle_set_pixeldata_request(Connection *conn, fits *fit, const char* p
 		munmap(shm_ptr, info->size);
 		close(fd);
 	#endif
+
+	/* NDE provenance (sketch §13.2): a script rewrote the document's pixels.
+	 * Only capture for the document image (fit == gfit); the handlers can also
+	 * write to non-gfit fits, which carry no provenance log.  Tier B (opaque):
+	 * no replayable params exist and no script name is on the Connection.
+	 * Runs on the python-comm worker thread while thread_claimed; the append
+	 * is leaf-mutex-safe from any thread. */
+	if (fit == gfit) {
+		if (processing_is_reserved_for_replay()) {
+			/* A Tier-C replay re-run opens no scope of its own; its writes
+			 * reproduce an existing record and must neither capture new ones
+			 * nor mark an unrelated resident script's open scope dirty (a
+			 * resident script cannot be writing here mid-replay — its
+			 * claim_thread is refused while SLOT_REPLAY is held), so this
+			 * guard comes BEFORE the scope check. */
+		} else if (nde_script_scope_active()) {
+			/* Inside a script scope: the end-of-scope net-effect record subsumes
+			 * this write (nde-phase5).  Just flag the pixel mutation — never one
+			 * record per set_pixeldata call. */
+			nde_script_scope_mark_pixels_dirty();
+		} else {
+			nde_capture_opaque("python.set_pixeldata", NDE_SCOPE_LAYER,
+			                   nde_capture_target_item(),
+			                   _("Python script pixel update"), fit);
+		}
+	}
 
 	// In all cases we have now finished with the shm and closed and unlinked it.
 	// On receipt of the response, python will also close and unlink the shm in its
@@ -930,6 +969,25 @@ gboolean handle_set_image_mask_request(Connection *conn, fits *fit, incoming_ima
 	#endif
 
 	set_mask_active(fit, TRUE);
+
+	/* NDE provenance (sketch §13.2): a script set/updated the document's mask.
+	 * Only for the document image (fit == gfit); Tier B (opaque). */
+	if (fit == gfit) {
+		if (processing_is_reserved_for_replay()) {
+			/* Replay re-runs reproduce an existing record — no new capture,
+			 * and no marking of an unrelated resident script's open scope
+			 * (checked BEFORE the scope, same as handle_set_pixeldata). */
+		} else if (nde_script_scope_active()) {
+			/* Inside a script scope: coalesce into the end-of-scope record.  A
+			 * mask change is invisible to the pixel-hash net-effect test, so
+			 * flag it as a non-pixel mutation to force a record. */
+			nde_script_scope_mark_nonpixel_dirty();
+		} else {
+			nde_capture_opaque("python.set_mask", NDE_SCOPE_LAYER,
+			                   nde_capture_target_item(),
+			                   _("Python script mask update"), fit);
+		}
+	}
 
 	// In all cases we have now finished with the shm and closed and unlinked it.
 	// On receipt of the response, python will also close and unlink the shm in its
@@ -1640,11 +1698,9 @@ gboolean handle_set_iccprofile_request(Connection* conn, const incoming_image_in
 		return send_response(conn, STATUS_ERROR, error_msg, strlen(error_msg));
 	}
 
-	// convert the bytes into a cmsPROFILE
-	if (gfit->icc_profile)
-		cmsCloseProfile(gfit->icc_profile);
-	gfit->icc_profile = cmsOpenProfileFromMem(shm_ptr, info->size);
-	color_manage(gfit, TRUE);
+	// install the bytes as the current image's ICC profile via the accessor
+	current_image_set_icc_profile(cmsOpenProfileFromMem(shm_ptr, info->size));
+	current_image_color_manage(current_icc_profile() != NULL);
 
 	// Cleanup shared memory
 	#ifdef _WIN32
@@ -2225,6 +2281,10 @@ static void teardown_connection_and_worker(Connection *conn, GThread *worker) {
 
 static gpointer connection_worker(gpointer data) {
 	Connection *conn = (Connection*)data;
+	/* Job submissions from this thread (a script's cmd()/IPC requests) must
+	 * be attributed to the script, not the user — see the scope-suppression
+	 * gates in processing.c. */
+	processing_mark_python_comm_thread();
 	siril_log_debug("Python communication initialized...\n");
 	while (!conn->should_stop) {
 		if (wait_for_client(conn)) {
@@ -3353,7 +3413,8 @@ static void execute_startup_scripts(void) {
 							NULL,                    /* argv_script  */
 							FALSE,                   /* is_temp_file */
 							FALSE,                   /* from_cli     */
-							FALSE);
+							FALSE,                   /* debug_mode   */
+							FALSE);                  /* for_replay   */
 	}
 }
 
@@ -3489,6 +3550,7 @@ typedef struct {
     gchar *temp_filename;  // Path to temporary file
     GPid child_pid;        // Process ID of the spawned Python process
     gboolean is_temp_file; // Flag indicating if file should be deleted after execution
+    gboolean for_replay;   // NDE replay re-run: no capture scope was opened
     Connection *python_conn; // Python connection for cleanup
     GThread *worker_thread;  // Comm worker to join before freeing python_conn
 } python_cleanup_info;
@@ -3541,6 +3603,17 @@ static void python_process_cleanup(GPid pid, gint status, gpointer user_data) {
 		cleanup->python_conn = NULL;
 		cleanup->worker_thread = NULL;
 
+		/* Close the NDE provenance scope opened at launch (nde-phase5).  The
+		 * script's IPC mutations all completed synchronously before the process
+		 * exited (the script blocks for each response), so gfit is in its final
+		 * state and every dirty flag is set: this decides Tier-C / Tier-B /
+		 * nothing and captures at most one record.  A replay re-run opened no
+		 * scope, and must not end one either: a concurrent resident script's
+		 * capture scope may be open, and this end would wrongly decrement its
+		 * depth. */
+		if (!cleanup->for_replay)
+			nde_script_scope_end();
+
 		// Remove from children list
 		remove_child_from_children(cleanup->child_pid);
 
@@ -3591,9 +3664,14 @@ gboolean pyc_matches_magic(const char *pyc_path, const char *expected_hex_magic)
 	return g_strcmp0(actual_hex, expected_hex_magic) == 0;
 }
 
-void execute_python_script(gchar* script_name, gboolean from_file, gboolean sync,
+int execute_python_script(gchar* script_name, gboolean from_file, gboolean sync,
 						gchar** argv_script, gboolean is_temp_file, gboolean from_cli,
-						gboolean debug_mode) {
+						gboolean debug_mode, gboolean for_replay) {
+	/* for_replay launches are always synchronous: the NDE replay conductor
+	 * blocks on the script and re-runs a Tier-C history step against gfit while
+	 * holding the SLOT_REPLAY reservation. */
+	g_return_val_if_fail(!for_replay || sync, -1);
+
 	/* Wait for the initialisation whenever one is in flight, rather than only
 	 * when com.python_version is still unset: the version is assigned early in
 	 * the venv setup, while the venv's environment variables are only exported
@@ -3611,7 +3689,7 @@ void execute_python_script(gchar* script_name, gboolean from_file, gboolean sync
 		if (is_temp_file && script_name)
 			g_unlink(script_name);
 		g_free(script_name);
-		return;
+		return -1;
 	}
 
 	// Generate a unique connection path for the pipe or socket for this script
@@ -3637,7 +3715,7 @@ void execute_python_script(gchar* script_name, gboolean from_file, gboolean sync
 			g_free(script_name);
 		}
 		g_free(connection_path);
-		return;
+		return -1;
 	}
 
 	// Create worker thread
@@ -3654,7 +3732,7 @@ void execute_python_script(gchar* script_name, gboolean from_file, gboolean sync
 			g_free(script_name);
 		}
 		g_free(connection_path);
-		return;
+		return -1;
 	}
 	init_shm_tracking(commstate.python_conn);
 
@@ -3671,7 +3749,7 @@ void execute_python_script(gchar* script_name, gboolean from_file, gboolean sync
 		}
 		g_free(script_name);
 		g_free(connection_path);
-		return;
+		return -1;
 	}
 
 	// Handle virtual environment if active
@@ -3741,7 +3819,7 @@ void execute_python_script(gchar* script_name, gboolean from_file, gboolean sync
 			g_unlink(script_name);
 		}
 		g_free(script_name);
-		return;
+		return -1;
 	} else {
 		// Clear any ROI that is set
 		gui_iface.clear_roi();
@@ -3793,6 +3871,21 @@ void execute_python_script(gchar* script_name, gboolean from_file, gboolean sync
 			// Set the flag that a python script is running
 			com.python_script = TRUE;
 			siril_log_debug("***** com.python_script flag set\n");
+			/* Register this script's comm thread as an admitted identity for
+			 * the replay reservation.  Done only after a successful spawn (the
+			 * error paths below join the comm thread and return), and before
+			 * the subprocess can connect and issue any command. */
+			if (for_replay)
+				processing_register_replay_script(commstate.worker_thread);
+			/* Open the NDE provenance scope for a normal launch (nde-phase5):
+			 * it coalesces the script's whole net effect into at most one
+			 * record and suppresses per-op capture meanwhile.  A replay re-run
+			 * (for_replay) must NOT open a capture scope — it is reproducing an
+			 * existing record, not creating a new one.  Only a real, re-runnable
+			 * script file can become Tier-C, so pass the path only for a
+			 * non-temp from_file launch. */
+			if (!for_replay)
+				nde_script_scope_begin((from_file && !is_temp_file) ? script_name : NULL);
 			// Prepend this process to the list of child processes
 			gchar *script_basename = g_path_get_basename(script_name);
 			gchar *childname = g_strdup_printf("%s %s", PYTHON_EXE, from_file ? script_basename : "script");
@@ -3826,7 +3919,7 @@ void execute_python_script(gchar* script_name, gboolean from_file, gboolean sync
 
 		// Re-enable widgets
 		gui_iface.script_widgets_async(TRUE);
-		return;
+		return -1;
 	}
 
 	// Create cleanup info structure for either synchronous or async operation
@@ -3840,29 +3933,43 @@ void execute_python_script(gchar* script_name, gboolean from_file, gboolean sync
 	g_free(script_name);
 	cleanup->child_pid = child_pid;
 	cleanup->is_temp_file = is_temp_file;
+	cleanup->for_replay = for_replay;
 	cleanup->python_conn = commstate.python_conn;
 	cleanup->worker_thread = commstate.worker_thread;
 
+	int ret = 0;
 	if (sync) {
-		/* sync mode only ever runs on the dedicated pyscript_thread (see
-		 * execute_python_script_wrapper), never on the GTK main thread, so the
-		 * teardown join inside python_process_cleanup() runs inline and cannot
-		 * deadlock the main loop. */
+		/* sync mode only ever runs on the dedicated pyscript_thread or the NDE
+		 * replay conductor (see execute_python_script_wrapper), never on the
+		 * GTK main thread, so the teardown join inside python_process_cleanup()
+		 * runs inline and cannot deadlock the main loop. */
 		// Cross-platform process waiting
+		gint child_status = 0;
 #ifdef _WIN32
 		// Use Windows-specific waiting
 		HANDLE process_handle = (HANDLE) child_pid;
+		DWORD exit_code = 1;
 		if (process_handle != NULL) {
 			WaitForSingleObject(process_handle, INFINITE);
+			if (!GetExitCodeProcess(process_handle, &exit_code))
+				exit_code = 1;
 			CloseHandle(process_handle);
 		}
+		child_status = (gint)exit_code;
+		ret = (exit_code == 0) ? 0 : 1;
 #else
 		// Use POSIX waitpid
-		gint status;
+		gint status = 0;
 		waitpid(child_pid, &status, 0);
+		child_status = status;
+		ret = (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : 1;
 #endif
 		// Handle cleanup directly (joins the worker and frees conn inline).
-		python_process_cleanup(child_pid, 0, cleanup);
+		python_process_cleanup(child_pid, child_status, cleanup);
+		/* Clear the admitted-script identity now the comm thread is joined,
+		 * before its GThread address could be reused by another thread. */
+		if (for_replay)
+			processing_unregister_replay_script();
 	} else {
 		/* Async: the child-watch fires python_process_cleanup() on the GTK main
 		 * loop when the process exits; it tears the worker + conn down via a
@@ -3915,5 +4022,5 @@ void execute_python_script(gchar* script_name, gboolean from_file, gboolean sync
 	siril_log_debug("Python script launched asynchronously with PID %d\n", child_pid);
 	g_free(working_dir);
 	g_strfreev(env);
-
+	return ret;
 }

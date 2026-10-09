@@ -29,6 +29,7 @@
 #include "core/arithm.h"
 #include "core/gui_iface.h"
 #include "core/masks.h"
+#include "core/nde/nde_history.h"
 #include "core/op_descriptors.h"
 #include "core/processing.h"
 #include "core/proto.h"
@@ -36,9 +37,178 @@
 #include "core/siril_log.h"
 #include "io/gps_parser.h"
 #include "io/image_format_fits.h"
+#include "io/image_format_flis.h"
 #include "io/sequence.h"
 #include "io/single_image.h"
 #include "opencv/opencv.h"
+
+/* ---------------------------------------------------------------------- *
+ *  NDE serializers (flis-nde-sketch.md §11-§12).  Each pair serializes    *
+ *  exactly the fields the matching image_hook reads that affect output    *
+ *  pixels; runtime context (fit/seq/threads/destroy_fn) is skipped.       *
+ *  All geometry param structs are POD; deserializers set destroy_fn to    *
+ *  the module's existing free_*_args.                                     *
+ * ---------------------------------------------------------------------- */
+
+/* geometry.crop — hook reads params->area {x,y,w,h}. */
+static gchar *crop_serialize(gconstpointer user) {
+	const struct crop_args *p = user;
+	GString *kv = nde_kv_start();
+	nde_kv_add_int(kv, "x", p->area.x);
+	nde_kv_add_int(kv, "y", p->area.y);
+	nde_kv_add_int(kv, "w", p->area.w);
+	nde_kv_add_int(kv, "h", p->area.h);
+	return nde_kv_end(kv);
+}
+
+static gpointer crop_deserialize(const gchar *blob, int version) {
+	if (version > op_desc_crop.version)
+		return NULL;
+	GHashTable *kv = nde_kv_parse(blob);
+	gint64 x, y, w, h;
+	NDE_KV_REQUIRE(kv, nde_kv_get_int(kv, "x", &x) &&
+	                   nde_kv_get_int(kv, "y", &y) &&
+	                   nde_kv_get_int(kv, "w", &w) &&
+	                   nde_kv_get_int(kv, "h", &h));
+	struct crop_args *p = new_crop_args();
+	if (p) {
+		p->area.x = (int)x; p->area.y = (int)y;
+		p->area.w = (int)w; p->area.h = (int)h;
+	}
+	g_hash_table_unref(kv);
+	return p;
+}
+
+/* geometry.rotation — hook reads area{x,y,w,h}, angle, interpolation,
+ * cropped, clamp. */
+static gchar *rotation_serialize(gconstpointer user) {
+	const struct rotation_args *p = user;
+	GString *kv = nde_kv_start();
+	nde_kv_add_int(kv, "x", p->area.x);
+	nde_kv_add_int(kv, "y", p->area.y);
+	nde_kv_add_int(kv, "w", p->area.w);
+	nde_kv_add_int(kv, "h", p->area.h);
+	nde_kv_add_double(kv, "angle", p->angle);
+	/* on-disk value: enum order is frozen by the NDE format — do not reorder */
+	nde_kv_add_int(kv, "interp", p->interpolation);
+	nde_kv_add_int(kv, "cropped", p->cropped);
+	nde_kv_add_bool(kv, "clamp", p->clamp);
+	return nde_kv_end(kv);
+}
+
+static gpointer rotation_deserialize(const gchar *blob, int version) {
+	if (version > op_desc_rotation.version)
+		return NULL;
+	GHashTable *kv = nde_kv_parse(blob);
+	gint64 x, y, w, h, interp, cropped;
+	double angle;
+	gboolean clamp;
+	NDE_KV_REQUIRE(kv, nde_kv_get_int(kv, "x", &x) &&
+	                   nde_kv_get_int(kv, "y", &y) &&
+	                   nde_kv_get_int(kv, "w", &w) &&
+	                   nde_kv_get_int(kv, "h", &h) &&
+	                   nde_kv_get_double(kv, "angle", &angle) &&
+	                   nde_kv_get_int(kv, "interp", &interp) &&
+	                   nde_kv_get_int(kv, "cropped", &cropped) &&
+	                   nde_kv_get_bool(kv, "clamp", &clamp));
+	struct rotation_args *p = new_rotation_args();
+	if (p) {
+		p->area.x = (int)x; p->area.y = (int)y;
+		p->area.w = (int)w; p->area.h = (int)h;
+		p->angle = angle;
+		p->interpolation = (int)interp;
+		p->cropped = (int)cropped;
+		p->clamp = clamp;
+	}
+	g_hash_table_unref(kv);
+	return p;
+}
+
+/* geometry.mirrorx / geometry.mirrory — shared mirror_args; hooks call
+ * mirrorx()/mirrory() unconditionally, x_axis is serialized anyway so the
+ * op identity is fully captured by the record's op_id + this field. */
+static gchar *mirror_serialize(gconstpointer user) {
+	const struct mirror_args *p = user;
+	GString *kv = nde_kv_start();
+	nde_kv_add_bool(kv, "x_axis", p->x_axis);
+	return nde_kv_end(kv);
+}
+
+static gpointer mirror_deserialize(const gchar *blob, int version) {
+	/* both mirror descriptors share version 1 */
+	if (version > op_desc_mirrorx.version)
+		return NULL;
+	GHashTable *kv = nde_kv_parse(blob);
+	gboolean x_axis;
+	NDE_KV_REQUIRE(kv, nde_kv_get_bool(kv, "x_axis", &x_axis));
+	struct mirror_args *p = new_mirror_args();
+	if (p)
+		p->x_axis = x_axis;
+	g_hash_table_unref(kv);
+	return p;
+}
+
+/* geometry.binning — hook reads factor, mean. */
+static gchar *binning_serialize(gconstpointer user) {
+	const struct binning_args *p = user;
+	GString *kv = nde_kv_start();
+	nde_kv_add_int(kv, "factor", p->factor);
+	nde_kv_add_bool(kv, "mean", p->mean);
+	return nde_kv_end(kv);
+}
+
+static gpointer binning_deserialize(const gchar *blob, int version) {
+	if (version > op_desc_binning.version)
+		return NULL;
+	GHashTable *kv = nde_kv_parse(blob);
+	gint64 factor;
+	gboolean mean;
+	NDE_KV_REQUIRE(kv, nde_kv_get_int(kv, "factor", &factor) &&
+	                   nde_kv_get_bool(kv, "mean", &mean));
+	struct binning_args *p = new_binning_args();
+	if (p) {
+		p->factor = (int)factor;
+		p->mean = mean;
+	}
+	g_hash_table_unref(kv);
+	return p;
+}
+
+/* geometry.resample — hook reads toX, toY, interpolation, clamp, update_wcs. */
+static gchar *resample_serialize(gconstpointer user) {
+	const struct resample_args *p = user;
+	GString *kv = nde_kv_start();
+	nde_kv_add_int(kv, "toX", p->toX);
+	nde_kv_add_int(kv, "toY", p->toY);
+	/* on-disk value: enum order is frozen by the NDE format — do not reorder */
+	nde_kv_add_int(kv, "interp", p->interpolation);
+	nde_kv_add_bool(kv, "clamp", p->clamp);
+	nde_kv_add_bool(kv, "update_wcs", p->update_wcs);
+	return nde_kv_end(kv);
+}
+
+static gpointer resample_deserialize(const gchar *blob, int version) {
+	if (version > op_desc_resample.version)
+		return NULL;
+	GHashTable *kv = nde_kv_parse(blob);
+	gint64 toX, toY, interp;
+	gboolean clamp, update_wcs;
+	NDE_KV_REQUIRE(kv, nde_kv_get_int(kv, "toX", &toX) &&
+	                   nde_kv_get_int(kv, "toY", &toY) &&
+	                   nde_kv_get_int(kv, "interp", &interp) &&
+	                   nde_kv_get_bool(kv, "clamp", &clamp) &&
+	                   nde_kv_get_bool(kv, "update_wcs", &update_wcs));
+	struct resample_args *p = new_resample_args();
+	if (p) {
+		p->toX = (int)toX;
+		p->toY = (int)toY;
+		p->interpolation = (opencv_interpolation)interp;
+		p->clamp = clamp;
+		p->update_wcs = update_wcs;
+	}
+	g_hash_table_unref(kv);
+	return p;
+}
 
 /* Op descriptors — single source of truth for the geometry operations.
  * All change image dimensions, hence OP_GEOMETRY_CHANGING (the master worker
@@ -50,6 +220,7 @@ const op_descriptor op_desc_crop = {
 	.description = N_("Crop"),
 	.mem_ratio = 1.0f,
 	.flags = OP_GEOMETRY_CHANGING,
+	.serialize = crop_serialize, .deserialize = crop_deserialize,
 };
 
 const op_descriptor op_desc_binning = {
@@ -59,6 +230,7 @@ const op_descriptor op_desc_binning = {
 	.description = N_("Binning"),
 	.mem_ratio = 1.5f,
 	.flags = OP_GEOMETRY_CHANGING,
+	.serialize = binning_serialize, .deserialize = binning_deserialize,
 };
 
 /* mem_ratio is always computed per-site (from the scale factors), so the
@@ -70,6 +242,7 @@ const op_descriptor op_desc_resample = {
 	.description = N_("Resample"),
 	.mem_ratio = 0.0f,
 	.flags = OP_GEOMETRY_CHANGING,
+	.serialize = resample_serialize, .deserialize = resample_deserialize,
 };
 
 /* Default mem_ratio 2.0 (arbitrary-angle rotation); the 90°/180° variants
@@ -81,6 +254,7 @@ const op_descriptor op_desc_rotation = {
 	.description = N_("Rotation"),
 	.mem_ratio = 2.0f,
 	.flags = OP_GEOMETRY_CHANGING,
+	.serialize = rotation_serialize, .deserialize = rotation_deserialize,
 };
 
 const op_descriptor op_desc_mirrorx = {
@@ -89,6 +263,7 @@ const op_descriptor op_desc_mirrorx = {
 	.description = N_("Mirror X"),
 	.mem_ratio = 1.0f,
 	.flags = OP_GEOMETRY_CHANGING,
+	.serialize = mirror_serialize, .deserialize = mirror_deserialize,
 };
 
 const op_descriptor op_desc_mirrory = {
@@ -97,6 +272,7 @@ const op_descriptor op_desc_mirrory = {
 	.description = N_("Mirror Y"),
 	.mem_ratio = 1.0f,
 	.flags = OP_GEOMETRY_CHANGING,
+	.serialize = mirror_serialize, .deserialize = mirror_deserialize,
 };
 
 /* Mask helper functions */
@@ -801,6 +977,28 @@ int fits_binning(fits *fit, int factor, gboolean mean) {
 		}
 	}
 
+	/* FLIS: keep the layer mask (lmask) in step with the pixel data —
+	 * a stale-size lmask corrupts compositing.  Wrapped as a mask_t so
+	 * the shared geometry helpers apply.  This hook runs under
+	 * generic_image_worker (no stack lock), so take the stack writer
+	 * lock around the lmask lifetime mutation — M-F12 rule 2 allows
+	 * fits→stack nesting; the free is deferred to the main thread. */
+	flis_stack_writer_lock();
+	flis_layer_t *_lay_bin = flis_layer_get_by_fit(fit);
+	if (_lay_bin && _lay_bin->lmask && _lay_bin->lmask->data) {
+		mask_t _tmp = { .bitpix = _lay_bin->lmask->bitpix, .data = _lay_bin->lmask->data };
+		if (bin_mask(&_tmp, old_rx, old_ry, factor, mean)) {
+			siril_log_error(_("Error binning layer mask\n"));
+			layermask_free_deferred(_lay_bin->lmask);
+			_lay_bin->lmask = NULL;
+		} else {
+			_lay_bin->lmask->data = _tmp.data;
+			_lay_bin->lmask->w = old_rx / factor;
+			_lay_bin->lmask->h = old_ry / factor;
+		}
+	}
+	flis_stack_writer_unlock();
+
 	if (has_wcs(fit)) {
 		Homography H = { 0 };
 		cvGetEye(&H);
@@ -871,6 +1069,26 @@ int verbose_resize_gaussian(fits *image, int toX, int toY, opencv_interpolation 
 		}
 	}
 
+	if (retvalue == 0) {
+		/* Stack writer lock: see the matching comment in the binning
+		 * hook (M-F12 — lmask lifetime mutation from the image worker). */
+		flis_stack_writer_lock();
+		flis_layer_t *_lay_res = flis_layer_get_by_fit(image);
+		if (_lay_res && _lay_res->lmask && _lay_res->lmask->data) {
+			mask_t _tmp = { .bitpix = _lay_res->lmask->bitpix, .data = _lay_res->lmask->data };
+			if (resize_mask(&_tmp, old_rx, old_ry, toX, toY, interpolation)) {
+				siril_log_error(_("Error resizing layer mask\n"));
+				layermask_free_deferred(_lay_res->lmask);
+				_lay_res->lmask = NULL;
+			} else {
+				_lay_res->lmask->data = _tmp.data;
+				_lay_res->lmask->w = toX;
+				_lay_res->lmask->h = toY;
+			}
+		}
+		flis_stack_writer_unlock();
+	}
+
 	if (image->keywords.pixel_size_x > 0) image->keywords.pixel_size_x *= factor_X;
 	if (image->keywords.pixel_size_y > 0) image->keywords.pixel_size_y *= factor_Y;
 
@@ -910,6 +1128,10 @@ static void GetMatrixReframe(fits *image, rectangle area, double angle, int crop
 // wraps cvRotateImage to update WCS data as well
 int verbose_rotate_fast(fits *image, int angle) {
 	if (angle % 90 != 0) return 1; // only for multiples of 90 \deg
+	/* 0° (and any multiple of 360°) is a no-op.  cvRotateImage() does not
+	 * handle angle==0 correctly (falls into the 270° branch), so bail out
+	 * before calling it. */
+	if (angle % 360 == 0) return 0;
 	gui_iface.on_geometry_changed(); // ROI is cleared on geometry-altering operations
 	gboolean tmp_mask_active = FALSE;
 	if (image->mask) {
@@ -938,6 +1160,24 @@ int verbose_rotate_fast(fits *image, int angle) {
 			set_mask_active(image, tmp_mask_active);
 		}
 	}
+
+	/* Stack writer lock: see the matching comment in the binning hook
+	 * (M-F12 — lmask lifetime mutation from the image worker). */
+	flis_stack_writer_lock();
+	flis_layer_t *_lay_rf = flis_layer_get_by_fit(image);
+	if (_lay_rf && _lay_rf->lmask && _lay_rf->lmask->data) {
+		mask_t _tmp = { .bitpix = _lay_rf->lmask->bitpix, .data = _lay_rf->lmask->data };
+		if (transform_mask(&_tmp, orig_rx, orig_ry, target_rx, target_ry, H, OPENCV_NEAREST)) {
+			siril_log_error(_("Error rotating layer mask\n"));
+			layermask_free_deferred(_lay_rf->lmask);
+			_lay_rf->lmask = NULL;
+		} else {
+			_lay_rf->lmask->data = _tmp.data;
+			_lay_rf->lmask->w = target_rx;
+			_lay_rf->lmask->h = target_ry;
+		}
+	}
+	flis_stack_writer_unlock();
 
 	if (has_wcs(image)) {
 		cvApplyFlips(&H, orig_ry, target_ry);
@@ -1654,30 +1894,81 @@ gchar *rotation_log_hook(gpointer p, log_hook_detail detail) {
  *      G E O M E T R Y   I M A G E   H O O K S   F O R   W O R K E R
  ****************************************************************************/
 
+/* Returns TRUE when the current op should propagate dimension/centre changes
+ * to non-active FLIS layers — i.e. a FLIS is loaded AND the op is targeting
+ * the active layer (gfit), not an ROI or out-of-band fit. */
+static inline gboolean op_is_active_layer_in_flis(const struct generic_img_args *args) {
+	return is_current_image_flis() && args->fit == gfit;
+}
+
+/* TRUE when the worker handed us a carried layer offset to evolve — the NDE
+ * replay, which runs on a private fits and so can never be "the active layer
+ * in a FLIS", but whose result still has to land at the right position
+ * (processing.h).  Checked BEFORE op_is_active_layer_in_flis: during a replay
+ * the live layer must not move. */
+static inline gboolean op_has_carried_offset(const struct generic_img_args *args) {
+	return args->layer_pos_x != NULL && args->layer_pos_y != NULL;
+}
+
 int binning_image_hook(struct generic_img_args *args, fits *fit, int nb_threads) {
 	struct binning_args *params = (struct binning_args *)args->user;
 	if (!params)
 		return 1;
 
-	return fits_binning(fit, params->factor, params->mean);
+	int old_rx = (int)fit->rx, old_ry = (int)fit->ry;
+	int retval = fits_binning(fit, params->factor, params->mean);
+	if (!retval) {
+		if (op_has_carried_offset(args))
+			flis_layer_offset_recentre(args->layer_pos_x, args->layer_pos_y,
+			                           old_rx, old_ry, (int)fit->rx, (int)fit->ry);
+		else if (op_is_active_layer_in_flis(args))
+			flis_update_layer_offset_after_resize(old_rx, old_ry,
+			                                      (int)fit->rx, (int)fit->ry);
+	}
+	return retval;
 }
 
 int crop_image_hook_single(struct generic_img_args *args, fits *fit, int nb_threads) {
 	struct crop_args *params = (struct crop_args *)args->user;
 	if (!params)
 		return 1;
+	gint canvas_sel_x = params->area.x;
+	gint canvas_sel_y = params->area.y;
+	/* params->area is in layer fit coords; convert to canvas coords for the
+	 * offset helper.  Base layer sits at (0,0) so this is a no-op there. */
+	if (op_has_carried_offset(args)) {
+		canvas_sel_x += *args->layer_pos_x;
+		canvas_sel_y += *args->layer_pos_y;
+	} else if (op_is_active_layer_in_flis(args)) {
+		flis_layer_t *active = flis_active_layer();
+		if (active) {
+			canvas_sel_x += active->position_x;
+			canvas_sel_y += active->position_y;
+		}
+	}
 	int retval = crop(fit, &params->area);
+	if (!retval) {
+		if (op_has_carried_offset(args))
+			flis_layer_offset_after_crop(args->layer_pos_x, args->layer_pos_y,
+			                             canvas_sel_x, canvas_sel_y);
+		else if (op_is_active_layer_in_flis(args))
+			flis_update_layer_offset_after_crop(canvas_sel_x, canvas_sel_y);
+	}
 	gui_iface.on_crop_complete();
 	return retval;
 }
 
 int mirrorx_image_hook(struct generic_img_args *args, fits *fit, int nb_threads) {
 	mirrorx(fit, FALSE);
+	if (op_is_active_layer_in_flis(args))
+		flis_update_layer_offset_after_mirrorx();
 	return 0;
 }
 
 int mirrory_image_hook(struct generic_img_args *args, fits *fit, int nb_threads) {
 	mirrory(fit, FALSE);
+	if (op_is_active_layer_in_flis(args))
+		flis_update_layer_offset_after_mirrory();
 	return 0;
 }
 
@@ -1686,8 +1977,17 @@ int resample_image_hook(struct generic_img_args *args, fits *fit, int nb_threads
 	if (!params)
 		return 1;
 
+	int old_rx = (int)fit->rx, old_ry = (int)fit->ry;
 	int retval = verbose_resize_gaussian(fit, params->toX, params->toY,
 	                                params->interpolation, params->clamp, params->update_wcs);
+	if (!retval) {
+		if (op_has_carried_offset(args))
+			flis_layer_offset_recentre(args->layer_pos_x, args->layer_pos_y,
+			                           old_rx, old_ry, (int)fit->rx, (int)fit->ry);
+		else if (op_is_active_layer_in_flis(args))
+			flis_update_layer_offset_after_resize(old_rx, old_ry,
+			                                      (int)fit->rx, (int)fit->ry);
+	}
 	gui_iface.update_menu_state();
 	return retval;
 }
@@ -1697,6 +1997,7 @@ int rotation_image_hook(struct generic_img_args *args, fits *fit, int nb_threads
 	if (!params)
 		return 1;
 
+	int old_rx = (int)fit->rx, old_ry = (int)fit->ry;
 	// Check for fast rotation (90 degree increments)
 	int angle_int = (int)params->angle;
 	int retval;
@@ -1708,6 +2009,16 @@ int rotation_image_hook(struct generic_img_args *args, fits *fit, int nb_threads
 		retval = verbose_rotate_image(fit, params->area, params->angle,
 	                             params->interpolation, params->cropped,
 	                             params->clamp);
+	}
+
+	if (!retval) {
+		if (op_has_carried_offset(args))
+			flis_layer_offset_recentre(args->layer_pos_x, args->layer_pos_y,
+			                           old_rx, old_ry, (int)fit->rx, (int)fit->ry);
+		else if (op_is_active_layer_in_flis(args))
+			flis_update_layer_offset_after_rotate(old_rx, old_ry,
+			                                      (int)fit->rx, (int)fit->ry,
+			                                      params->angle);
 	}
 
 	// If a selection is set, expand it to cover the entire (rotated) image.
