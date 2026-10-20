@@ -95,6 +95,15 @@ if criterion_dep.found()
 
      test('rejection_test', rejection_exec, suite: 'arithmetic')
 
+     lsf_math_exec = executable('lsf_math_test',
+                                'lsf_math_test.c',
+                                dependencies : [siril_dep, criterion_dep],
+                                link_args : siril_link_arg,
+                                c_args : siril_c_flag,
+                                cpp_args : siril_cpp_flag)
+
+     test('lsf_math_test', lsf_math_exec, suite: 'arithmetic')
+
      ser_exec = executable('ser_test',
                            'ser_test.c',
                            dependencies : [siril_dep, criterion_dep],

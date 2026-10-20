@@ -1,0 +1,122 @@
+/*
+ * This file is part of Siril, an astronomy image processor.
+ * Copyright (C) 2012-2026 team free-astro (see more in AUTHORS file)
+ * Reference site is https://siril.org
+ *
+ * Siril is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * Siril is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with Siril. If not, see <http://www.gnu.org/licenses/>.
+ */
+
+/* Tests of the LSF accumulator arithmetic (FITS profile v0.4) */
+
+#include <math.h>
+#include <criterion/criterion.h>
+
+#include "lsf/lsf.h"
+
+static const float samples[] = { 0.12f, 0.15f, 0.11f, 0.14f, 0.13f, 0.18f, 0.10f, 0.16f, 0.12f, 0.17f };
+static const double weights[] = { 1.0, 0.5, 2.0, 1.5, 1.0, 0.8, 1.2, 0.9, 1.1, 0.7 };
+
+/* merging two batches equals computing over all samples at once */
+Test(lsf_math, merge_equals_one_shot) {
+	double m, W, M2, W2;
+	lsf_batch_stats(samples, weights, 10, &m, &W, &M2, &W2);
+
+	double ma, wa, m2a, w2a, mb, wb, m2b, w2b;
+	lsf_batch_stats(samples, weights, 4, &ma, &wa, &m2a, &w2a);
+	lsf_batch_stats(samples + 4, weights + 4, 6, &mb, &wb, &m2b, &w2b);
+	float mean = (float) ma, w = (float) wa, m2 = (float) m2a, w2 = (float) w2a;
+	WORD count = 4;
+	gboolean sat = FALSE;
+	lsf_merge(&mean, &w, &m2, &w2, &count, mb, wb, m2b, w2b, 6, &sat);
+
+	cr_assert_float_eq(mean, m, 1e-6);
+	cr_assert_float_eq(w, W, 1e-5);
+	cr_assert_float_eq(m2, M2, 1e-7);
+	cr_assert_float_eq(w2, W2, 1e-5);
+	cr_assert_eq(count, 10);
+	cr_assert(!sat);
+}
+
+Test(lsf_math, merge_into_empty_history) {
+	float mean = 0.f, w = 0.f, m2 = 0.f, w2 = 0.f;
+	WORD count = 0;
+	lsf_merge(&mean, &w, &m2, &w2, &count, 0.25, 3.0, 0.01, 3.0, 3, NULL);
+	cr_assert_float_eq(mean, 0.25f, 1e-7);
+	cr_assert_float_eq(w, 3.f, 1e-7);
+	cr_assert_float_eq(m2, 0.01f, 1e-9);
+	cr_assert_eq(count, 3);
+}
+
+Test(lsf_math, count_saturates) {
+	float mean = 0.5f, w = 1.f, m2 = 0.f, w2 = 1.f;
+	WORD count = 65530;
+	gboolean sat = FALSE;
+	lsf_merge(&mean, &w, &m2, &w2, &count, 0.5, 10.0, 0.0, 10.0, 10, &sat);
+	cr_assert_eq(count, 65535);
+	cr_assert(sat);
+}
+
+/* Section 10.7: c is about 1.014 at +-3 sigma and 1.048 at +-2.5 sigma */
+Test(lsf_math, clip_correction) {
+	cr_assert_float_eq(lsf_clip_correction(3.0, 3.0), 1.014, 1e-3);
+	cr_assert_float_eq(lsf_clip_correction(2.5, 2.5), 1.048, 1e-3);
+	cr_assert(lsf_clip_correction(10.0, 10.0) < 1.0000001);
+}
+
+/* with N equal weights: s2 = M2 / (N - 1) and sigma_pred2 = s2 (1 + 1/N),
+ * for both estimators of Section 10.8 */
+Test(lsf_math, sigma_pred_equal_weights) {
+	int N = 10;
+	double M2 = 0.09, s2 = M2 / (N - 1);
+	double rel = lsf_sigma_pred2(NO_WEIGHT, N, M2, N, N, 1.0);
+	double prec = lsf_sigma_pred2(NOISE_WEIGHT, N, M2, N, N, 1.0);
+	cr_assert_float_eq(rel, s2 * (1.0 + 1.0 / N), 1e-12);
+	cr_assert_float_eq(prec, s2 * (1.0 + 1.0 / N), 1e-12);
+	/* undefined with a single sample */
+	cr_assert(lsf_sigma_pred2(NO_WEIGHT, 1.0, 0.0, 1.0, 1, 1.0) < 0.0);
+	cr_assert(lsf_sigma_pred2(NOISE_WEIGHT, 1.0, 0.0, 1.0, 1, 1.0) < 0.0);
+}
+
+Test(lsf_math, sigma_hist_floor) {
+	/* sigma_frame is a floor */
+	cr_assert_float_eq(lsf_sigma_hist(0.0001, 1.0, 0.05, 1.0), 0.05, 1e-12);
+	cr_assert_float_eq(lsf_sigma_hist(0.04, 1.0, 0.05, 2.0), 0.4, 1e-12);
+	/* undefined sigma_pred: sigma_frame alone */
+	cr_assert_float_eq(lsf_sigma_hist(-1.0, 1.014, 0.03, 1.0), 0.03, 1e-12);
+}
+
+Test(lsf_math, outnorm_range) {
+	float m0[] = { 0.f, 0.2f, 0.5f, 0.9f }, w0[] = { 0.f, 1.f, 1.f, 0.f };
+	float *mean[3] = { m0, NULL, NULL }, *W[3] = { w0, NULL, NULL };
+	double mini, maxi;
+	cr_assert(lsf_outnorm_range(mean, W, 4, 1, &mini, &maxi));
+	cr_assert_float_eq(mini, 0.2, 1e-7);
+	cr_assert_float_eq(maxi, 0.5, 1e-7);
+}
+
+/* the SHA-256 is computed over big-endian float32 values */
+Test(lsf_math, hash_of_float_data) {
+	float zeros[4] = { 0.f, 0.f, 0.f, 0.f };
+	gchar *h = lsf_hash_float_data(zeros, 4);
+	/* SHA-256 of 16 zero bytes */
+	cr_assert_str_eq(h, "374708fff7719dd5979ec875d56cd2286f6d3cf7ec317a3b25632aab28ec37bb");
+	g_free(h);
+	float one = 1.f;	// 0x3f800000, big-endian bytes 3f 80 00 00
+	gchar *h1 = lsf_hash_float_data(&one, 1);
+	guchar be[4] = { 0x3f, 0x80, 0x00, 0x00 };
+	gchar *ref = g_compute_checksum_for_data(G_CHECKSUM_SHA256, be, 4);
+	cr_assert_str_eq(h1, ref);
+	g_free(h1);
+	g_free(ref);
+}

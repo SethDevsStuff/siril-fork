@@ -115,6 +115,9 @@ static command commands[] = {
 #ifndef _WIN32
 	{"ls", 0, "ls", process_ls, STR_LS, FALSE, REQ_CMD_NONE},
 #endif
+	{"lsf_append", 2, "lsf_append file.lsf.fits sequencename [-noreg] [-backup] [-hist_low=] [-hist_high=] [-hist_margin=]", process_lsf_append, STR_LSF_APPEND, TRUE, REQ_CMD_NONE},
+	{"lsf_export", 2, "lsf_export file.lsf.fits output_filename", process_lsf_export, STR_LSF_EXPORT, TRUE, REQ_CMD_NONE},
+	{"lsf_init", 2, "lsf_init sequencename file.lsf.fits [rej [rejection type] [sigma_low sigma_high]] [-nonorm, -norm=] [-fastnorm] [-rgb_equal] [-weight={noise|wfwhm|nbstars}] [-output_norm] [-hist_low=] [-hist_high=] [-hist_margin=] [-overwrite]", process_lsf_init, STR_LSF_INIT, TRUE, REQ_CMD_NONE},
 	{"makepsf", 1, "makepsf clear\n"
 				"makepsf load filename\n"
 				"makepsf save [filename]\n"

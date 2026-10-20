@@ -211,6 +211,12 @@ src_files = [
   'io/spcc_json.c',
 
   'livestacking/livestacking.c',
+  'lsf/lsf_commands.c',
+  'lsf/lsf_fits.c',
+  'lsf/lsf_math.c',
+  'lsf/lsf_settings.c',
+  'lsf/lsf_stack.c',
+  'lsf/lsf_weights.c',
 
   'opencv/opencv.cpp',
   'opencv/guidedfilter.cpp',
