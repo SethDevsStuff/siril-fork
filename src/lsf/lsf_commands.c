@@ -17,10 +17,12 @@
  * along with Siril. If not, see <http://www.gnu.org/licenses/>.
  */
 
-/* LSF commands: lsf_init, lsf_append, lsf_export (FITS profile v0.4,
- * Sections 1 and 10). These are the only paths that write an LSF file. */
+/* LSF commands: lsf_init, lsf_append, lsf_export, lsf_check, lsf_maps
+ * (FITS profile v0.4, Sections 1, 8 and 10). These are the only paths that
+ * write an LSF file. */
 
 #include <string.h>
+#include <math.h>
 #include <glib/gstdio.h>
 
 #include "yyjson.h"
@@ -37,17 +39,23 @@
 #include "registration/registration.h"
 #include "lsf/lsf.h"
 
-typedef enum { LSF_CMD_INIT, LSF_CMD_APPEND, LSF_CMD_EXPORT } lsf_cmd_mode;
+typedef enum { LSF_CMD_INIT, LSF_CMD_APPEND, LSF_CMD_EXPORT, LSF_CMD_CHECK, LSF_CMD_MAPS } lsf_cmd_mode;
+
+/* maps of lsf_maps (Section 10.9) */
+enum { LSF_MAP_NEFF = 1 << 0, LSF_MAP_NOISE = 1 << 1, LSF_MAP_SIGMA = 1 << 2, LSF_MAP_SNR = 1 << 3,
+	LSF_MAP_REJ = 1 << 4 };
 
 struct lsf_cmd_args {
 	lsf_cmd_mode mode;
 	gchar *seqname;
 	gchar *path;
-	gchar *out;		// export
+	gchar *out;		// export, or the maps prefix
 	lsf_settings settings;	// init: requested settings
 	gboolean hist_low_set, hist_high_set, hist_margin_set;
 	double hist_low, hist_high, hist_margin;
 	gboolean noreg, backup, overwrite;
+	gboolean repair, adopt;	// check
+	guint maps;		// maps, LSF_MAP_* flags
 };
 
 static void free_cmd_args(struct lsf_cmd_args *a) {
@@ -255,7 +263,7 @@ static int lsf_append_run(struct lsf_cmd_args *a) {
 	int *src_index = NULL;
 	GPtrArray *rows = g_ptr_array_new_with_free_func(lsf_ledger_row_free);
 
-	if (lsf_open_and_validate(a->path, &f)) {
+	if (lsf_open_and_validate(a->path, &f, FALSE)) {
 		lsf_file_free(&f);
 		g_ptr_array_free(rows, TRUE);
 		return 1;
@@ -337,6 +345,160 @@ end:
 	return retval;
 }
 
+static void print_summary(const lsf_file *f) {
+	const lsf_settings *s = &f->settings;
+	const fkeywords *k = &f->primary.keywords;
+	siril_log_message(_("LSF file %s: version %s, id %s, generation %d\n"), f->path, LSF_VERSION, f->uid, f->gen);
+	siril_log_message(_("  %ld frames in %d batch(es), STACKCNT %u, live time %.1f s\n"), f->ledger_rows,
+			f->nb_batches, k->stackcnt, k->livetime > 0.0 ? k->livetime : 0.0);
+	siril_log_message(_("  grid %dx%d, %d channel(s), sensor %s%s%s\n"), f->rx, f->ry, f->nchan,
+			s->is_cfa ? "CFA " : "mono", s->is_cfa ? s->bayer : "", s->is_cfa ? " (debayered)" : "");
+	siril_log_message(_("  rejection %s %g %g, history test low %g high %g margin %g\n"),
+			lsf_rejection_name(s->rej), s->sig[0], s->sig[1], s->hist_low, s->hist_high, s->hist_margin);
+	siril_log_message(_("  normalization %s%s%s, output normalization %s\n"), lsf_norm_name(s->norm),
+			s->lite_norm ? " (fast)" : "", s->rgb_equal ? " (RGB equalized)" : "", s->outnorm ? "on" : "off");
+	switch (s->weighting) {
+	case NOISE_WEIGHT:
+		siril_log_message(_("  weighting noise, frozen norm %g %g %g\n"), s->noise_norm[0],
+				f->nchan == 3 ? s->noise_norm[1] : 0.0, f->nchan == 3 ? s->noise_norm[2] : 0.0);
+		break;
+	case WFWHM_WEIGHT:
+		siril_log_message(_("  weighting wfwhm, frozen min %g max %g norm %g\n"), s->fwhm_min, s->fwhm_max, s->fwhm_norm);
+		break;
+	case NBSTARS_WEIGHT:
+		siril_log_message(_("  weighting nbstars, frozen min %g max %g norm %g\n"), s->stars_min, s->stars_max, s->stars_norm);
+		break;
+	default:
+		siril_log_message(_("  weighting none\n"));
+	}
+}
+
+/* lsf_check: Section 8 validation and a summary; Repair or Adopt when only
+ * check 8 failed */
+static int lsf_check_run(struct lsf_cmd_args *a) {
+	lsf_file f;
+	int retval = 1;
+	GPtrArray *none = NULL;
+	if (lsf_open_and_validate(a->path, &f, TRUE)) {
+		lsf_file_free(&f);
+		return 1;
+	}
+	print_summary(&f);
+	if (!f.stack_modified) {
+		siril_log_info(_("LSF: %s passed all the checks of Section 8\n"), a->path);
+		if (a->repair || a->adopt)
+			siril_log_message(_("LSF: the Stack matches the accumulator, there is nothing to repair or adopt\n"));
+		retval = 0;
+		goto end;
+	}
+	if (!a->repair && !a->adopt) {
+		siril_log_error(_("LSF: %s fails check 8, its Stack was modified outside Siril. lsf_append will "
+					"refuse it until lsf_check is run with -repair (rebuild the Stack from the "
+					"accumulator) or -adopt (keep the edit)\n"), a->path);
+		goto end;
+	}
+	gchar *card;
+	int gen = f.gen + 1;
+	if (a->adopt) {
+		size_t n = (size_t) f.rx * f.ry, changed = 0;
+		gboolean norm = f.settings.outnorm;
+		if (norm && !(f.settings.outnorm_max > f.settings.outnorm_min)) {
+			siril_log_error(_("LSF: the output normalization range of %s is not valid, the edited Stack cannot be adopted\n"), a->path);
+			goto end;
+		}
+		for (int c = 0; c < f.nchan; c++)
+			changed += lsf_adopt_plane(f.hist.plane[LSF_PL_MEAN][c], f.hist.plane[LSF_PL_W][c],
+					f.stack_data + c * n, n, norm, f.settings.outnorm_min, f.settings.outnorm_max);
+		siril_log_message(_("LSF: %zu edited pixel(s) adopted into MEAN, M2 is unchanged\n"), changed);
+		card = g_strdup_printf("LSF generation %d: adopted the Stack edited outside Siril, %zu pixels", gen, changed);
+	} else {
+		card = g_strdup_printf("LSF generation %d: Stack edited outside Siril, repaired from MEAN", gen);
+	}
+	f.primary.history = g_slist_append(f.primary.history, card);
+	if (lsf_build_primary(&f.primary, &f.settings, &f.hist))
+		goto end;
+	none = g_ptr_array_new();
+	if (lsf_write_file(a->path, &f, &f.settings, &f.hist, &f.primary, f.uid, gen, none, f.nb_batches, a->backup))
+		goto end;
+	if (a->adopt)
+		siril_log_info(_("LSF: edited Stack of %s adopted, generation %d\n"), a->path, gen);
+	else siril_log_info(_("LSF: Stack of %s repaired from the accumulator, generation %d\n"), a->path, gen);
+	retval = 0;
+end:
+	if (none)
+		g_ptr_array_free(none, TRUE);
+	lsf_file_free(&f);
+	return retval;
+}
+
+/* lsf_maps: images derived from the accumulator (Sections 10.8, 10.9). The
+ * noise and sigma maps are in the units of the Stack. */
+static int lsf_maps_run(struct lsf_cmd_args *a) {
+	static const struct { guint flag; const char *suffix, *what; } kinds[] = {
+		{ LSF_MAP_NEFF, "neff", "effective number of frames" },
+		{ LSF_MAP_NOISE, "noise", "standard deviation of the mean" },
+		{ LSF_MAP_SIGMA, "sigma", "standard deviation of one frame" },
+		{ LSF_MAP_SNR, "snr", "mean over its standard deviation" },
+	};
+	lsf_file f;
+	int retval = 0;
+	if (lsf_open_and_validate(a->path, &f, TRUE)) {
+		lsf_file_free(&f);
+		return 1;
+	}
+	if (f.stack_modified)
+		siril_log_warning(_("LSF: the maps come from the accumulator, which is intact\n"));
+	if (a->maps & LSF_MAP_REJ)
+		siril_log_warning(_("LSF: %s has no rejection maps (LSF_REJ is not supported in this version)\n"), a->path);
+	const lsf_settings *s = &f.settings;
+	double scale = s->outnorm && s->outnorm_max > s->outnorm_min ? 1.0 / (s->outnorm_max - s->outnorm_min) : 1.0;
+	size_t n = (size_t) f.rx * f.ry;
+	for (int m = 0; m < (int) G_N_ELEMENTS(kinds) && !retval; m++) {
+		if (!(a->maps & kinds[m].flag))
+			continue;
+		fits *fit = NULL;
+		if (new_fit_image(&fit, f.rx, f.ry, f.nchan, DATA_FLOAT)) {
+			retval = 1;
+			break;
+		}
+		copy_fits_metadata(&f.primary, fit);
+		lsf_strip_lsf_keys(fit);
+		fit->keywords.lo = fit->keywords.hi = 0;
+		fit->keywords.flo = fit->keywords.fhi = 0.f;
+		for (int c = 0; c < f.nchan; c++) {
+			const float *mean = f.hist.plane[LSF_PL_MEAN][c], *W = f.hist.plane[LSF_PL_W][c];
+			const float *M2 = f.hist.plane[LSF_PL_M2][c], *W2 = f.hist.plane[LSF_PL_W2][c];
+			const WORD *N = f.hist.count[c];
+			float *out = fit->fpdata[c];
+			for (size_t i = 0; i < n; i++) {
+				double neff, s2, vm, v;
+				lsf_pixel_stats(s->weighting, W[i], M2[i], W2[i], N[i], &neff, &s2, &vm);
+				switch (kinds[m].flag) {
+				case LSF_MAP_NEFF: v = neff > 0.0 ? neff : 0.0; break;
+				case LSF_MAP_NOISE: v = vm >= 0.0 ? sqrt(vm) * scale : 0.0; break;
+				case LSF_MAP_SIGMA: v = s2 >= 0.0 ? sqrt(s2) * scale : 0.0; break;
+				default: v = vm > 0.0 ? mean[i] / sqrt(vm) : 0.0; break;
+				}
+				out[i] = (float) v;
+			}
+		}
+		fit->history = g_slist_append(fit->history, g_strdup_printf("LSF %s map (%s)",
+					kinds[m].suffix, kinds[m].what));
+		fit->history = g_slist_append(fit->history, g_strdup_printf("from LSF file %s, generation %d",
+					f.uid, f.gen));
+		gchar *name = g_strdup_printf("%s_%s", a->out, kinds[m].suffix);
+		if (savefits(name, fit)) {
+			siril_log_error(_("LSF: could not save the %s map\n"), kinds[m].suffix);
+			retval = 1;
+		} else siril_log_message(_("LSF: %s map (%s) saved as %s\n"), kinds[m].suffix, kinds[m].what, name);
+		g_free(name);
+		clearfits(fit);
+		free(fit);
+	}
+	lsf_file_free(&f);
+	return retval;
+}
+
 static gpointer lsf_worker(gpointer p) {
 	struct lsf_cmd_args *a = p;
 	int retval;
@@ -346,6 +508,12 @@ static gpointer lsf_worker(gpointer p) {
 		break;
 	case LSF_CMD_APPEND:
 		retval = lsf_append_run(a);
+		break;
+	case LSF_CMD_CHECK:
+		retval = lsf_check_run(a);
+		break;
+	case LSF_CMD_MAPS:
+		retval = lsf_maps_run(a);
 		break;
 	default:
 		retval = lsf_export_master(a->path, a->out);
@@ -516,6 +684,63 @@ int process_lsf_export(int nb) {
 	a->mode = LSF_CMD_EXPORT;
 	a->path = g_strdup(word[1]);
 	a->out = g_strdup(word[2]);
+	if (!start_in_new_thread(lsf_worker, a)) {
+		free_cmd_args(a);
+		return CMD_GENERIC_ERROR;
+	}
+	return CMD_OK;
+}
+
+/* lsf_check file.lsf.fits [-repair | -adopt] [-backup] */
+int process_lsf_check(int nb) {
+	struct lsf_cmd_args *a = calloc(1, sizeof(struct lsf_cmd_args));
+	a->mode = LSF_CMD_CHECK;
+	a->path = g_strdup(word[1]);
+	for (int i = 2; i < nb && word[i]; i++) {
+		const char *w = word[i];
+		if (!strcmp(w, "-repair")) a->repair = TRUE;
+		else if (!strcmp(w, "-adopt")) a->adopt = TRUE;
+		else if (!strcmp(w, "-backup")) a->backup = TRUE;
+		else {
+			siril_log_error(_("Unknown parameter %s, aborting.\n"), w);
+			goto failure;
+		}
+	}
+	if (a->repair && a->adopt) {
+		siril_log_error(_("-repair and -adopt cannot be used together\n"));
+		goto failure;
+	}
+	if (!start_in_new_thread(lsf_worker, a)) {
+		free_cmd_args(a);
+		return CMD_GENERIC_ERROR;
+	}
+	return CMD_OK;
+failure:
+	free_cmd_args(a);
+	return CMD_ARG_ERROR;
+}
+
+/* lsf_maps file.lsf.fits prefix [-neff] [-noise] [-sigma] [-snr] [-rej] */
+int process_lsf_maps(int nb) {
+	struct lsf_cmd_args *a = calloc(1, sizeof(struct lsf_cmd_args));
+	a->mode = LSF_CMD_MAPS;
+	a->path = g_strdup(word[1]);
+	a->out = g_strdup(word[2]);
+	for (int i = 3; i < nb && word[i]; i++) {
+		const char *w = word[i];
+		if (!strcmp(w, "-neff")) a->maps |= LSF_MAP_NEFF;
+		else if (!strcmp(w, "-noise")) a->maps |= LSF_MAP_NOISE;
+		else if (!strcmp(w, "-sigma")) a->maps |= LSF_MAP_SIGMA;
+		else if (!strcmp(w, "-snr")) a->maps |= LSF_MAP_SNR;
+		else if (!strcmp(w, "-rej")) a->maps |= LSF_MAP_REJ;
+		else {
+			siril_log_error(_("Unknown parameter %s, aborting.\n"), w);
+			free_cmd_args(a);
+			return CMD_ARG_ERROR;
+		}
+	}
+	if (!(a->maps & ~LSF_MAP_REJ))
+		a->maps |= LSF_MAP_NEFF | LSF_MAP_NOISE | LSF_MAP_SIGMA | LSF_MAP_SNR;
 	if (!start_in_new_thread(lsf_worker, a)) {
 		free_cmd_args(a);
 		return CMD_GENERIC_ERROR;

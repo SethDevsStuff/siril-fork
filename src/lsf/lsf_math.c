@@ -121,6 +121,58 @@ double lsf_sigma_hist(double sigma_pred2, double c, double sigma_frame, double m
 	return margin * s;
 }
 
+/* statistics of Section 10.8 at one pixel and channel: effective sample
+ * size, variance of one sample (unit-weight variance for noise weights) and
+ * variance of the mean. Each is set to a negative value where undefined. */
+void lsf_pixel_stats(weightingType scheme, double W, double M2, double W2, int N,
+		double *neff, double *sigma2, double *var_mean) {
+	*neff = *sigma2 = *var_mean = -1.0;
+	if (W <= 0.0)
+		return;
+	if (W2 > 0.0)
+		*neff = W * W / W2;
+	if (scheme == NOISE_WEIGHT) {
+		if (N < 2)
+			return;
+		*sigma2 = M2 / (double) (N - 1);
+		*var_mean = *sigma2 / W;
+		return;
+	}
+	if (*neff <= LSF_NEFF_MIN)
+		return;
+	*sigma2 = M2 / (W - W2 / W);
+	*var_mean = *sigma2 * W2 / (W * W);
+}
+
+/* value of the Stack (HDU 0) at one pixel: 0 without data, output-normalized
+ * when norm, otherwise clamped to [0,1] as Siril's 32-bit stacks are
+ * (Sections 3, 4.1) */
+float lsf_stack_value(float mean, float w, gboolean norm, double mini, double range) {
+	if (!(w > 0.f))
+		return 0.f;
+	if (norm)
+		return (float) (((double) mean - mini) / range);
+	return mean < 0.f ? 0.f : (mean > 1.f ? 1.f : mean);
+}
+
+/* Adopt (Section 8): the edited Stack disp becomes the new MEAN. A pixel
+ * whose Stack value is still the one MEAN gives was not edited and keeps
+ * MEAN exactly, which also keeps the values clamped or rounded by the Stack.
+ * Edited pixels get MEAN from disp, inverting the output normalization.
+ * Pixels without data (W = 0) stay 0. Returns the number of pixels changed. */
+size_t lsf_adopt_plane(float *mean, const float *w, const float *disp, size_t n,
+		gboolean norm, double mini, double maxi) {
+	double range = maxi - mini;
+	size_t changed = 0;
+	for (size_t i = 0; i < n; i++) {
+		if (!(w[i] > 0.f) || disp[i] == lsf_stack_value(mean[i], w[i], norm, mini, range))
+			continue;
+		mean[i] = norm ? (float) ((double) disp[i] * range + mini) : disp[i];
+		changed++;
+	}
+	return changed;
+}
+
 /* min and max for the output normalization: over all channels, where W > 0
  * and the mean is non-zero, as norm_to_0_1_range() does for stacks */
 gboolean lsf_outnorm_range(float *const mean[3], float *const W[3], size_t n, int nchan,

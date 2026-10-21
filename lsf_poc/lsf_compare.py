@@ -37,9 +37,26 @@ Stage check  <p>_check.csv          pure-Python v0.4 structure checks of every .
                                     LSFHASH == sha256(primary data), plus `fitsverify` if on PATH.
                                     Raises if any check fails.
 Stage parity <p>_parity.csv         lsf_set_k vs siril_set_k and lsf_cum_X vs siril_cum_X:
-                                    per-channel max abs and max rel difference. Known, expected
+                                    per-channel max abs and max rel difference; pixels that
+                                    differ at full and at partial coverage (LSF_COUNT vs
+                                    STACKCNT) and that have data in only one image; Siril's
+                                    Noise Estimation of both images and the rows where it
+                                    differs. These are the same frames with the same settings,
+                                    so the images are expected to be identical. Known, expected
                                     exceptions (logged): wfwhm / nbstars weighting, and sigmedian
                                     rejection without weights.
+             <p>_diff_<pair>.fit    LSF - Siril, written only for pairs that differ.
+Stage flip   <p>_flip.csv           Section 12 check 7, on a scratch copy of an LSF product: its
+                                    Stack flipped with the old DATASUM kept; lsf_append must refuse
+                                    it, lsf_check -repair must restore it bit-exactly, and one
+                                    pixel edited then kept with -adopt must change nothing else.
+Stage drift  <p>_drift.csv          Section 12 check 8, synthetic frames from a fixed noise model:
+                                    lsf_init then --drift-appends appends; the history-test
+                                    rejection (HISTORY cards) must stay flat.
+Stage weights <p>_weights.csv       Section 12 check 9: a good batch, then a batch with twice the
+                                    noise, noise weighting: a poor frame must weigh about 1/4 of a
+                                    good one (ledger WEIGHT).
+The flip, drift and weights stages raise if their test fails.
 Stage stats  <p>_noise.csv          one row per file and channel; the .lsf.fits files are loaded
                                     directly (this also tests that Siril opens one as an image).
 
@@ -51,9 +68,13 @@ is computed once (lsf_set_1) and copied to lsf_cum_1 and lsf_1 (siril_set_1 -> s
 NOISE
 -----
 For every product the script loads it in Siril, runs `stat [-cfa] [main]` and reads the per-channel
-statistics back through the Python API. Siril's background noise estimate is the `bgnoise` column.
-The script also measures an independent per-pixel noise (robust MAD of neighbour differences on a
-few horizontal bands; --no-own-noise to skip).
+statistics back through the Python API. `noise_est_adu` is the value Tools > Image Analysis > Noise
+Estimation (the bgnoise command) logs for each channel, and `noise_est_mean_adu` their mean: Siril's
+background noise (FnNoise1: the RMS of the differences between neighbouring pixels in each row,
+5-sigma clipped, median over the rows, divided by sqrt(2)), x65535 for float images. It comes from
+a plain `stat`, run first when --cfa or --stat-main is set. The raw statistic is the `bgnoise`
+column. The script also measures an independent per-pixel noise (robust MAD of neighbour
+differences on a few horizontal bands; --no-own-noise to skip).
 
 CLEAN-UP
 --------
@@ -82,6 +103,7 @@ import math
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -100,7 +122,7 @@ except ImportError:
 N_SETS = 4
 STAT_FIELDS = ("total", "ngoodpix", "mean", "median", "sigma", "avgDev", "mad", "sqrtbwmv",
                "location", "scale", "min", "max", "normValue", "bgnoise")
-STAGES = ("base", "siril", "sos", "iter", "check", "parity", "stats")   # run order
+STAGES = ("base", "siril", "sos", "iter", "check", "flip", "parity", "stats", "drift", "weights")   # run order
 SKIPPABLE = STAGES
 
 # Siril's 8 rejection methods -> `stack` / lsf_init token, and Siril's default low/high
@@ -287,6 +309,205 @@ def channel_diffs(x, y) -> list:
     return out
 
 
+_FITS_DTYPES = {8: ">u1", 16: ">i2", 32: ">i4", 64: ">i8", -32: ">f4", -64: ">f8"}
+
+
+def fits_image(path: str, extname=None):
+    """Image HDU (the primary, or the one named `extname`) read straight from the file as float64
+    (channels, h, w) in file row order, with BSCALE/BZERO applied. None when the HDU is missing or
+    tile-compressed. Reading every image the same way keeps LSF and Siril files in one orientation."""
+    for h in read_hdus(path):
+        c = h["cards"]
+        if extname is not None and c.get("EXTNAME") != extname:
+            continue
+        if c.get("ZIMAGE") == "T" or int(c.get("NAXIS", 0)) < 2:
+            return None
+        dims = [int(c[f"NAXIS{i}"]) for i in range(int(c["NAXIS"]), 0, -1)]
+        with open(path, "rb") as f:
+            f.seek(h["data_offset"])
+            a = np.frombuffer(f.read(h["data_size"]), dtype=_FITS_DTYPES[int(c["BITPIX"])]).reshape(dims)
+        a = a.astype(np.float64) * float(c.get("BSCALE", 1)) + float(c.get("BZERO", 0))
+        return a[None] if a.ndim == 2 else a
+    return None
+
+
+def noise_estimation(img) -> tuple:
+    """Siril's "Noise Estimation" (Tools > Image Analysis, the bgnoise command), ported from
+    FnNoise1_float in src/algos/quantize.c: in each row, the first differences between consecutive
+    pixels that are not 0 or NaN; their RMS (population sigma), 5-sigma clipped up to 3 times; the
+    median over rows, times 1/sqrt(2). Returns (noise, per-row sigma with NaN for skipped rows), in
+    the units of `img` (Siril logs it x65535 for float images)."""
+    img = np.asarray(img, dtype=np.float32)
+    rows = np.full(img.shape[0], np.nan)
+    for j, r in enumerate(img):
+        v = r[(r != 0) & ~np.isnan(r)]
+        if v.size < 3:
+            continue
+        d = v[:-1] - v[1:]
+        dd = d.astype(np.float64)
+        mean, sd = dd.mean(), dd.std()
+        if sd > 0:
+            for _ in range(3):
+                keep = np.abs(d - np.float32(mean)) < 5.0 * sd
+                if keep.all():
+                    break
+                d = d[keep]
+                dd = d.astype(np.float64)
+                mean, sd = dd.mean(), dd.std()
+        rows[j] = sd
+    ok = rows[~np.isnan(rows)]
+    return (0.70710678 * float(np.median(ok)) if ok.size else 0.0), rows
+
+
+def write_fits_float32(path: str, data, history=()) -> None:
+    """Minimal float32 FITS writer (primary HDU only), stdlib + numpy, for diagnostic images."""
+    a = np.asarray(data, dtype=">f4")
+    if a.ndim == 3 and a.shape[0] == 1:
+        a = a[0]
+    cards = ["SIMPLE  =                    T", "BITPIX  =                  -32", f"NAXIS   = {a.ndim:20d}"]
+    cards += [f"NAXIS{i + 1:<3d}= {n:20d}" for i, n in enumerate(reversed(a.shape))]
+    cards += [f"HISTORY {h}"[:80] for h in history] + ["END"]
+    head = "".join(c.ljust(80) for c in cards).encode("ascii")
+    with open(path, "wb") as f:
+        f.write(head + b" " * (-len(head) % 2880))
+        raw = a.tobytes()
+        f.write(raw + b"\0" * (-len(raw) % 2880))
+
+
+def history_cards(path: str) -> list:
+    """Text of the HISTORY cards of the primary header, in order."""
+    out = []
+    with open(path, "rb") as f:
+        while True:
+            block = f.read(2880)
+            if len(block) < 2880:
+                break
+            for i in range(0, 2880, 80):
+                card = block[i:i + 80].decode("ascii", "replace")
+                if card.startswith("END") and not card[3:].strip():
+                    return out
+                if card.startswith("HISTORY"):
+                    out.append(card[8:].rstrip())
+    return out
+
+
+def rejection_from_history(cards: list) -> dict:
+    """{generation: [(batch_low, batch_high, hist_low, hist_high) per channel]} in percent, from the
+    'LSF gen G ch C rejected %: ...' HISTORY cards written by lsf_init and lsf_append."""
+    out = {}
+    for c in cards:
+        m = re.match(r"LSF gen (\d+) ch (\d+) rejected %: ([\d.]+) ([\d.]+) hist ([\d.]+) ([\d.]+)", c)
+        if m:
+            out.setdefault(int(m.group(1)), []).append(tuple(float(m.group(k)) for k in range(3, 7)))
+    return out
+
+
+_TFORM_BYTES = {"L": 1, "X": 1, "B": 1, "I": 2, "J": 4, "K": 8, "A": 1, "E": 4, "D": 8, "C": 8, "M": 16,
+                "P": 8, "Q": 16}
+_TFORM_NUMPY = {"B": ">u1", "I": ">i2", "J": ">i4", "K": ">i8", "E": ">f4", "D": ">f8"}
+
+
+def table_column(path: str, extname: str, name: str) -> np.ndarray:
+    """A numeric column of a BINTABLE as an array (rows, repeat), read from the fixed-size part of
+    the rows (stdlib + numpy; variable-length columns are skipped over, not read)."""
+    for h in read_hdus(path):
+        c = h["cards"]
+        if c.get("EXTNAME") != extname:
+            continue
+        nrows, width = int(c["NAXIS2"]), int(c["NAXIS1"])
+        offset = 0
+        for k in range(1, int(c["TFIELDS"]) + 1):
+            m = re.match(r"(\d*)([A-Z])", c[f"TFORM{k}"].strip())
+            rep, code = int(m.group(1) or 1), m.group(2)
+            size = rep * _TFORM_BYTES[code] if code not in "PQ" else _TFORM_BYTES[code]
+            if c.get(f"TTYPE{k}", "").strip() == name:
+                with open(path, "rb") as f:
+                    f.seek(h["data_offset"])
+                    raw = np.frombuffer(f.read(nrows * width), dtype=np.uint8).reshape(nrows, width)
+                cells = np.ascontiguousarray(raw[:, offset:offset + size])
+                return cells.view(_TFORM_NUMPY[code]).reshape(nrows, rep).astype(np.float64)
+            offset += size
+        raise KeyError(f"{extname} has no column {name}")
+    raise KeyError(f"{os.path.basename(path)} has no {extname}")
+
+
+def primary_layout(path: str) -> tuple:
+    """(data offset, shape (channels, h, w)) of the primary image."""
+    c = read_hdus(path)[0]
+    cards = c["cards"]
+    n = int(cards["NAXIS"])
+    shape = (int(cards["NAXIS3"]) if n == 3 else 1, int(cards["NAXIS2"]), int(cards["NAXIS1"]))
+    return c["data_offset"], shape
+
+
+def primary_bytes(path: str) -> bytes:
+    off, shape = primary_layout(path)
+    with open(path, "rb") as f:
+        f.seek(off)
+        return f.read(int(np.prod(shape)) * 4)
+
+
+def edit_primary(path: str, fn) -> None:
+    """Rewrites the float32 primary data in place with fn(array (channels, h, w)) -> array, leaving
+    every header untouched (so DATASUM and CHECKSUM keep their old values), as an outside tool that
+    keeps the extensions would."""
+    off, shape = primary_layout(path)
+    with open(path, "r+b") as f:
+        f.seek(off)
+        a = np.frombuffer(f.read(int(np.prod(shape)) * 4), dtype=">f4").reshape(shape)
+        f.seek(off)
+        f.write(np.ascontiguousarray(fn(a.copy()), dtype=">f4").tobytes())
+
+
+def synthetic_frames(n: int, sigma: float, seed: int, shape=(128, 128), level=0.2) -> list:
+    """n frames of a fixed sky (a smooth pattern and a few Gaussian stars on a constant level) plus
+    independent Gaussian noise of the given sigma: the fixed noise model of the Section 12 tests."""
+    h, w = shape
+    yy, xx = np.mgrid[0:h, 0:w]
+    sky = level + 0.02 * np.sin(xx / 9.0) * np.cos(yy / 13.0)
+    rs = np.random.default_rng(12345)
+    for _ in range(12):
+        cy, cx, amp = rs.uniform(8, h - 8), rs.uniform(8, w - 8), rs.uniform(0.05, 0.4)
+        sky = sky + amp * np.exp(-((yy - cy) ** 2 + (xx - cx) ** 2) / (2 * 1.8 ** 2))
+    rng = np.random.default_rng(seed)
+    return [(sky + rng.normal(0.0, sigma, shape)).astype(np.float32) for _ in range(n)]
+
+
+def parity_breakdown(x, y, count=None, stackcnt=None) -> list:
+    """Per-channel parity of an LSF stack x against a Siril stack y (both (channels, h, w), same
+    orientation). Splits the pixels into full coverage (LSF_COUNT == STACKCNT), partial coverage,
+    and pixels where exactly one image is 0 (no data in one of them), and compares Siril's noise
+    estimate on both, row by row."""
+    x, y = as_channels(x), as_channels(y)
+    if x.shape != y.shape:
+        raise RuntimeError(f"shape mismatch {x.shape} vs {y.shape}")
+    out = []
+    for c in range(x.shape[0]):
+        d = np.abs(x[c] - y[c])
+        one_zero = (x[c] == 0) ^ (y[c] == 0)
+        both = ~one_zero
+        r = {"n_diff": int((d > 0).sum()), "max_abs": float(d.max()) if d.size else 0.0,
+             "max_abs_both_data": float(d[both].max()) if both.any() else 0.0,
+             "n_one_zero": int(one_zero.sum())}
+        if count is not None and stackcnt:
+            n = count[c] if count.shape[0] > c else count[0]
+            full = n == stackcnt
+            r["n_diff_full"] = int((d[full] > 0).sum())
+            r["n_diff_partial"] = int((d[~full] > 0).sum())
+            r["max_abs_full"] = float(d[full].max()) if full.any() else 0.0
+            r["max_abs_partial"] = float(d[~full].max()) if (~full).any() else 0.0
+        nx, rx = noise_estimation(x[c])
+        ny, ry = noise_estimation(y[c])
+        rel = np.abs(rx - ry) / np.where(ry > 0, ry, np.nan)
+        r["noise_lsf"], r["noise_siril"] = nx, ny
+        r["noise_ratio"] = nx / ny if ny else float("nan")
+        r["rows_noise_differ"] = int(np.nansum(rel > 1e-4))
+        worst = np.argsort(np.nan_to_num(rel, nan=-1.0))[::-1][:5]
+        r["worst_rows"] = [(int(j), float(rel[j])) for j in worst if np.isfinite(rel[j]) and rel[j] > 1e-4]
+        out.append(r)
+    return out
+
+
 def check_lsf_file(path: str) -> tuple:
     """v0.4 structural checks of one LSF file. Returns (results, info) where results is a list of
     (check, ok, detail) and info = {uid, gen}."""
@@ -341,16 +562,78 @@ def check_lsf_file(path: str) -> tuple:
     return res, {"uid": uid, "gen": gen_i}
 
 
+def var_string_bad_rows(path: str, hdu_index: int, col: int) -> list:
+    """Rows (1-based) whose variable-length string (TFORM nPA / nQA) in column `col` of HDU
+    `hdu_index` (0-based) holds bytes outside printable ASCII, read straight from the heap."""
+    hdu = read_hdus(path)[hdu_index]
+    c = hdu["cards"]
+    width, nrows = int(c["NAXIS1"]), int(c["NAXIS2"])
+    offs, pos, kind = {}, 0, None
+    for i in range(1, int(c["TFIELDS"]) + 1):
+        m = re.match(r"\s*(\d*)([A-Z])(\w?)", c[f"TFORM{i}"])
+        rep, code = int(m.group(1) or 1), m.group(2)
+        offs[i] = pos
+        if i == col:
+            kind = code if code in "PQ" and m.group(3) == "A" else None
+        pos += _TFORM_BYTES[code] * (1 if code in "PQ" else rep)
+    if kind is None:
+        raise ValueError(f"column {col} is not a variable-length string column")
+    heap = hdu["data_offset"] + int(c.get("THEAP", width * nrows))
+    bad = []
+    with open(path, "rb") as f:
+        for r in range(nrows):
+            f.seek(hdu["data_offset"] + r * width + offs[col])
+            n, off = struct.unpack(">ii" if kind == "P" else ">qq", f.read(8 if kind == "P" else 16))
+            f.seek(heap + off)
+            if any(b < 32 or b > 126 for b in f.read(n)):
+                bad.append(r + 1)
+    return bad
+
+
 def run_fitsverify(path: str):
-    """(ok, detail) from fitsverify, or None if it is not on PATH."""
+    """(ok, detail) from fitsverify, or None if it is not on PATH.
+
+    CFITSIO (seen in 4.7.0) truncates a variable-length string when reading it across two FITS block
+    boundaries, and fitsverify then scans stale bytes of its reused buffer and reports "String in row
+    #r, and column #c contains non-ASCII text". Such errors are re-checked byte for byte from the heap
+    and ignored when the stored string is clean; any other fitsverify error is a failure."""
     exe = shutil.which("fitsverify")
     if not exe:
         return None
-    r = subprocess.run([exe, "-q", path], capture_output=True, text=True)
+    r = subprocess.run([exe, path], capture_output=True, text=True)
     out = (r.stdout + r.stderr).strip()
-    m = re.search(r"(\d+)\s+error", out)
-    errors = int(m.group(1)) if m else (0 if r.returncode == 0 else 1)
-    return errors == 0, out.splitlines()[-1] if out else f"exit {r.returncode}"
+    m = re.search(r"found\s+(\d+)\s+warning\(s\) and\s+(\d+)\s+error", out)
+    errors = int(m.group(2)) if m else (0 if r.returncode == 0 else 1)
+    if errors == 0:
+        return True, "verification OK"
+    hdu, other, suspect = 0, [], {}
+    for line in out.splitlines():
+        h = re.search(r"=+\s*HDU\s+(\d+):", line)
+        if h:
+            hdu = int(h.group(1)) - 1                     # fitsverify numbers HDUs from 1
+        elif "*** Error:" in line:
+            v = re.search(r"String in row #(\d+), and column #(\d+) contains non-ASCII text", line)
+            if v:
+                suspect.setdefault((hdu, int(v.group(2))), []).append(int(v.group(1)))
+            else:
+                other.append(line.split("*** Error:", 1)[1].strip())
+    if "give up" in out:
+        other.append("fitsverify gave up (too many errors)")
+    n_suspect = sum(len(v) for v in suspect.values())
+    if n_suspect + len(other) != errors:
+        other.append(f"{errors} errors reported, {n_suspect + len(other)} parsed")
+    for (h, col), rows in suspect.items():
+        try:
+            bad = var_string_bad_rows(path, h, col)
+        except Exception as e:  # noqa: BLE001
+            other.append(f"HDU {h + 1} col {col}: cannot re-check ({e})")
+            continue
+        if bad:
+            other.append(f"HDU {h + 1} col {col}: non-ASCII bytes in rows {bad[:10]}")
+    if other:
+        return False, f"{errors} error(s): " + "; ".join(other[:5])
+    return True, (f"verification OK apart from {n_suspect} CFITSIO long-string read false positive(s) "
+                  f"(stored strings checked byte for byte)")
 
 
 def run_cmd(siril, *parts) -> None:
@@ -382,7 +665,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--skip", nargs="+", choices=SKIPPABLE, default=[],
                    help="Leave out stages: base (lsf_init per-set + running stacks), siril (native stack), "
                         "sos (stack on stack), iter (lsf_append chain), check (v0.4 structure), "
-                        "parity (LSF vs Siril), stats (noise export).")
+                        "flip (repair/adopt test), parity (LSF vs Siril), stats (noise export), "
+                        "drift (rejection over many appends), weights (frozen weight constants).")
     p.add_argument("--export-fits", action="store_true",
                    help="Also write <name>.fit next to every LSF file with lsf_export.")
     g = p.add_argument_group("stacking settings (shared by lsf_init and stack)")
@@ -398,6 +682,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Rejection for the stack on stack only (default: same as --rejection).")
     g.add_argument("--sos-sigma-low", type=float, default=None)
     g.add_argument("--sos-sigma-high", type=float, default=None)
+    g.add_argument("--drift-appends", type=int, default=50,
+                   help="Number of appends in the drift test (default 50, Section 12 check 8).")
     g = p.add_argument_group("noise export")
     g.add_argument("--cfa", action="store_true", help="Add -cfa to the stat command (undebayered data).")
     g.add_argument("--stat-main", action="store_true",
@@ -448,7 +734,8 @@ class Comparison:
             out += [self.p(f"lsf_{k}.lsf.fits") for k in range(1, N_SETS + 1)]
         if a.export_fits:
             out += [plain_path(f) for f in out if f.endswith(".lsf.fits")]
-        for st, name in (("check", "check.csv"), ("parity", "parity.csv"), ("stats", "noise.csv")):
+        for st, name in (("check", "check.csv"), ("flip", "flip.csv"), ("parity", "parity.csv"),
+                         ("stats", "noise.csv"), ("drift", "drift.csv"), ("weights", "weights.csv")):
             if st not in a.skip:
                 out.append(self.p(name))
         return out
@@ -720,8 +1007,16 @@ class Comparison:
         run_cmd(self.siril, "load", _q(path))
         return as_channels(self.siril.get_image_pixeldata())
 
+    BREAKDOWN_FIELDS = ("n_diff", "max_abs_both_data", "n_one_zero", "n_diff_full", "max_abs_full",
+                        "n_diff_partial", "max_abs_partial", "noise_lsf_adu", "noise_siril_adu", "noise_ratio",
+                        "rows_noise_differ")
+
     def stage_parity(self, step) -> None:
-        """LSF vs native Siril stacks, per channel."""
+        """LSF vs native Siril stacks, per channel. Same frames, same reference and settings, so the
+        Stack of an lsf_init file is expected to equal Siril's stack exactly (see known_exceptions).
+        Both images are read from the files in the same orientation; when they differ, a diff image
+        <p>_diff_<pair>.fit (LSF - Siril) is written and the differences are broken down by coverage,
+        with Siril's Noise Estimation computed on both images, row by row."""
         pairs = [(f"set_{k}", f"lsf_set_{k}.lsf.fits", f"siril_set_{k}.fit") for k in range(1, N_SETS + 1)]
         pairs += [(f"cum_{cum_tag(k)}", f"lsf_cum_{cum_tag(k)}.lsf.fits", f"siril_cum_{cum_tag(k)}.fit")
                   for k in range(1, N_SETS + 1)]
@@ -729,10 +1024,11 @@ class Comparison:
         if exc:
             self.log("Parity: known exceptions apply, differences are expected: " + "; ".join(exc), LogColor.SALMON)
         csv_path = self.p("parity.csv")
+        mismatched = []
         with open(csv_path, "w", newline="", encoding="utf-8") as fh:
             w = csv.writer(fh)
-            w.writerow(["pair", "lsf_file", "siril_file", "channel", "max_abs_diff", "max_rel_diff",
-                        "known_exception"])
+            w.writerow(["pair", "lsf_file", "siril_file", "channel", "max_abs_diff", "max_rel_diff"]
+                       + list(self.BREAKDOWN_FIELDS) + ["known_exception"])
             for tag, lname, sname in pairs:
                 lp, sp = self.p(lname), self.p(sname)
                 if not (os.path.exists(lp) and os.path.exists(sp)):
@@ -741,21 +1037,209 @@ class Comparison:
                     continue
                 step(f"Parity {tag}")
                 try:
-                    x = self.load_pixels(lp)
-                    y = self.load_pixels(sp)
+                    x, y = fits_image(lp), fits_image(sp)
+                    if x is None or y is None:      # tile-compressed: Siril reads both the same way
+                        x, y = self.load_pixels(lp), self.load_pixels(sp)
+                        count = None
+                    else:
+                        count = fits_image(lp, "LSF_COUNT")
                     diffs = channel_diffs(x, y)
-                    del x, y
+                    brk = parity_breakdown(x, y, count, header_int(lp, "STACKCNT"))
+                    dpath = self.p(f"diff_{tag}.fit")
+                    if any(b["n_diff"] for b in brk):
+                        write_fits_float32(dpath, x - y, (f"LSF - Siril: {lname} - {sname}",))
+                    elif os.path.exists(dpath):     # left over from an earlier run
+                        os.remove(dpath)
+                    del x, y, count
                 except Exception as e:  # noqa: BLE001
                     self.log(f"  parity {tag}: failed ({e})", LogColor.SALMON)
-                    w.writerow([tag, lname, sname, "", "", "", "; ".join(exc)])
+                    w.writerow([tag, lname, sname, "", "", ""] + [""] * len(self.BREAKDOWN_FIELDS) + ["; ".join(exc)])
                     continue
-                for c, (ab, rel) in enumerate(diffs):
-                    w.writerow([tag, lname, sname, c, repr(ab), repr(rel), "; ".join(exc)])
-                self.log(f"  parity {tag:<9s} " + "  ".join(f"[c{c}: abs {ab:.3g} rel {rel:.3g}]"
-                                                         for c, (ab, rel) in enumerate(diffs)))
+                for c, ((ab, rel), b) in enumerate(zip(diffs, brk)):
+                    b["noise_lsf_adu"], b["noise_siril_adu"] = b["noise_lsf"] * 65535, b["noise_siril"] * 65535
+                    w.writerow([tag, lname, sname, c, repr(ab), repr(rel)]
+                               + ["" if b.get(k) is None else repr(b[k]) for k in self.BREAKDOWN_FIELDS]
+                               + ["; ".join(exc)])
+                    self.log(f"  parity {tag:<9s} c{c}: max abs {ab:.3g} ({b['n_diff']} pixels differ"
+                             + (f": {b['n_diff_full']} full / {b['n_diff_partial']} partial coverage"
+                                if "n_diff_full" in b else "")
+                             + f", {b['n_one_zero']} with data in only one)  Noise Estimation "
+                             f"LSF {b['noise_lsf_adu']:.4f} / Siril {b['noise_siril_adu']:.4f} ADU "
+                             f"(ratio {b['noise_ratio']:.6f})",
+                             LogColor.GREEN if b["n_diff"] == 0 else LogColor.SALMON)
+                    if b["worst_rows"]:
+                        self.log("      rows whose noise differs most (file row: relative difference): "
+                                 + ", ".join(f"{j + 1}: {r:.2e}" for j, r in b["worst_rows"]))
+                    if b["n_diff"] and tag.startswith("cum_"):
+                        mismatched.append(f"{tag} c{c}")
                 fh.flush()
                 gc.collect()
         self.log(f"Parity table written to {csv_path}", LogColor.GREEN)
+        if mismatched:
+            self.log("Full stacks that differ from Siril's: " + ", ".join(mismatched)
+                     + (" (known exceptions apply)" if exc else " -- unexpected, see the diff_*.fit images"),
+                     LogColor.SALMON if exc else LogColor.RED)
+
+    # ---- Section 12 behaviour tests ----------------------------------------------
+    def try_cmd(self, *parts) -> bool:
+        """A command that may be refused: True if Siril reports success. The tests below judge the
+        outcome from the files, so a refusal reported either way is fine."""
+        try:
+            run_cmd(self.siril, *parts)
+            return True
+        except RuntimeError:
+            return False
+
+    def in_workdir(self, fn):
+        """Runs fn() with Siril's working directory set to the private scratch folder."""
+        run_cmd(self.siril, "cd", _q(self.workdir))
+        try:
+            return fn()
+        finally:
+            try:
+                run_cmd(self.siril, "cd", _q(self.wd))
+            except Exception as e:  # noqa: BLE001
+                self.log(f"Could not restore Siril's working directory: {e}", LogColor.SALMON)
+
+    def make_seq(self, root: str, frames: list) -> str:
+        """Writes frames as root00001.fit... in the scratch folder (Siril's working directory must be
+        that folder) and makes a sequence of them; returns its name."""
+        for i, a in enumerate(frames, 1):
+            write_fits_float32(os.path.join(self.workdir, f"{root}{i:05d}.fit"), a, ("lsf_compare synthetic frame",))
+        if not self.siril.create_new_seq(root):
+            raise RuntimeError(f"Siril could not create the sequence {root}.")
+        return next((c for c in (root, root + "_") if os.path.exists(os.path.join(self.workdir, c + ".seq"))), root)
+
+    def stage_flip(self, step) -> None:
+        """Section 12 check 7: an LSF file whose Stack is flipped by an outside tool that keeps the old
+        DATASUM. lsf_append must refuse it, lsf_check -repair must restore the Stack bit-exactly, and an
+        edit of one pixel kept with -adopt must leave the rest of the Stack unchanged."""
+        src = next((self.p(n) for n in ("lsf_cum_1234.lsf.fits", "lsf_set_1.lsf.fits", "lsf_4.lsf.fits")
+                    if os.path.exists(self.p(n))), None)
+        if src is None:
+            self.log("flip: no LSF product to test with, skipped.", LogColor.SALMON)
+            return
+        step("Flip, repair and adopt test")
+        rows, failed = [], []
+
+        def chk(name, ok, detail=""):
+            rows.append(("flip", name, "ok" if ok else "FAIL", detail))
+            if not ok:
+                failed.append(f"{name} ({detail})")
+
+        work = os.path.join(self.workdir, "flip.lsf.fits")
+        shutil.copy2(src, work)
+        orig = primary_bytes(work)
+        gen0 = header_int(work, "LSFGEN")
+        edit_primary(work, lambda a: a[:, ::-1, :])
+        chk("flipped_differs", primary_bytes(work) != orig, os.path.basename(src))
+        self.try_cmd("lsf_check", _q(work))
+        self.try_cmd("lsf_append", _q(work), _q(self.seqname), "-noreg")
+        chk("append_refused", header_int(work, "LSFGEN") == gen0, f"LSFGEN {header_int(work, 'LSFGEN')}")
+        self.try_cmd("lsf_check", _q(work), "-repair")
+        chk("repair_bit_exact", primary_bytes(work) == orig, "primary data compared byte by byte")
+        chk("repair_new_generation", header_int(work, "LSFGEN") == gen0 + 1, f"LSFGEN {header_int(work, 'LSFGEN')}")
+        chk("passes_after_repair", all(ok for _, ok, _ in check_lsf_file(work)[0]), "structure and LSFHASH")
+
+        # adopt: one pixel with data, set to a value strictly inside the range of the Stack
+        x = fits_image(work)
+        ch, ys, xs = np.nonzero((x > np.quantile(x, 0.4)) & (x < np.quantile(x, 0.6)))
+        c, y, xx = int(ch[len(ch) // 2]), int(ys[len(ys) // 2]), int(xs[len(xs) // 2])
+        new_value = np.float32((x[c, y, xx] + np.quantile(x, 0.6)) / 2)
+
+        def poke(a):
+            a[c, y, xx] = new_value
+            return a
+        edit_primary(work, poke)
+        before = fits_image(work)
+        self.try_cmd("lsf_check", _q(work), "-adopt")
+        after = fits_image(work)
+        changed = np.argwhere(after != before)
+        chk("adopt_keeps_the_edit", after[c, y, xx] == new_value, f"pixel ({c},{y},{xx})")
+        chk("adopt_changes_nothing_else", len(changed) == 0, f"{len(changed)} other pixels differ")
+        chk("adopt_new_generation", header_int(work, "LSFGEN") == gen0 + 2, f"LSFGEN {header_int(work, 'LSFGEN')}")
+        chk("passes_after_adopt", all(ok for _, ok, _ in check_lsf_file(work)[0]), "structure and LSFHASH")
+        self.write_test_csv("flip", rows, failed)
+
+    def stage_drift(self, step) -> None:
+        """Section 12 check 8: frames from a fixed noise model, an lsf_init then --drift-appends
+        appends. M2 only keeps accepted samples, so without the Section 10.7 guards the history test
+        would reject more on every append; with them the rejected fraction must stay flat."""
+        a = self.a
+        n_app = a.drift_appends
+        rows, failed = [], []
+
+        def run():
+            step("Drift test: first batch")
+            dest = os.path.join(self.workdir, "drift.lsf.fits")
+            seq = self.make_seq("drift0_", synthetic_frames(30, 0.01, seed=1))
+            run_cmd(self.siril, "lsf_init", seq, _q(dest), "rej", "w", "3", "3", "-norm=add", "-overwrite")
+            for k in range(1, n_app + 1):
+                if k % 10 == 1:
+                    step(f"Drift test: appends {k}-{min(k + 9, n_app)} of {n_app}")
+                seq = self.make_seq(f"drift{k}_", synthetic_frames(10, 0.01, seed=1000 + k))
+                run_cmd(self.siril, "lsf_append", _q(dest), seq, "-noreg")
+            return rejection_from_history(history_cards(dest))
+
+        rej = self.in_workdir(run)
+        hist = [sum(v[2] + v[3] for v in rej[g]) / len(rej[g]) for g in sorted(rej) if g >= 2]
+        for g in sorted(rej):
+            for c, (bl, bh, hl, hh) in enumerate(rej[g]):
+                rows.append(("drift", f"gen_{g}_ch{c}", "", f"batch {bl:.4f} {bh:.4f} history {hl:.4f} {hh:.4f} %"))
+        if len(hist) < max(4, n_app):
+            failed.append(f"rejection found for {len(hist)} of {n_app} appends")
+        else:
+            q = max(2, len(hist) // 5)
+            first, last = float(np.mean(hist[:q])), float(np.mean(hist[-q:]))
+            slope = float(np.polyfit(np.arange(len(hist)), hist, 1)[0])
+            flat = first > 0 and 0.67 <= last / first <= 1.5
+            rows.append(("drift", "history_rejection_flat", "ok" if flat else "FAIL",
+                         f"first {q} appends {first:.4f} %, last {q} {last:.4f} %, slope {slope:+.5f} % per append"))
+            if not flat:
+                failed.append(f"history rejection went from {first:.4f} % to {last:.4f} %")
+            self.log(f"  drift: history rejection {first:.4f} % over the first {q} appends, {last:.4f} % over the "
+                     f"last {q} (slope {slope:+.5f} % per append)")
+        self.write_test_csv("drift", rows, failed)
+
+    def stage_weights(self, step) -> None:
+        """Section 12 check 9: one good and one poor batch (twice the noise) with noise weighting. With
+        the constants frozen from the first batch, a poor frame must get about a quarter of the weight
+        of a good one, not the same weight per frame."""
+        rows, failed = [], []
+
+        def run():
+            step("Weight consistency test")
+            dest = os.path.join(self.workdir, "weights.lsf.fits")
+            good = self.make_seq("wgood_", synthetic_frames(30, 0.01, seed=7))
+            poor = self.make_seq("wpoor_", synthetic_frames(30, 0.02, seed=8))
+            run_cmd(self.siril, "lsf_init", good, _q(dest), "rej", "w", "3", "3", "-norm=add", "-weight=noise",
+                    "-overwrite")
+            run_cmd(self.siril, "lsf_append", _q(dest), poor, "-noreg")
+            return table_column(dest, "LSF_LEDGER", "BATCH")[:, 0], table_column(dest, "LSF_LEDGER", "WEIGHT")
+
+        batch, weight = self.in_workdir(run)
+        w1, w2 = weight[batch == 1].mean(axis=0), weight[batch == 2].mean(axis=0)
+        for c in range(weight.shape[1]):
+            ratio = w2[c] / w1[c]
+            ok = 0.2 <= ratio <= 0.3
+            rows.append(("weights", f"ch{c}_poor_over_good", "ok" if ok else "FAIL",
+                         f"mean weight good {w1[c]:.4f}, poor {w2[c]:.4f}, ratio {ratio:.4f} (expected about 0.25)"))
+            if not ok:
+                failed.append(f"channel {c}: poor/good weight ratio {ratio:.3f}, expected about 0.25")
+            self.log(f"  weights: good frames {w1[c]:.4f}, poor frames {w2[c]:.4f}, ratio {ratio:.4f} "
+                     f"(about 0.25 expected)")
+        self.write_test_csv("weights", rows, failed)
+
+    def write_test_csv(self, name: str, rows: list, failed: list) -> None:
+        csv_path = self.p(f"{name}.csv")
+        with open(csv_path, "w", newline="", encoding="utf-8") as fh:
+            w = csv.writer(fh)
+            w.writerow(["test", "check", "result", "detail"])
+            w.writerows(rows)
+        if failed:
+            self.log(f"{name} test FAILED: " + "; ".join(failed) + f" -> {csv_path}", LogColor.RED)
+            raise RuntimeError(f"{name} test failed: " + "; ".join(failed))
+        self.log(f"{name} test passed -> {csv_path}", LogColor.GREEN)
 
     # ---- noise ----------------------------------------------------------------
     def measure_own_noise(self, channels: int, shape) -> list:
@@ -779,9 +1263,19 @@ class Comparison:
         a = self.a
         stackcnt = header_int(path, "STACKCNT")
         run_cmd(self.siril, "load", _q(path))
-        run_cmd(self.siril, "stat", *(["-cfa"] if a.cfa else []), *(["main"] if a.stat_main else []))
         shape = self.siril.get_image_shape()
         channels = int(shape[0]) if shape else 1
+        noise_est = [None] * channels
+        if a.cfa or a.stat_main:
+            # `stat -cfa` works on the CFA sub-channels and `stat main` has no noise estimate:
+            # a plain `stat` first gives the value Noise Estimation reports
+            run_cmd(self.siril, "stat")
+            noise_est = self.noise_estimation_adu(channels, path)
+        run_cmd(self.siril, "stat", *(["-cfa"] if a.cfa else []), *(["main"] if a.stat_main else []))
+        if not (a.cfa or a.stat_main):
+            noise_est = self.noise_estimation_adu(channels, path)
+        known = [v for v in noise_est if v is not None]
+        noise_mean = sum(known) / len(known) if len(known) == channels else None
         own = self.measure_own_noise(channels, shape) if (a.own_noise and shape) else [None] * channels
         summary = []
         for c in range(channels):
@@ -794,12 +1288,52 @@ class Comparison:
             med, on = vals["median"], own[c]
             writer.writerow([label, kind, os.path.basename(path), expected if expected is not None else "",
                              stackcnt if stackcnt is not None else "", c]
-                            + ["" if vals[k] is None else repr(float(vals[k])) for k in STAT_FIELDS]
+                            + ["" if vals[k] is None or float(vals[k]) == -999999.0 else repr(float(vals[k])) for k in STAT_FIELDS]
+                            + ["" if noise_est[c] is None else repr(noise_est[c]),
+                               "" if noise_mean is None else repr(noise_mean)]
                             + ["" if on is None else repr(on),
                                "" if (on is None or not med) else repr(on / float(med))])
-            summary.append((vals["bgnoise"], on))
+            summary.append((noise_est[c], on))
         fh.flush()
         return summary
+
+    def noise_estimation_adu(self, channels: int, path: str) -> list:
+        """Per-channel value of Tools > Image Analysis > Noise Estimation (the bgnoise command), in
+        ADU as Siril logs it: x65535 for float images.
+
+        Siril's statistics of the loaded image come first. In this build, after `stat` they come
+        back from the Python API as -999999 (not computed), so the fallback is
+        analyse_image_from_file(), which runs the same estimator (STATS_SIGMEAN, FnNoise1) but only
+        on channel 0, or green for colour. Any other channel uses noise_estimation(), a port of
+        FnNoise1 that matches Siril's value to 4 decimals, on the pixels of the file."""
+        try:
+            img = self.siril.get_image(with_pixels=False)
+            is_float = int(getattr(img, "bitpix", -32)) in (-32, -64)
+        except Exception:  # noqa: BLE001
+            is_float = True
+        scale = 65535.0 if is_float else 1.0
+        out = []
+        for c in range(channels):
+            try:
+                bg = getattr(self.siril.get_image_stats(c), "bgnoise", None)
+            except Exception:  # noqa: BLE001
+                bg = None
+            out.append(float(bg) * scale if bg is not None and bg >= 0 else None)
+        if all(v is not None for v in out):
+            return out
+        try:        # analyse_image_from_file returns bgnoise in [0, 1] for every image type
+            bg = float(self.siril.analyse_image_from_file(path).bgnoise)
+            ch = 0 if channels == 1 else 1
+            if out[ch] is None and bg > 0:
+                out[ch] = bg * 65535.0
+        except Exception as e:  # noqa: BLE001
+            self.log(f"  analyse_image_from_file failed ({e}); using the Python noise estimate.", LogColor.SALMON)
+        if any(v is None for v in out):
+            x = fits_image(path)
+            for c in range(channels):
+                if out[c] is None and x is not None and c < x.shape[0]:
+                    out[c] = noise_estimation(x[c])[0] * 65535.0
+        return out
 
     def stage_stats(self, step) -> None:
         csv_path = self.p("noise.csv")
@@ -815,7 +1349,8 @@ class Comparison:
         with open(csv_path, "w", newline="", encoding="utf-8") as fh:
             writer = csv.writer(fh)
             writer.writerow(["label", "kind", "file", "frames_expected", "stackcnt_header", "channel"]
-                            + list(STAT_FIELDS) + ["own_noise", "own_noise_over_median"])
+                            + list(STAT_FIELDS) + ["noise_est_adu", "noise_est_mean_adu", "own_noise",
+                                                     "own_noise_over_median"])
             for label, kind, path, expected in files:
                 step(f"Noise statistics: {label}")
                 try:
@@ -823,13 +1358,13 @@ class Comparison:
                 except Exception as e:  # noqa: BLE001
                     self.log(f"  {label}: could not be measured ({e})", LogColor.SALMON)
                     writer.writerow([label, kind, os.path.basename(path), "", "", "", *[""] * len(STAT_FIELDS),
-                                     "", ""])
+                                     "", "", "", ""])
                 gc.collect()
         self.log(f"Noise table written to {csv_path}", LogColor.GREEN)
-        self.log("Noise summary (Siril bgnoise | independent estimate, per channel):")
-        fmt = lambda v: "n/a" if v is None else f"{float(v):.6g}"        # noqa: E731
+        self.log("Noise summary, ADU (Siril Noise Estimation | independent estimate x65535, per channel):")
+        fmt = lambda v, k=1.0: "n/a" if v is None else f"{float(v) * k:.6g}"        # noqa: E731
         for label, summ in rows_seen:
-            self.log(f"  {label:<14s} " + "  ".join(f"[{fmt(b)} | {fmt(o)}]" for b, o in summ))
+            self.log(f"  {label:<14s} " + "  ".join(f"[{fmt(b)} | {fmt(o, 65535.0)}]" for b, o in summ))
 
     @staticmethod
     def known_outputs() -> list:
@@ -859,6 +1394,21 @@ class Comparison:
         self.sets = split_sets(self.original_selected, N_SETS, a.split)
         self.wd = siril.get_siril_wd()
         self.outdir = os.path.abspath(a.outdir or os.path.join(self.wd, "lsf_compare"))
+
+    def prime_stats_cache(self) -> None:
+        """Make every stack of this run normalize with the same frame statistics. Siril keeps the
+        statistics it computes in the .seq file, with 6 significant digits: the first command that
+        needs them on a fresh sequence uses the full-precision values, later ones read the rounded
+        cache. lsf_init and stack would then differ by float rounding and by the odd rejection
+        decision. `seqstat ... full` computes and caches the normalization statistics (location and
+        scale, IKSS and lite) of the selected frames, and reloading the sequence puts the cached
+        values in memory for `stack` too; lsf_init reads them from the .seq file."""
+        t = time.perf_counter()
+        self.ensure_seq()
+        run_cmd(self.siril, "seqstat", _q(self.seqname), _q(os.path.join(self.workdir, "seqstat.csv")), "full")
+        run_cmd(self.siril, "load_seq", _q(self.seqname))
+        self.log(f"Frame statistics cached in {self.seqname}.seq ({time.perf_counter() - t:.1f} s), so that "
+                 f"LSF and Siril stacks use the same values.")
 
     def describe_plan(self) -> None:
         a = self.a
@@ -898,11 +1448,15 @@ class Comparison:
                 return
             os.makedirs(self.outdir, exist_ok=True)
             self.workdir = tempfile.mkdtemp(prefix=".lsfcmp_", dir=self.outdir)
+            if "base" not in a.skip or "siril" not in a.skip:
+                self.prime_stats_cache()
 
-            weights = {"base": 7, "siril": 7, "sos": 1, "iter": 4, "check": 1, "parity": 8, "stats": 21}
+            weights = {"base": 7, "siril": 7, "sos": 1, "iter": 4, "check": 1, "flip": 1, "parity": 8, "stats": 21,
+                       "drift": 1 + (a.drift_appends + 9) // 10, "weights": 1}
             stages = {"base": self.stage_base, "siril": self.stage_siril, "sos": self.stage_sos,
                       "iter": self.stage_iter, "check": self.stage_check, "parity": self.stage_parity,
-                      "stats": self.stage_stats}
+                      "stats": self.stage_stats, "flip": self.stage_flip, "drift": self.stage_drift,
+                      "weights": self.stage_weights}
             todo = [st for st in STAGES if st not in a.skip]
             total_steps = sum(weights[st] for st in todo)
             done = [0]

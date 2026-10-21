@@ -120,3 +120,64 @@ Test(lsf_math, hash_of_float_data) {
 	g_free(h1);
 	g_free(ref);
 }
+
+/* Section 4.1: without output normalization the Stack is MEAN clamped to
+ * [0,1], as Siril clamps its 32-bit stacks; 0 where W = 0 */
+Test(lsf_math, stack_value) {
+	cr_assert_eq(lsf_stack_value(0.25f, 1.f, FALSE, 0.0, 1.0), 0.25f);
+	cr_assert_eq(lsf_stack_value(1.57f, 1.f, FALSE, 0.0, 1.0), 1.f);
+	cr_assert_eq(lsf_stack_value(-0.01f, 1.f, FALSE, 0.0, 1.0), 0.f);
+	cr_assert_eq(lsf_stack_value(0.25f, 0.f, FALSE, 0.0, 1.0), 0.f);
+	cr_assert_float_eq(lsf_stack_value(0.6f, 1.f, TRUE, 0.2, 0.8), 0.5f, 1e-7);
+}
+
+/* Adopt keeps MEAN exactly where the Stack was not edited (including clamped
+ * pixels), takes edited pixels, and leaves pixels without data at 0 */
+Test(lsf_math, adopt_unedited_and_edited) {
+	float mean[] = { 0.25f, 1.57f, 0.40f, 0.f }, w[] = { 1.f, 1.f, 1.f, 0.f };
+	float disp[4];
+	for (int i = 0; i < 4; i++)
+		disp[i] = lsf_stack_value(mean[i], w[i], FALSE, 0.0, 1.0);
+	cr_assert_eq(lsf_adopt_plane(mean, w, disp, 4, FALSE, 0.0, 0.0), 0);
+	cr_assert_eq(mean[1], 1.57f);
+	disp[2] = 0.30f;	// edited
+	disp[3] = 0.50f;	// painted where there is no data
+	cr_assert_eq(lsf_adopt_plane(mean, w, disp, 4, FALSE, 0.0, 0.0), 1);
+	cr_assert_eq(mean[2], 0.30f);
+	cr_assert_eq(mean[3], 0.f);
+}
+
+/* with output normalization, an edited pixel is mapped back to MEAN units */
+Test(lsf_math, adopt_normalized) {
+	double mini = 0.2, maxi = 0.8;
+	float mean[] = { 0.2f, 0.5f, 0.8f }, w[] = { 1.f, 1.f, 1.f }, disp[3];
+	for (int i = 0; i < 3; i++)
+		disp[i] = lsf_stack_value(mean[i], w[i], TRUE, mini, maxi - mini);
+	cr_assert_eq(lsf_adopt_plane(mean, w, disp, 3, TRUE, mini, maxi), 0);
+	disp[1] = 0.75f;
+	cr_assert_eq(lsf_adopt_plane(mean, w, disp, 3, TRUE, mini, maxi), 1);
+	cr_assert_float_eq(mean[1], 0.65f, 1e-6);
+}
+
+/* Section 10.8 with N equal weights: n_eff = N, s2 = M2 / (N - 1) and the
+ * variance of the mean s2 / N, for both estimators */
+Test(lsf_math, pixel_stats_equal_weights) {
+	int N = 10;
+	double M2 = 0.09, s2 = M2 / (N - 1);
+	double neff, sig2, vm;
+	lsf_pixel_stats(NO_WEIGHT, N, M2, N, N, &neff, &sig2, &vm);
+	cr_assert_float_eq(neff, N, 1e-12);
+	cr_assert_float_eq(sig2, s2, 1e-12);
+	cr_assert_float_eq(vm, s2 / N, 1e-12);
+	lsf_pixel_stats(NOISE_WEIGHT, N, M2, N, N, &neff, &sig2, &vm);
+	cr_assert_float_eq(neff, N, 1e-12);
+	cr_assert_float_eq(sig2, s2, 1e-12);
+	cr_assert_float_eq(vm, s2 / N, 1e-12);
+	/* one sample: n_eff defined, the variances are not */
+	lsf_pixel_stats(NO_WEIGHT, 1.0, 0.0, 1.0, 1, &neff, &sig2, &vm);
+	cr_assert_float_eq(neff, 1.0, 1e-12);
+	cr_assert(sig2 < 0.0 && vm < 0.0);
+	/* no data */
+	lsf_pixel_stats(NO_WEIGHT, 0.0, 0.0, 0.0, 0, &neff, &sig2, &vm);
+	cr_assert(neff < 0.0 && sig2 < 0.0 && vm < 0.0);
+}

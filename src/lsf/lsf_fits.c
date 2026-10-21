@@ -86,6 +86,8 @@ void lsf_file_free(lsf_file *f) {
 	lsf_settings_free(&f->settings);
 	lsf_history_free(&f->hist);
 	clearfits(&f->primary);
+	free(f->stack_data);
+	f->stack_data = NULL;
 	if (f->unknown_hdus)
 		g_array_free(f->unknown_hdus, TRUE);
 	f->unknown_hdus = NULL;
@@ -176,8 +178,12 @@ static const char *find_row(GPtrArray *rows, const char *key) {
 
 /* Opens an LSF file, runs the pre-merge validation of Section 8 in order,
  * and loads what is needed to append to it. Returns 0 on success, or the
- * number of the failed check. The file is never modified. */
-int lsf_open_and_validate(const char *path, lsf_file *f) {
+ * number of the failed check. The file is never modified.
+ * With tolerate_edited_stack, a failure of check 8 alone (the Stack was
+ * modified outside Siril, the accumulator is intact) is not an error: the
+ * file is loaded, f->stack_modified is set and f->stack_data holds the
+ * edited Stack, for Repair and Adopt. */
+int lsf_open_and_validate(const char *path, lsf_file *f, gboolean tolerate_edited_stack) {
 	fitsfile *fptr = NULL;
 	int status = 0, hdunum = 0;
 	int ret = 0;
@@ -367,7 +373,8 @@ int lsf_open_and_validate(const char *path, lsf_file *f) {
 		if (g > f->max_ledger_gen) f->max_ledger_gen = g;
 		if (b > f->nb_batches) f->nb_batches = b;
 	}
-	if (status || f->max_ledger_gen > f->gen || (f->ledger_rows > 0 && f->max_ledger_gen != f->gen)) {
+	/* a generation without ledger rows changed no frame (Repair, Adopt) */
+	if (status || f->max_ledger_gen > f->gen) {
 		ret = validation_failure(6, path, _("ledger generations do not match LSFGEN"));
 		goto end;
 	}
@@ -439,9 +446,17 @@ int lsf_open_and_validate(const char *path, lsf_file *f) {
 		gboolean match = computed && !g_ascii_strcasecmp(computed, hash);
 		g_free(computed);
 		if (!match) {
-			ret = validation_failure(8, path, _("the Stack (HDU 0) was modified outside Siril; "
-						"repair or adopt are not available in this version, restore a backup"));
-			goto end;
+			if (!tolerate_edited_stack) {
+				ret = validation_failure(8, path, _("the Stack (HDU 0) was modified outside Siril. "
+							"Run lsf_check with -repair to rebuild it from the accumulator, "
+							"or with -adopt to keep the edit"));
+				goto end;
+			}
+			siril_log_warning(_("LSF validation of %s: check 8 (Section 8) failed, the Stack (HDU 0) "
+						"was modified outside Siril. The accumulator is intact.\n"), path);
+			f->stack_modified = TRUE;
+			f->stack_data = primary_data;
+			primary_data = NULL;
 		}
 	}
 
@@ -502,6 +517,15 @@ static gboolean is_wcs_key(const char *key) {
 		if (g_str_has_prefix(key, prefixes[i]))
 			return TRUE;
 	return FALSE;
+}
+
+/* deletes a keyword that may be absent, without leaving cfitsio error
+ * messages that a later report_fits_error() would print */
+static void delete_key_quiet(fitsfile *fptr, const char *key) {
+	int st = 0;
+	fits_write_errmark();
+	fits_delete_key(fptr, key, &st);
+	fits_clear_errmark();
 }
 
 /* the WCS cards of the current HDU, as records */
@@ -686,14 +710,28 @@ static int flush_to_disk(const char *path) {
 	return ret;
 }
 
-/* atomic replace of target by source (Section 10.11) */
+/* atomic replace of target by source (Section 10.11). On Windows a file
+ * that was just written can be held for a moment by another process, such as
+ * a virus scanner: a sharing or access error is retried for about 2 s before
+ * giving up. */
 static int replace_file(const char *source, const char *target) {
 #ifdef _WIN32
 	wchar_t *wsrc = g_utf8_to_utf16(source, -1, NULL, NULL, NULL);
 	wchar_t *wdst = g_utf8_to_utf16(target, -1, NULL, NULL, NULL);
-	BOOL ok = MoveFileExW(wsrc, wdst, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+	DWORD err = 0;
+	BOOL ok = FALSE;
+	for (int attempt = 0; attempt < 20 && !ok; attempt++) {
+		ok = MoveFileExW(wsrc, wdst, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+		if (ok) break;
+		err = GetLastError();
+		if (err != ERROR_SHARING_VIOLATION && err != ERROR_ACCESS_DENIED && err != ERROR_LOCK_VIOLATION)
+			break;
+		g_usleep(100000);
+	}
 	g_free(wsrc);
 	g_free(wdst);
+	if (!ok)
+		siril_log_warning(_("LSF: replacing %s failed with Windows error %lu\n"), target, (unsigned long) err);
 	return ok ? 0 : 1;
 #else
 	return g_rename(source, target);
@@ -745,8 +783,7 @@ int lsf_write_file(const char *path, lsf_file *old, const lsf_settings *s, lsf_h
 	}
 	status = 0;
 	for (int i = 0; i < (int) G_N_ELEMENTS(primary_banned_keys); i++) {
-		int st = 0;
-		fits_delete_key(fptr, primary_banned_keys[i], &st);
+		delete_key_quiet(fptr, primary_banned_keys[i]);
 	}
 	{
 		int t = TRUE, f = FALSE;
@@ -759,10 +796,7 @@ int lsf_write_file(const char *path, lsf_file *old, const lsf_settings *s, lsf_h
 		fits_update_key(fptr, TSTRING, "LSFSENS", (char *) (s->is_cfa ? "CFA" : "MONO"), "LSF sensor class", &status);
 		if (s->is_cfa)
 			fits_update_key(fptr, TSTRING, "LSFBAYR", (void *) s->bayer, "LSF Bayer pattern of the sensor", &status);
-		else {
-			int st = 0;
-			fits_delete_key(fptr, "LSFBAYR", &st);
-		}
+		else delete_key_quiet(fptr, "LSFBAYR");
 		fits_update_key(fptr, TSTRING, "LSFDMOD", (char *) (s->is_cfa ? "DEBAYER" : "NONE"), "LSF demosaic mode", &status);
 		fits_update_key(fptr, TLOGICAL, "LSFNORM", s->outnorm ? &t : &f,
 				"Stack is output-normalized", &status);
@@ -771,13 +805,10 @@ int lsf_write_file(const char *path, lsf_file *old, const lsf_settings *s, lsf_h
 			fits_update_key_dbl(fptr, "LSFNMIN", s->outnorm_min, -17, "output normalization min", &status);
 			fits_update_key_dbl(fptr, "LSFNMAX", s->outnorm_max, -17, "output normalization max", &status);
 		} else {
-			int st = 0;
-			fits_delete_key(fptr, "LSFNMIN", &st);
-			st = 0;
-			fits_delete_key(fptr, "LSFNMAX", &st);
+			delete_key_quiet(fptr, "LSFNMIN");
+			delete_key_quiet(fptr, "LSFNMAX");
 		}
-		int st = 0;
-		fits_delete_key(fptr, "LSFBUSY", &st);
+		delete_key_quiet(fptr, "LSFBUSY");
 		gchar *hash = lsf_hash_float_data(primary->fdata, npix * nchan);
 		fits_update_key(fptr, TSTRING, "LSFHASH", hash, "SHA-256 of the primary data", &status);
 		g_free(hash);
@@ -923,6 +954,32 @@ end:
 	return retval;
 }
 
+/* removes the LSF keywords that Siril kept as unknown keywords of a header
+ * copied from an LSF primary, so a derived image does not claim to be LSF */
+void lsf_strip_lsf_keys(fits *fit) {
+	if (!fit->unknown_keys)
+		return;
+	gchar **cards = g_strsplit(fit->unknown_keys, "\n", -1);
+	GString *kept = g_string_new(NULL);
+	for (int i = 0; cards[i]; i++) {
+		char key[FLEN_KEYWORD];
+		int len = 0, status = 0;
+		if (!cards[i][0])
+			continue;
+		fits_get_keyname(cards[i], key, &len, &status);
+		gboolean lsf = FALSE;
+		for (int k = 0; !status && k < (int) G_N_ELEMENTS(lsf_keys); k++)
+			lsf |= !strcmp(key, lsf_keys[k]);
+		if (lsf)
+			continue;
+		g_string_append(kept, cards[i]);
+		g_string_append_c(kept, '\n');
+	}
+	g_strfreev(cards);
+	g_free(fit->unknown_keys);
+	fit->unknown_keys = g_string_free(kept, FALSE);
+}
+
 /* Flattened master (Section 10.9): HDU 0 without the LSF keywords */
 int lsf_export_master(const char *lsf_path, const char *out_path) {
 	fitsfile *in = NULL, *out = NULL;
@@ -940,10 +997,8 @@ int lsf_export_master(const char *lsf_path, const char *out_path) {
 		return 1;
 	}
 	fits_copy_hdu(in, out, 0, &status);
-	for (int i = 0; i < (int) G_N_ELEMENTS(lsf_keys); i++) {
-		int st = 0;
-		fits_delete_key(out, lsf_keys[i], &st);
-	}
+	for (int i = 0; i < (int) G_N_ELEMENTS(lsf_keys); i++)
+		delete_key_quiet(out, lsf_keys[i]);
 	gchar *hist = g_strdup_printf("Exported from LSF file %s, generation %d", uid, gen);
 	fits_write_history(out, hist, &status);
 	g_free(hist);

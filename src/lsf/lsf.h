@@ -88,6 +88,8 @@ typedef struct {
 	int max_ledger_gen;
 	int nb_batches;
 	double outnorm_min, outnorm_max;	// LSFNMIN/LSFNMAX
+	gboolean stack_modified;	// check 8 failed (only when tolerated)
+	float *stack_data;		// HDU 0 pixels when stack_modified, file order
 } lsf_file;
 
 /* one frame of a batch, for the ledger */
@@ -123,6 +125,11 @@ double lsf_sigma_pred2(weightingType scheme, double W, double M2, double W2, int
 double lsf_sigma_hist(double sigma_pred2, double c, double sigma_frame, double margin);
 gboolean lsf_outnorm_range(float *const mean[3], float *const W[3], size_t n, int nchan,
 		double *mini, double *maxi);
+void lsf_pixel_stats(weightingType scheme, double W, double M2, double W2, int N,
+		double *neff, double *sigma2, double *var_mean);
+float lsf_stack_value(float mean, float w, gboolean norm, double mini, double range);
+size_t lsf_adopt_plane(float *mean, const float *w, const float *disp, size_t n,
+		gboolean norm, double mini, double maxi);
 
 /* lsf_weights.c */
 int lsf_freeze_weights(lsf_settings *s, int nb_frames, int nchan, const double *noise_raw,
@@ -148,11 +155,12 @@ void lsf_setting_row_free(gpointer p);
 int lsf_history_alloc(lsf_history *h, int rx, int ry, int nchan);
 void lsf_history_free(lsf_history *h);
 void lsf_file_free(lsf_file *f);
-int lsf_open_and_validate(const char *path, lsf_file *f);
+int lsf_open_and_validate(const char *path, lsf_file *f, gboolean tolerate_edited_stack);
 gchar *lsf_hash_float_data(const float *data, size_t n);
 int lsf_write_file(const char *path, lsf_file *old, const lsf_settings *s, lsf_history *h,
 		fits *primary, const char *uid, int gen, GPtrArray *new_rows, int batch, gboolean backup);
 int lsf_export_master(const char *lsf_path, const char *out_path);
+void lsf_strip_lsf_keys(fits *fit);
 
 /* lsf_stack.c */
 struct lsf_batch_args {

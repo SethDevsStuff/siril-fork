@@ -15,7 +15,7 @@ The v0.2 data model needs the same additions.
 
 **Governing priority: a stock FITS reader must open an LSF file and see the current stack, correctly, without knowing LSF exists.** Wherever LSF convenience conflicts with this, compatibility wins. The words MUST, SHOULD and MAY are used as in RFC 2119.
 
-**Design principle: augment Siril, do not change it.** LSF reuses Siril's existing calibration, registration, star detection, normalization, rejection and weighting code. It adds only the accumulator merge, the history rejection test, the frame-weight scaling of Section 10.4 and the file I/O. LSF operations are exposed only through dedicated LSF commands (provisional names: lsf\_init, lsf\_append, lsf\_export, lsf\_maps, lsf\_check). Existing commands, stacking paths and save paths are unchanged.
+**Design principle: augment Siril, do not change it.** LSF reuses Siril's existing calibration, registration, star detection, normalization, rejection and weighting code. It adds only the accumulator merge, the history rejection test, the frame-weight scaling of Section 10.4 and the file I/O. LSF operations are exposed only through dedicated LSF commands: lsf\_init, lsf\_append, lsf\_export, lsf\_check and lsf\_maps. Existing commands, stacking paths and save paths are unchanged.
 
 **Current scope.** This is a proof of concept. Only Siril appends to an LSF file. Other tools are expected to read the file, not to keep the full LSF structure when they save it (see Section 15).
 
@@ -49,7 +49,7 @@ P is the number of channels: 1 for mono, 3 for OSC (R, G, B).
   - All four planes are always per channel.
 - **Why one cube.** Siril treats a FITS file holding several image HDUs of the same size and BITPIX as a FITS sequence (src/io/fits\_sequence.c, \_find\_hdus). An HDU whose NAXIS3 or BITPIX differs from the first image is skipped. With separate float32 planes, stock Siril opened an LSF file as a 4-frame sequence. NAXIS3 = 4·P (4 or 12) never equals the primary's NAXIS3 (none or 3), and LSF\_COUNT and LSF\_REJ differ in BITPIX. Stock Siril therefore sees a single image, without any change to its reader.
 - **LSF\_COUNT** has the same grid as the Stack. Mono files use NAXIS = 2. OSC files use NAXIS = 3 with NAXIS3 = 3. LSF\_COUNT may use NAXIS3 = 1 only when every channel always accepts or rejects the same samples (for example cfa.mode = DEBAYER with rejection disabled). It never may for CFADRIZ, where coverage differs per channel.
-- **HDU 0 is derived from MEAN.** It is rebuilt from MEAN on every commit: output-normalized when LSFNORM = T, and 0 wherever W = 0. HDU 0 is load-bearing for compatibility (C1), but it is no longer the only copy of the mean, so a damaged primary can be repaired (Section 8).
+- **HDU 0 is derived from MEAN.** It is rebuilt from MEAN on every commit: output-normalized when LSFNORM = T, otherwise clamped to \[0, 1\] (Section 4.1), and 0 wherever W = 0. HDU 0 is load-bearing for compatibility (C1), but it is no longer the only copy of the mean, so a damaged primary can be repaired (Section 8).
 - **Ledger placement.** An LSF writer puts LSF\_LEDGER last. Readers MUST NOT require it to be last (C6). When rewriting, a writer places unknown HDUs (C7) after the LSF image and settings HDUs and before the ledger, in their original relative order. Optional LSF\_ HDUs, including the deferred per-frame data of v0.2 Section 14, also go before the ledger.
 
 **Size.** Per pixel per channel: Stack 4 B, LSF\_ACC 16 B, LSF\_COUNT 2 B, total 22 B. With LSF\_REJ, add 4 B, for 26 B. On a 26-megapixel sensor this is about 575 MB mono and 1.72 GB OSC, or 680 MB and 2.03 GB with rejection maps. Lossless compression of the extensions (Section 5.3) typically saves 20 to 35 percent of the extension size.
@@ -62,7 +62,7 @@ P is the number of channels: 1 for mono, 3 for OSC (R, G, B).
 - BSCALE and BZERO MUST be absent or 1 and 0 (Siril writes BSCALE = 1 and BZERO = 0).
 - The primary MUST carry ROWORDER, as Siril does ('TOP-DOWN' in the sample header). Every extension image MUST use the same row order, because the registration transforms and any WCS depend on it.
 - Pixels with no data (weight 0) are written as 0.0, not NaN. NaN breaks statistics and auto-stretch in many viewers, and 0 matches the output-normalization behavior in v0.2 Section 9.
-- When output normalization is enabled, the primary is MEAN with the same min-max output normalization Siril applies to stacks, and is in \[0, 1\]. Otherwise it equals MEAN.
+- When output normalization is enabled, the primary is MEAN with the same min-max output normalization Siril applies to stacks, and is in \[0, 1\]. Otherwise it is MEAN clamped to \[0, 1\], as Siril clamps its own 32-bit stacks. With the same frames and settings, the primary then equals the image Siril's stack command produces. MEAN is never clamped, so values above 1 (star cores raised by normalization) stay available to the accumulator and to a later output normalization.
 - An OSC primary is already RGB data. BAYERPAT, XBAYROFF and YBAYROFF MUST NOT appear in the primary header, because tools that see BAYERPAT may try to debayer an already-debayered image. The pattern is recorded in LSFBAYR instead. This matches Siril 1.4.4, whose OSC stack header carries none of these keywords.
 
 ### 4.2 LSF keywords
@@ -165,7 +165,7 @@ The primary header follows what Siril's own stacks write (STACKCNT, LIVETIME, EX
 | DATE-OBS | Earliest frame start, UTC |
 | DATE | Time the file was written, UTC |
 | PROGRAM | Writer name and version |
-| HISTORY | One card per append, giving the generation, batch number and frame count |
+| HISTORY | One card per append, giving the generation, batch number and frame count, followed by one card per channel with the percentages of samples rejected low and high by the batch-local and the history tests. Repair and Adopt (Section 8) add one card each |
 | WCS keywords | Updated on grid expansion (CRPIX, Section 10.6) or when the stack is plate-solved again |
 | MIPS-HI, MIPS-LO | Removed on append, because display cutoffs saved for the previous stack no longer fit |
 
@@ -200,16 +200,16 @@ LSFHASH replaces the LSFDSUM of v0.3. DATASUM is a ones-complement sum of 32-bit
 3. Every required HDU is present (PRIMARY, LSF\_ACC, LSF\_COUNT, LSF\_SETTINGS, LSF\_LEDGER, found by EXTNAME) with consistent dimensions, and LSF\_ACC holds the expected named planes.
 4. LSFUID and LSFGEN are identical across all LSF HDUs.
 5. DATASUM and CHECKSUM match on every extension where they are present.
-6. Every ledger GEN is at most LSFGEN, and the highest ledger GEN equals LSFGEN.
+6. Every ledger GEN is at most LSFGEN. A generation with no ledger rows is one that merged no frame (Repair or Adopt), and is recorded in a HISTORY card.
 7. Mirrored settings agree.
 8. The SHA-256 recomputed from the primary data equals LSFHASH.
 
 If any of checks 1 to 7 fails, the writer refuses to merge, reports which check failed, and leaves the file untouched. The file stays readable as an image (C1). There is no silent repair. If LSF\_ACC itself is damaged (check 3 or 5), the accumulator cannot be trusted, and the user restores a backup copy.
 
-If only check 8 fails, the accumulators are intact but the primary was changed outside Siril. The writer stops, reports that the Stack was modified outside Siril, and offers two explicit actions:
+If only check 8 fails, the accumulators are intact but the primary was changed outside Siril. The writer stops, reports that the Stack was modified outside Siril, and offers two explicit actions. In Siril they are options of lsf\_check, which otherwise only validates the file and summarizes it:
 
-- **Repair** (the default). Rebuild HDU 0 from MEAN (Section 3). This undoes the outside edit.
-- **Adopt.** Accept the edited primary as the new mean. MEAN is rebuilt from HDU 0, inverting output normalization with LSFNMIN and LSFNMAX when LSFNORM = T, and pixels with W = 0 stay 0. M2 is not adjusted, so adopt is meant for small cosmetic fixes the user wants to keep. Adopt cannot work if the dimensions have changed.
+- **Repair** (the default, lsf\_check -repair). Rebuild HDU 0 from MEAN (Section 3). This undoes the outside edit: the rebuilt primary is bit-identical to the one written at the last commit.
+- **Adopt** (lsf\_check -adopt). Accept the edited primary as the new mean. A pixel whose primary value is still the one its MEAN gives was not edited and keeps MEAN exactly, which also keeps values the primary clamps (Section 4.1). An edited pixel gets MEAN from HDU 0, inverting output normalization with LSFNMIN and LSFNMAX when LSFNORM = T. Pixels with W = 0 stay 0. M2 is not adjusted, so adopt is meant for small cosmetic fixes the user wants to keep. Adopt cannot work if the dimensions have changed. The primary is then rebuilt from the new MEAN, so with output normalization an edit beyond the old range rescales the whole Stack.
 
 Either action records a HISTORY card, increments LSFGEN, and recomputes LSFHASH and the checksums.
 
@@ -260,6 +260,7 @@ Rules:
 
 - Readers locate columns by TTYPE. Every quality column is optional. Unknown values are NaN (floats), TNULL (integers) or empty (strings). Files written by earlier versions simply lack columns.
 - Unknown columns MUST be preserved on rewrite (C7).
+- String columns hold printable ASCII only (32 to 126), as FITS requires. ORIGHDR is stored the way FITS stores a header: 80-character cards one after another, padded with spaces, with no line breaks. A reader splits it every 80 characters. Siril keeps headers as text with one card per line, so the writer removes the line breaks.
 - The ledger is append-only in normal operation. Because the writer puts it last, the writer can rewrite it in full on every append without moving any other HDU. It holds scalars and short text, so this stays cheap.
 - REG\_XFRM always maps onto the grid as it is now. A grid expansion rewrites the existing rows (Section 10.6).
 
@@ -392,7 +393,13 @@ The two sets agree when all weights are equal. The weight constants are frozen (
 ### 10.9 Exports
 
 - **Flattened master** (lsf\_export). Copy HDU 0 to a new file and remove the LSF keywords. The result is a plain FITS file. If output normalization is enabled, the primary is already the normalized image. The export keeps a HISTORY card naming the source LSFUID and LSFGEN as provenance.
-- **Noise and confidence maps** (lsf\_maps). Derived as in v0.2 Section 9, using the statistics of Section 10.8. Not stored. They may be exported as ordinary FITS images. If LSF\_REJ is present, the low and high rejection maps may be exported the same way.
+- **Noise and confidence maps** (lsf\_maps). Derived from the accumulator with the statistics of Section 10.8, never stored, and saved as ordinary FITS images with the primary's header (LSF keywords removed) and a HISTORY card naming the source LSFUID and LSFGEN:
+  - **neff**: the effective number of frames, W^2 / W2;
+  - **noise**: the standard deviation of the mean;
+  - **sigma**: the standard deviation of one frame (of a unit-weight frame under noise weighting);
+  - **snr**: MEAN divided by the standard deviation of the mean.
+
+  noise and sigma are in the units of the Stack: divided by LSFNMAX - LSFNMIN when LSFNORM = T. A pixel where a value is undefined (no data, or too few samples) is 0. If LSF\_REJ is present, the low and high rejection maps may be exported the same way.
 
 ### 10.10 Undo
 
@@ -400,7 +407,8 @@ The format keeps no per-batch history planes, because they would grow the file w
 
 ### 10.11 Implementation notes
 
-- **Atomic replace on Windows.** A plain rename fails when the target exists, so it needs MoveFileEx with MOVEFILE\_REPLACE\_EXISTING. It still fails while another program, such as a viewer, holds the file open. The writer must report this and keep the temporary file, not lose the commit.
+- **Atomic replace on Windows.** A plain rename fails when the target exists, so it needs MoveFileEx with MOVEFILE\_REPLACE\_EXISTING. It still fails while another program, such as a viewer, holds the file open. A file that was just written can also be held for a moment by a virus scanner, so a sharing or access error is retried for a short time first. If it persists, the writer must report this and keep the temporary file, not lose the commit.
+- **Long ledger strings and CFITSIO.** CFITSIO 4.7.0 truncates a variable-length string (1PA) that crosses two 2880-byte block boundaries when it is read as text (fits\_read\_col with TSTRING). It returns only the part before the second boundary. ORIGHDR is several kilobytes per row, so some rows are affected in every file, including files written by other tools. A reader that needs the full header reads the column as bytes (TBYTE), using the length from the descriptor (fits\_read\_descript). fitsverify reads these strings the same way and reports "contains non-ASCII text" for the affected rows, because it scans stale bytes in its buffer. That error is a false positive when the stored bytes are printable ASCII. lsf\_compare.py checks the stored bytes directly before it accepts this error.
 - **Converting v0.3 files.** A v0.3 file (separate LSF\_WEIGHT, LSF\_M2 and LSF\_W2 HDUs, LSFDSUM) can be converted to v0.4 without loss. MEAN is obtained by inverting the output normalization of the primary, the planes are packed into LSF\_ACC, and LSFHASH is computed.
 
 ## 11. Conformance
@@ -440,6 +448,7 @@ Nothing in this profile has been tested against real software yet, except the Si
 8. **Shrinking spread.** Run 50 simulated appends from a fixed noise model, with and without the Section 10.7 guards. The rejected fraction per append must stay flat with the guards.
 9. **Weight consistency.** Append one good and one poor batch. The total weight each batch adds must reflect its quality, rather than being equal per frame.
 10. **Grid expansion.** Append a batch shifted beyond the grid edge. Existing pixels must be unchanged, and the WCS and the ledger transforms must still agree.
+11. **Parity with Siril's stack.** lsf\_init over a set of frames must give the same image as Siril's stack command with the same frames, reference and settings, bit for bit, when both normalize with the same frame statistics. Siril caches those in the .seq file with 6 significant digits: the first command on a fresh sequence uses full-precision values and later ones the cached values, so the cache is filled first (seqstat full). Known exceptions: wfwhm and nbstars weighting (Siril keeps a weight-0 frame in the rejection set, LSF drops it), and sigmedian rejection without weights (Siril averages the medians that replaced outliers, LSF counts them as rejected).
 
 ## 13. Open Questions
 

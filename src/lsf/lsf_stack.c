@@ -135,6 +135,29 @@ static void reconcile_first_frame_keywords(fits *primary, const fits *frame) {
 	if (differ_str(p->object, f->object)) p->object[0] = '\0';
 }
 
+/* Siril keeps a frame's header as text, one card per line. FITS string columns
+ * hold printable ASCII only, so store it the FITS way: 80-character cards one
+ * after another, no line breaks (what fits_hdr2str produces). */
+static gchar *header_as_cards(const char *header) {
+	if (!header)
+		return g_strdup("");
+	GString *out = g_string_sized_new(strlen(header) + 80);
+	gchar **lines = g_strsplit(header, "\n", -1);
+	for (int i = 0; lines[i]; i++) {
+		char card[81];
+		int n = 0;
+		for (const char *c = lines[i]; *c && n < 80; c++)
+			if (*c >= 32 && *c <= 126)
+				card[n++] = *c;
+		if (n == 0)
+			continue;
+		memset(card + n, ' ', 80 - n);
+		g_string_append_len(out, card, 80);
+	}
+	g_strfreev(lines);
+	return g_string_free(out, FALSE);
+}
+
 static void fill_ledger_row(lsf_ledger_row *r, struct lsf_batch_args *args, const batch_frames *b,
 		int k, const fits *meta, imstats **stats) {
 	sequence *seq = args->seq;
@@ -156,7 +179,7 @@ static void fill_ledger_row(lsf_ledger_row *r, struct lsf_batch_args *args, cons
 	r->ybin = meta->keywords.binning_y ? (int) meta->keywords.binning_y : INT_MIN;
 	r->ccd_temp = dbl_known(meta->keywords.ccd_temp) ? (float) meta->keywords.ccd_temp : NAN;
 	r->filter = g_strdup(meta->keywords.filter);
-	r->orighdr = g_strdup(meta->header ? meta->header : "");
+	r->orighdr = header_as_cards(meta->header);
 
 	/* registration: the transform onto the grid is the one computed for the
 	 * source frame when the batch was registered against the Stack */
@@ -209,6 +232,7 @@ typedef struct {
 	WORD *wbuf;		// ushort read buffer
 	float *xbuf;		// accepted samples
 	double *wbufd;		// their weights
+	gboolean *sel;		// frame survived the batch-local rejection
 	void *mem;
 } lsf_thread_data;
 
@@ -222,10 +246,11 @@ static int alloc_thread_data(lsf_thread_data *t, int nb, size_t block_pix, gbool
 	t->db.rejected = malloc(nb * sizeof(int));
 	t->xbuf = malloc(nb * sizeof(float));
 	t->wbufd = malloc(nb * sizeof(double));
+	t->sel = malloc(nb * sizeof(gboolean));
 	if (ushort_input)
 		t->wbuf = malloc(block_pix * sizeof(WORD));
 	if (!t->pix || !t->mem || !t->db.stack || !t->db.o_stack || !t->db.w_stack || !t->db.rejected
-			|| !t->xbuf || !t->wbufd || (ushort_input && !t->wbuf))
+			|| !t->xbuf || !t->wbufd || !t->sel || (ushort_input && !t->wbuf))
 		return 1;
 	for (int f = 0; f < nb; f++)
 		t->pix[f] = (float *) t->mem + (size_t) f * block_pix;
@@ -247,7 +272,7 @@ static int alloc_thread_data(lsf_thread_data *t, int nb, size_t block_pix, gbool
 }
 
 static void free_thread_data(lsf_thread_data *t) {
-	free(t->pix); free(t->mem); free(t->wbuf); free(t->xbuf); free(t->wbufd);
+	free(t->pix); free(t->mem); free(t->wbuf); free(t->xbuf); free(t->wbufd); free(t->sel);
 	free(t->db.stack); free(t->db.o_stack); free(t->db.w_stack); free(t->db.rejected);
 	free(t->db.xf);
 }
@@ -334,10 +359,12 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 		gboolean found = FALSE;
 		for (int k = 0; k < nb_incl; k++)
 			found |= cand[k] == args->ref_image;
-		if (!found) {
-			siril_log_error(_("LSF: the reference image is not in the selected set of images\n"));
-			free(cand);
-			goto end;
+		if (!found && nb_incl > 0) {
+			/* like stack (sequence_filtering.c): the first selected frame is
+			 * the temporary reference for this run */
+			siril_log_warning(_("LSF: the reference image is not in the selected set of images, "
+					"using image %d as temporary reference image\n"), cand[0] + 1);
+			args->ref_image = cand[0];
 		}
 	}
 	if (nb_incl == 0) {
@@ -610,17 +637,39 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 				brej[1] += rej[1];
 				if (kept_pixels <= 0)
 					continue;	// no data here: nothing is added
-				/* survivors, identified as mean_and_reject() does */
+				/* survivors, identified as mean_and_reject() does: its weighted
+				 * branch takes the values of o_stack within the range of the kept
+				 * samples, its unweighted branch the kept samples themselves. They
+				 * differ only when the stop rule of the rejection (N - r <= 4) left
+				 * a gap in the kept range, then the kept samples are matched back
+				 * to their frames. Sigmedian keeps the range test: its kept samples
+				 * include the medians that replaced the outliers. */
 				float pmin = FLT_MAX, pmax = -FLT_MAX;
 				for (int f = 0; f < kept_pixels; f++) {
 					if (pmin > stack[f]) pmin = stack[f];
 					if (pmax < stack[f]) pmax = stack[f];
 				}
+				gboolean *sel = td->sel;
+				int nsel = 0;
+				for (int f = 0; f < nb; f++) {
+					float val = o_stack[f];
+					sel[f] = val >= pmin && val <= pmax && val != 0.f;
+					nsel += sel[f];
+				}
+				if (nsel != kept_pixels && s->weighting == NO_WEIGHT && s->rej != SIGMEDIAN) {
+					memset(sel, 0, nb * sizeof(gboolean));
+					for (int k = 0; k < kept_pixels; k++)
+						for (int f = 0; f < nb; f++)
+							if (!sel[f] && o_stack[f] == stack[k]) {
+								sel[f] = TRUE;
+								break;
+							}
+				}
 				double Wh = w_h[pdata_idx];
 				int n = 0;
 				for (int f = 0; f < nb; f++) {
 					float val = o_stack[f];
-					if (!(val >= pmin && val <= pmax && val != 0.f))
+					if (!sel[f])
 						continue;
 					double wf = b.weight[layer][f];
 					if (Wh > 0.0) {	// history test, Section 10.7
@@ -726,6 +775,11 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 	g_strlcpy(p->keywords.program, "Siril " PACKAGE_VERSION, sizeof p->keywords.program);
 	p->history = g_slist_append(p->history, g_strdup_printf("LSF generation %d: batch %d, %d frames from %s",
 				args->gen, args->batch, nb, args->seq_name));
+	/* rejected samples in percent, low and high: batch-local then history */
+	for (int c = 0; c < nchan; c++)
+		p->history = g_slist_append(p->history, g_strdup_printf("LSF gen %d ch %d rejected %%: %.4f %.4f hist %.4f %.4f",
+					args->gen, c, irej[c][0] / nb_tot * 100.0, irej[c][1] / nb_tot * 100.0,
+					hrej[c][0] / nb_tot * 100.0, hrej[c][1] / nb_tot * 100.0));
 	retval = 0;
 
 end:
@@ -760,7 +814,9 @@ end:
 	return retval;
 }
 
-/* HDU 0 from MEAN: output-normalized when enabled, 0 where W = 0 (Section 3) */
+/* HDU 0 from MEAN: output-normalized when enabled, otherwise clamped to [0,1]
+ * like the 32-bit output of stack_mean_with_rejection(), 0 where W = 0
+ * (Sections 3, 4.1). MEAN itself is not clamped. */
 int lsf_build_primary(fits *primary, lsf_settings *s, const lsf_history *h) {
 	size_t n = (size_t) h->rx * h->ry;
 	float *data = malloc(n * h->nchan * sizeof(float));
@@ -778,11 +834,8 @@ int lsf_build_primary(fits *primary, lsf_settings *s, const lsf_history *h) {
 	for (int c = 0; c < h->nchan; c++) {
 		const float *m = h->plane[LSF_PL_MEAN][c], *w = h->plane[LSF_PL_W][c];
 		float *out = data + c * n;
-		for (size_t i = 0; i < n; i++) {
-			if (w[i] > 0.f)
-				out[i] = norm ? (float) (((double) m[i] - mini) / range) : m[i];
-			else out[i] = 0.f;
-		}
+		for (size_t i = 0; i < n; i++)
+			out[i] = lsf_stack_value(m[i], w[i], norm, mini, range);
 	}
 	s->outnorm_min = norm ? mini : 0.0;
 	s->outnorm_max = norm ? maxi : 0.0;
