@@ -29,6 +29,7 @@
 #include "core/siril.h"
 #include "core/proto.h"
 #include "core/siril_log.h"
+#include "core/OS_utils.h"
 #include "core/command.h"
 #include "core/command_line_processor.h"
 #include "core/processing.h"
@@ -36,6 +37,8 @@
 #include "io/sequence.h"
 #include "io/image_format_fits.h"
 #include "algos/siril_wcs.h"
+#include "algos/astrometry_solver.h"
+#include "opencv/opencv.h"
 #include "registration/registration.h"
 #include "lsf/lsf.h"
 
@@ -54,6 +57,10 @@ struct lsf_cmd_args {
 	gboolean hist_low_set, hist_high_set, hist_margin_set;
 	double hist_low, hist_high, hist_margin;
 	gboolean noreg, backup, overwrite;
+	framing_type framing;		// init and append: -framing=, FRAMING_MAX by default (Sections 10.1, 10.6)
+	gboolean framing_set;
+	gboolean expand_force;
+	int expand_step;
 	gboolean repair, adopt;	// check
 	guint maps;		// maps, LSF_MAP_* flags
 };
@@ -122,6 +129,24 @@ static void apply_hist_overrides(struct lsf_cmd_args *a, lsf_settings *s) {
 	if (a->hist_margin_set) s->hist_margin = a->hist_margin;
 }
 
+#define LSF_REG_PREFIX "lsf_r_"
+static sequence *apply_init_registration(sequence *seq, const struct lsf_cmd_args *a, int *ref,
+		int origin[2], Homography *base);
+static int *map_to_sources(sequence *seq, sequence *rseq);
+
+static gboolean any_pad(const int pad[4]) {
+	return pad[LSF_PAD_LEFT] || pad[LSF_PAD_RIGHT] || pad[LSF_PAD_FIRST] || pad[LSF_PAD_LAST];
+}
+
+static const char *lsf_framing_name(framing_type f) {
+	switch (f) {
+	case FRAMING_CURRENT: return "current";
+	case FRAMING_MIN: return "min";
+	case FRAMING_COG: return "cog";
+	default: return "max";
+	}
+}
+
 static int lsf_init_run(struct lsf_cmd_args *a) {
 	lsf_settings *s = &a->settings;
 	lsf_history h = { 0 };
@@ -129,6 +154,10 @@ static int lsf_init_run(struct lsf_cmd_args *a) {
 	GPtrArray *rows = g_ptr_array_new_with_free_func(lsf_ledger_row_free);
 	int retval = 1;
 	gchar *uid = NULL;
+	sequence *rseq = NULL;
+	int *src_index = NULL;
+	int origin[2] = { 0, 0 };
+	Homography base;
 
 	if (g_file_test(a->path, G_FILE_TEST_EXISTS) && !a->overwrite) {
 		siril_log_error(_("LSF: %s already exists, use lsf_append to add frames to it, or -overwrite\n"), a->path);
@@ -140,17 +169,28 @@ static int lsf_init_run(struct lsf_cmd_args *a) {
 		g_ptr_array_free(rows, TRUE);
 		return 1;
 	}
-	int reglayer = get_registration_layer(seq);
-	if (layer_has_usable_registration(seq, reglayer)) {
-		siril_log_error(_("LSF: the sequence %s has registration data that is not applied. lsf_init needs "
-					"frames already on a common grid: apply the registration first (seqapplyreg or "
-					"register without -2pass)\n"), a->seqname);
-		goto end;
+	/* registration computed but not applied: lsf_init applies it, by default
+	 * onto the union of all the frames (Section 10.1) */
+	int ref = sequence_find_refimage(seq);
+	sequence *batch = seq;
+	int batch_ref = ref;
+	if (layer_has_usable_registration(seq, get_registration_layer(seq))) {
+		rseq = apply_init_registration(seq, a, &ref, origin, &base);
+		if (!rseq || !(src_index = map_to_sources(seq, rseq)))
+			goto end;
+		batch = rseq;
+		batch_ref = 0;
+		for (int i = 0; i < rseq->number; i++)
+			if (src_index[i] == ref)
+				batch_ref = i;
+		s->origin_x = origin[0];
+		s->origin_y = origin[1];
+	} else if (a->framing_set) {
+		siril_log_warning(_("LSF: the frames of %s are already on a common grid, -framing is ignored\n"), a->seqname);
 	}
 
 	/* sensor and fixed settings */
 	fits refmeta = { 0 };
-	int ref = sequence_find_refimage(seq);
 	if (!seq_read_frame_metadata(seq, ref, &refmeta)) {
 		s->is_cfa = seq->nb_layers == 3;
 		const char *pat = refmeta.keywords.bayer_pattern;
@@ -175,11 +215,15 @@ static int lsf_init_run(struct lsf_cmd_args *a) {
 	apply_hist_overrides(a, s);
 
 	struct lsf_batch_args bargs = { 0 };
-	bargs.seq = seq;
+	bargs.seq = batch;
+	bargs.src_seq = rseq ? seq : NULL;
+	bargs.src_index = src_index;
+	bargs.xfrm_base = rseq ? &base : NULL;
+	bargs.framing = lsf_framing_name(a->framing);
 	bargs.settings = s;
 	bargs.hist = &h;
 	bargs.init = TRUE;
-	bargs.ref_image = ref;
+	bargs.ref_image = batch_ref;
 	bargs.batch = 1;
 	bargs.gen = 1;
 	bargs.prev_frames = 0;
@@ -188,6 +232,10 @@ static int lsf_init_run(struct lsf_cmd_args *a) {
 	bargs.primary = &primary;
 	if (lsf_process_batch(&bargs))
 		goto end;
+	if (rseq)
+		primary.history = g_slist_append(primary.history, g_strdup_printf(
+					"LSF gen 1: registration applied, %s framing, origin %d %d", bargs.framing,
+					origin[0], origin[1]));
 	if (lsf_build_primary(&primary, s, &h))
 		goto end;
 	uid = g_uuid_string_random();
@@ -201,44 +249,35 @@ end:
 	clearfits(&primary);
 	lsf_history_free(&h);
 	g_ptr_array_free(rows, TRUE);
+	if (rseq) {
+		remove_prefixed_sequence_files(seq, LSF_REG_PREFIX);
+		free_sequence(rseq, TRUE);
+	}
+	free(src_index);
 	free_sequence(seq, TRUE);
 	return retval;
 }
 
-/* registers the batch against HDU 0 of the LSF file with Siril's global star
- * alignment and an external reference (Section 10.5). Returns the registered
- * sequence, written with the lsf_r_ prefix. */
-#define LSF_REG_PREFIX "lsf_r_"
-static sequence *register_against_stack(sequence *seq, const char *lsf_path, const lsf_settings *s) {
-	star_finder_params backup = com.pref.starfinder_conf;
-	findstar_from_json(s->findstar_json, &com.pref.starfinder_conf);
-
+/* registration arguments for Siril's star alignment and apply steps */
+static struct registration_args *new_regargs(sequence *seq, const lsf_settings *s) {
 	struct registration_args *regargs = calloc(1, sizeof(struct registration_args));
-	regargs->func = register_star_alignment;
 	regargs->seq = seq;
 	regargs->reference_image = sequence_find_refimage(seq);
 	regargs->layer = seq->nb_layers == 3 ? 1 : 0;
 	regargs->filters.filter_included = TRUE;
 	regargs->run_in_thread = FALSE;
-	regargs->no_output = FALSE;
 	regargs->output_scale = 1.f;
 	regargs->prefix = strdup(LSF_REG_PREFIX);
-	regargs->min_pairs = s->min_pairs;
-	regargs->max_stars_candidates = MAX_STARS_FITTED;
 	regargs->type = s->transform;
 	regargs->interpolation = s->interpolation;
 	regargs->clamp = s->interpolation == OPENCV_CUBIC || s->interpolation == OPENCV_LANCZOS4;
 	regargs->undistort = DISTO_UNDEF;
+	regargs->framing = FRAMING_CURRENT;
 	regargs->load_new_sequence = FALSE;
-	regargs->external_ref_path = g_strdup(lsf_path);
-	regargs->use_external_ref = TRUE;
+	return regargs;
+}
 
-	siril_log_message(_("LSF: registering %d frames against the Stack of %s\n"), seq->selnum, lsf_path);
-	int ret = register_star_alignment(regargs);
-	com.pref.starfinder_conf = backup;
-	if (!ret)
-		writeseqfile(seq);
-
+static void free_regargs(struct registration_args *regargs) {
 	free(regargs->prefix);
 	g_free(regargs->external_ref_path);
 	g_free(regargs->new_seq_name);
@@ -246,10 +285,268 @@ static sequence *register_against_stack(sequence *seq, const char *lsf_path, con
 		wcsfree(regargs->wcsref);
 	free(regargs->sfargs);
 	free(regargs);
-	if (ret) {
+}
+
+/* grid expansion (Section 10.6): the padding of each side needed by the
+ * footprint box of the registered frames, or 0 when no expansion is wanted
+ * or needed. Fails when the expansion is refused. */
+static int plan_expansion(const lsf_file *f, const struct lsf_cmd_args *a, const double box[4], int pad[4]) {
+	int need[4];
+	memset(pad, 0, 4 * sizeof(int));
+	if (!lsf_grid_overhang(box, f->rx, f->ry, need))
+		return 0;
+	if (a->framing == FRAMING_CURRENT) {
+		siril_log_warning(_("LSF: the batch reaches beyond the grid by %d px on the left, %d on the right, "
+					"%d before row 1 and %d after the last row; these pixels are cropped (-framing=current)\n"),
+				need[LSF_PAD_LEFT], need[LSF_PAD_RIGHT], need[LSF_PAD_FIRST], need[LSF_PAD_LAST]);
+		return 0;
+	}
+	lsf_expand_pads(need, a->expand_step, pad);
+	int nrx = f->rx + pad[LSF_PAD_LEFT] + pad[LSF_PAD_RIGHT];
+	int nry = f->ry + pad[LSF_PAD_FIRST] + pad[LSF_PAD_LAST];
+	if (!a->expand_force && (nrx > 2 * f->rx || nry > 2 * f->ry)) {
+		siril_log_error(_("LSF: this batch would grow the grid from %dx%d to %dx%d, more than twice on one axis, "
+					"which usually means a wrong registration. Check the registration, or use -expand_force "
+					"to grow the grid anyway, or -framing=current to crop the batch to the grid\n"),
+				f->rx, f->ry, nrx, nry);
+		return 1;
+	}
+	guint64 bytes = (guint64) nrx * nry * f->nchan * (LSF_NB_PL * sizeof(float) + sizeof(WORD));
+	int max_mb = get_max_memory_in_MB();
+	if (bytes > (guint64) max_mb * BYTES_IN_A_MB) {
+		siril_log_error(_("LSF: the accumulator of the expanded %dx%d grid needs %.0f MB, more than the %d MB "
+					"Siril may use. Use -framing=current to crop the batch to the grid, or raise the memory limit\n"),
+				nrx, nry, (double) bytes / BYTES_IN_A_MB, max_mb);
+		return 1;
+	}
+	siril_log_message(_("LSF: the grid grows from %dx%d to %dx%d: %d px on the left, %d on the right, "
+				"%d before row 1, %d after the last row\n"), f->rx, f->ry, nrx, nry,
+			pad[LSF_PAD_LEFT], pad[LSF_PAD_RIGHT], pad[LSF_PAD_FIRST], pad[LSF_PAD_LAST]);
+	return 0;
+}
+
+/* registers the batch against HDU 0 of the LSF file (Section 10.5) in two
+ * passes: Siril's global star alignment with an external reference computes
+ * the transforms, then the footprint of the registered frames decides the
+ * expansion of the grid (pad), and the registration is applied onto the
+ * grid, expanded or not. Returns the registered sequence, written with the
+ * lsf_r_ prefix. The transforms in seq stay relative to the grid before the
+ * expansion. */
+static sequence *register_against_stack(sequence *seq, const lsf_file *f, const struct lsf_cmd_args *a, int pad[4]) {
+	const lsf_settings *s = &f->settings;
+	star_finder_params backup = com.pref.starfinder_conf;
+	findstar_from_json(s->findstar_json, &com.pref.starfinder_conf);
+
+	struct registration_args *regargs = new_regargs(seq, s);
+	regargs->func = register_star_alignment;
+	regargs->no_output = TRUE;
+	regargs->min_pairs = s->min_pairs;
+	regargs->max_stars_candidates = MAX_STARS_FITTED;
+	regargs->external_ref_path = g_strdup(f->path);
+	regargs->use_external_ref = TRUE;
+
+	siril_log_message(_("LSF: registering %d frames against the Stack of %s\n"), seq->selnum, f->path);
+	int ret = register_star_alignment(regargs);
+	com.pref.starfinder_conf = backup;
+	int layer = regargs->layer;
+	free_regargs(regargs);
+	if (ret || !seq->regparam[layer]) {
 		siril_log_error(_("LSF: registration against the Stack failed\n"));
 		return NULL;
 	}
+
+	/* footprint of the registered frames on the grid */
+	double box[4];
+	int first = -1;
+	lsf_footprint_init(box);
+	for (int i = 0; i < seq->number; i++) {
+		const Homography *H = &seq->regparam[layer][i].H;
+		if (!seq->imgparam[i].incl || guess_transform_from_H(*H) == NULL_TRANSFORMATION)
+			continue;
+		double h[9] = { H->h00, H->h01, H->h02, H->h10, H->h11, H->h12, H->h20, H->h21, H->h22 };
+		lsf_footprint_add(h, seq->is_variable ? seq->imgparam[i].rx : seq->rx,
+				seq->is_variable ? seq->imgparam[i].ry : seq->ry, box);
+		if (first < 0)
+			first = i;
+	}
+	if (first < 0) {
+		siril_log_error(_("LSF: no frame could be registered against the Stack\n"));
+		return NULL;
+	}
+	if (plan_expansion(f, a, box, pad))
+		return NULL;
+
+	/* second pass. Apply checks the reference frame of the sequence, which
+	 * plays no part with an external reference: use a registered one. */
+	regargs = new_regargs(seq, s);
+	regargs->func = register_apply_reg;
+	regargs->no_output = FALSE;
+	if (any_pad(pad))
+		regargs->canvas =(framing_roi) { -pad[LSF_PAD_LEFT], -pad[LSF_PAD_LAST],
+			f->rx + pad[LSF_PAD_LEFT] + pad[LSF_PAD_RIGHT], f->ry + pad[LSF_PAD_FIRST] + pad[LSF_PAD_LAST] };
+	int seq_ref = seq->reference_image;
+	seq->reference_image = first;
+	regargs->reference_image = first;
+	ret = register_apply_reg(regargs);
+	seq->reference_image = seq_ref;
+	free_regargs(regargs);
+	if (ret) {
+		siril_log_error(_("LSF: applying the registration onto the grid failed\n"));
+		return NULL;
+	}
+	writeseqfile(seq);
+	gchar *rname = g_strdup_printf("%s%s", LSF_REG_PREFIX, seq->seqname);
+	sequence *rseq = load_batch(rname);
+	g_free(rname);
+	return rseq;
+}
+
+/* grows the grid of the file in memory before merging (Section 10.6): the
+ * accumulator planes, grid.origin_*, the WCS of the Stack, and the shift
+ * applied to the transforms of the ledger when the file is written */
+static int expand_grid(lsf_file *f, const int pad[4], int gen) {
+	int orx = f->rx, ory = f->ry;
+	if (lsf_history_grow(&f->hist, pad))
+		return 1;
+	f->rx = f->hist.rx;
+	f->ry = f->hist.ry;
+	f->settings.origin_x += pad[LSF_PAD_LEFT];
+	f->settings.origin_y += pad[LSF_PAD_FIRST];
+	f->xfrm_shift[0] = pad[LSF_PAD_LEFT];
+	f->xfrm_shift[1] = pad[LSF_PAD_LAST];
+	if (has_wcs(&f->primary)) {
+		/* CRPIX counts pixels in storage order */
+		Homography T;
+		cvGetEye(&T);
+		T.h02 = pad[LSF_PAD_LEFT];
+		T.h12 = pad[LSF_PAD_FIRST];
+		reframe_wcs(f->primary.keywords.wcslib, &T);
+	}
+	f->primary.history = g_slist_append(f->primary.history, g_strdup_printf(
+				"LSF gen %d: grid %dx%d expanded to %dx%d, pad %d %d %d %d", gen, orx, ory,
+				f->rx, f->ry, pad[LSF_PAD_LEFT], pad[LSF_PAD_RIGHT], pad[LSF_PAD_FIRST], pad[LSF_PAD_LAST]));
+	return 0;
+}
+
+/* the registered frames carry the WCS that Siril's apply derived for the
+ * expanded grid; it must agree with the one computed for the Stack */
+static void check_expanded_wcs(sequence *rseq, fits *primary) {
+	fits meta = { 0 };
+	if (!has_wcs(primary) || seq_read_frame_metadata(rseq, 0, &meta))
+		return;
+	if (has_wcs(&meta)) {
+		const double *a = primary->keywords.wcslib->crpix, *b = meta.keywords.wcslib->crpix;
+		if (fabs(a[0] - b[0]) > 1e-6 || fabs(a[1] - b[1]) > 1e-6)
+			siril_log_warning(_("LSF: the WCS of the expanded Stack (CRPIX %g %g) and of the registered "
+						"frames (CRPIX %g %g) disagree\n"), a[0], a[1], b[0], b[1]);
+		else siril_log_message(_("LSF: the WCS of the expanded Stack agrees with the registered frames\n"));
+	}
+	clearfits(&meta);
+}
+
+/* index in seq of each frame of the registered sequence rseq, or NULL */
+static int *map_to_sources(sequence *seq, sequence *rseq) {
+	int *src_index = malloc(rseq->number * sizeof(int));
+	for (int i = 0; i < rseq->number; i++) {
+		src_index[i] = -1;
+		for (int j = 0; j < seq->number; j++)
+			if (seq->imgparam[j].filenum == rseq->imgparam[i].filenum) {
+				src_index[i] = j;
+				break;
+			}
+		if (src_index[i] < 0) {
+			siril_log_error(_("LSF: cannot map registered frame %d back to its source\n"), rseq->imgparam[i].filenum);
+			free(src_index);
+			return NULL;
+		}
+	}
+	return src_index;
+}
+
+/* lsf_init on a sequence whose registration is computed but not applied
+ * (Section 10.1): applies it with Siril's apply step and the framing asked
+ * for: onto the union of all the selected frames (max, the default; every
+ * frame keeps the size of the grid instead of Siril's per-frame crop), the
+ * reference frame (current), their intersection (min) or the reference
+ * frame's size centred on their centre of gravity (cog). ref is the
+ * reference frame, replaced by the first registered one when it is not
+ * selected, origin the margins of the grid before it in storage order
+ * (negative when the grid starts inside it) and base the transform from the
+ * registration of the sequence onto the grid. Returns the registered
+ * sequence, written with the lsf_r_ prefix. */
+static sequence *apply_init_registration(sequence *seq, const struct lsf_cmd_args *a, int *ref,
+		int origin[2], Homography *base) {
+	int layer = get_registration_layer(seq);
+	int pad[4] = { 0 };
+	if (seq->ext_ref) {
+		siril_log_error(_("LSF: the registration of %s was computed against an external reference image. "
+					"lsf_init can only apply a registration onto one of the frames: register the sequence "
+					"again, or apply its registration first\n"), seq->seqname);
+		return NULL;
+	}
+	gboolean ok = seq->imgparam[*ref].incl && guess_transform_from_H(seq->regparam[layer][*ref].H) != NULL_TRANSFORMATION;
+	for (int i = 0; !ok && i < seq->number; i++) {
+		if (seq->imgparam[i].incl && guess_transform_from_H(seq->regparam[layer][i].H) != NULL_TRANSFORMATION) {
+			siril_log_warning(_("LSF: the reference image is not in the selected set of images, "
+						"using image %d as temporary reference image\n"), i + 1);
+			*ref = i;
+			ok = TRUE;
+		}
+	}
+	if (!ok) {
+		siril_log_error(_("LSF: no selected frame of %s has registration data\n"), seq->seqname);
+		return NULL;
+	}
+	Homography Href = seq->regparam[layer][*ref].H;
+	int rx = seq->is_variable ? seq->imgparam[*ref].rx : seq->rx;
+	int ry = seq->is_variable ? seq->imgparam[*ref].ry : seq->ry;
+
+	if (a->framing == FRAMING_MAX) {
+		/* footprint of the frames on the reference frame, as a canvas */
+		double box[4];
+		lsf_footprint_init(box);
+		for (int i = 0; i < seq->number; i++) {
+			Homography Hi = seq->regparam[layer][i].H, Hr;
+			if (!seq->imgparam[i].incl || guess_transform_from_H(Hi) == NULL_TRANSFORMATION)
+				continue;
+			cvTransfH(&Hi, &Href, &Hr);	// Href^-1 * Hi
+			double h[9] = { Hr.h00, Hr.h01, Hr.h02, Hr.h10, Hr.h11, Hr.h12, Hr.h20, Hr.h21, Hr.h22 };
+			lsf_footprint_add(h, seq->is_variable ? seq->imgparam[i].rx : seq->rx,
+					seq->is_variable ? seq->imgparam[i].ry : seq->ry, box);
+		}
+		lsf_grid_overhang(box, rx, ry, pad);
+	}
+	struct registration_args *regargs = new_regargs(seq, &a->settings);
+	regargs->func = register_apply_reg;
+	regargs->layer = layer;
+	regargs->no_output = FALSE;
+	regargs->framing = a->framing == FRAMING_MAX ? FRAMING_CURRENT : a->framing;
+	if (any_pad(pad))
+		regargs->canvas = (framing_roi) { -pad[LSF_PAD_LEFT], -pad[LSF_PAD_LAST],
+			rx + pad[LSF_PAD_LEFT] + pad[LSF_PAD_RIGHT], ry + pad[LSF_PAD_FIRST] + pad[LSF_PAD_LAST] };
+	int seq_ref = seq->reference_image;
+	seq->reference_image = *ref;
+	regargs->reference_image = *ref;
+	int ret = register_apply_reg(regargs);
+	seq->reference_image = seq_ref;
+	if (ret) {
+		free_regargs(regargs);
+		siril_log_error(_("LSF: applying the registration of %s failed\n"), seq->seqname);
+		return NULL;
+	}
+	/* Siril's apply maps each frame onto the grid by Htransf^-1 * H, for
+	 * every framing; the reference frame's first stored pixel gives origin */
+	Homography R, Ht = regargs->framingd.Htransf;
+	int nrx = regargs->framingd.roi_out.w, nry = regargs->framingd.roi_out.h;
+	free_regargs(regargs);
+	*base = Ht;
+	cvInvertH(base);
+	cvMultH(*base, Href, &R);
+	origin[0] = (int) lround(R.h01 * (ry - 1) + R.h02);
+	origin[1] = nry - 1 - (int) lround(R.h11 * (ry - 1) + R.h12);
+	siril_log_message(_("LSF: registration of %s applied with %s framing: grid %dx%d, origin %d %d "
+				"from the reference frame\n"), seq->seqname, lsf_framing_name(a->framing), nrx, nry,
+			origin[0], origin[1]);
 	gchar *rname = g_strdup_printf("%s%s", LSF_REG_PREFIX, seq->seqname);
 	sequence *rseq = load_batch(rname);
 	g_free(rname);
@@ -278,24 +575,19 @@ static int lsf_append_run(struct lsf_cmd_args *a) {
 	}
 
 	sequence *batch = seq;
+	int gen = f.gen + 1, batchnum = f.nb_batches + 1;
+	int pad[4] = { 0 };
 	if (!a->noreg) {
-		rseq = register_against_stack(seq, a->path, &f.settings);
+		rseq = register_against_stack(seq, &f, a, pad);
 		if (!rseq)
 			goto end;
-		/* map registered frames back to their sources */
-		src_index = malloc(rseq->number * sizeof(int));
-		for (int i = 0; i < rseq->number; i++) {
-			src_index[i] = -1;
-			for (int j = 0; j < seq->number; j++)
-				if (seq->imgparam[j].filenum == rseq->imgparam[i].filenum) {
-					src_index[i] = j;
-					break;
-				}
-			if (src_index[i] < 0) {
-				siril_log_error(_("LSF: cannot map registered frame %d back to its source\n"), rseq->imgparam[i].filenum);
+		if (any_pad(pad)) {
+			if (expand_grid(&f, pad, gen))
 				goto end;
-			}
+			check_expanded_wcs(rseq, &f.primary);
 		}
+		if (!(src_index = map_to_sources(seq, rseq)))
+			goto end;
 		int dropped = seq->selnum - rseq->number;
 		if (dropped > 0)
 			siril_log_warning(_("LSF: %d frame(s) could not be registered against the Stack and are not merged\n"), dropped);
@@ -309,11 +601,11 @@ static int lsf_append_run(struct lsf_cmd_args *a) {
 		}
 	}
 
-	int gen = f.gen + 1, batchnum = f.nb_batches + 1;
 	struct lsf_batch_args bargs = { 0 };
 	bargs.seq = batch;
 	bargs.src_seq = a->noreg ? NULL : seq;
 	bargs.src_index = src_index;
+	bargs.framing = a->noreg ? NULL : lsf_framing_name(a->framing);
 	bargs.settings = &f.settings;
 	bargs.hist = &f.hist;
 	bargs.init = FALSE;
@@ -325,6 +617,11 @@ static int lsf_append_run(struct lsf_cmd_args *a) {
 	bargs.primary = &f.primary;
 	if (lsf_process_batch(&bargs))
 		goto end;
+	/* the transforms of the new rows were computed onto the grid before its expansion */
+	for (guint i = 0; i < rows->len && (f.xfrm_shift[0] != 0.0 || f.xfrm_shift[1] != 0.0); i++) {
+		lsf_ledger_row *r = g_ptr_array_index(rows, i);
+		lsf_xfrm_shift(r->xfrm, f.xfrm_shift[0], f.xfrm_shift[1]);
+	}
 	if (lsf_build_primary(&f.primary, &f.settings, &f.hist))
 		goto end;
 	if (lsf_write_file(a->path, &f, &f.settings, &f.hist, &f.primary, f.uid, gen, rows, batchnum, a->backup))
@@ -555,14 +852,29 @@ static int parse_common_option(struct lsf_cmd_args *a, const char *w) {
 		}
 		return a->hist_margin_set == TRUE ? 1 : -1;
 	}
+	if (g_str_has_prefix(w, "-framing=")) {
+		const char *v = w + 9;
+		if (!strcmp(v, "max")) a->framing = FRAMING_MAX;
+		else if (!strcmp(v, "current")) a->framing = FRAMING_CURRENT;
+		else if (!strcmp(v, "min")) a->framing = FRAMING_MIN;
+		else if (!strcmp(v, "cog")) a->framing = FRAMING_COG;
+		else {
+			siril_log_error(_("LSF: framing %s is not supported (max, current, min, cog)\n"), v);
+			return -1;
+		}
+		a->framing_set = TRUE;
+		return 1;
+	}
 	return 0;
 }
 
 /* lsf_init sequencename file.lsf.fits [rej [type] sigma_low sigma_high] [-nonorm, -norm=] [-fastnorm]
- *   [-rgb_equal] [-weight=] [-output_norm] [-hist_low=] [-hist_high=] [-hist_margin=] [-overwrite] */
+ *   [-rgb_equal] [-weight=] [-output_norm] [-framing=max|current|min|cog] [-hist_low=] [-hist_high=] [-hist_margin=]
+ *   [-overwrite] */
 int process_lsf_init(int nb) {
 	struct lsf_cmd_args *a = calloc(1, sizeof(struct lsf_cmd_args));
 	a->mode = LSF_CMD_INIT;
+	a->framing = FRAMING_MAX;
 	a->seqname = g_strdup(word[1]);
 	a->path = g_strdup(word[2]);
 	lsf_settings *s = &a->settings;
@@ -650,23 +962,42 @@ failure:
 	return CMD_ARG_ERROR;
 }
 
-/* lsf_append file.lsf.fits sequencename [-noreg] [-backup] [-hist_low=] [-hist_high=] [-hist_margin=] */
+/* lsf_append file.lsf.fits sequencename [-noreg] [-framing=max|current] [-noexpand] [-expand_step=] [-expand_force] [-backup]
+ *   [-hist_low=] [-hist_high=] [-hist_margin=] */
 int process_lsf_append(int nb) {
 	struct lsf_cmd_args *a = calloc(1, sizeof(struct lsf_cmd_args));
 	a->mode = LSF_CMD_APPEND;
 	a->path = g_strdup(word[1]);
 	a->seqname = g_strdup(word[2]);
+	a->expand_step = 64;
+	a->framing = FRAMING_MAX;
 	for (int i = 3; i < nb && word[i]; i++) {
 		const char *w = word[i];
 		int c = parse_common_option(a, w);
 		if (c < 0) goto failure;
 		if (c > 0) continue;
 		if (!strcmp(w, "-noreg")) a->noreg = TRUE;
+		else if (!strcmp(w, "-noexpand")) a->framing = FRAMING_CURRENT;	// same as -framing=current
+		else if (!strcmp(w, "-expand_force")) a->expand_force = TRUE;
+		else if (g_str_has_prefix(w, "-expand_step=")) {
+			gchar *end;
+			gint64 v = g_ascii_strtoll(w + 13, &end, 10);
+			if (end == w + 13 || *end || v < 1 || v > 4096) {
+				siril_log_error(_("Wrong parameter values. %s is not valid (1 to 4096), aborting.\n"), w);
+				goto failure;
+			}
+			a->expand_step = (int) v;
+		}
 		else if (!strcmp(w, "-backup")) a->backup = TRUE;
 		else {
 			siril_log_error(_("Unknown parameter %s, aborting.\n"), w);
 			goto failure;
 		}
+	}
+	if (a->framing == FRAMING_MIN || a->framing == FRAMING_COG) {
+		siril_log_error(_("LSF: lsf_append supports -framing=max or -framing=current only. The grid of an LSF "
+					"file never shrinks or moves (Section 10.6), so min and cog framing apply to lsf_init\n"));
+		goto failure;
 	}
 	if (!start_in_new_thread(lsf_worker, a)) {
 		free_cmd_args(a);

@@ -17,11 +17,12 @@
  * along with Siril. If not, see <http://www.gnu.org/licenses/>.
  */
 
-/* LSF accumulator arithmetic (FITS profile v0.4, Sections 10.2, 10.7, 10.8).
+/* LSF accumulator arithmetic (FITS profile v0.4, Sections 10.2, 10.6, 10.7, 10.8).
  * Pure functions, no I/O. */
 
 #include <math.h>
 #include <float.h>
+#include <string.h>
 #include <gsl/gsl_cdf.h>
 
 #include "lsf/lsf.h"
@@ -193,4 +194,68 @@ gboolean lsf_outnorm_range(float *const mean[3], float *const W[3], size_t n, in
 	*mini = mn;
 	*maxi = mx;
 	return TRUE;
+}
+
+/* Grid expansion (Section 10.6). Footprints are in registration coordinates,
+ * where a frame's transform H maps its pixels onto the grid; their y runs
+ * opposite to the FITS storage order. box is xmin, xmax, ymin, ymax. */
+void lsf_footprint_init(double box[4]) {
+	box[0] = box[2] = DBL_MAX;
+	box[1] = box[3] = -DBL_MAX;
+}
+
+/* adds the corners of an fx x fy frame transformed by h (row-major 3x3) */
+void lsf_footprint_add(const double h[9], int fx, int fy, double box[4]) {
+	const double cx[4] = { 0.0, fx - 1.0, fx - 1.0, 0.0 }, cy[4] = { 0.0, 0.0, fy - 1.0, fy - 1.0 };
+	for (int j = 0; j < 4; j++) {
+		double w = h[6] * cx[j] + h[7] * cy[j] + h[8];
+		double x = (h[0] * cx[j] + h[1] * cy[j] + h[2]) / w;
+		double y = (h[3] * cx[j] + h[4] * cy[j] + h[5]) / w;
+		if (x < box[0]) box[0] = x;
+		if (x > box[1]) box[1] = x;
+		if (y < box[2]) box[2] = y;
+		if (y > box[3]) box[3] = y;
+	}
+}
+
+/* whole pixels of the footprint beyond each edge of an rx x ry grid, in
+ * storage order (LSF_PAD_*). A pixel outside the grid is covered only when
+ * the footprint reaches its center, so sub-pixel overhangs need nothing. */
+gboolean lsf_grid_overhang(const double box[4], int rx, int ry, int need[4]) {
+	const double eps = 1e-6;
+	double over[4];
+	over[LSF_PAD_LEFT] = -box[0];
+	over[LSF_PAD_RIGHT] = box[1] - (rx - 1.0);
+	over[LSF_PAD_LAST] = -box[2];
+	over[LSF_PAD_FIRST] = box[3] - (ry - 1.0);
+	gboolean any = FALSE;
+	for (int s = 0; s < 4; s++) {
+		need[s] = over[s] > 0.0 ? (int) floor(over[s] + eps) : 0;
+		any |= need[s] > 0;
+	}
+	return any;
+}
+
+/* each side grows in multiples of step pixels */
+void lsf_expand_pads(const int need[4], int step, int pad[4]) {
+	for (int s = 0; s < 4; s++)
+		pad[s] = need[s] > 0 ? (need[s] + step - 1) / step * step : 0;
+}
+
+/* T * h, T being the translation by (dx, dy) in registration coordinates:
+ * a transform onto the grid becomes one onto the expanded grid */
+void lsf_xfrm_shift(double h[9], double dx, double dy) {
+	for (int j = 0; j < 3; j++) {
+		h[j] += dx * h[6 + j];
+		h[3 + j] += dy * h[6 + j];
+	}
+}
+
+/* copies an rx x ry plane of elsize-byte pixels, storage order, into dst,
+ * which holds the padded plane and is already zeroed */
+void lsf_pad_plane(const void *src, void *dst, size_t elsize, int rx, int ry, const int pad[4]) {
+	size_t nrx = (size_t) rx + pad[LSF_PAD_LEFT] + pad[LSF_PAD_RIGHT];
+	for (int y = 0; y < ry; y++)
+		memcpy((char *) dst + (((size_t) y + pad[LSF_PAD_FIRST]) * nrx + pad[LSF_PAD_LEFT]) * elsize,
+				(const char *) src + (size_t) y * rx * elsize, (size_t) rx * elsize);
 }

@@ -20,6 +20,7 @@
 /* Tests of the LSF accumulator arithmetic (FITS profile v0.4) */
 
 #include <math.h>
+#include <string.h>
 #include <criterion/criterion.h>
 
 #include "lsf/lsf.h"
@@ -180,4 +181,86 @@ Test(lsf_math, pixel_stats_equal_weights) {
 	/* no data */
 	lsf_pixel_stats(NO_WEIGHT, 0.0, 0.0, 0.0, 0, &neff, &sig2, &vm);
 	cr_assert(neff < 0.0 && sig2 < 0.0 && vm < 0.0);
+}
+
+/* Section 10.6: a frame shifted +150 columns and +70 storage rows on a
+ * 1600x1200 grid has H = translation (150, -70) in registration coordinates
+ * (measured on NGC7023 crops). It overhangs the right side and the end of
+ * storage, and its shifted transform then fits the expanded grid. */
+Test(lsf_math, expansion_shifted_frame) {
+	double h[9] = { 1, 0, 150, 0, 1, -70, 0, 0, 1 }, box[4];
+	int need[4], pad[4];
+	lsf_footprint_init(box);
+	lsf_footprint_add(h, 1600, 1200, box);
+	cr_assert(lsf_grid_overhang(box, 1600, 1200, need));
+	cr_assert_eq(need[LSF_PAD_LEFT], 0);
+	cr_assert_eq(need[LSF_PAD_RIGHT], 150);
+	cr_assert_eq(need[LSF_PAD_FIRST], 0);
+	cr_assert_eq(need[LSF_PAD_LAST], 70);
+	lsf_expand_pads(need, 64, pad);
+	cr_assert_eq(pad[LSF_PAD_RIGHT], 192);
+	cr_assert_eq(pad[LSF_PAD_LAST], 128);
+	cr_assert_eq(pad[LSF_PAD_LEFT] + pad[LSF_PAD_FIRST], 0);
+
+	lsf_xfrm_shift(h, pad[LSF_PAD_LEFT], pad[LSF_PAD_LAST]);
+	lsf_footprint_init(box);
+	lsf_footprint_add(h, 1600, 1200, box);
+	cr_assert(!lsf_grid_overhang(box, 1600 + 192, 1200 + 128, need));
+}
+
+/* the opposite shift needs columns on the left and rows before row 1 */
+Test(lsf_math, expansion_other_side) {
+	double h[9] = { 1, 0, -10, 0, 1, 65, 0, 0, 1 }, box[4];
+	int need[4], pad[4];
+	lsf_footprint_init(box);
+	lsf_footprint_add(h, 100, 100, box);
+	cr_assert(lsf_grid_overhang(box, 100, 100, need));
+	cr_assert_eq(need[LSF_PAD_LEFT], 10);
+	cr_assert_eq(need[LSF_PAD_FIRST], 65);
+	cr_assert_eq(need[LSF_PAD_RIGHT] + need[LSF_PAD_LAST], 0);
+	lsf_expand_pads(need, 64, pad);
+	cr_assert_eq(pad[LSF_PAD_LEFT], 64);
+	cr_assert_eq(pad[LSF_PAD_FIRST], 128);
+}
+
+/* sub-pixel overhangs from registration noise need no expansion */
+Test(lsf_math, expansion_subpixel) {
+	double h[9] = { 1, 0, -0.4, 0, 1, 0.9, 0, 0, 1 }, box[4];
+	int need[4];
+	lsf_footprint_init(box);
+	lsf_footprint_add(h, 100, 100, box);
+	cr_assert(!lsf_grid_overhang(box, 100, 100, need));
+	h[2] = -1.0;
+	lsf_footprint_init(box);
+	lsf_footprint_add(h, 100, 100, box);
+	cr_assert(lsf_grid_overhang(box, 100, 100, need));
+	cr_assert_eq(need[LSF_PAD_LEFT], 1);
+}
+
+/* the shifted transform maps every point to the old image plus the shift */
+Test(lsf_math, xfrm_shift) {
+	double h[9] = { 0.99, 0.02, 12.5, -0.03, 1.01, -7.25, 1e-6, -2e-6, 1.0 }, s[9];
+	memcpy(s, h, sizeof h);
+	lsf_xfrm_shift(s, 64.0, 128.0);
+	double x = 321.0, y = 123.0;
+	double w = h[6] * x + h[7] * y + h[8], ws = s[6] * x + s[7] * y + s[8];
+	cr_assert_float_eq((s[0] * x + s[1] * y + s[2]) / ws, (h[0] * x + h[1] * y + h[2]) / w + 64.0, 1e-9);
+	cr_assert_float_eq((s[3] * x + s[4] * y + s[5]) / ws, (h[3] * x + h[4] * y + h[5]) / w + 128.0, 1e-9);
+}
+
+/* padding keeps every existing pixel and adds zeros (W = 0, no data) */
+Test(lsf_math, pad_plane) {
+	float src[6] = { 1, 2, 3, 4, 5, 6 };	// 3 x 2, storage order
+	int pad[4] = { 1, 2, 1, 0 };
+	float dst[6 * 3] = { 0 };
+	lsf_pad_plane(src, dst, sizeof(float), 3, 2, pad);
+	const float expect[18] = { 0, 0, 0, 0, 0, 0,
+		0, 1, 2, 3, 0, 0,
+		0, 4, 5, 6, 0, 0 };
+	for (int i = 0; i < 18; i++)
+		cr_assert_eq(dst[i], expect[i], "pixel %d", i);
+	WORD c[2] = { 7, 9 }, cd[2 * 2] = { 0 };
+	int p2[4] = { 0, 0, 0, 1 };
+	lsf_pad_plane(c, cd, sizeof(WORD), 2, 1, p2);
+	cr_assert(cd[0] == 7 && cd[1] == 9 && cd[2] == 0 && cd[3] == 0);
 }

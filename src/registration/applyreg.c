@@ -145,6 +145,15 @@ static gboolean compute_framing(struct registration_args *regargs) {
 				}
 			}
 			total_Mpix = (double)n * rx * ry * regargs->output_scale * regargs->output_scale * 1.e-6;
+			if (regargs->canvas.w > 0 && regargs->canvas.h > 0) {
+				// output onto a canvas around the reference (LSF): every image keeps the
+				// size of the canvas, shifted by its origin as max framing does
+				rx_0 = regargs->canvas.w;
+				ry_0 = regargs->canvas.h;
+				Hshift.h02 = (double) regargs->canvas.x;
+				Hshift.h12 = (double) regargs->canvas.y;
+				total_Mpix = (double)n * rx_0 * ry_0 * regargs->output_scale * regargs->output_scale * 1.e-6;
+			}
 			break;
 		case FRAMING_MAX:
 			xmin = DBL_MAX;
@@ -1316,10 +1325,12 @@ int register_apply_reg(struct registration_args *regargs) {
 			reframe_wcs(regargs->wcsref, &H);
 		}
 		// we can't apply same for max framing as the individual image size is different from regargs->framingd.roi_out.h / scale
-		if (regargs->framing == FRAMING_MIN || regargs->framing == FRAMING_COG) {
+		gboolean canvas = regargs->framing == FRAMING_CURRENT && regargs->canvas.w > 0 && regargs->canvas.h > 0;
+		if (regargs->framing == FRAMING_MIN || regargs->framing == FRAMING_COG || canvas) {
 			Homography H = regargs->framingd.Hshift;
 			cvInvertH(&H);
-			int orig_ry = (regargs->seq->is_variable) ? regargs->seq->imgparam[regargs->reference_image].ry : regargs->seq->ry;
+			int orig_ry = (canvas && regargs->use_external_ref) ? (int) regargs->external_ref_ry :
+				(regargs->seq->is_variable) ? regargs->seq->imgparam[regargs->reference_image].ry : regargs->seq->ry;
 			cvApplyFlips(&H, orig_ry, regargs->framingd.roi_out.h / regargs->output_scale);
 			reframe_wcs(regargs->wcsref, &H);
 		}

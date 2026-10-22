@@ -182,22 +182,35 @@ static void fill_ledger_row(lsf_ledger_row *r, struct lsf_batch_args *args, cons
 	r->orighdr = header_as_cards(meta->header);
 
 	/* registration: the transform onto the grid is the one computed for the
-	 * source frame when the batch was registered against the Stack */
-	regdata *src_reg = (layer_has_registration(src, reglayer)) ? &src->regparam[reglayer][src_idx] : NULL;
+	 * source frame when the batch was registered against the Stack, or, when
+	 * lsf_init applied the registration of the sequence, that one mapped onto
+	 * the grid */
+	int src_layer = args->xfrm_base ? get_registration_layer(src) : reglayer;
+	regdata *src_reg = (src_layer >= 0 && layer_has_registration(src, src_layer)) ? &src->regparam[src_layer][src_idx] : NULL;
 	regdata *reg = (layer_has_registration(seq, reglayer)) ? &seq->regparam[reglayer][idx] : NULL;
 	Homography H;
-	if (args->src_seq && src_reg)
+	if (args->src_seq && src_reg) {
 		H = src_reg->H;
-	else cvGetEye(&H);
+		if (args->xfrm_base)
+			cvMultH(*args->xfrm_base, src_reg->H, &H);
+	} else cvGetEye(&H);
 	double h[9] = { H.h00, H.h01, H.h02, H.h10, H.h11, H.h12, H.h20, H.h21, H.h22 };
 	memcpy(r->xfrm, h, sizeof h);
 	static const char *transf[] = { "SHIFT", "SIMILAR", "AFFINE", "HOMOGR" };
 	transformation_type t = args->settings->transform;
+	if (args->xfrm_base && src_reg) {
+		t = guess_transform_from_H(src_reg->H);	// unknown otherwise: the user registered the sequence
+		if (t < SHIFT_TRANSFORMATION) t = SHIFT_TRANSFORMATION;
+	}
 	g_strlcpy(r->reg_type, args->src_seq ? transf[t < 0 ? 3 : t] : "NONE", sizeof r->reg_type);
-	r->align_json = args->src_seq ?
-		g_strdup_printf("{\"reference\":\"stack\",\"transform\":\"%s\",\"interpolation\":%d,\"min_pairs\":%d}",
-				transf[t < 0 ? 3 : t], args->settings->interpolation, args->settings->min_pairs) :
-		g_strdup("{\"reference\":\"none\"}");
+	if (!args->src_seq)
+		r->align_json = g_strdup("{\"reference\":\"none\"}");
+	else if (args->xfrm_base)
+		r->align_json = g_strdup_printf("{\"reference\":\"sequence\",\"framing\":\"%s\",\"transform\":\"%s\",\"interpolation\":%d}",
+				args->framing ? args->framing : "current", transf[t], args->settings->interpolation);
+	else r->align_json = g_strdup_printf("{\"reference\":\"stack\",\"framing\":\"%s\",\"transform\":\"%s\",\"interpolation\":%d,\"min_pairs\":%d}",
+				args->framing ? args->framing : "current", transf[t < 0 ? 3 : t], args->settings->interpolation,
+				args->settings->min_pairs);
 
 	regdata *q = reg ? reg : src_reg;
 	r->fwhm = q ? q->fwhm : NAN;
@@ -320,8 +333,8 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 	}
 	if (h->plane[0][0]) {
 		if (seq->rx != h->rx || seq->ry != h->ry || nchan != h->nchan) {
-			siril_log_error(_("LSF: the batch is %dx%dx%d, the LSF grid is %dx%dx%d. "
-						"Grid expansion is not supported in this version.\n"),
+			siril_log_error(_("LSF: the batch is %dx%dx%d, the LSF grid is %dx%dx%d. Frames that are "
+						"not on the grid must be registered by lsf_append (no -noreg).\n"),
 					seq->rx, seq->ry, nchan, h->rx, h->ry, h->nchan);
 			return 1;
 		}

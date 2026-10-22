@@ -134,7 +134,7 @@ Required keys:
 - sensor.class, sensor.bayer, sensor.binning, cfa.mode
 - grid.oversample, grid.pixfrac, grid.kernel
   - The grid size and WCS are the primary's NAXIS and WCS keywords, and are not duplicated.
-- grid.reference ('stack' or 'wcs', Section 10.5), grid.origin\_x, grid.origin\_y (total shift from grid expansions, Section 10.6), grid.expand, grid.expand\_step
+- grid.reference ('stack' or 'wcs', Section 10.5), grid.origin\_x, grid.origin\_y (margins of the grid before the first reference frame, from max framing at initialization and from grid expansions, Sections 10.1 and 10.6). Whether and by what step the grid expands is chosen per append and is not stored (Section 10.6)
 - align.transform, align.interpolation, align.min\_pairs, align.findstar (JSON: the star-detection parameters used for registration)
 - reject.method, reject.params, reject.hist\_low, reject.hist\_high, reject.hist\_margin (Section 10.7)
 - weight.scheme, plus the frozen weight constants for that scheme (Section 10.4):
@@ -165,7 +165,7 @@ The primary header follows what Siril's own stacks write (STACKCNT, LIVETIME, EX
 | DATE-OBS | Earliest frame start, UTC |
 | DATE | Time the file was written, UTC |
 | PROGRAM | Writer name and version |
-| HISTORY | One card per append, giving the generation, batch number and frame count, followed by one card per channel with the percentages of samples rejected low and high by the batch-local and the history tests. Repair and Adopt (Section 8) add one card each |
+| HISTORY | One card per append, giving the generation, batch number and frame count, followed by one card per channel with the percentages of samples rejected low and high by the batch-local and the history tests. Repair, Adopt (Section 8) and each grid expansion (Section 10.6) add one card each |
 | WCS keywords | Updated on grid expansion (CRPIX, Section 10.6) or when the stack is plate-solved again |
 | MIPS-HI, MIPS-LO | Removed on append, because display cutoffs saved for the previous stack no longer fit |
 
@@ -270,7 +270,7 @@ Rules:
 
 lsf\_init does the following:
 
-1. Builds the canonical grid from the first batch's reference frame, using Siril's existing registration.
+1. Builds the canonical grid from the first batch, using Siril's existing registration. When the registration is not applied yet, the writer applies it. By default the grid is the union of all the first batch's frames (max framing), so no frame is cropped, as grid expansion does on append (Section 10.6). The user may instead ask for Siril's other framings: the reference frame's own size (current), the area common to all the frames (min), or the reference frame's size centred on the frames' centre of gravity (cog). With max framing every frame is placed on the whole grid, rather than cropped to its own bounding box as Siril's max framing does. grid.origin\_x and grid.origin\_y then hold the margins of the grid before the reference frame (negative when the grid starts inside it, as with min framing), and REG\_XFRM maps each frame onto the grid. A batch whose registration is already applied defines the grid by the size of its frames.
 2. Merges the first batch (v0.2 Section 9).
 3. Freezes the weight constants (Section 10.4).
 4. Writes every HDU. LSF\_REJ is written only if the user asked for rejection maps.
@@ -286,7 +286,7 @@ If the first batch has fewer than 25 frames, the writer SHOULD warn the user bef
    - calibration;
    - registration against the grid reference (Section 10.5);
    - normalization (v0.2 Section 8.3).
-3. Grow the grid first if needed (Section 10.6).
+3. Grow the grid first if the registered frames reach beyond it, unless the user asked to crop them to the grid (Section 10.6).
 4. Compute the frame weights (Section 10.4) and run rejection (Section 10.7).
 5. Update the accumulator, in memory or band by band.
    - The batch is merged into history with the weighted pairwise update. With δ = MEAN\_b − MEAN\_a and W = W\_a + W\_b:
@@ -323,7 +323,7 @@ A frame whose weight is 0 after clamping contributes nothing. It is not merged, 
 
 ### 10.5 Registration and the grid reference
 
-The canonical grid is the Stack's own pixel grid. At initialization it is defined by the first batch's reference frame, scaled by grid.oversample. That frame is not stored, so later batches are registered against **HDU 0 itself**. They use Siril's existing star detection, with the parameters stored in align.findstar, and Siril's existing global registration.
+The canonical grid is the Stack's own pixel grid. At initialization it is defined by the first batch, by default as the union of its registered frames (Section 10.1), scaled by grid.oversample. That frame is not stored, so later batches are registered against **HDU 0 itself**. They use Siril's existing star detection, with the parameters stored in align.findstar, and Siril's existing global registration.
 
 The Stack is the highest-SNR reference available and already defines the grid. The writer records grid.reference = 'stack'. When the Stack has a WCS, grid.reference MAY be 'wcs', and new frames are registered with Siril's astrometric registration instead.
 
@@ -331,13 +331,18 @@ The optional LSF\_STARS BINTABLE caches the star list detected on HDU 0, typical
 
 ### 10.6 Grid expansion
 
-Framing drifts between sessions, so the grid must be able to grow. When grid.expand = T (the default) and accepted frames would cover pixels outside the current grid, the writer grows the grid before merging:
+Framing drifts between sessions, so the grid must be able to grow. When registered frames would cover pixels outside the current grid, the writer grows the grid before merging, unless the user asked to crop the batch to the grid instead (current framing). Expanding is the default, as max framing is at initialization (Section 10.1). This choice and the step below belong to the append command or the user interface, not to the file: they change no data a reader interprets, so LSF\_SETTINGS does not store them. On append only max and current framing apply: min and cog would shrink or move the grid. Files from earlier writers may hold grid.expand and grid.expand\_step rows; a reader ignores them and a writer drops them.
 
-- Growth is in multiples of grid.expand\_step pixels (default 64), so small drifts do not rewrite the file on every append.
+A pixel outside the grid counts as covered when a transformed frame reaches its center, so sub-pixel overhangs from registration noise need no expansion. Registration transforms (REG\_XFRM) use Siril's registration coordinates, whose y axis runs opposite to the FITS storage order: rows a frame needs below y = 0 there are inserted after the existing data, and rows it needs past the last row are inserted before it. Then:
+
+- Each side grows in multiples of the expansion step (default 64 pixels), so small drifts do not rewrite the file on every append.
 - Every image plane is padded with zeros. W = 0 means no data, so padding changes no existing pixel.
 - Rows or columns inserted before the existing data, in storage order, are added to CRPIX1 and CRPIX2 in every HDU that carries a WCS, and to grid.origin\_x and grid.origin\_y.
 - REG\_XFRM in every existing ledger row is rewritten to include the shift, so every transform keeps mapping onto the current grid.
 - LSF\_STARS is shifted the same way, or discarded.
+- A HISTORY card records the old and new grid size and the padding of each side.
+
+The writer refuses an append that would more than double the grid on either axis in one expansion, since that usually means a wrong registration, unless the user forces it. It also refuses one whose expanded accumulator would not fit in the memory it may use. In both cases the user can crop the batch to the grid instead.
 
 Expansion never shrinks the grid. Cropping is a separate operation, out of scope here.
 
@@ -459,8 +464,7 @@ Nothing in this profile has been tested against real software yet, except the Si
    - Weighting: the estimator depends on the weighting scheme (Section 10.8).
 
    Still open:
-   - the clipping correction c for batch methods without a sigma threshold (percentile, GESD), which currently fall back to the history thresholds alone;
-   - whether grid expansion needs a size cap.
+   - the clipping correction c for batch methods without a sigma threshold (percentile, GESD), which currently fall back to the history thresholds alone.
 
    The shared v0.2 data model needs the same answers.
 

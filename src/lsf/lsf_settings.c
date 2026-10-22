@@ -73,8 +73,6 @@ void lsf_settings_init(lsf_settings *s) {
 	memset(s, 0, sizeof(lsf_settings));
 	g_strlcpy(s->bayer, "NONE", sizeof s->bayer);
 	s->binning = 1;
-	s->expand = FALSE;	// grid expansion is not implemented yet
-	s->expand_step = 64;
 	s->transform = HOMOGRAPHY_TRANSFORMATION;
 	s->interpolation = OPENCV_LANCZOS4;
 	s->min_pairs = 10;
@@ -139,8 +137,6 @@ GPtrArray *lsf_settings_to_rows(const lsf_settings *s, int nchan) {
 	add_str(rows, "grid.reference", "stack");
 	add_int(rows, "grid.origin_x", s->origin_x);
 	add_int(rows, "grid.origin_y", s->origin_y);
-	add_bool(rows, "grid.expand", s->expand);
-	add_int(rows, "grid.expand_step", s->expand_step);
 	add_str(rows, "align.transform", transf_names[s->transform < 0 ? HOMOGRAPHY_TRANSFORMATION : s->transform]);
 	add_str(rows, "align.interpolation", interp_names[s->interpolation]);
 	add_int(rows, "align.min_pairs", s->min_pairs);
@@ -264,8 +260,9 @@ int lsf_settings_from_rows(lsf_settings *s, GPtrArray *rows, int nchan) {
 		else if (!strcmp(k, "sensor.binning")) s->binning = atoi(v);
 		else if (!strcmp(k, "grid.origin_x")) s->origin_x = atoi(v);
 		else if (!strcmp(k, "grid.origin_y")) s->origin_y = atoi(v);
-		else if (!strcmp(k, "grid.expand")) s->expand = parse_bool(v);
-		else if (!strcmp(k, "grid.expand_step")) s->expand_step = atoi(v);
+		else if (!strcmp(k, "grid.expand") || !strcmp(k, "grid.expand_step")) {
+			/* written by earlier versions, dropped: expansion is chosen per append */
+		}
 		else if (!strcmp(k, "align.transform")) {
 			idx = name_index(transf_names, G_N_ELEMENTS(transf_names), v);
 			if (idx < 0) err = 1; else s->transform = (transformation_type) idx;

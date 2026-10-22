@@ -166,6 +166,7 @@ struct registration_args {
 	gchar *external_ref_path;	// path to external reference image (global reg only)
 	gboolean use_external_ref;	// TRUE: all sequence images aligned to external ref
 	unsigned int external_ref_rx, external_ref_ry; // dimensions of the external reference image (for global/apply reg only)
+	framing_roi canvas;	// apply reg with FRAMING_CURRENT: output canvas in the reference's pixels, opencv convention, origin may be negative (w = 0: the reference itself)
 	disto_data *disto_ext;			// undistortion information for an external reference
 };
 

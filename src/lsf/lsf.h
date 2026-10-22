@@ -42,9 +42,7 @@ typedef struct {
 	gchar bayer[16];		// sensor.bayer, "NONE" for mono
 	int binning;			// sensor.binning
 	/* grid */
-	int origin_x, origin_y;		// grid.origin_*
-	gboolean expand;		// grid.expand
-	int expand_step;		// grid.expand_step
+	int origin_x, origin_y;		// grid.origin_*, total padding before the data (Section 10.6)
 	/* registration */
 	transformation_type transform;	// align.transform
 	opencv_interpolation interpolation;	// align.interpolation
@@ -90,6 +88,7 @@ typedef struct {
 	double outnorm_min, outnorm_max;	// LSFNMIN/LSFNMAX
 	gboolean stack_modified;	// check 8 failed (only when tolerated)
 	float *stack_data;		// HDU 0 pixels when stack_modified, file order
+	double xfrm_shift[2];		// grid expansion of this commit: shift of the REG_XFRM already in the ledger
 } lsf_file;
 
 /* one frame of a batch, for the ledger */
@@ -115,6 +114,11 @@ typedef struct {
 	float st_mean[3], st_sig[3], st_mad[3], st_sqbw[3], st_loc[3], st_scl[3];
 } lsf_ledger_row;
 
+/* sides of a grid expansion, in FITS storage order (Section 10.6): FIRST
+ * pads before FITS row 1, LAST after row NAXIS2. Registration coordinates
+ * run the other way in y, so a frame above y = 0 there needs LAST rows. */
+enum { LSF_PAD_LEFT, LSF_PAD_RIGHT, LSF_PAD_FIRST, LSF_PAD_LAST };
+
 /* lsf_math.c: pure functions, unit-tested */
 void lsf_batch_stats(const float *x, const double *w, int n,
 		double *mean, double *W, double *M2, double *W2);
@@ -130,6 +134,12 @@ void lsf_pixel_stats(weightingType scheme, double W, double M2, double W2, int N
 float lsf_stack_value(float mean, float w, gboolean norm, double mini, double range);
 size_t lsf_adopt_plane(float *mean, const float *w, const float *disp, size_t n,
 		gboolean norm, double mini, double maxi);
+void lsf_footprint_init(double box[4]);
+void lsf_footprint_add(const double h[9], int fx, int fy, double box[4]);
+gboolean lsf_grid_overhang(const double box[4], int rx, int ry, int need[4]);
+void lsf_expand_pads(const int need[4], int step, int pad[4]);
+void lsf_xfrm_shift(double h[9], double dx, double dy);
+void lsf_pad_plane(const void *src, void *dst, size_t elsize, int rx, int ry, const int pad[4]);
 
 /* lsf_weights.c */
 int lsf_freeze_weights(lsf_settings *s, int nb_frames, int nchan, const double *noise_raw,
@@ -153,6 +163,7 @@ void lsf_setting_row_free(gpointer p);
 
 /* lsf_fits.c */
 int lsf_history_alloc(lsf_history *h, int rx, int ry, int nchan);
+int lsf_history_grow(lsf_history *h, const int pad[4]);
 void lsf_history_free(lsf_history *h);
 void lsf_file_free(lsf_file *f);
 int lsf_open_and_validate(const char *path, lsf_file *f, gboolean tolerate_edited_stack);
@@ -167,6 +178,8 @@ struct lsf_batch_args {
 	sequence *seq;			// registered batch, on the grid
 	sequence *src_seq;		// unregistered source (append), or NULL
 	int *src_index;			// seq index -> src_seq index, or NULL
+	const Homography *xfrm_base;	// init: maps the registration of src_seq onto the grid, or NULL
+	const char *framing;		// framing of the registration ("max", "current"), or NULL
 	lsf_settings *settings;
 	lsf_history *hist;		// in: history (may be empty), out: merged
 	gboolean init;			// first batch: freeze the constants

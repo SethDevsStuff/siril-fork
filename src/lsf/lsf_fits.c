@@ -69,6 +69,32 @@ fail:
 	return 1;
 }
 
+/* grid expansion (Section 10.6): pads every plane with zeros, one plane at a
+ * time so that only one extra plane is in memory. W = 0 in the padding, so
+ * no existing pixel changes. */
+int lsf_history_grow(lsf_history *h, const int pad[4]) {
+	int nrx = h->rx + pad[LSF_PAD_LEFT] + pad[LSF_PAD_RIGHT];
+	int nry = h->ry + pad[LSF_PAD_FIRST] + pad[LSF_PAD_LAST];
+	size_t n = (size_t) nrx * nry;
+	for (int c = 0; c < h->nchan; c++) {
+		for (int k = 0; k <= LSF_NB_PL; k++) {
+			void **plane = k < LSF_NB_PL ? (void **) &h->plane[k][c] : (void **) &h->count[c];
+			size_t elsize = k < LSF_NB_PL ? sizeof(float) : sizeof(WORD);
+			void *grown = calloc(n, elsize);
+			if (!grown) {
+				PRINT_ALLOC_ERR;
+				return 1;	// planes already grown and not: the history is unusable
+			}
+			lsf_pad_plane(*plane, grown, elsize, h->rx, h->ry, pad);
+			free(*plane);
+			*plane = grown;
+		}
+	}
+	h->rx = nrx;
+	h->ry = nry;
+	return 0;
+}
+
 void lsf_history_free(lsf_history *h) {
 	for (int c = 0; c < 3; c++) {
 		for (int k = 0; k < LSF_NB_PL; k++) {
@@ -697,6 +723,19 @@ static void write_ledger_rows(fitsfile *fptr, GPtrArray *rows, long first_row, i
 	}
 }
 
+/* after a grid expansion, the transforms of the rows already in the ledger
+ * are shifted so they keep mapping onto the grid as it is now (Section 9) */
+static void shift_ledger_xfrm(fitsfile *fptr, long nrows, const double shift[2], int *status) {
+	int c = colnum(fptr, "REG_XFRM");
+	if (!c) return;
+	for (long row = 1; row <= nrows && !*status; row++) {
+		double h[9];
+		fits_read_col(fptr, TDOUBLE, c, row, 1, 9, NULL, h, NULL, status);
+		lsf_xfrm_shift(h, shift[0], shift[1]);
+		fits_write_col(fptr, TDOUBLE, c, row, 1, 9, h, status);
+	}
+}
+
 static int flush_to_disk(const char *path) {
 	int fd = g_open(path, O_RDWR, 0);
 	if (fd < 0)
@@ -882,6 +921,8 @@ int lsf_write_file(const char *path, lsf_file *old, const lsf_settings *s, lsf_h
 		fits_movabs_hdu(oldf, old->ledger_hdu, NULL, &status);
 		fits_copy_hdu(oldf, fptr, 0, &status);	// keeps unknown columns (C7)
 		first_row = old->ledger_rows + 1;
+		if (old->xfrm_shift[0] != 0.0 || old->xfrm_shift[1] != 0.0)
+			shift_ledger_xfrm(fptr, old->ledger_rows, old->xfrm_shift, &status);
 	} else {
 		create_ledger_hdu(fptr, nchan, &status);
 	}
