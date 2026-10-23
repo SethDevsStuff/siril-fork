@@ -126,6 +126,7 @@ struct registration_args {
 	seq_image_filter filtering_criterion; // the filter, (seqapplyreg only)
 	double filtering_parameter;	// and its parameter (seqapplyreg only)
 	gboolean no_starlist;		// disable star list creation (2pass only)
+	const star_finder_params *sf_params;	// star detection settings for global and 2pass, NULL to use the preferences
 	float output_scale;		// scaling factor
 	disto_source undistort;		// type of undistortion to apply
 	disto_params distoparam;		// type of undistortion to apply

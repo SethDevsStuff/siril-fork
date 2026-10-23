@@ -87,7 +87,7 @@ Test(lsf_math, count_add) {
 	cr_assert(sat);
 }
 
-/* Section 10.7: c is about 1.014 at +-3 sigma and 1.048 at +-2.5 sigma */
+/* Section 10.6: c is about 1.014 at +-3 sigma and 1.048 at +-2.5 sigma */
 Test(lsf_math, clip_correction) {
 	cr_assert_float_eq(lsf_clip_correction(3.0, 3.0), 1.014, 1e-3);
 	cr_assert_float_eq(lsf_clip_correction(2.5, 2.5), 1.048, 1e-3);
@@ -95,7 +95,7 @@ Test(lsf_math, clip_correction) {
 }
 
 /* with N equal weights: s2 = M2 / (N - 1) and sigma_pred2 = s2 (1 + 1/N),
- * for both estimators of Section 10.8 */
+ * for both estimators of Section 10.7 */
 Test(lsf_math, sigma_pred_equal_weights) {
 	int N = 10;
 	double M2 = 0.09, s2 = M2 / (N - 1);
@@ -158,11 +158,11 @@ Test(lsf_math, adopt_unedited_and_edited) {
 	float disp[4];
 	for (int i = 0; i < 4; i++)
 		disp[i] = lsf_stack_value(mean[i], w[i], FALSE, 0.0, 1.0);
-	cr_assert_eq(lsf_adopt_plane(mean, w, disp, 4, FALSE, 0.0, 0.0), 0);
+	cr_assert_eq(lsf_adopt_plane(mean, w, disp, 4, FALSE, 0.0, 0.0, NULL), 0);
 	cr_assert_eq(mean[1], 1.57f);
 	disp[2] = 0.30f;	// edited
 	disp[3] = 0.50f;	// painted where there is no data
-	cr_assert_eq(lsf_adopt_plane(mean, w, disp, 4, FALSE, 0.0, 0.0), 1);
+	cr_assert_eq(lsf_adopt_plane(mean, w, disp, 4, FALSE, 0.0, 0.0, NULL), 1);
 	cr_assert_eq(mean[2], 0.30f);
 	cr_assert_eq(mean[3], 0.f);
 }
@@ -173,13 +173,25 @@ Test(lsf_math, adopt_normalized) {
 	float mean[] = { 0.2f, 0.5f, 0.8f }, w[] = { 1.f, 1.f, 1.f }, disp[3];
 	for (int i = 0; i < 3; i++)
 		disp[i] = lsf_stack_value(mean[i], w[i], TRUE, mini, maxi - mini);
-	cr_assert_eq(lsf_adopt_plane(mean, w, disp, 3, TRUE, mini, maxi), 0);
+	cr_assert_eq(lsf_adopt_plane(mean, w, disp, 3, TRUE, mini, maxi, NULL), 0);
 	disp[1] = 0.75f;
-	cr_assert_eq(lsf_adopt_plane(mean, w, disp, 3, TRUE, mini, maxi), 1);
+	cr_assert_eq(lsf_adopt_plane(mean, w, disp, 3, TRUE, mini, maxi, NULL), 1);
 	cr_assert_float_eq(mean[1], 0.65f, 1e-6);
 }
 
-/* Section 10.8 with N equal weights: n_eff = N, s2 = M2 / (N - 1) and the
+/* a NaN or infinite edit is not adopted: MEAN keeps its value */
+Test(lsf_math, adopt_nonfinite) {
+	float mean[] = { 0.25f, 0.40f, 0.60f }, w[] = { 1.f, 1.f, 1.f };
+	float disp[] = { NAN, INFINITY, 0.50f };
+	size_t nonfinite = 0;
+	cr_assert_eq(lsf_adopt_plane(mean, w, disp, 3, FALSE, 0.0, 0.0, &nonfinite), 1);
+	cr_assert_eq(nonfinite, 2);
+	cr_assert_eq(mean[0], 0.25f);
+	cr_assert_eq(mean[1], 0.40f);
+	cr_assert_eq(mean[2], 0.50f);
+}
+
+/* Section 10.7 with N equal weights: n_eff = N, s2 = M2 / (N - 1) and the
  * variance of the mean s2 / N, for both estimators */
 Test(lsf_math, pixel_stats_equal_weights) {
 	int N = 10;
@@ -202,7 +214,7 @@ Test(lsf_math, pixel_stats_equal_weights) {
 	cr_assert(neff < 0.0 && sig2 < 0.0 && vm < 0.0);
 }
 
-/* Section 10.6: a frame shifted +150 columns and +70 storage rows on a
+/* Section 10.5: a frame shifted +150 columns and +70 storage rows on a
  * 1600x1200 grid has H = translation (150, -70) in registration coordinates
  * (measured on NGC7023 crops). It overhangs the right side and the end of
  * storage, and its shifted transform then fits the expanded grid. */
@@ -282,4 +294,30 @@ Test(lsf_math, pad_plane) {
 	int p2[4] = { 0, 0, 0, 1 };
 	lsf_pad_plane(c, cd, sizeof(WORD), 2, 1, p2);
 	cr_assert(cd[0] == 7 && cd[1] == 9 && cd[2] == 0 && cd[3] == 0);
+}
+
+/* Section 10.3: a frame worse than the worst of the first batch keeps the
+ * floor weight instead of 0, for wfwhm and nbstars */
+Test(lsf_weights, wfwhm_floor) {
+	lsf_settings s;
+	lsf_settings_init(&s);
+	s.weighting = WFWHM_WEIGHT;
+	const float wfwhm[] = { 2.f, 3.f, 4.f };
+	cr_assert_eq(lsf_freeze_weights(&s, 3, 1, NULL, wfwhm, NULL), 0);
+	cr_assert_float_eq(lsf_frame_weight(&s, 0, 0.0, 4.f, 0), LSF_WEIGHT_FLOOR / s.fwhm_norm, 1e-12);
+	cr_assert_float_eq(lsf_frame_weight(&s, 0, 0.0, 6.f, 0), LSF_WEIGHT_FLOOR / s.fwhm_norm, 1e-12);
+	cr_assert_float_eq(lsf_frame_weight(&s, 0, 0.0, 2.f, 0), 1.0 / s.fwhm_norm, 1e-12);
+	cr_assert_eq(lsf_frame_weight(&s, 0, 0.0, 0.f, 0), 0.0);	// no stars measured
+	lsf_settings_free(&s);
+}
+
+Test(lsf_weights, nbstars_floor) {
+	lsf_settings s;
+	lsf_settings_init(&s);
+	s.weighting = NBSTARS_WEIGHT;
+	const int nstars[] = { 100, 200, 300 };
+	cr_assert_eq(lsf_freeze_weights(&s, 3, 1, NULL, NULL, nstars), 0);
+	cr_assert_float_eq(lsf_frame_weight(&s, 0, 0.0, 0.f, 50), LSF_WEIGHT_FLOOR / s.stars_norm, 1e-12);
+	cr_assert_float_eq(lsf_frame_weight(&s, 0, 0.0, 0.f, 300), 1.0 / s.stars_norm, 1e-12);
+	lsf_settings_free(&s);
 }

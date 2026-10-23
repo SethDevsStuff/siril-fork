@@ -19,6 +19,9 @@
 #define LSF_COUNT_MAX 65535
 #define LSF_LOW_STACK_WARN 25
 #define LSF_NEFF_MIN (1.0 + 1e-4)
+/* least wfwhm or nbstars weight before normalization (Section 10.3), 1 being
+ * the best frame of the first batch: a frame at or beyond its worst still counts */
+#define LSF_WEIGHT_FLOOR 0.01
 
 /* tile compression of the extension images (Section 5.3): LSF_ACC with
  * GZIP_1 or GZIP_2 and no quantization, the count planes with RICE_1 */
@@ -52,7 +55,8 @@ typedef struct {
 	gchar bayer[16];		// sensor.bayer, "NONE" for mono
 	int binning;			// sensor.binning
 	/* grid */
-	int origin_x, origin_y;		// grid.origin_*, total padding before the data (Section 10.6)
+	int origin_x, origin_y;		// grid.origin_*, total padding before the data (Section 10.5)
+	int oversample;			// grid.oversample, the drizzle scale: this writer merges onto 1 only
 	/* registration */
 	transformation_type transform;	// align.transform
 	opencv_interpolation interpolation;	// align.interpolation
@@ -62,7 +66,7 @@ typedef struct {
 	rejection rej;			// reject.method
 	double sig[2];			// reject.params
 	double hist_low, hist_high, hist_margin;
-	/* weighting, with constants frozen from the first batch (§10.4) */
+	/* weighting, with constants frozen from the first batch (§10.3) */
 	weightingType weighting;	// weight.scheme
 	double noise_norm[3];		// per channel
 	double fwhm_min, fwhm_max, fwhm_norm;
@@ -127,7 +131,7 @@ typedef struct {
 	float st_mean[3], st_sig[3], st_mad[3], st_sqbw[3], st_loc[3], st_scl[3];
 } lsf_ledger_row;
 
-/* sides of a grid expansion, in FITS storage order (Section 10.6): FIRST
+/* sides of a grid expansion, in FITS storage order (Section 10.5): FIRST
  * pads before FITS row 1, LAST after row NAXIS2. Registration coordinates
  * run the other way in y, so a frame above y = 0 there needs LAST rows. */
 enum { LSF_PAD_LEFT, LSF_PAD_RIGHT, LSF_PAD_FIRST, LSF_PAD_LAST };
@@ -147,7 +151,7 @@ void lsf_pixel_stats(weightingType scheme, double W, double M2, double W2, int N
 		double *neff, double *sigma2, double *var_mean);
 float lsf_stack_value(float mean, float w, gboolean norm, double mini, double range);
 size_t lsf_adopt_plane(float *mean, const float *w, const float *disp, size_t n,
-		gboolean norm, double mini, double maxi);
+		gboolean norm, double mini, double maxi, size_t *nonfinite);
 void lsf_footprint_init(double box[4]);
 void lsf_footprint_add(const double h[9], int fx, int fy, double box[4]);
 gboolean lsf_grid_overhang(const double box[4], int rx, int ry, int need[4]);
@@ -183,6 +187,7 @@ void lsf_history_free(lsf_history *h);
 void lsf_file_free(lsf_file *f);
 int lsf_open_and_validate(const char *path, lsf_file *f, gboolean tolerate_edited_stack);
 gchar *lsf_hash_float_data(const float *data, size_t n);
+gchar *lsf_now_utc_iso(void);
 int lsf_write_file(const char *path, lsf_file *old, const lsf_settings *s, lsf_history *h,
 		fits *primary, const char *uid, int gen, GPtrArray *new_rows, int batch, gboolean backup,
 		lsf_compression comp);

@@ -26,7 +26,7 @@ These come first, because every UI item below depends on them.
    - Add an optional `int *image_indices, nb` to the batch params, used instead of `seq->imgparam[i].incl`. The GUI fills it from the same filter code as stacking.
    - At the very least, `writeseqfile(&com.seq)` before starting, so manual selection changes are honoured.
 5. **Low-stack warning as a question.** Section 10.1 asks the writer to warn when the first batch has fewer than 25 frames. Today this is a log line. In the GUI it should be a `siril_confirm_dialog` before the run, so the check belongs in a pre-flight function that the GUI calls, not in the worker.
-6. **Disk-space pre-flight.** An append writes a full temporary copy, plus the .bak when asked. Estimate the size from `acc_bytes + count_bytes + rej_bytes` (and the grid growth when known) and warn when the volume's free space is short. On Windows, a rename that keeps failing leaves the temporary file (Section 10.11). The GUI should show that as a dialog, not only as a log line.
+6. **Disk-space pre-flight.** An append writes a full temporary copy, plus the .bak when asked. Estimate the size from `acc_bytes + count_bytes + rej_bytes` (and the grid growth when known) and warn when the volume's free space is short. On Windows, a rename that keeps failing leaves the temporary file (Section 10.10). The GUI should show that as a dialog, not only as a log line.
 
 ## B. UI work
 
@@ -58,7 +58,7 @@ When an LSF entry is selected:
 - **New LSF-only panel** (a small expander, visible only in LSF modes):
   - history test: low, high and margin, with an "Same as batch sigma" toggle that is on by default;
   - compression: none / gzip2 / gzip1.
-- **"+ image".** After the commit, run `lsf_export_master` to `<name>.fit` (Siril's extension and compression preferences apply, Section 10.9). In both LSF modes, load the Stack into the display afterwards, as stacking does with its result. The display should be marked as an LSF view (B5).
+- **"+ image".** After the commit, run `lsf_export_master` to `<name>.fit` (Siril's extension and compression preferences apply, Section 10.8). In both LSF modes, load the Stack into the display afterwards, as stacking does with its result. The display should be marked as an LSF view (B5).
 - **Default name.** `$seqname$_<FILTER>.lsf.fits`. The file is one per filter, so putting the filter in the name helps the user pick the right file later.
 
 ### B2. Appending to an LSF
@@ -70,7 +70,7 @@ Recommended flow: a fourth result entry on the stacking tab, **Append to LSF…*
 1. Run `lsf_read_info` (A1) and show an info box: frames, batches, generation, grid size, channels, filter, total exposure, last session date, compression, rejection maps.
 2. **Pre-fill and lock the widgets.**
    - **Facts** are filled and made insensitive: normalization method, estimator, RGB equal, weighting, output normalization. They are frozen in the file, and changing them would make the accumulator meaningless.
-   - **Defaults** are filled from the file: the rejection method and sigmas, and the history low, high and margin. The history values can already be overridden on append (`-hist_*`). Rejection cannot (see C2).
+   - **Defaults** are filled from the file: the rejection method and sigmas, and the history low, high and margin. The history values can already be overridden on append (`-hist_*`). Rejection cannot (see C2). An override is saved in the file and becomes the default of later appends (decided 2026-10-23). When the user changes one of these values, show a notice before the run: the change cannot affect the frames already in the stack, and it is saved for the appends that follow. The command logs the same thing.
 3. **Compatibility pre-check** against the loaded sequence: channel count, sensor class and Bayer pattern, binning, filter, and pixel size and focal length (Section 7). Show the problems inline and disable Run on a hard mismatch. Today the user would only see them in the log after the job starts.
 4. **Append-only widgets:**
    - framing: max (grow the grid) or current (crop to it), since min and cog do not apply on append;
@@ -79,7 +79,7 @@ Recommended flow: a fourth result entry on the stacking tab, **Append to LSF…*
    - "frames already on the grid" (-noreg);
    - "add rejection maps" (-rejmaps), shown only when the file has none, with a note that the counts start from this append;
    - compression: keep (default), change, or remove;
-   - **keep a backup (.bak), on by default in the GUI**, because there is no undo (Section 10.10).
+   - **keep a backup (.bak), on by default in the GUI**, because there is no undo (Section 10.9).
    - Later, from M5: registration by stars or by WCS.
 5. Run, then reload the Stack in the display and refresh the info box.
 
@@ -120,7 +120,7 @@ The user can pick each action from a menu, but every action needs the same file 
 
 ### B5. Protecting LSF files opened as images (do first)
 
-File > Open of an .lsf.fits loads HDU 0 as a normal image. A plain Save then calls `savefits(com.uniq->filename, gfit)` (save_dialog.c), which rewrites the file without its extensions. Siril would then be the "foreign save" that ends the stack's life (Section 15), and it takes a single Ctrl+S.
+File > Open of an .lsf.fits loads HDU 0 as a normal image. A plain Save then calls `savefits(com.uniq->filename, gfit)` (save_dialog.c), which rewrites the file without its extensions. Siril would then be the "foreign save" that ends the stack's life (Section 13), and it takes a single Ctrl+S.
 
 - On open, detect `LSF = T` and set a flag on the loaded image.
 - While the flag is set:

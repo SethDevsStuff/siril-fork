@@ -17,7 +17,7 @@
  * along with Siril. If not, see <http://www.gnu.org/licenses/>.
  */
 
-/* LSF batch engine (FITS profile v0.4, Sections 10.2, 10.4, 10.7).
+/* LSF batch engine (FITS profile v0.4, Sections 10.2, 10.3, 10.6).
  *
  * The batch, a sequence already on the LSF grid, is read in blocks of rows
  * like stack_mean_with_rejection() does. Each pixel goes through Siril's own
@@ -48,10 +48,6 @@
 #include "opencv/opencv.h"
 #include "registration/registration.h"
 #include "lsf/lsf.h"
-
-/* from median_and_mean.c */
-int stack_open_all_files(struct stacking_args *args, int *bitpix, int *naxis, long *naxes,
-		GList **list_date, fits *fit);
 
 void lsf_ledger_row_free(gpointer p) {
 	lsf_ledger_row *r = p;
@@ -94,6 +90,13 @@ static gchar *format_date(GDateTime *dt) {
 }
 
 static gboolean dbl_known(double v) { return v > DEFAULT_DOUBLE_VALUE; }
+
+/* layer holding the registration data of the batch, as the stack command
+ * finds it; green or mono when there is none */
+static int batch_reg_layer(const sequence *seq) {
+	int layer = get_registration_layer(seq);
+	return layer >= 0 ? layer : (seq->nb_layers == 3 ? 1 : 0);
+}
 
 static gboolean differ_dbl(double a, double b) {
 	return dbl_known(a) && dbl_known(b) && fabs(a - b) > 1e-6 * MAX(fabs(a), fabs(b));
@@ -163,7 +166,7 @@ static void fill_ledger_row(lsf_ledger_row *r, struct lsf_batch_args *args, cons
 	sequence *seq = args->seq;
 	int idx = b->idx[k];
 	int nchan = seq->nb_layers;
-	int reglayer = nchan == 3 ? 1 : 0;
+	int reglayer = batch_reg_layer(seq);
 	sequence *src = args->src_seq ? args->src_seq : seq;
 	int src_idx = args->src_index ? args->src_index[idx] : idx;
 	char name[256];
@@ -308,7 +311,10 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 	lsf_settings *s = args->settings;
 	lsf_history *h = args->hist;
 	int nchan = seq->nb_layers;
-	int reglayer = nchan == 3 ? 1 : 0;
+	int reglayer = batch_reg_layer(seq);
+	/* norm.rgb_equal equalizes to green: the baseline is frozen per channel,
+	 * so the reference channel cannot follow the registration layer */
+	int rgb_ref = 1;
 	int retval = 1;
 	batch_frames b = { 0 };
 	fits *metas = NULL;
@@ -398,6 +404,11 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 	for (int k = 0; k < nb_incl; k++) {
 		int i = cand[k];
 		stats[i] = calloc(3, sizeof(imstats *));
+		if (!stats[i]) {
+			PRINT_ALLOC_ERR;
+			free(cand);
+			goto end;
+		}
 		if (compute_all_channels_statistics_seqimage(seq, i, NULL, s->lite_norm ? STATS_LITENORM : STATS_NORM,
 					MULTI_THREADED, -1, stats[i])) {
 			siril_log_error(_("LSF: could not compute the statistics of frame %d\n"), seq->imgparam[i].filenum);
@@ -437,11 +448,19 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 	double *noise_raw = malloc(nchan * nb * sizeof(double));
 	float *wfwhm = malloc(nb * sizeof(float));
 	int *nstars = malloc(nb * sizeof(int));
+	gboolean alloc_ok = b.idx && noise_raw && wfwhm && nstars;
+	for (int c = 0; c < nchan; c++)
+		alloc_ok = alloc_ok && b.pscale[c] && b.poffset[c] && b.pmul[c] && b.weight[c] && b.sframe[c];
+	if (!alloc_ok) {
+		PRINT_ALLOC_ERR;
+		free(noise_raw); free(wfwhm); free(nstars); free(cand);
+		goto end;
+	}
 	gboolean has_reg = layer_has_registration(seq, reglayer);
 	for (int k = 0; k < nb; k++) {
 		int i = cand[k];
 		for (int c = 0; c < nchan; c++) {
-			int reflayer = s->rgb_equal && nchan == 3 ? reglayer : c;
+			int reflayer = s->rgb_equal && nchan == 3 ? rgb_ref : c;
 			double loc = est_loc(stats[i][c], s->lite_norm), sca = est_scale(stats[i][c], s->lite_norm);
 			double pscale = 1.0, poffset = 0.0, pmul = 1.0;
 			switch (s->norm) {
@@ -548,6 +567,10 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 	if (rargs.type_of_rejection == GESDT) {
 		int max_outliers = (int) floor(nb * rargs.sig[0]);
 		rargs.critical_value = malloc(MAX(max_outliers, 1) * sizeof(float));
+		if (!rargs.critical_value) {
+			PRINT_ALLOC_ERR;
+			goto end;
+		}
 		for (int j = 0, size = nb; j < max_outliers; j++, size--) {
 			float t_dist = gsl_cdf_tdist_Pinv(1 - rargs.sig[1] / (2 * size), size - 2);
 			float numerator = (size - 1) * t_dist;
@@ -556,7 +579,7 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 		}
 	}
 
-	/* history test constants (Section 10.7) */
+	/* history test constants (Section 10.6) */
 	double kl = s->hist_low, kh = s->hist_high;
 	if (lsf_rejection_has_sigma(s->rej)) {
 		kl = MIN(kl, s->sig[0]);
@@ -571,11 +594,21 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 	if (nb_threads > 1 && (seq->type == SEQ_REGULAR || seq->type == SEQ_FITSEQ) && !fits_is_reentrant())
 		nb_threads = 1;
 #endif
+	/* the accumulator stays in memory during the merge, so it counts against
+	 * Siril's memory limit. With a limit set as a ratio of the available
+	 * memory, the part already read may be counted twice, which only makes
+	 * the blocks smaller. */
+	guint64 hist_bytes = (guint64) h->rx * h->ry * h->nchan * (LSF_NB_PL * sizeof(float)
+			+ (h->rej[0][0] ? 3 : 1) * sizeof(WORD));
 	guint64 mem = (guint64) get_max_memory_in_MB() * BYTES_IN_A_MB;
+	mem = mem > hist_bytes ? mem - hist_bytes : 0;
 	guint64 row_bytes = (guint64) nb * naxes[0] * (sizeof(float) + (ushort_input ? sizeof(WORD) : 0));
 	long max_rows = (long) (mem / (MAX(row_bytes, 1) * nb_threads));
 	if (max_rows < 1) {
-		siril_log_error(_("LSF: not enough memory to process the batch\n"));
+		siril_log_error(_("LSF: not enough memory to process the batch: the accumulator uses %.0f MB of the "
+					"%d MB Siril may use, and reading the frames needs at least %.0f MB more\n"),
+				(double) hist_bytes / BYTES_IN_A_MB, get_max_memory_in_MB(),
+				(double) row_bytes * nb_threads / BYTES_IN_A_MB);
 		goto end;
 	}
 	if (max_rows > naxes[1]) max_rows = naxes[1];
@@ -585,6 +618,10 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 		goto end;
 	size_t block_pix = (size_t) largest_block_height * naxes[0];
 	tdata = calloc(nb_threads, sizeof(lsf_thread_data));
+	if (!tdata) {
+		PRINT_ALLOC_ERR;
+		goto end;
+	}
 	for (int t = 0; t < nb_threads; t++) {
 		if (alloc_thread_data(&tdata[t], nb, block_pix, ushort_input, rargs.type_of_rejection)) {
 			PRINT_ALLOC_ERR;
@@ -698,7 +735,7 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 					if (!sel[f])
 						continue;
 					double wf = b.weight[layer][f];
-					if (Wh > 0.0) {	// history test, Section 10.7
+					if (Wh > 0.0) {	// history test, Section 10.6
 						double sp2 = lsf_sigma_pred2(s->weighting, Wh, m2_h[pdata_idx],
 								w2_h[pdata_idx], count_h[pdata_idx], wf);
 						double sh = lsf_sigma_hist(sp2, clip_c, b.sframe[layer][f], margin);
@@ -862,7 +899,8 @@ int lsf_build_primary(fits *primary, lsf_settings *s, const lsf_history *h) {
 	double mini = 0.0, maxi = 1.0;
 	gboolean norm = s->outnorm;
 	if (norm && !lsf_outnorm_range(h->plane[LSF_PL_MEAN], h->plane[LSF_PL_W], n, h->nchan, &mini, &maxi)) {
-		siril_log_warning(_("LSF: output normalization skipped, no valid dynamic range\n"));
+		siril_log_warning(_("LSF: the Stack has no valid dynamic range for output normalization. "
+					"Output normalization is now off for this file, and later appends will not turn it back on\n"));
 		norm = FALSE;
 	}
 	double range = maxi - mini;

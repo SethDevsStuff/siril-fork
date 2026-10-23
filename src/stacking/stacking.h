@@ -220,6 +220,8 @@ int check_G_values(float Gs, float Gc);
 void confirm_outliers(struct ESD_outliers *out, int N, double median, int *rejected, int rej[2]);
 int stack_compute_parallel_blocks(struct _image_block **blocksptr, long max_number_of_rows,
 		const long naxes[3], int nb_threads, long *largest_block_height, int *nb_blocks);
+int stack_open_all_files(struct stacking_args *args, int *bitpix, int *naxis, long *naxes,
+		GList **list_date, fits *fit);
 
 /* up-scaling functions */
 

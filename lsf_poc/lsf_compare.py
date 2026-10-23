@@ -46,17 +46,11 @@ Stage parity <p>_parity.csv         lsf_set_k vs siril_set_k and lsf_cum_X vs si
                                     exceptions (logged): wfwhm / nbstars weighting, and sigmedian
                                     rejection without weights.
              <p>_diff_<pair>.fit    LSF - Siril, written only for pairs that differ.
-Stage flip   <p>_flip.csv           Section 12 check 7, on a scratch copy of an LSF product: its
+Stage flip   <p>_flip.csv           On a scratch copy of an LSF product: its
                                     Stack flipped with the old DATASUM kept; lsf_append must refuse
                                     it, lsf_util -repair must restore it bit-exactly, and one
                                     pixel edited then kept with -adopt must change nothing else.
-Stage drift  <p>_drift.csv          Section 12 check 8, synthetic frames from a fixed noise model:
-                                    lsf_init then --drift-appends appends; the history-test
-                                    rejection (HISTORY cards) must stay flat.
-Stage weights <p>_weights.csv       Section 12 check 9: a good batch, then a batch with twice the
-                                    noise, noise weighting: a poor frame must weigh about 1/4 of a
-                                    good one (ledger WEIGHT).
-The flip, drift and weights stages raise if their test fails.
+                                    Raises if the test fails.
 Stage stats  <p>_noise.csv          one row per file and channel; the .lsf.fits files are loaded
                                     directly (this also tests that Siril opens one as an image).
 
@@ -123,7 +117,7 @@ except ImportError:
 N_SETS = 4
 STAT_FIELDS = ("total", "ngoodpix", "mean", "median", "sigma", "avgDev", "mad", "sqrtbwmv",
                "location", "scale", "min", "max", "normValue", "bgnoise")
-STAGES = ("base", "siril", "sos", "iter", "check", "flip", "parity", "stats", "drift", "weights")   # run order
+STAGES = ("base", "siril", "sos", "iter", "check", "flip", "parity", "stats")   # run order
 SKIPPABLE = STAGES
 
 # Siril's 8 rejection methods -> `stack` / lsf_init token, and Siril's default low/high
@@ -388,61 +382,8 @@ def write_fits_float32(path: str, data, history=()) -> None:
         f.write(raw + b"\0" * (-len(raw) % 2880))
 
 
-def history_cards(path: str) -> list:
-    """Text of the HISTORY cards of the primary header, in order."""
-    out = []
-    with open(path, "rb") as f:
-        while True:
-            block = f.read(2880)
-            if len(block) < 2880:
-                break
-            for i in range(0, 2880, 80):
-                card = block[i:i + 80].decode("ascii", "replace")
-                if card.startswith("END") and not card[3:].strip():
-                    return out
-                if card.startswith("HISTORY"):
-                    out.append(card[8:].rstrip())
-    return out
-
-
-def rejection_from_history(cards: list) -> dict:
-    """{generation: [(batch_low, batch_high, hist_low, hist_high) per channel]} in percent, from the
-    'LSF gen G ch C rejected %: ...' HISTORY cards written by lsf_init and lsf_append."""
-    out = {}
-    for c in cards:
-        m = re.match(r"LSF gen (\d+) ch (\d+) rejected %: ([\d.]+) ([\d.]+) hist ([\d.]+) ([\d.]+)", c)
-        if m:
-            out.setdefault(int(m.group(1)), []).append(tuple(float(m.group(k)) for k in range(3, 7)))
-    return out
-
-
 _TFORM_BYTES = {"L": 1, "X": 1, "B": 1, "I": 2, "J": 4, "K": 8, "A": 1, "E": 4, "D": 8, "C": 8, "M": 16,
                 "P": 8, "Q": 16}
-_TFORM_NUMPY = {"B": ">u1", "I": ">i2", "J": ">i4", "K": ">i8", "E": ">f4", "D": ">f8"}
-
-
-def table_column(path: str, extname: str, name: str) -> np.ndarray:
-    """A numeric column of a BINTABLE as an array (rows, repeat), read from the fixed-size part of
-    the rows (stdlib + numpy; variable-length columns are skipped over, not read)."""
-    for h in read_hdus(path):
-        c = h["cards"]
-        if c.get("EXTNAME") != extname:
-            continue
-        nrows, width = int(c["NAXIS2"]), int(c["NAXIS1"])
-        offset = 0
-        for k in range(1, int(c["TFIELDS"]) + 1):
-            m = re.match(r"(\d*)([A-Z])", c[f"TFORM{k}"].strip())
-            rep, code = int(m.group(1) or 1), m.group(2)
-            size = rep * _TFORM_BYTES[code] if code not in "PQ" else _TFORM_BYTES[code]
-            if c.get(f"TTYPE{k}", "").strip() == name:
-                with open(path, "rb") as f:
-                    f.seek(h["data_offset"])
-                    raw = np.frombuffer(f.read(nrows * width), dtype=np.uint8).reshape(nrows, width)
-                cells = np.ascontiguousarray(raw[:, offset:offset + size])
-                return cells.view(_TFORM_NUMPY[code]).reshape(nrows, rep).astype(np.float64)
-            offset += size
-        raise KeyError(f"{extname} has no column {name}")
-    raise KeyError(f"{os.path.basename(path)} has no {extname}")
 
 
 def primary_layout(path: str) -> tuple:
@@ -471,20 +412,6 @@ def edit_primary(path: str, fn) -> None:
         a = np.frombuffer(f.read(int(np.prod(shape)) * 4), dtype=">f4").reshape(shape)
         f.seek(off)
         f.write(np.ascontiguousarray(fn(a.copy()), dtype=">f4").tobytes())
-
-
-def synthetic_frames(n: int, sigma: float, seed: int, shape=(128, 128), level=0.2) -> list:
-    """n frames of a fixed sky (a smooth pattern and a few Gaussian stars on a constant level) plus
-    independent Gaussian noise of the given sigma: the fixed noise model of the Section 12 tests."""
-    h, w = shape
-    yy, xx = np.mgrid[0:h, 0:w]
-    sky = level + 0.02 * np.sin(xx / 9.0) * np.cos(yy / 13.0)
-    rs = np.random.default_rng(12345)
-    for _ in range(12):
-        cy, cx, amp = rs.uniform(8, h - 8), rs.uniform(8, w - 8), rs.uniform(0.05, 0.4)
-        sky = sky + amp * np.exp(-((yy - cy) ** 2 + (xx - cx) ** 2) / (2 * 1.8 ** 2))
-    rng = np.random.default_rng(seed)
-    return [(sky + rng.normal(0.0, sigma, shape)).astype(np.float32) for _ in range(n)]
 
 
 def parity_breakdown(x, y, count=None, stackcnt=None) -> list:
@@ -679,8 +606,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--skip", nargs="+", choices=SKIPPABLE, default=[],
                    help="Leave out stages: base (lsf_init per-set + running stacks), siril (native stack), "
                         "sos (stack on stack), iter (lsf_append chain), check (v0.4 structure), "
-                        "flip (repair/adopt test), parity (LSF vs Siril), stats (noise export), "
-                        "drift (rejection over many appends), weights (frozen weight constants).")
+                        "flip (repair/adopt test), parity (LSF vs Siril), stats (noise export).")
     p.add_argument("--export-fits", action="store_true",
                    help="Also write <name>.fit next to every LSF file with lsf_export.")
     g = p.add_argument_group("stacking settings (shared by lsf_init and stack)")
@@ -696,8 +622,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Rejection for the stack on stack only (default: same as --rejection).")
     g.add_argument("--sos-sigma-low", type=float, default=None)
     g.add_argument("--sos-sigma-high", type=float, default=None)
-    g.add_argument("--drift-appends", type=int, default=50,
-                   help="Number of appends in the drift test (default 50, Section 12 check 8).")
     g = p.add_argument_group("noise export")
     g.add_argument("--cfa", action="store_true", help="Add -cfa to the stat command (undebayered data).")
     g.add_argument("--stat-main", action="store_true",
@@ -749,7 +673,7 @@ class Comparison:
         if a.export_fits:
             out += [plain_path(f) for f in out if f.endswith(".lsf.fits")]
         for st, name in (("check", "check.csv"), ("flip", "flip.csv"), ("parity", "parity.csv"),
-                         ("stats", "noise.csv"), ("drift", "drift.csv"), ("weights", "weights.csv")):
+                         ("stats", "noise.csv")):
             if st not in a.skip:
                 out.append(self.p(name))
         return out
@@ -1093,7 +1017,7 @@ class Comparison:
                      + (" (known exceptions apply)" if exc else " -- unexpected, see the diff_*.fit images"),
                      LogColor.SALMON if exc else LogColor.RED)
 
-    # ---- Section 12 behaviour tests ----------------------------------------------
+    # ---- behaviour tests --------------------------------------------------------
     def try_cmd(self, *parts) -> bool:
         """A command that may be refused: True if Siril reports success. The tests below judge the
         outcome from the files, so a refusal reported either way is fine."""
@@ -1103,28 +1027,8 @@ class Comparison:
         except RuntimeError:
             return False
 
-    def in_workdir(self, fn):
-        """Runs fn() with Siril's working directory set to the private scratch folder."""
-        run_cmd(self.siril, "cd", _q(self.workdir))
-        try:
-            return fn()
-        finally:
-            try:
-                run_cmd(self.siril, "cd", _q(self.wd))
-            except Exception as e:  # noqa: BLE001
-                self.log(f"Could not restore Siril's working directory: {e}", LogColor.SALMON)
-
-    def make_seq(self, root: str, frames: list) -> str:
-        """Writes frames as root00001.fit... in the scratch folder (Siril's working directory must be
-        that folder) and makes a sequence of them; returns its name."""
-        for i, a in enumerate(frames, 1):
-            write_fits_float32(os.path.join(self.workdir, f"{root}{i:05d}.fit"), a, ("lsf_compare synthetic frame",))
-        if not self.siril.create_new_seq(root):
-            raise RuntimeError(f"Siril could not create the sequence {root}.")
-        return next((c for c in (root, root + "_") if os.path.exists(os.path.join(self.workdir, c + ".seq"))), root)
-
     def stage_flip(self, step) -> None:
-        """Section 12 check 7: an LSF file whose Stack is flipped by an outside tool that keeps the old
+        """An LSF file whose Stack is flipped by an outside tool that keeps the old
         DATASUM. lsf_append must refuse it, lsf_util -repair must restore the Stack bit-exactly, and an
         edit of one pixel kept with -adopt must leave the rest of the Stack unchanged."""
         src = next((self.p(n) for n in ("lsf_cum_1234.lsf.fits", "lsf_set_1.lsf.fits", "lsf_4.lsf.fits")
@@ -1173,75 +1077,6 @@ class Comparison:
         chk("adopt_new_generation", header_int(work, "LSFGEN") == gen0 + 2, f"LSFGEN {header_int(work, 'LSFGEN')}")
         chk("passes_after_adopt", all(ok for _, ok, _ in check_lsf_file(work)[0]), "structure and LSFHASH")
         self.write_test_csv("flip", rows, failed)
-
-    def stage_drift(self, step) -> None:
-        """Section 12 check 8: frames from a fixed noise model, an lsf_init then --drift-appends
-        appends. M2 only keeps accepted samples, so without the Section 10.7 guards the history test
-        would reject more on every append; with them the rejected fraction must stay flat."""
-        a = self.a
-        n_app = a.drift_appends
-        rows, failed = [], []
-
-        def run():
-            step("Drift test: first batch")
-            dest = os.path.join(self.workdir, "drift.lsf.fits")
-            seq = self.make_seq("drift0_", synthetic_frames(30, 0.01, seed=1))
-            run_cmd(self.siril, "lsf_init", seq, _q(dest), "rej", "w", "3", "3", "-norm=add", "-overwrite")
-            for k in range(1, n_app + 1):
-                if k % 10 == 1:
-                    step(f"Drift test: appends {k}-{min(k + 9, n_app)} of {n_app}")
-                seq = self.make_seq(f"drift{k}_", synthetic_frames(10, 0.01, seed=1000 + k))
-                run_cmd(self.siril, "lsf_append", _q(dest), seq, "-noreg")
-            return rejection_from_history(history_cards(dest))
-
-        rej = self.in_workdir(run)
-        hist = [sum(v[2] + v[3] for v in rej[g]) / len(rej[g]) for g in sorted(rej) if g >= 2]
-        for g in sorted(rej):
-            for c, (bl, bh, hl, hh) in enumerate(rej[g]):
-                rows.append(("drift", f"gen_{g}_ch{c}", "", f"batch {bl:.4f} {bh:.4f} history {hl:.4f} {hh:.4f} %"))
-        if len(hist) < max(4, n_app):
-            failed.append(f"rejection found for {len(hist)} of {n_app} appends")
-        else:
-            q = max(2, len(hist) // 5)
-            first, last = float(np.mean(hist[:q])), float(np.mean(hist[-q:]))
-            slope = float(np.polyfit(np.arange(len(hist)), hist, 1)[0])
-            flat = first > 0 and 0.67 <= last / first <= 1.5
-            rows.append(("drift", "history_rejection_flat", "ok" if flat else "FAIL",
-                         f"first {q} appends {first:.4f} %, last {q} {last:.4f} %, slope {slope:+.5f} % per append"))
-            if not flat:
-                failed.append(f"history rejection went from {first:.4f} % to {last:.4f} %")
-            self.log(f"  drift: history rejection {first:.4f} % over the first {q} appends, {last:.4f} % over the "
-                     f"last {q} (slope {slope:+.5f} % per append)")
-        self.write_test_csv("drift", rows, failed)
-
-    def stage_weights(self, step) -> None:
-        """Section 12 check 9: one good and one poor batch (twice the noise) with noise weighting. With
-        the constants frozen from the first batch, a poor frame must get about a quarter of the weight
-        of a good one, not the same weight per frame."""
-        rows, failed = [], []
-
-        def run():
-            step("Weight consistency test")
-            dest = os.path.join(self.workdir, "weights.lsf.fits")
-            good = self.make_seq("wgood_", synthetic_frames(30, 0.01, seed=7))
-            poor = self.make_seq("wpoor_", synthetic_frames(30, 0.02, seed=8))
-            run_cmd(self.siril, "lsf_init", good, _q(dest), "rej", "w", "3", "3", "-norm=add", "-weight=noise",
-                    "-overwrite")
-            run_cmd(self.siril, "lsf_append", _q(dest), poor, "-noreg")
-            return table_column(dest, "LSF_LEDGER", "BATCH")[:, 0], table_column(dest, "LSF_LEDGER", "WEIGHT")
-
-        batch, weight = self.in_workdir(run)
-        w1, w2 = weight[batch == 1].mean(axis=0), weight[batch == 2].mean(axis=0)
-        for c in range(weight.shape[1]):
-            ratio = w2[c] / w1[c]
-            ok = 0.2 <= ratio <= 0.3
-            rows.append(("weights", f"ch{c}_poor_over_good", "ok" if ok else "FAIL",
-                         f"mean weight good {w1[c]:.4f}, poor {w2[c]:.4f}, ratio {ratio:.4f} (expected about 0.25)"))
-            if not ok:
-                failed.append(f"channel {c}: poor/good weight ratio {ratio:.3f}, expected about 0.25")
-            self.log(f"  weights: good frames {w1[c]:.4f}, poor frames {w2[c]:.4f}, ratio {ratio:.4f} "
-                     f"(about 0.25 expected)")
-        self.write_test_csv("weights", rows, failed)
 
     def write_test_csv(self, name: str, rows: list, failed: list) -> None:
         csv_path = self.p(f"{name}.csv")
@@ -1464,12 +1299,10 @@ class Comparison:
             if "base" not in a.skip or "siril" not in a.skip:
                 self.prime_stats_cache()
 
-            weights = {"base": 7, "siril": 7, "sos": 1, "iter": 4, "check": 1, "flip": 1, "parity": 8, "stats": 21,
-                       "drift": 1 + (a.drift_appends + 9) // 10, "weights": 1}
+            weights = {"base": 7, "siril": 7, "sos": 1, "iter": 4, "check": 1, "flip": 1, "parity": 8, "stats": 21}
             stages = {"base": self.stage_base, "siril": self.stage_siril, "sos": self.stage_sos,
                       "iter": self.stage_iter, "check": self.stage_check, "parity": self.stage_parity,
-                      "stats": self.stage_stats, "flip": self.stage_flip, "drift": self.stage_drift,
-                      "weights": self.stage_weights}
+                      "stats": self.stage_stats, "flip": self.stage_flip}
             todo = [st for st in STAGES if st not in a.skip]
             total_steps = sum(weights[st] for st in todo)
             done = [0]

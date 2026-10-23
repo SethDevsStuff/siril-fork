@@ -18,7 +18,7 @@
  */
 
 /* LSF file I/O (FITS profile v0.4): validation (Section 8), writing
- * (Sections 3 to 9) and the commit protocol (Section 10.2, 10.11) */
+ * (Sections 3 to 9) and the commit protocol (Section 10.2, 10.10) */
 
 #include <string.h>
 #include <limits.h>
@@ -85,7 +85,7 @@ int lsf_history_alloc_rej(lsf_history *h, int first_gen) {
 	return 0;
 }
 
-/* grid expansion (Section 10.6): pads every plane with zeros, one plane at a
+/* grid expansion (Section 10.5): pads every plane with zeros, one plane at a
  * time so that only one extra plane is in memory. W = 0 in the padding, so
  * no existing pixel changes. */
 int lsf_history_grow(lsf_history *h, const int pad[4]) {
@@ -209,31 +209,37 @@ static int read_uid_gen(fitsfile *fptr, char *uid, int *gen) {
 }
 
 static GPtrArray *read_settings_rows(fitsfile *fptr, int *status) {
-	long nrows = 0;
-	int ckey, ctype, cvalue;
+	long nrows = 0, wkey = 0, wtype = 0, width = 0;
+	int ckey, ctype, cvalue, typecode = 0;
 	fits_get_num_rows(fptr, &nrows, status);
 	fits_get_colnum(fptr, CASEINSEN, "KEY", &ckey, status);
 	fits_get_colnum(fptr, CASEINSEN, "TYPE", &ctype, status);
 	fits_get_colnum(fptr, CASEINSEN, "VALUE", &cvalue, status);
-	if (*status)
+	/* the string buffers are sized from the columns as the file declares
+	 * them, which another writer may have made wider than this one does */
+	fits_get_coltype(fptr, ckey, &typecode, &wkey, &width, status);
+	fits_get_coltype(fptr, ctype, &typecode, &wtype, &width, status);
+	if (*status || wkey < 1 || wtype < 1)
 		return NULL;
 	GPtrArray *rows = g_ptr_array_new_with_free_func(lsf_setting_row_free);
+	gchar *key = g_malloc0(wkey + 1), *type = g_malloc0(wtype + 1);
 	for (long r = 1; r <= nrows && !*status; r++) {
-		char key[80] = { 0 }, type[80] = { 0 };
-		char *pk = key, *pt = type;
 		long repeat = 0, offset = 0;
-		fits_read_col_str(fptr, ckey, r, 1, 1, "", &pk, NULL, status);
-		fits_read_col_str(fptr, ctype, r, 1, 1, "", &pt, NULL, status);
+		fits_read_col_str(fptr, ckey, r, 1, 1, "", &key, NULL, status);
+		fits_read_col_str(fptr, ctype, r, 1, 1, "", &type, NULL, status);
 		fits_read_descript(fptr, cvalue, r, &repeat, &offset, status);
-		char *value = calloc(repeat + 1, 1);
+		if (*status)
+			break;
+		gchar *value = g_malloc0(repeat + 1);
 		fits_read_col_str(fptr, cvalue, r, 1, 1, "", &value, NULL, status);
 		lsf_setting_row *row = g_new(lsf_setting_row, 1);
 		row->key = g_strstrip(g_strdup(key));
 		row->type = g_strstrip(g_strdup(type));
-		row->value = g_strdup(value);
-		free(value);
+		row->value = value;
 		g_ptr_array_add(rows, row);
 	}
+	g_free(key);
+	g_free(type);
 	return rows;
 }
 
@@ -338,7 +344,7 @@ int lsf_open_and_validate(const char *path, lsf_file *f, gboolean tolerate_edite
 		else if (!strcmp(extname, LSF_EXT_LEDGER)) hdu_ledger = i;
 		else if (!strcmp(extname, LSF_EXT_REJ)) hdu_rej = i;
 		else if (!strcmp(extname, "LSF_STARS")) {
-			/* the star cache would be stale after this append (Section 10.5) */
+			/* the star cache would be stale after this append (Section 10.4) */
 			siril_log_warning(_("LSF: %s is not supported by this version and will be dropped\n"), extname);
 		}
 		else g_array_append_val(f->unknown_hdus, i);
@@ -388,11 +394,12 @@ int lsf_open_and_validate(const char *path, lsf_file *f, gboolean tolerate_edite
 		}
 
 	long cnaxes[3] = { 0, 0, 1 };
-	int cnaxis = 0, cbitpix = 0;
+	int cnaxis = 0, cbitpix = 0, ctype = 0;
 	status = 0;
 	fits_movabs_hdu(fptr, hdu_count, NULL, &status);
 	fits_get_img_param(fptr, 3, &cbitpix, &cnaxis, cnaxes, &status);
-	if (status || cnaxes[0] != f->rx || cnaxes[1] != f->ry ||
+	fits_get_img_equivtype(fptr, &ctype, &status);
+	if (status || ctype != USHORT_IMG || cnaxes[0] != f->rx || cnaxes[1] != f->ry ||
 			(f->nchan == 1 && cnaxis != 2) ||
 			(f->nchan == 3 && !(cnaxis == 3 && (cnaxes[2] == 3 || cnaxes[2] == 1)))) {
 		ret = validation_failure(3, path, _("LSF_COUNT does not have the expected dimensions"));
@@ -875,35 +882,65 @@ static int flush_to_disk(const char *path) {
 	return ret;
 }
 
-/* atomic replace of target by source (Section 10.11). On Windows a file
- * that was just written can be held for a moment by another process, such as
- * a virus scanner: a sharing or access error is retried for about 2 s before
- * giving up. */
-static int replace_file(const char *source, const char *target) {
+/* atomic replace of target by source (Section 10.10), keeping the previous
+ * target as backup when backup is not NULL. target always holds either the
+ * previous or the new file, also when this fails. On Windows a file that was
+ * just written can be held for a moment by another process, such as a virus
+ * scanner: a sharing or access error is retried for about 2 s before giving
+ * up. */
+static int replace_file(const char *source, const char *target, const char *backup) {
 #ifdef _WIN32
 	wchar_t *wsrc = g_utf8_to_utf16(source, -1, NULL, NULL, NULL);
 	wchar_t *wdst = g_utf8_to_utf16(target, -1, NULL, NULL, NULL);
+	wchar_t *wbak = backup ? g_utf8_to_utf16(backup, -1, NULL, NULL, NULL) : NULL;
 	DWORD err = 0;
 	BOOL ok = FALSE;
 	for (int attempt = 0; attempt < 20 && !ok; attempt++) {
-		ok = MoveFileExW(wsrc, wdst, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+		/* ReplaceFileW renames target to backup and source to target in one call */
+		ok = wbak ? ReplaceFileW(wdst, wsrc, wbak, 0, NULL, NULL) :
+			MoveFileExW(wsrc, wdst, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
 		if (ok) break;
 		err = GetLastError();
-		if (err != ERROR_SHARING_VIOLATION && err != ERROR_ACCESS_DENIED && err != ERROR_LOCK_VIOLATION)
+		if (err == ERROR_UNABLE_TO_MOVE_REPLACEMENT_2) {
+			/* target was renamed to backup but source could not take its place:
+			 * put target back before anything else */
+			if (!MoveFileExW(wbak, wdst, MOVEFILE_WRITE_THROUGH)) {
+				siril_log_error(_("LSF: %s could not be replaced and is now %s, rename it back\n"), target, backup);
+				break;
+			}
+		} else if (err != ERROR_SHARING_VIOLATION && err != ERROR_ACCESS_DENIED && err != ERROR_LOCK_VIOLATION)
 			break;
 		g_usleep(100000);
 	}
 	g_free(wsrc);
 	g_free(wdst);
+	g_free(wbak);
 	if (!ok)
 		siril_log_warning(_("LSF: replacing %s failed with Windows error %lu\n"), target, (unsigned long) err);
 	return ok ? 0 : 1;
 #else
-	return g_rename(source, target);
+	if (backup && link(target, backup)) {
+		/* no hard links on this file system: rename, and rename back on failure */
+		if (g_rename(target, backup))
+			return 1;
+		if (g_rename(source, target)) {
+			if (g_rename(backup, target))
+				siril_log_error(_("LSF: %s could not be replaced and is now %s, rename it back\n"), target, backup);
+			return 1;
+		}
+		return 0;
+	}
+	if (g_rename(source, target)) {
+		if (backup)
+			g_unlink(backup);	// the hard link: target is unchanged
+		return 1;
+	}
+	return 0;
 #endif
 }
 
-static gchar *now_utc_iso(void) {
+/* current UTC time, ISO 8601 without fraction (ADDED_UTC, created_utc) */
+gchar *lsf_now_utc_iso(void) {
 	GDateTime *now = g_date_time_new_now_utc();
 	gchar *s = g_date_time_format(now, "%Y-%m-%dT%H:%M:%S");
 	g_date_time_unref(now);
@@ -928,7 +965,7 @@ int lsf_write_file(const char *path, lsf_file *old, const lsf_settings *s, lsf_h
 	int status = 0;
 	fitsfile *fptr = NULL, *oldf = NULL;
 	gchar *tmp = g_strdup_printf("%s.lsf_tmp", path);
-	gchar *added = now_utc_iso();
+	gchar *added = lsf_now_utc_iso();
 	GPtrArray *wcs = NULL;
 	int nchan = h->nchan;
 	size_t npix = (size_t) h->rx * h->ry;
@@ -1134,22 +1171,24 @@ int lsf_write_file(const char *path, lsf_file *old, const lsf_settings *s, lsf_h
 	if (flush_to_disk(tmp))
 		siril_log_warning(_("LSF: could not flush %s to disk\n"), tmp);
 
-	/* atomic replace, keeping the temporary file on failure */
+	/* atomic replace, keeping the temporary file on failure. The previous
+	 * file becomes the backup in the same step, so path never goes missing */
+	gchar *bak = NULL;
 	if (backup && g_file_test(path, G_FILE_TEST_EXISTS)) {
-		gchar *bak = g_strdup_printf("%s.bak", path);
+		bak = g_strdup_printf("%s.bak", path);
 		g_unlink(bak);
-		if (g_rename(path, bak))
-			siril_log_warning(_("LSF: could not keep a backup copy as %s\n"), bak);
-		else siril_log_message(_("LSF: previous file kept as %s\n"), bak);
-		g_free(bak);
 	}
-	if (replace_file(tmp, path)) {
+	if (replace_file(tmp, path, bak)) {
 		siril_log_error(_("LSF: could not replace %s (is it open in another program?). "
-					"The new file was kept as %s\n"), path, tmp);
+					"It was not changed, and the new file was kept as %s\n"), path, tmp);
+		g_free(bak);
 		g_free(tmp);
 		tmp = NULL;
 		goto end;
 	}
+	if (bak)
+		siril_log_message(_("LSF: previous file kept as %s\n"), bak);
+	g_free(bak);
 	retval = 0;
 
 end:
@@ -1196,19 +1235,23 @@ void lsf_strip_lsf_keys(fits *fit) {
 	fit->unknown_keys = g_string_free(kept, FALSE);
 }
 
-/* Flattened master (Section 10.9): HDU 0 without the LSF keywords, saved
+/* Flattened master (Section 10.8): HDU 0 without the LSF keywords, saved
  * like any image Siril saves, so the extension and compression preferences
  * apply */
 int lsf_export_master(const char *lsf_path, const char *out_path) {
-	fitsfile *in = NULL;
-	int status = 0, gen = 0;
-	char uid[FLEN_VALUE] = { 0 };
-	if (fits_open_diskfile(&in, lsf_path, READONLY, &status)) {
-		report_fits_error(status);
+	/* the file is validated first (Section 8). A Stack edited outside Siril
+	 * is exported as it is, which is what the user sees when opening it */
+	lsf_file f;
+	if (lsf_open_and_validate(lsf_path, &f, TRUE)) {
+		lsf_file_free(&f);
 		return 1;
 	}
-	read_uid_gen(in, uid, &gen);
-	fits_close_file(in, &status);
+	if (f.stack_modified)
+		siril_log_warning(_("LSF: the Stack of %s was edited outside Siril and is exported with the edit\n"), lsf_path);
+	char uid[FLEN_VALUE];
+	g_strlcpy(uid, f.uid, sizeof uid);
+	int gen = f.gen;
+	lsf_file_free(&f);
 	fits fit = { 0 };
 	if (readfits(lsf_path, &fit, NULL, TRUE)) {
 		clearfits(&fit);

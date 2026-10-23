@@ -17,11 +17,12 @@
  * along with Siril. If not, see <http://www.gnu.org/licenses/>.
  */
 
-/* LSF frame weights (FITS profile v0.4, Section 10.4).
+/* LSF frame weights (FITS profile v0.4, Section 10.3).
  * Siril's per-frame inputs and formulas (compute_noise_weights,
  * compute_wfwhm_weights and compute_nbstars_weights in median_and_mean.c),
  * but with the constants frozen from the first batch, so that weights stay
- * comparable across appends. Siril's own functions are not changed. */
+ * comparable across appends, and with a floor (LSF_WEIGHT_FLOOR) where
+ * Siril gives the worst frame 0. Siril's own functions are not changed. */
 
 #include <math.h>
 #include <float.h>
@@ -45,7 +46,7 @@ static double wfwhm_formula(const lsf_settings *s, float wfwhm) {
 	if (f > s->fwhm_max) f = s->fwhm_max;
 	double invfwhmax2 = 1.0 / (s->fwhm_max * s->fwhm_max);
 	double invdenom = 1.0 / (1.0 / (s->fwhm_min * s->fwhm_min) - invfwhmax2);
-	return (1.0 / (f * f) - invfwhmax2) * invdenom;
+	return MAX((1.0 / (f * f) - invfwhmax2) * invdenom, LSF_WEIGHT_FLOOR);
 }
 
 static double nbstars_formula(const lsf_settings *s, int nstars) {
@@ -55,7 +56,7 @@ static double nbstars_formula(const lsf_settings *s, int nstars) {
 	if (n < s->stars_min) n = s->stars_min;
 	if (n > s->stars_max) n = s->stars_max;
 	double invdenom = 1.0 / (s->stars_max - s->stars_min);
-	return (n - s->stars_min) * (n - s->stars_min) * invdenom * invdenom;
+	return MAX((n - s->stars_min) * (n - s->stars_min) * invdenom * invdenom, LSF_WEIGHT_FLOOR);
 }
 
 /* freezes the weight constants from the first batch.

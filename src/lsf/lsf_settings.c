@@ -55,7 +55,7 @@ gboolean lsf_weight_from_name(const char *name, weightingType *w) {
 	return FALSE;
 }
 
-/* methods whose thresholds are expressed in sigma units, Section 10.7 */
+/* methods whose thresholds are expressed in sigma units, Section 10.6 */
 gboolean lsf_rejection_has_sigma(rejection r) {
 	return r == SIGMA || r == MAD || r == SIGMEDIAN || r == WINSORIZED || r == LINEARFIT;
 }
@@ -73,6 +73,7 @@ void lsf_settings_init(lsf_settings *s) {
 	memset(s, 0, sizeof(lsf_settings));
 	g_strlcpy(s->bayer, "NONE", sizeof s->bayer);
 	s->binning = 1;
+	s->oversample = 1;
 	s->transform = HOMOGRAPHY_TRANSFORMATION;
 	s->interpolation = OPENCV_LANCZOS4;
 	s->min_pairs = 10;
@@ -131,10 +132,10 @@ GPtrArray *lsf_settings_to_rows(const lsf_settings *s, int nchan) {
 	add_str(rows, "sensor.bayer", s->bayer);
 	add_int(rows, "sensor.binning", s->binning);
 	add_str(rows, "cfa.mode", s->is_cfa ? "DEBAYER" : "NONE");
-	add_int(rows, "grid.oversample", 1);
-	add_flt(rows, "grid.pixfrac", 1.0);
-	add_str(rows, "grid.kernel", "none");
-	add_str(rows, "grid.reference", "stack");
+	/* written back as read, so a rewrite never changes what the grid is.
+	 * The drizzle pixel fraction and kernel are choices of each append, not
+	 * stored (Section 6) */
+	add_int(rows, "grid.oversample", s->oversample);
 	add_int(rows, "grid.origin_x", s->origin_x);
 	add_int(rows, "grid.origin_y", s->origin_y);
 	add_str(rows, "align.transform", transf_names[s->transform < 0 ? HOMOGRAPHY_TRANSFORMATION : s->transform]);
@@ -260,8 +261,14 @@ int lsf_settings_from_rows(lsf_settings *s, GPtrArray *rows, int nchan) {
 		else if (!strcmp(k, "sensor.binning")) s->binning = atoi(v);
 		else if (!strcmp(k, "grid.origin_x")) s->origin_x = atoi(v);
 		else if (!strcmp(k, "grid.origin_y")) s->origin_y = atoi(v);
-		else if (!strcmp(k, "grid.expand") || !strcmp(k, "grid.expand_step")) {
-			/* written by earlier versions, dropped: expansion is chosen per append */
+		else if (!strcmp(k, "grid.oversample")) {
+			gchar *end;
+			gint64 o = g_ascii_strtoll(v, &end, 10);
+			if (end == v || o < 1 || o > 16) err = 1; else s->oversample = (int) o;
+		}
+		else if (!strcmp(k, "grid.expand") || !strcmp(k, "grid.expand_step") || !strcmp(k, "grid.pixfrac")
+				|| !strcmp(k, "grid.kernel") || !strcmp(k, "grid.reference")) {
+			/* written by earlier versions, dropped (Section 6): chosen per append */
 		}
 		else if (!strcmp(k, "align.transform")) {
 			idx = name_index(transf_names, G_N_ELEMENTS(transf_names), v);
@@ -296,15 +303,10 @@ int lsf_settings_from_rows(lsf_settings *s, GPtrArray *rows, int nchan) {
 		else if (!strcmp(k, "rejmaps.enabled")) s->rejmaps = parse_bool(v);
 		else if (!strcmp(k, "filter")) { g_free(s->filter); s->filter = g_strdup(v); }
 		else if (!strcmp(k, "created_utc")) { g_free(s->created_utc); s->created_utc = g_strdup(v); }
-		else if (!strcmp(k, "cfa.mode") || !strcmp(k, "grid.oversample") || !strcmp(k, "grid.pixfrac")
-				|| !strcmp(k, "grid.kernel") || !strcmp(k, "grid.reference") || !strcmp(k, "writer")) {
+		else if (!strcmp(k, "cfa.mode") || !strcmp(k, "writer")) {
 			/* fixed values in this version, rewritten on save */
 			if (!strcmp(k, "cfa.mode") && !g_ascii_strcasecmp(v, "CFADRIZ")) {
 				siril_log_error(_("LSF: CFA drizzle files are not supported yet\n"));
-				err = 1;
-			}
-			if (!strcmp(k, "grid.reference") && g_ascii_strcasecmp(v, "stack")) {
-				siril_log_error(_("LSF: grid reference '%s' is not supported yet\n"), v);
 				err = 1;
 			}
 		}
@@ -315,6 +317,13 @@ int lsf_settings_from_rows(lsf_settings *s, GPtrArray *rows, int nchan) {
 			u->value = g_strdup(v);
 			g_ptr_array_add(s->unknown, u);
 		}
+	}
+	/* the history test thresholds are in sigma units: 0 would reject every
+	 * sample on that side of the mean */
+	if (!(s->hist_low > 0.0) || !(s->hist_high > 0.0) || !(s->hist_margin >= 1.0)) {
+		siril_log_error(_("LSF: the history test settings are not valid (reject.hist_low and reject.hist_high "
+					"must be above 0, reject.hist_margin at least 1)\n"));
+		err = 1;
 	}
 	return err;
 }

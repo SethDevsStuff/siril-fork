@@ -44,7 +44,7 @@
 
 typedef enum { LSF_CMD_INIT, LSF_CMD_APPEND, LSF_CMD_EXPORT, LSF_CMD_UTIL, LSF_CMD_MAPS } lsf_cmd_mode;
 
-/* maps of lsf_maps (Section 10.9) */
+/* maps of lsf_maps (Section 10.8) */
 enum { LSF_MAP_NEFF = 1 << 0, LSF_MAP_NOISE = 1 << 1, LSF_MAP_SIGMA = 1 << 2, LSF_MAP_SNR = 1 << 3,
 	LSF_MAP_REJLO = 1 << 4, LSF_MAP_REJHI = 1 << 5 };
 
@@ -58,7 +58,7 @@ struct lsf_cmd_args {
 	double hist_low, hist_high, hist_margin;
 	gboolean noreg, backup, overwrite;
 	gboolean rejmaps;		// init and append: -rejmaps (Section 5.4)
-	framing_type framing;		// init and append: -framing=, FRAMING_MAX by default (Sections 10.1, 10.6)
+	framing_type framing;		// init and append: -framing=, FRAMING_MAX by default (Sections 10.1, 10.5)
 	gboolean framing_set;
 	gboolean expand_force;
 	int expand_step;
@@ -106,13 +106,6 @@ static void findstar_from_json(const char *json, star_finder_params *sf) {
 	if ((v = yyjson_obj_get(root, "max_A")) && yyjson_is_num(v)) sf->max_A = yyjson_get_num(v);
 	if ((v = yyjson_obj_get(root, "max_r")) && yyjson_is_num(v)) sf->max_r = yyjson_get_num(v);
 	yyjson_doc_free(doc);
-}
-
-static gchar *now_utc_iso(void) {
-	GDateTime *now = g_date_time_new_now_utc();
-	gchar *s = g_date_time_format(now, "%Y-%m-%dT%H:%M:%S");
-	g_date_time_unref(now);
-	return s;
 }
 
 static sequence *load_batch(const char *name) {
@@ -211,11 +204,11 @@ static int lsf_init_run(struct lsf_cmd_args *a) {
 	g_free(s->findstar_json);
 	s->findstar_json = findstar_to_json(&com.pref.starfinder_conf);
 	g_free(s->created_utc);
-	s->created_utc = now_utc_iso();
+	s->created_utc = lsf_now_utc_iso();
 	if (!a->hist_low_set)
-		s->hist_low = lsf_rejection_has_sigma(s->rej) ? s->sig[0] : 3.0;
+		s->hist_low = lsf_rejection_has_sigma(s->rej) && s->sig[0] > 0.0 ? s->sig[0] : 3.0;
 	if (!a->hist_high_set)
-		s->hist_high = lsf_rejection_has_sigma(s->rej) ? s->sig[1] : 3.0;
+		s->hist_high = lsf_rejection_has_sigma(s->rej) && s->sig[1] > 0.0 ? s->sig[1] : 3.0;
 	apply_hist_overrides(a, s);
 
 	struct lsf_batch_args bargs = { 0 };
@@ -291,7 +284,7 @@ static void free_regargs(struct registration_args *regargs) {
 	free(regargs);
 }
 
-/* grid expansion (Section 10.6): the padding of each side needed by the
+/* grid expansion (Section 10.5): the padding of each side needed by the
  * footprint box of the registered frames, or 0 when no expansion is wanted
  * or needed. Fails when the expansion is refused. */
 static int plan_expansion(const lsf_file *f, const struct lsf_cmd_args *a, const double box[4], int pad[4]) {
@@ -330,7 +323,7 @@ static int plan_expansion(const lsf_file *f, const struct lsf_cmd_args *a, const
 	return 0;
 }
 
-/* registers the batch against HDU 0 of the LSF file (Section 10.5) in two
+/* registers the batch against HDU 0 of the LSF file (Section 10.4) in two
  * passes: Siril's global star alignment with an external reference computes
  * the transforms, then the footprint of the registered frames decides the
  * expansion of the grid (pad), and the registration is applied onto the
@@ -339,12 +332,19 @@ static int plan_expansion(const lsf_file *f, const struct lsf_cmd_args *a, const
  * expansion. */
 static sequence *register_against_stack(sequence *seq, const lsf_file *f, const struct lsf_cmd_args *a, int pad[4]) {
 	const lsf_settings *s = &f->settings;
-	star_finder_params backup = com.pref.starfinder_conf;
-	findstar_from_json(s->findstar_json, &com.pref.starfinder_conf);
+	/* the star detection settings stored in the file, over a copy of the
+	 * preferences for what they do not hold; the preferences are not changed */
+	star_finder_params sf = com.pref.starfinder_conf;
+	findstar_from_json(s->findstar_json, &sf);
 
+	/* the registration against the Stack stays in memory and in the
+	 * temporary lsf_r_ sequence: the .seq file of the batch and its cached
+	 * star lists are left as the user made them */
 	struct registration_args *regargs = new_regargs(seq, s);
 	regargs->func = register_star_alignment;
 	regargs->no_output = TRUE;
+	regargs->no_starlist = TRUE;
+	regargs->sf_params = &sf;
 	regargs->min_pairs = s->min_pairs;
 	regargs->max_stars_candidates = MAX_STARS_FITTED;
 	regargs->external_ref_path = g_strdup(f->path);
@@ -352,7 +352,6 @@ static sequence *register_against_stack(sequence *seq, const lsf_file *f, const 
 
 	siril_log_message(_("LSF: registering %d frames against the Stack of %s\n"), seq->selnum, f->path);
 	int ret = register_star_alignment(regargs);
-	com.pref.starfinder_conf = backup;
 	int layer = regargs->layer;
 	free_regargs(regargs);
 	if (ret || !seq->regparam[layer]) {
@@ -399,14 +398,13 @@ static sequence *register_against_stack(sequence *seq, const lsf_file *f, const 
 		siril_log_error(_("LSF: applying the registration onto the grid failed\n"));
 		return NULL;
 	}
-	writeseqfile(seq);
 	gchar *rname = g_strdup_printf("%s%s", LSF_REG_PREFIX, seq->seqname);
 	sequence *rseq = load_batch(rname);
 	g_free(rname);
 	return rseq;
 }
 
-/* grows the grid of the file in memory before merging (Section 10.6): the
+/* grows the grid of the file in memory before merging (Section 10.5): the
  * accumulator planes, grid.origin_*, the WCS of the Stack, and the shift
  * applied to the transforms of the ledger when the file is written */
 static int expand_grid(lsf_file *f, const int pad[4], int gen) {
@@ -570,7 +568,22 @@ static int lsf_append_run(struct lsf_cmd_args *a) {
 		g_ptr_array_free(rows, TRUE);
 		return 1;
 	}
+	/* this writer merges onto a grid at the frames' own scale only: frames
+	 * merged onto a drizzled grid (Section 6) would land on the wrong pixels */
+	if (f.settings.oversample != 1) {
+		siril_log_error(_("LSF: %s has a grid drizzled at scale %d, which this version cannot append to. "
+					"Only grid.oversample 1 is supported\n"), a->path, f.settings.oversample);
+		goto end;
+	}
+	double hist_before[3] = { f.settings.hist_low, f.settings.hist_high, f.settings.hist_margin };
 	apply_hist_overrides(a, &f.settings);
+	if (hist_before[0] != f.settings.hist_low || hist_before[1] != f.settings.hist_high
+			|| hist_before[2] != f.settings.hist_margin)
+		siril_log_message(_("LSF: history test changed from low %g high %g margin %g to low %g high %g margin %g. "
+					"It applies from this append on and is saved in the file for the following ones; "
+					"the frames already in the stack are not affected\n"),
+				hist_before[0], hist_before[1], hist_before[2],
+				f.settings.hist_low, f.settings.hist_high, f.settings.hist_margin);
 	if (a->rejmaps && f.settings.rejmaps)
 		siril_log_message(_("LSF: %s already has rejection maps, counted since generation %d\n"),
 				a->path, f.hist.rej_gen);
@@ -743,7 +756,7 @@ static int lsf_util_run(struct lsf_cmd_args *a) {
 					"LSF generation %d: written from %s", gen, f.path));
 	if (fix_stack) {
 		if (a->adopt) {
-			size_t n = (size_t) f.rx * f.ry, changed = 0;
+			size_t n = (size_t) f.rx * f.ry, changed = 0, nonfinite = 0;
 			gboolean norm = f.settings.outnorm;
 			if (norm && !(f.settings.outnorm_max > f.settings.outnorm_min)) {
 				siril_log_error(_("LSF: the output normalization range of %s is not valid, the edited Stack cannot be adopted\n"), a->path);
@@ -751,8 +764,11 @@ static int lsf_util_run(struct lsf_cmd_args *a) {
 			}
 			for (int c = 0; c < f.nchan; c++)
 				changed += lsf_adopt_plane(f.hist.plane[LSF_PL_MEAN][c], f.hist.plane[LSF_PL_W][c],
-						f.stack_data + c * n, n, norm, f.settings.outnorm_min, f.settings.outnorm_max);
+						f.stack_data + c * n, n, norm, f.settings.outnorm_min, f.settings.outnorm_max, &nonfinite);
 			siril_log_message(_("LSF: %zu edited pixel(s) adopted into MEAN, M2 is unchanged\n"), changed);
+			if (nonfinite)
+				siril_log_warning(_("LSF: %zu edited pixel(s) are NaN or infinite and were not adopted, "
+							"they keep the value of the accumulator\n"), nonfinite);
 			card = g_strdup_printf("LSF generation %d: adopted the Stack edited outside Siril, %zu pixels", gen, changed);
 		} else {
 			card = g_strdup_printf("LSF generation %d: Stack edited outside Siril, repaired from MEAN", gen);
@@ -791,7 +807,7 @@ end:
 	return retval;
 }
 
-/* lsf_maps: images derived from the accumulator (Sections 10.8, 10.9). The
+/* lsf_maps: images derived from the accumulator (Sections 10.7, 10.8). The
  * noise and sigma maps are in the units of the Stack. */
 static int lsf_maps_run(struct lsf_cmd_args *a) {
 	static const struct { guint flag; int rej; const char *suffix, *what; } kinds[] = {
@@ -909,7 +925,8 @@ static gboolean parse_double_opt(const char *word_i, const char *prefix, double 
 	const char *value = word_i + strlen(prefix);
 	gchar *end;
 	double v = g_ascii_strtod(value, &end);
-	if (end == value || v < 0.0) {
+	/* thresholds in sigma units: 0 would reject every sample on that side of the mean */
+	if (end == value || *end || !(v > 0.0) || !isfinite(v)) {
 		siril_log_error(_("Wrong parameter values. %s is not valid, aborting.\n"), word_i);
 		*set = -1;
 		return TRUE;
@@ -1107,7 +1124,7 @@ int process_lsf_append(int nb) {
 	}
 	if (a->framing == FRAMING_MIN || a->framing == FRAMING_COG) {
 		siril_log_error(_("LSF: lsf_append supports -framing=max or -framing=current only. The grid of an LSF "
-					"file never shrinks or moves (Section 10.6), so min and cog framing apply to lsf_init\n"));
+					"file never shrinks or moves (Section 10.5), so min and cog framing apply to lsf_init\n"));
 		goto failure;
 	}
 	if (!start_in_new_thread(lsf_worker, a)) {

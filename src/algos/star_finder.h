@@ -33,6 +33,7 @@ struct starfinder_data {
 	gboolean already_in_thread;
 	gboolean keep_stars; // TRUE to avoid freeing stars in findstar_worker
 	gboolean onepass;	// identifies if we need to free stars and nb_stars
+	const star_finder_params *params;	// detection settings, NULL to use the preferences
 };
 
 struct star_candidate_struct {
@@ -64,7 +65,7 @@ typedef enum {
 
 void update_peaker_GUI();
 void confirm_peaker_GUI();
-psf_star **peaker(image *image, int layer, star_finder_params *sf, int *nb_stars, rectangle *area, gboolean showtime, gboolean limit_nbstars, int maxstars, starprofile profile, int threads);
+psf_star **peaker(image *image, int layer, const star_finder_params *sf, int *nb_stars, rectangle *area, gboolean showtime, gboolean limit_nbstars, int maxstars, starprofile profile, int threads);
 psf_star *add_star(fits *fit, int layer, int *index);
 int remove_star(int index);
 void sort_stars_by_mag(psf_star **stars, int total);
