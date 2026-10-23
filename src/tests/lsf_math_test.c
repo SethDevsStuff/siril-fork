@@ -23,7 +23,11 @@
 #include <string.h>
 #include <criterion/criterion.h>
 
+#include "core/siril.h"
 #include "lsf/lsf.h"
+
+cominfo com;	// the core data struct
+fits *gfit;	// currently loaded image
 
 static const float samples[] = { 0.12f, 0.15f, 0.11f, 0.14f, 0.13f, 0.18f, 0.10f, 0.16f, 0.12f, 0.17f };
 static const double weights[] = { 1.0, 0.5, 2.0, 1.5, 1.0, 0.8, 1.2, 0.9, 1.1, 0.7 };
