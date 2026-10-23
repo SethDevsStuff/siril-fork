@@ -13,6 +13,7 @@
 #define LSF_VERSION "0.4"
 #define LSF_EXT_ACC "LSF_ACC"
 #define LSF_EXT_COUNT "LSF_COUNT"
+#define LSF_EXT_REJ "LSF_REJ"
 #define LSF_EXT_SETTINGS "LSF_SETTINGS"
 #define LSF_EXT_LEDGER "LSF_LEDGER"
 #define LSF_COUNT_MAX 65535
@@ -33,6 +34,11 @@ typedef struct {
 	float *plane[LSF_NB_PL][3];
 	WORD *count[3];
 	gboolean count_saturated;
+	/* rejection maps (Section 5.4), NULL when the file has no LSF_REJ:
+	 * rejected samples per pixel, low then high */
+	WORD *rej[2][3];
+	gboolean rej_saturated;
+	int rej_gen;			// LSFRGEN, the first generation counted
 } lsf_history;
 
 /* one row of LSF_SETTINGS that this writer does not know, kept (C7) */
@@ -94,8 +100,8 @@ typedef struct {
 	float *stack_data;		// HDU 0 pixels when stack_modified, file order
 	double xfrm_shift[2];		// grid expansion of this commit: shift of the REG_XFRM already in the ledger
 	lsf_compression compression;	// of LSF_ACC, as found in the file
-	gchar acc_codec[FLEN_VALUE], count_codec[FLEN_VALUE];	// ZCMPTYPE, "none" when not compressed
-	long long acc_bytes, count_bytes;	// size of the data units as stored
+	gchar acc_codec[FLEN_VALUE], count_codec[FLEN_VALUE], rej_codec[FLEN_VALUE];	// ZCMPTYPE, "none" when not compressed
+	long long acc_bytes, count_bytes, rej_bytes;	// size of the data units as stored
 } lsf_file;
 
 /* one frame of a batch, for the ledger */
@@ -131,6 +137,7 @@ void lsf_batch_stats(const float *x, const double *w, int n,
 		double *mean, double *W, double *M2, double *W2);
 void lsf_merge(float *mean_a, float *w_a, float *m2_a, float *w2_a, WORD *c_a,
 		double mean_b, double w_b, double m2_b, double w2_b, int c_b, gboolean *saturated);
+void lsf_count_add(WORD *c, int n, gboolean *saturated);
 double lsf_clip_correction(double kl, double kh);
 double lsf_sigma_pred2(weightingType scheme, double W, double M2, double W2, int N, double w_new);
 double lsf_sigma_hist(double sigma_pred2, double c, double sigma_frame, double margin);
@@ -170,6 +177,7 @@ void lsf_setting_row_free(gpointer p);
 
 /* lsf_fits.c */
 int lsf_history_alloc(lsf_history *h, int rx, int ry, int nchan);
+int lsf_history_alloc_rej(lsf_history *h, int first_gen);
 int lsf_history_grow(lsf_history *h, const int pad[4]);
 void lsf_history_free(lsf_history *h);
 void lsf_file_free(lsf_file *f);

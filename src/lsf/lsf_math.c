@@ -61,13 +61,21 @@ void lsf_merge(float *mean_a, float *w_a, float *m2_a, float *w2_a, WORD *c_a,
 	*m2_a = (float) ((double) *m2_a + m2_b + delta * delta * wa * w_b / W);
 	*w_a = (float) W;
 	*w2_a = (float) ((double) *w2_a + w2_b);
-	int c = (int) *c_a + c_b;
-	if (c > LSF_COUNT_MAX) {
-		c = LSF_COUNT_MAX;
+	lsf_count_add(c_a, c_b, saturated);
+}
+
+/* adds n to a uint16 count that saturates at 65535 and never wraps
+ * (Sections 5.2, 5.4) */
+void lsf_count_add(WORD *c, int n, gboolean *saturated) {
+	if (n <= 0)
+		return;
+	int v = (int) *c + n;
+	if (v > LSF_COUNT_MAX) {
+		v = LSF_COUNT_MAX;
 		if (saturated)
 			*saturated = TRUE;
 	}
-	*c_a = (WORD) c;
+	*c = (WORD) v;
 }
 
 static double phi(double x) {

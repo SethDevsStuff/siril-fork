@@ -63,7 +63,7 @@ Order matters: B3 (band-by-band) and B4 (CFADRIZ) both rewrite the core of `lsf_
 
 Apply A1.1, A1.4–A1.6 and A2.8–A2.14 to "live stack fits.md", plus the outcome of the C-decisions. Keep LSFVER at 0.4, because nothing here changes the layout of existing files except adding optional ledger columns and an optional HDU.
 
-### B2. LSF_REJ (if C3 = yes)
+### B2. LSF_REJ — DONE 2026-10-22 (uncommitted), tests in D:\siril_script_test\lsf_rej_test
 
 - `lsf_init -rejmaps`; `lsf_append -rejmaps` enables it later and sets LSFRGEN. The HDU's presence is the fact, and `rejmaps.enabled` mirrors it.
 - Keep a per-pixel uint16 low/high counter per channel in `lsf_history` (2·P planes, +4 B/px/chan), fed by both the batch-local and the history test. It saturates and sets LSFRSAT.
@@ -126,9 +126,9 @@ The best place is Python in lsf_poc: lsf_fits.py already reads v0.3, and C does 
 ## C. Decisions needed
 
 1. **In-place append (§10.3):** DECIDED 2026-10-22: dropped. Delete §10.3. Keep LSFBUSY as a reserved keyword (check 2 stays, so check numbering is unchanged).
-2. **v0.3 converter:** do you have v0.3 files worth keeping? If not, drop it and delete the §10.11 paragraph (recommended). If yes, write it in Python in lsf_poc.
-3. **LSF_REJ:** pull it into M5 (recommended: it is cheap, B3 has to design around it anyway, and it fixes the check 7 bug)?
-4. **grid.reference, pixfrac, kernel:** per-append options plus ledger facts rather than stored settings (recommended, per the facts-not-policy rule)?
+2. **v0.3 converter:** DECIDED 2026-10-22: dropped (B6 cancelled). §10.11 now says v0.3 files are not converted.
+3. **LSF_REJ:** DECIDED 2026-10-22: in M5.
+4. **grid.reference, pixfrac, kernel:** DECIDED 2026-10-22: per-append options, with pixfrac and kernel recorded in the ledger (DRZ_PIXF, DRZ_KERN). 'wcs' registration is linear only (no distortion correction). The drizzle weight scale is frozen at init as weight.driz_norm.
 5. **Mono drizzle:** support it alongside CFADRIZ (nearly free), or refuse it?
 
 Suggested order: B1 → B2 → B3 → B4 stage 1 → B4 stage 2 → B5 → B6. B4 stage 1 could go before B3 if CFADRIZ is wanted sooner, at the cost of touching the merge loop twice.

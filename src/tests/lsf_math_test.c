@@ -68,6 +68,21 @@ Test(lsf_math, count_saturates) {
 	cr_assert(sat);
 }
 
+/* rejection counts (Section 5.4) saturate the same way */
+Test(lsf_math, count_add) {
+	WORD c = 10;
+	gboolean sat = FALSE;
+	lsf_count_add(&c, 0, &sat);
+	cr_assert_eq(c, 10);
+	lsf_count_add(&c, 5, &sat);
+	cr_assert_eq(c, 15);
+	cr_assert(!sat);
+	c = 65534;
+	lsf_count_add(&c, 3, &sat);
+	cr_assert_eq(c, 65535);
+	cr_assert(sat);
+}
+
 /* Section 10.7: c is about 1.014 at +-3 sigma and 1.048 at +-2.5 sigma */
 Test(lsf_math, clip_correction) {
 	cr_assert_float_eq(lsf_clip_correction(3.0, 3.0), 1.014, 1e-3);

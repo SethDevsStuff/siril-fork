@@ -46,7 +46,7 @@ typedef enum { LSF_CMD_INIT, LSF_CMD_APPEND, LSF_CMD_EXPORT, LSF_CMD_UTIL, LSF_C
 
 /* maps of lsf_maps (Section 10.9) */
 enum { LSF_MAP_NEFF = 1 << 0, LSF_MAP_NOISE = 1 << 1, LSF_MAP_SIGMA = 1 << 2, LSF_MAP_SNR = 1 << 3,
-	LSF_MAP_REJ = 1 << 4 };
+	LSF_MAP_REJLO = 1 << 4, LSF_MAP_REJHI = 1 << 5 };
 
 struct lsf_cmd_args {
 	lsf_cmd_mode mode;
@@ -57,6 +57,7 @@ struct lsf_cmd_args {
 	gboolean hist_low_set, hist_high_set, hist_margin_set;
 	double hist_low, hist_high, hist_margin;
 	gboolean noreg, backup, overwrite;
+	gboolean rejmaps;		// init and append: -rejmaps (Section 5.4)
 	framing_type framing;		// init and append: -framing=, FRAMING_MAX by default (Sections 10.1, 10.6)
 	gboolean framing_set;
 	gboolean expand_force;
@@ -206,6 +207,7 @@ static int lsf_init_run(struct lsf_cmd_args *a) {
 	}
 	if (s->rgb_equal && seq->nb_layers != 3)
 		s->rgb_equal = FALSE;
+	s->rejmaps = a->rejmaps;
 	g_free(s->findstar_json);
 	s->findstar_json = findstar_to_json(&com.pref.starfinder_conf);
 	g_free(s->created_utc);
@@ -313,7 +315,8 @@ static int plan_expansion(const lsf_file *f, const struct lsf_cmd_args *a, const
 				f->rx, f->ry, nrx, nry);
 		return 1;
 	}
-	guint64 bytes = (guint64) nrx * nry * f->nchan * (LSF_NB_PL * sizeof(float) + sizeof(WORD));
+	guint64 bytes = (guint64) nrx * nry * f->nchan * (LSF_NB_PL * sizeof(float)
+			+ (f->settings.rejmaps ? 3 : 1) * sizeof(WORD));
 	int max_mb = get_max_memory_in_MB();
 	if (bytes > (guint64) max_mb * BYTES_IN_A_MB) {
 		siril_log_error(_("LSF: the accumulator of the expanded %dx%d grid needs %.0f MB, more than the %d MB "
@@ -568,6 +571,10 @@ static int lsf_append_run(struct lsf_cmd_args *a) {
 		return 1;
 	}
 	apply_hist_overrides(a, &f.settings);
+	if (a->rejmaps && f.settings.rejmaps)
+		siril_log_message(_("LSF: %s already has rejection maps, counted since generation %d\n"),
+				a->path, f.hist.rej_gen);
+	f.settings.rejmaps |= a->rejmaps;	// lsf_process_batch() creates them
 	seq = load_batch(a->seqname);
 	if (!seq)
 		goto end;
@@ -679,6 +686,11 @@ static void print_summary(const lsf_file *f) {
 	siril_log_message(_("  LSF_ACC %s, %.0f MB stored (%.0f%% of raw), LSF_COUNT %s, %.0f MB stored (%.0f%% of raw)\n"),
 			f->acc_codec, (double) f->acc_bytes / BYTES_IN_A_MB, 100.0 * f->acc_bytes / (raw * LSF_NB_PL * sizeof(float)),
 			f->count_codec, (double) f->count_bytes / BYTES_IN_A_MB, 100.0 * f->count_bytes / (raw * sizeof(WORD)));
+	if (f->hist.rej[0][0])
+		siril_log_message(_("  LSF_REJ %s, %.0f MB stored (%.0f%% of raw), rejections counted since generation %d%s\n"),
+				f->rej_codec, (double) f->rej_bytes / BYTES_IN_A_MB, 100.0 * f->rej_bytes / (raw * 2 * sizeof(WORD)),
+				f->hist.rej_gen, f->hist.rej_saturated ? ", some counts saturated" : "");
+	else siril_log_message(_("  no rejection maps (LSF_REJ)\n"));
 }
 
 /* lsf_util: Section 8 validation and a summary (-check), Repair or Adopt
@@ -782,11 +794,13 @@ end:
 /* lsf_maps: images derived from the accumulator (Sections 10.8, 10.9). The
  * noise and sigma maps are in the units of the Stack. */
 static int lsf_maps_run(struct lsf_cmd_args *a) {
-	static const struct { guint flag; const char *suffix, *what; } kinds[] = {
-		{ LSF_MAP_NEFF, "neff", "effective number of frames" },
-		{ LSF_MAP_NOISE, "noise", "standard deviation of the mean" },
-		{ LSF_MAP_SIGMA, "sigma", "standard deviation of one frame" },
-		{ LSF_MAP_SNR, "snr", "mean over its standard deviation" },
+	static const struct { guint flag; int rej; const char *suffix, *what; } kinds[] = {
+		{ LSF_MAP_NEFF, -1, "neff", "effective number of frames" },
+		{ LSF_MAP_NOISE, -1, "noise", "standard deviation of the mean" },
+		{ LSF_MAP_SIGMA, -1, "sigma", "standard deviation of one frame" },
+		{ LSF_MAP_SNR, -1, "snr", "mean over its standard deviation" },
+		{ LSF_MAP_REJLO, 0, "rejlo", "samples rejected low" },
+		{ LSF_MAP_REJHI, 1, "rejhi", "samples rejected high" },
 	};
 	lsf_file f;
 	int retval = 0;
@@ -796,8 +810,12 @@ static int lsf_maps_run(struct lsf_cmd_args *a) {
 	}
 	if (f.stack_modified)
 		siril_log_warning(_("LSF: the maps come from the accumulator, which is intact\n"));
-	if (a->maps & LSF_MAP_REJ)
-		siril_log_warning(_("LSF: %s has no rejection maps (LSF_REJ is not supported in this version)\n"), a->path);
+	if ((a->maps & (LSF_MAP_REJLO | LSF_MAP_REJHI)) && !f.hist.rej[0][0]) {
+		siril_log_error(_("LSF: %s has no rejection maps. They are created by lsf_init or lsf_append "
+					"with -rejmaps, and count from then on\n"), a->path);
+		lsf_file_free(&f);
+		return 1;
+	}
 	const lsf_settings *s = &f.settings;
 	double scale = s->outnorm && s->outnorm_max > s->outnorm_min ? 1.0 / (s->outnorm_max - s->outnorm_min) : 1.0;
 	size_t n = (size_t) f.rx * f.ry;
@@ -805,7 +823,8 @@ static int lsf_maps_run(struct lsf_cmd_args *a) {
 		if (!(a->maps & kinds[m].flag))
 			continue;
 		fits *fit = NULL;
-		if (new_fit_image(&fit, f.rx, f.ry, f.nchan, DATA_FLOAT)) {
+		int rej = kinds[m].rej;
+		if (new_fit_image(&fit, f.rx, f.ry, f.nchan, rej >= 0 ? DATA_USHORT : DATA_FLOAT)) {
 			retval = 1;
 			break;
 		}
@@ -813,7 +832,10 @@ static int lsf_maps_run(struct lsf_cmd_args *a) {
 		lsf_strip_lsf_keys(fit);
 		fit->keywords.lo = fit->keywords.hi = 0;
 		fit->keywords.flo = fit->keywords.fhi = 0.f;
-		for (int c = 0; c < f.nchan; c++) {
+		/* rejection maps: the counts themselves, as LSF_REJ stores them */
+		for (int c = 0; rej >= 0 && c < f.nchan; c++)
+			memcpy(fit->pdata[c], f.hist.rej[rej][c], n * sizeof(WORD));
+		for (int c = 0; rej < 0 && c < f.nchan; c++) {
 			const float *mean = f.hist.plane[LSF_PL_MEAN][c], *W = f.hist.plane[LSF_PL_W][c];
 			const float *M2 = f.hist.plane[LSF_PL_M2][c], *W2 = f.hist.plane[LSF_PL_W2][c];
 			const WORD *N = f.hist.count[c];
@@ -830,7 +852,10 @@ static int lsf_maps_run(struct lsf_cmd_args *a) {
 				out[i] = (float) v;
 			}
 		}
-		fit->history = g_slist_append(fit->history, g_strdup_printf("LSF %s map (%s)",
+		if (rej >= 0)
+			fit->history = g_slist_append(fit->history, g_strdup_printf("LSF %s map (%s since generation %d)",
+						kinds[m].suffix, kinds[m].what, f.hist.rej_gen));
+		else fit->history = g_slist_append(fit->history, g_strdup_printf("LSF %s map (%s)",
 					kinds[m].suffix, kinds[m].what));
 		fit->history = g_slist_append(fit->history, g_strdup_printf("from LSF file %s, generation %d",
 					f.uid, f.gen));
@@ -945,6 +970,10 @@ static int parse_common_option(struct lsf_cmd_args *a, const char *w) {
 		a->framing_set = TRUE;
 		return 1;
 	}
+	if (!strcmp(w, "-rejmaps")) {
+		a->rejmaps = TRUE;
+		return 1;
+	}
 	if (!strcmp(w, "-nocompress"))
 		return set_compression_opt(a, LSF_COMP_NONE);
 	return parse_compress_option(a, w);
@@ -952,7 +981,7 @@ static int parse_common_option(struct lsf_cmd_args *a, const char *w) {
 
 /* lsf_init sequencename file.lsf.fits [rej [type] sigma_low sigma_high] [-nonorm, -norm=] [-fastnorm]
  *   [-rgb_equal] [-weight=] [-output_norm] [-framing=max|current|min|cog] [-hist_low=] [-hist_high=] [-hist_margin=]
- *   [-compress[=gzip2|gzip1]] [-overwrite] */
+ *   [-rejmaps] [-compress[=gzip2|gzip1]] [-overwrite] */
 int process_lsf_init(int nb) {
 	struct lsf_cmd_args *a = calloc(1, sizeof(struct lsf_cmd_args));
 	a->mode = LSF_CMD_INIT;
@@ -1045,7 +1074,7 @@ failure:
 }
 
 /* lsf_append file.lsf.fits sequencename [-noreg] [-framing=max|current] [-noexpand] [-expand_step=] [-expand_force] [-backup]
- *   [-hist_low=] [-hist_high=] [-hist_margin=] [-compress[=gzip2|gzip1] | -nocompress] */
+ *   [-hist_low=] [-hist_high=] [-hist_margin=] [-rejmaps] [-compress[=gzip2|gzip1] | -nocompress] */
 int process_lsf_append(int nb) {
 	struct lsf_cmd_args *a = calloc(1, sizeof(struct lsf_cmd_args));
 	a->mode = LSF_CMD_APPEND;
@@ -1153,7 +1182,7 @@ failure:
 	return CMD_ARG_ERROR;
 }
 
-/* lsf_maps file.lsf.fits prefix [-neff] [-noise] [-sigma] [-snr] [-rej] */
+/* lsf_maps file.lsf.fits prefix [-neff] [-noise] [-sigma] [-snr] [-rejlo] [-rejhi] */
 int process_lsf_maps(int nb) {
 	struct lsf_cmd_args *a = calloc(1, sizeof(struct lsf_cmd_args));
 	a->mode = LSF_CMD_MAPS;
@@ -1165,15 +1194,16 @@ int process_lsf_maps(int nb) {
 		else if (!strcmp(w, "-noise")) a->maps |= LSF_MAP_NOISE;
 		else if (!strcmp(w, "-sigma")) a->maps |= LSF_MAP_SIGMA;
 		else if (!strcmp(w, "-snr")) a->maps |= LSF_MAP_SNR;
-		else if (!strcmp(w, "-rej")) a->maps |= LSF_MAP_REJ;
+		else if (!strcmp(w, "-rejlo")) a->maps |= LSF_MAP_REJLO;
+		else if (!strcmp(w, "-rejhi")) a->maps |= LSF_MAP_REJHI;
 		else {
 			siril_log_error(_("Unknown parameter %s, aborting.\n"), w);
 			free_cmd_args(a);
 			return CMD_ARG_ERROR;
 		}
 	}
-	if (!(a->maps & ~LSF_MAP_REJ))
-		a->maps |= LSF_MAP_NEFF | LSF_MAP_NOISE | LSF_MAP_SIGMA | LSF_MAP_SNR;
+	if (!a->maps)
+		a->maps = LSF_MAP_NEFF | LSF_MAP_NOISE | LSF_MAP_SIGMA | LSF_MAP_SNR;
 	if (!start_in_new_thread(lsf_worker, a)) {
 		free_cmd_args(a);
 		return CMD_GENERIC_ERROR;

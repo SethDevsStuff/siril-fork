@@ -54,6 +54,8 @@ P is the number of channels: 1 for mono, 3 for OSC (R, G, B).
 
 **Size.** Per pixel per channel: Stack 4 B, LSF\_ACC 16 B, LSF\_COUNT 2 B, total 22 B. With LSF\_REJ, add 4 B, for 26 B. On a 26-megapixel sensor this is about 575 MB mono and 1.72 GB OSC, or 680 MB and 2.03 GB with rejection maps. Lossless compression of the extensions (Section 5.3) stored them in 23 to 34 percent of their raw size in tests on real OSC stacks. A 7539 x 7302 OSC file of 3.6 GB would shrink to about 1.35 GB, most of which is then the uncompressed primary.
 
+Drizzle at scale s (grid.oversample) multiplies the pixel count by s². A 26-megapixel OSC sensor drizzled at scale 2 gives a 104-megapixel grid: about 6.9 GB uncompressed, of which about 5.6 GB is accumulator and counts. That is more than a writer can usually hold in memory at once (band-by-band processing, Section 10.11).
+
 ## 4. Primary HDU
 
 ### 4.1 Image
@@ -79,7 +81,7 @@ P is the number of channels: 1 for mono, 3 for OSC (R, G, B).
 | LSFNORM | logical | T if the Stack is output-normalized |
 | LSFNMIN, LSFNMAX | float | Min and max of the output-normalization map |
 | LSFHASH | string | SHA-256 of the primary data at last commit, lowercase hex (Section 8) |
-| LSFBUSY | logical | Present and T only during an in-place update (Section 10.3) |
+| LSFBUSY | logical | Reserved. No writer of this version sets it. A file where it is T is refused for merging (Section 8, check 2) |
 
 LSFHASH is computed over the primary data unit as stored: big-endian float32 values in file order, without the trailing padding to a 2880-byte block. Its 64 characters fit in a string card.
 
@@ -109,17 +111,17 @@ Under reliability weights, saturation does not affect n\_eff, which is computed 
   - LSF\_ACC uses GZIP\_2 (byte-shuffled, the default) or GZIP\_1, with float quantization disabled (ZQUANTIZ = 'NONE'). RICE\_1 cannot compress floating-point data without quantizing it, so it is prohibited for LSF\_ACC, as is any quantized mode.
   - LSF\_COUNT and LSF\_REJ are integers, which every allowed method compresses losslessly. Siril writes them with RICE\_1, which was nearly as small as GZIP\_2 (14.5 against 13.5 percent of raw) and about 20 times faster in tests.
   - Pre-merge validation refuses any other method, and a quantized LSF\_ACC (Section 8, check 3).
-- **Tiling.** The writer uses CFITSIO's default tiles, one row of one plane each. Taller tiles (16 or 64 rows) saved under 1 percent and were slower in tests.
+- **Tiling.** The writer uses CFITSIO's default tiles, one row of one plane each. Taller tiles (16 or 64 rows) saved under 1 percent and were slower in tests. One-row tiles also let a writer read and write the accumulator in bands of rows (Section 10.11).
 - **Primary.** The primary HDU MUST NOT be tile-compressed, and MUST NOT be replaced by an empty primary followed by a compressed image extension. That pattern breaks C1. Siril's existing compressed save writes exactly this pattern, so the LSF writer cannot use it for HDU 0. It enables compression only after HDU 0 is written, and disables it before the tables.
 - **Not stored in the file.** Whether to compress is a choice made when writing, not a fact a reader needs, so LSF\_SETTINGS does not store it. Whether the file is compressed, and how, is read from the extensions themselves (ZCMPTYPE of LSF\_ACC).
 - **Commands.**
   - lsf\_init writes uncompressed extensions by default. -compress uses GZIP\_2 for LSF\_ACC, -compress=gzip1 uses GZIP\_1.
   - lsf\_append keeps the compression of the file, unless -compress or -nocompress is given.
-  - lsf\_util -compress and -decompress convert a file without appending, in place or, with -out=, into a new file (Section 8).
+  - lsf\_util -compress and -decompress convert a file without appending, replacing it through the commit protocol or, with -out=, into a new file (Section 8).
   - Siril's global FITS compression preference does not apply to LSF files, because it allows quantized float compression. It does apply to the plain images that lsf\_export and lsf\_maps save (Section 10.9).
 - **Cost.** On a 7539 x 7302 grid, one channel's LSF\_ACC and LSF\_COUNT took about 4.5 s to write compressed instead of 1.6 s, and 2.0 s to read instead of 1.0 s (from the operating system's cache). An OSC commit therefore takes about 9 s longer. CFITSIO compresses on one thread, and its gzip level cannot be set through its public interface (CFITSIO 4.7).
 - **Whole-file gzip** (.fits.gz) is allowed for transport only. A file must be decompressed before appending.
-- **Updates.** Compressed HDUs cannot be updated band by band in place. A writer using compression rewrites them on append (Section 10.2).
+- **Updates.** Every append rewrites the whole file (Section 10.2), so compressed HDUs never need to be updated in place.
 - **XISF modes.** The XISF-specific modes (zlib+sh, zlib-mt, subblocks) do not carry over. CFITSIO tile compression replaces them.
 
 ### 5.4 Rejection planes (optional)
@@ -141,21 +143,30 @@ A BINTABLE with one row per setting: KEY (32A), TYPE (8A: STR, INT, FLT, BOOL or
 Required keys:
 
 - sensor.class, sensor.bayer, sensor.binning, cfa.mode
-- grid.oversample, grid.pixfrac, grid.kernel
+- grid.oversample (the drizzle scale, 1 without drizzle)
   - The grid size and WCS are the primary's NAXIS and WCS keywords, and are not duplicated.
-- grid.reference ('stack' or 'wcs', Section 10.5), grid.origin\_x, grid.origin\_y (margins of the grid before the first reference frame, from max framing at initialization and from grid expansions, Sections 10.1 and 10.6). Whether and by what step the grid expands is chosen per append and is not stored (Section 10.6)
+- grid.origin\_x, grid.origin\_y (margins of the grid before the first reference frame, from max framing at initialization and from grid expansions, Sections 10.1 and 10.6)
 - align.transform, align.interpolation, align.min\_pairs, align.findstar (JSON: the star-detection parameters used for registration)
 - reject.method, reject.params, reject.hist\_low, reject.hist\_high, reject.hist\_margin (Section 10.7)
 - weight.scheme, plus the frozen weight constants for that scheme (Section 10.4):
   - noise: weight.noise\_norm
   - wfwhm: weight.fwhm\_min, weight.fwhm\_max, weight.fwhm\_norm
   - nbstars: weight.stars\_min, weight.stars\_max, weight.stars\_norm
-- norm.method
+  - CFADRIZ, whatever the scheme: weight.driz\_norm (JSON, one value per channel)
+- norm.method, norm.estimator ('ikss' or 'lite', the statistics the normalization uses), norm.rgb\_equal (BOOL)
+  - norm.baseline (JSON: loc and scale, one value per channel each), the reference statistics frozen from the first batch. Required unless norm.method is none
 - outnorm.enabled, outnorm.min, outnorm.max
 - rejmaps.enabled
 - filter (mono and OSC files), created\_utc, writer (name and version)
 
-Conditional key: ledger.orig\_baseline, the baseline header that ORIGHDR diffs are taken against (Section 9). Required when any ledger row stores a diff.
+Conditional key: ledger.orig\_baseline, the baseline header that ORIGHDR diffs are taken against (Section 9). Required when any ledger row stores a diff. A writer MAY store diffs. Siril stores every header verbatim and writes no baseline.
+
+**Facts and defaults.** The rows are of two kinds.
+
+- **Facts** are values the data depends on, which a reader or a later append needs to interpret the accumulator: sensor.\*, cfa.mode, grid.\*, weight.\*, norm.\* and outnorm.\*. They never change after initialization, except outnorm.min and outnorm.max, which change on every commit, and grid.origin\_\*, which changes on grid expansion.
+- **Defaults** are the processing choices of the first batch (align.\*, reject.\*). They are recalled on append, so later batches are processed the same way unless the user overrides them for that append.
+
+Choices that apply to one append only are command options and are not stored. These are whether and by what step the grid expands (Section 10.6), the registration method (Section 10.5), and the drizzle pixel fraction and kernel. The ledger records what each frame used. Files from earlier writers may hold grid.reference, grid.pixfrac, grid.kernel, grid.expand and grid.expand\_step rows; a reader ignores them and a writer drops them.
 
 Settings are recalled on append (v0.2 Section 6). Some values are mirrored in the primary header: sensor.class and LSFSENS, sensor.bayer and LSFBAYR, cfa.mode and LSFDMOD, outnorm.\* and LSFNORM, LSFNMIN, LSFNMAX, and rejmaps.enabled and the presence of LSF\_REJ. These MUST agree. A disagreement fails validation (Section 8).
 
@@ -174,14 +185,14 @@ The primary header follows what Siril's own stacks write (STACKCNT, LIVETIME, EX
 | DATE-OBS | Earliest frame start, UTC |
 | DATE | Time the file was written, UTC |
 | PROGRAM | Writer name and version |
-| HISTORY | One card per append, giving the generation, batch number and frame count, followed by one card per channel with the percentages of samples rejected low and high by the batch-local and the history tests. Repair, Adopt (Section 8), each change of the compression of the extensions (Section 5.3) and each grid expansion (Section 10.6) add one card each |
-| WCS keywords | Updated on grid expansion (CRPIX, Section 10.6) or when the stack is plate-solved again |
+| HISTORY | One card per append, giving the generation, batch number and frame count, followed by one card per channel with the percentages of samples rejected low and high by the batch-local and the history tests. Repair, Adopt (Section 8), each change of the compression of the extensions (Section 5.3), each grid expansion (Section 10.6) and each WCS import (Section 8) add one card each |
+| WCS keywords | Updated on grid expansion (CRPIX, Section 10.6), and replaced when a plate-solved WCS is imported (lsf\_util -wcs, Section 8) |
 | MIPS-HI, MIPS-LO | Removed on append, because display cutoffs saved for the previous stack no longer fit |
 
 **Set at initialization, then checked on append.** A mismatch fails the compatibility check and the frame is not merged:
 
 - XBINNING, YBINNING
-- XPIXSZ, YPIXSZ and FOCALLEN, scaled for drizzle the way Siril does it
+- XPIXSZ, YPIXSZ and FOCALLEN, scaled for drizzle the way Siril does it. Raw frames carry the sensor's own values, so an incoming frame's values are scaled the same way before they are compared
 - INSTRUME, FILTER
 
 **Copied from the first frame.** If a later frame differs, the keyword is removed from the primary, and the ledger keeps the per-frame values:
@@ -206,10 +217,10 @@ LSFHASH replaces the LSFDSUM of v0.3. DATASUM is a ones-complement sum of 32-bit
 
 1. LSF = T and LSFVER is supported (Section 11).
 2. LSFBUSY is absent or F.
-3. Every required HDU is present (PRIMARY, LSF\_ACC, LSF\_COUNT, LSF\_SETTINGS, LSF\_LEDGER, found by EXTNAME) with consistent dimensions, LSF\_ACC holds the expected named planes, and any tile compression of LSF\_ACC and LSF\_COUNT uses an allowed method losslessly (Section 5.3).
+3. Every required HDU is present (PRIMARY, LSF\_ACC, LSF\_COUNT, LSF\_SETTINGS, LSF\_LEDGER, found by EXTNAME) with consistent dimensions, LSF\_ACC holds the expected named planes, and any tile compression of LSF\_ACC and LSF\_COUNT uses an allowed method losslessly (Section 5.3). LSF\_REJ, when present, is checked the same way.
 4. LSFUID and LSFGEN are identical across all LSF HDUs.
 5. DATASUM and CHECKSUM match on every extension where they are present.
-6. Every ledger GEN is at most LSFGEN. A generation with no ledger rows is one that merged no frame (Repair, Adopt or a change of compression), and is recorded in a HISTORY card.
+6. Every ledger GEN is at most LSFGEN. A generation with no ledger rows is one that merged no frame (Repair, Adopt, a change of compression or a WCS import), and is recorded in a HISTORY card.
 7. Mirrored settings agree.
 8. The SHA-256 recomputed from the primary data equals LSFHASH.
 
@@ -222,7 +233,12 @@ If only check 8 fails, the accumulators are intact but the primary was changed o
 
 Either action records a HISTORY card, increments LSFGEN, and recomputes LSFHASH and the checksums.
 
-lsf\_util also changes the compression of the extensions with -compress\[=gzip2|gzip1\] or -decompress (Section 5.3), which likewise records a HISTORY card and increments LSFGEN although no data changes, so that two different files never share an LSFUID and LSFGEN. lsf\_util needs at least one action. Its actions combine into one rewrite with one LSFGEN increment, for example -repair -compress. Every rewrite rebuilds HDU 0 from MEAN, so a change of compression alone is refused while check 8 fails: it would silently repair the Stack. A requested state the file already has is reported and changes nothing. With -out=, the result is written to a new file and the source is left untouched; with no other action this makes a copy. The copy keeps the LSFUID of its source with an incremented LSFGEN and a HISTORY card naming the source, so the two files are successive versions of one stack, and only one of them should be appended to.
+lsf\_util has two more actions:
+
+- **Compression.** -compress\[=gzip2|gzip1\] or -decompress changes the compression of the extensions (Section 5.3).
+- **WCS import.** -wcs=file imports a WCS. The file is an image of the Stack that was plate-solved, such as the output of lsf\_export (Section 10.9) after plate solving. It must have the Stack's dimensions. When it carries the export's provenance HISTORY card, that card must name the file's LSFUID. The writer replaces the WCS keywords of HDU 0 and of every extension (Section 5.1). The pixels do not change, so neither does LSFHASH.
+
+Both actions record a HISTORY card and increment LSFGEN although no data changes, so that two different files never share an LSFUID and LSFGEN. lsf\_util needs at least one action. Its actions combine into one rewrite with one LSFGEN increment, for example -repair -compress. Every rewrite rebuilds HDU 0 from MEAN. A change of compression or a WCS import without -repair or -adopt is therefore refused while check 8 fails, because it would silently repair the Stack. A requested state the file already has is reported and changes nothing. With -out=, the result is written to a new file and the source is left untouched; with no other action this makes a copy. The copy keeps the LSFUID of its source with an incremented LSFGEN and a HISTORY card naming the source, so the two files are successive versions of one stack, and only one of them should be appended to.
 
 **Expected behavior of foreign tools:**
 
@@ -259,6 +275,8 @@ A BINTABLE, written as the last HDU (Section 3), with one row per contributing f
 | REG\_TYPE | 8A | Transform type |
 | REG\_XFRM | 9D | 3x3 transform onto the current grid, row-major, TDIM = (3,3) |
 | ALIGN | 1PA | Alignment parameters used (JSON) |
+| DRZ\_PIXF | E | Drizzle pixel fraction (CFADRIZ) |
+| DRZ\_KERN | 8A | Drizzle kernel (CFADRIZ) |
 | NORM\_SC, NORM\_OFF | nD | Normalization scale and offset per plane |
 | NORM\_MTH | (12·P)A, TDIM = (12,P) | linear, offset\_only, failed or skipped, per plane (12A mono, 36A OSC) |
 | WEIGHT | nD | Weight applied per plane, after the scaling of Section 10.4 |
@@ -273,7 +291,7 @@ Rules:
 - Unknown columns MUST be preserved on rewrite (C7).
 - String columns hold printable ASCII only (32 to 126), as FITS requires. ORIGHDR is stored the way FITS stores a header: 80-character cards one after another, padded with spaces, with no line breaks. A reader splits it every 80 characters. Siril keeps headers as text with one card per line, so the writer removes the line breaks.
 - The ledger is append-only in normal operation. Because the writer puts it last, the writer can rewrite it in full on every append without moving any other HDU. It holds scalars and short text, so this stays cheap.
-- REG\_XFRM always maps onto the grid as it is now. A grid expansion rewrites the existing rows (Section 10.6).
+- REG\_XFRM always maps onto the grid as it is now. A grid expansion rewrites the existing rows (Section 10.6). It is exact, because every registration this profile supports is a homography (Section 10.5).
 
 ## 10. Operations
 
@@ -281,21 +299,21 @@ Rules:
 
 lsf\_init does the following:
 
-1. Builds the canonical grid from the first batch, using Siril's existing registration. When the registration is not applied yet, the writer applies it. By default the grid is the union of all the first batch's frames (max framing), so no frame is cropped, as grid expansion does on append (Section 10.6). The user may instead ask for Siril's other framings: the reference frame's own size (current), the area common to all the frames (min), or the reference frame's size centred on the frames' centre of gravity (cog). With max framing every frame is placed on the whole grid, rather than cropped to its own bounding box as Siril's max framing does. grid.origin\_x and grid.origin\_y then hold the margins of the grid before the reference frame (negative when the grid starts inside it, as with min framing), and REG\_XFRM maps each frame onto the grid. A batch whose registration is already applied defines the grid by the size of its frames.
+1. Builds the canonical grid from the first batch, using Siril's existing registration. When the registration is not applied yet, the writer applies it. By default the grid is the union of all the first batch's frames (max framing), so no frame is cropped, as grid expansion does on append (Section 10.6). The user may instead ask for Siril's other framings: the reference frame's own size (current), the area common to all the frames (min), or the reference frame's size centred on the frames' centre of gravity (cog). With max framing every frame is placed on the whole grid, rather than cropped to its own bounding box as Siril's max framing does. grid.origin\_x and grid.origin\_y then hold the margins of the grid before the reference frame (negative when the grid starts inside it, as with min framing), and REG\_XFRM maps each frame onto the grid. A batch whose registration is already applied defines the grid by the size of its frames. Under CFADRIZ the batch is a calibrated CFA sequence that is not debayered. The writer applies its registration with Siril's Bayer drizzle at scale grid.oversample, which gives RGB frames and their drizzle weights (Section 10.4).
 2. Merges the first batch (v0.2 Section 9).
-3. Freezes the weight constants (Section 10.4).
+3. Freezes the weight constants, including weight.driz\_norm under CFADRIZ (Section 10.4).
 4. Writes every HDU. LSF\_REJ is written only if the user asked for rejection maps.
 5. Sets a new LSFUID and LSFGEN = 1, and writes LSFHASH and the checksums.
 
 If the first batch has fewer than 25 frames, the writer SHOULD warn the user before creating the file. Per-pixel scatter estimated from so few frames is unreliable, and any rejection decision made on it stays in the stack. The warning does not block creation. The profile defines no minimum stack size for rejection, so rejection behaves the same at every count. The threshold of 25 is a default.
 
-### 10.2 Append (preferred commit protocol)
+### 10.2 Append (commit protocol)
 
 1. Run the Section 8 validation.
 2. Process the batch with Siril's existing code:
    - the v0.2 compatibility check, which includes the Section 7 keywords that are set at initialization;
    - calibration;
-   - registration against the grid reference (Section 10.5);
+   - registration onto the grid (Section 10.5);
    - normalization (v0.2 Section 8.3).
 3. Grow the grid first if the registered frames reach beyond it, unless the user asked to crop them to the grid (Section 10.6).
 4. Compute the frame weights (Section 10.4) and run rejection (Section 10.7).
@@ -310,14 +328,9 @@ If the first batch has fewer than 25 frames, the writer SHOULD warn the user bef
 7. Write the complete new file to a temporary name in the same directory.
 8. Flush to disk, then atomically replace the original (Section 10.11). A writer SHOULD offer to keep the previous file as a backup.
 
-### 10.3 Append (in-place alternative, uncompressed files only)
+### 10.3 (removed)
 
-1. Set LSFBUSY = T and flush the header.
-2. Update the planes, the ledger and the keywords.
-3. Recompute LSFHASH, and increment LSFGEN in every LSF HDU.
-4. Clear LSFBUSY.
-
-A reader that finds LSFBUSY = T knows an update was interrupted. The Stack is still viewable, but merging is refused until the user restores a backup. A writer using in-place updates SHOULD keep a backup.
+Earlier drafts described an in-place append for uncompressed files. It was removed for two reasons. An append changes nearly every pixel of the accumulator, so updating in place saved almost no writing. And an interrupted update left a file that could no longer be merged into. The section number is kept so that references to later sections stay valid. See Section 14.
 
 ### 10.4 Frame weights
 
@@ -330,19 +343,32 @@ LSF therefore reuses Siril's per-frame inputs and Siril's formulas, but with con
 - **nbstars:** Siril's formula, with weight.stars\_min, weight.stars\_max and weight.stars\_norm from the first batch. Star counts are clamped the same way.
 - **none:** every weight is 1.
 
+**Drizzle pixel weights.** Under CFADRIZ, Siril's drizzle gives each output pixel of a frame a weight per channel, 0 where no input pixel of that channel's color landed. Siril rescales these weights per channel by the largest output weight of each run (max\_weight), and may save them as 8- or 16-bit integers. Rescaling per run would make batches incomparable, as above. LSF therefore does the following:
+
+- It keeps the drizzle weights in float32 and unscaled.
+- It divides them by weight.driz\_norm, the per-channel max\_weight of the first batch, frozen at initialization. The result is d.
+- A sample's weight is the frame weight of its channel times d.
+- A sample with d = 0 is absent: it is not counted, tested or rejected.
+- W, W2, COUNT, LSF\_REJ and the history test (Section 10.7) all use this per-sample weight.
+
 A frame whose weight is 0 after clamping contributes nothing. It is not merged, and it is reported to the user. These rules live in an LSF helper alongside Siril's code; Siril's own weighting functions are not changed. Siril's nbstack weighting is not supported in this version.
 
 ### 10.5 Registration and the grid reference
 
-The canonical grid is the Stack's own pixel grid. At initialization it is defined by the first batch, by default as the union of its registered frames (Section 10.1), scaled by grid.oversample. That frame is not stored, so later batches are registered against **HDU 0 itself**. They use Siril's existing star detection, with the parameters stored in align.findstar, and Siril's existing global registration.
+The canonical grid is the Stack's own pixel grid. At initialization it is defined by the first batch, by default as the union of its registered frames (Section 10.1), scaled by grid.oversample. That frame is not stored, so later batches are registered against **HDU 0 itself**, by one of two methods chosen for each append. The choice is a command option and is not stored (Section 6).
 
-The Stack is the highest-SNR reference available and already defines the grid. The writer records grid.reference = 'stack'. When the Stack has a WCS, grid.reference MAY be 'wcs', and new frames are registered with Siril's astrometric registration instead.
+- **Stars** (the default). Siril's existing star detection, with the parameters stored in align.findstar, and Siril's existing global registration against HDU 0. The Stack is the highest-SNR reference available and already defines the grid.
+- **WCS** (lsf\_append -wcsreg). Siril's astrometric registration: each frame's transform onto the grid is computed from the frame's WCS and the Stack's WCS. The frames must be plate-solved, and the Stack must have a WCS (Section 7). This method suits frames that share too few stars with the Stack.
+
+Every transform is a homography, so REG\_XFRM describes it exactly (Section 9). Siril's distortion correction, which resamples frames through their SIP terms instead of a homography, is not used, and registration with distortion correction is not supported in this version (Section 14).
+
+Under CFADRIZ the incoming frames are CFA images and the Stack is RGB at scale grid.oversample. The transforms are computed onto the grid at its scale, so the drizzle step must not apply the scale a second time.
 
 The optional LSF\_STARS BINTABLE caches the star list detected on HDU 0, typically under 1 MB, to make appends faster and repeatable. Its columns are X, Y, FLUX and FWHM, in grid pixels. Its header carries LSFGEN. A reader uses the cache only when that LSFGEN equals the file's; otherwise it detects stars again.
 
 ### 10.6 Grid expansion
 
-Framing drifts between sessions, so the grid must be able to grow. When registered frames would cover pixels outside the current grid, the writer grows the grid before merging, unless the user asked to crop the batch to the grid instead (current framing). Expanding is the default, as max framing is at initialization (Section 10.1). This choice and the step below belong to the append command or the user interface, not to the file: they change no data a reader interprets, so LSF\_SETTINGS does not store them. On append only max and current framing apply: min and cog would shrink or move the grid. Files from earlier writers may hold grid.expand and grid.expand\_step rows; a reader ignores them and a writer drops them.
+Framing drifts between sessions, so the grid must be able to grow. When registered frames would cover pixels outside the current grid, the writer grows the grid before merging, unless the user asked to crop the batch to the grid instead (current framing). Expanding is the default, as max framing is at initialization (Section 10.1). This choice and the step below belong to the append command or the user interface, not to the file: they change no data a reader interprets, so LSF\_SETTINGS does not store them. On append only max and current framing apply: min and cog would shrink or move the grid. Older files may hold grid.expand and grid.expand\_step rows, which are ignored (Section 6).
 
 A pixel outside the grid counts as covered when a transformed frame reaches its center, so sub-pixel overhangs from registration noise need no expansion. Registration transforms (REG\_XFRM) use Siril's registration coordinates, whose y axis runs opposite to the FITS storage order: rows a frame needs below y = 0 there are inserted after the existing data, and rows it needs past the last row are inserted before it. Then:
 
@@ -350,10 +376,10 @@ A pixel outside the grid counts as covered when a transformed frame reaches its 
 - Every image plane is padded with zeros. W = 0 means no data, so padding changes no existing pixel.
 - Rows or columns inserted before the existing data, in storage order, are added to CRPIX1 and CRPIX2 in every HDU that carries a WCS, and to grid.origin\_x and grid.origin\_y.
 - REG\_XFRM in every existing ledger row is rewritten to include the shift, so every transform keeps mapping onto the current grid.
-- LSF\_STARS is shifted the same way, or discarded.
+- LSF\_STARS is discarded.
 - A HISTORY card records the old and new grid size and the padding of each side.
 
-The writer refuses an append that would more than double the grid on either axis in one expansion, since that usually means a wrong registration, unless the user forces it. It also refuses one whose expanded accumulator would not fit in the memory it may use. In both cases the user can crop the batch to the grid instead.
+The writer refuses an append that would more than double the grid on either axis in one expansion, since that usually means a wrong registration, unless the user forces it. It also refuses one when a band of the expanded grid, together with the batch's frame buffers, would not fit in the memory it may use (Section 10.11). In both cases the user can crop the batch to the grid instead.
 
 Expansion never shrinks the grid. Cropping is a separate operation, out of scope here.
 
@@ -401,7 +427,7 @@ With W, M2 and W2 the LSF\_ACC planes and N the LSF\_COUNT value at a pixel and 
 
 - Unit-weight variance: σ0^2 = M2 / (N − 1). Undefined when N < 2.
 - Variance of the mean: σ0^2 / W.
-- Predicted variance of a new sample with weight w\_new: σ\_pred² = σ0^2 · (1 / w\_new + 1 / W).
+- Predicted variance of a new sample with weight w\_new (the per-sample weight under CFADRIZ, Section 10.4): σ\_pred² = σ0^2 · (1 / w\_new + 1 / W).
 - n\_eff = W^2 / W2 is still reported as an effective-integration map.
 
 The two sets agree when all weights are equal. The weight constants are frozen (Section 10.4), so the weights keep the same scale across appends and these estimators stay valid as the stack grows.
@@ -415,7 +441,7 @@ The two sets agree when all weights are equal. The weight constants are frozen (
   - **sigma**: the standard deviation of one frame (of a unit-weight frame under noise weighting);
   - **snr**: MEAN divided by the standard deviation of the mean.
 
-  noise and sigma are in the units of the Stack: divided by LSFNMAX - LSFNMIN when LSFNORM = T. A pixel where a value is undefined (no data, or too few samples) is 0. If LSF\_REJ is present, the low and high rejection maps may be exported the same way.
+  noise and sigma are in the units of the Stack: divided by LSFNMAX - LSFNMIN when LSFNORM = T. A pixel where a value is undefined (no data, or too few samples) is 0. If LSF\_REJ is present, lsf\_maps -rejlo and -rejhi export the low and high rejection maps the same way, as the uint16 counts LSF\_REJ stores, with a HISTORY card giving LSFRGEN. Unlike Siril's own rejection maps, they are not divided by a number of frames: the samples a pixel received since LSFRGEN are not stored.
 
 The exports are not LSF files, so Siril's FITS preferences apply to them like to any image it saves: its file extension, and its FITS compression when enabled (the file is then named with .fz added, and floating-point data is quantized unless the quantization is 0). With compression off, the flattened master is bit-identical to HDU 0.
 
@@ -427,7 +453,8 @@ The format keeps no per-batch history planes, because they would grow the file w
 
 - **Atomic replace on Windows.** A plain rename fails when the target exists, so it needs MoveFileEx with MOVEFILE\_REPLACE\_EXISTING. It still fails while another program, such as a viewer, holds the file open. A file that was just written can also be held for a moment by a virus scanner, so a sharing or access error is retried for a short time first. If it persists, the writer must report this and keep the temporary file, not lose the commit.
 - **Long ledger strings and CFITSIO.** CFITSIO 4.7.0 truncates a variable-length string (1PA) that crosses two 2880-byte block boundaries when it is read as text (fits\_read\_col with TSTRING). It returns only the part before the second boundary. ORIGHDR is several kilobytes per row, so some rows are affected in every file, including files written by other tools. A reader that needs the full header reads the column as bytes (TBYTE), using the length from the descriptor (fits\_read\_descript). fitsverify reads these strings the same way and reports "contains non-ASCII text" for the affected rows, because it scans stale bytes in its buffer. That error is a false positive when the stored bytes are printable ASCII. lsf\_compare.py checks the stored bytes directly before it accepts this error.
-- **Converting v0.3 files.** A v0.3 file (separate LSF\_WEIGHT, LSF\_M2 and LSF\_W2 HDUs, LSFDSUM) can be converted to v0.4 without loss. MEAN is obtained by inverting the output normalization of the primary, the planes are packed into LSF\_ACC, and LSFHASH is computed.
+- **Band-by-band processing.** A writer MAY hold the accumulator in bands of rows rather than all at once: it reads each band from the old file, merges it and writes it to the new one. With output normalization, HDU 0 needs the minimum and maximum of the new MEAN, which are known only after the last band. HDU 0 is therefore written in a second pass, from the MEAN and W just written. The result MUST be bit-identical to processing the file in one band.
+- **Files from v0.3.** v0.3 files (separate LSF\_WEIGHT, LSF\_M2 and LSF\_W2 HDUs, LSFDSUM) were written only by the proof-of-concept scripts and are not converted. Their LSFVER fails check 1, and the stack is rebuilt from the frames.
 
 ## 11. Conformance
 
@@ -449,6 +476,7 @@ Nothing in this profile has been tested against real software yet, except the Si
 - uncompressed and compressed extensions;
 - with and without LSF\_REJ;
 - a 2x drizzle file, to check XPIXSZ against the WCS;
+- CFADRIZ files at scale 1 and 2;
 - a file after a grid expansion.
 
 **Checks per tool:**
@@ -468,6 +496,10 @@ Nothing in this profile has been tested against real software yet, except the Si
 10. **Grid expansion.** Append a batch shifted beyond the grid edge. Existing pixels must be unchanged, and the WCS and the ledger transforms must still agree.
 11. **Parity with Siril's stack.** lsf\_init over a set of frames must give the same image as Siril's stack command with the same frames, reference and settings, bit for bit, when both normalize with the same frame statistics. Siril caches those in the .seq file with 6 significant digits: the first command on a fresh sequence uses full-precision values and later ones the cached values, so the cache is filled first (seqstat full). Known exceptions: wfwhm and nbstars weighting (Siril keeps a weight-0 frame in the rejection set, LSF drops it), and sigmedian rejection without weights (Siril averages the medians that replaced outliers, LSF counts them as rejected).
 12. **Compression parity.** The same lsf\_init, lsf\_append (including a grid expansion) and lsf\_util conversions run with and without -compress must give bit-identical Stack, accumulator, count and ledger data. lsf\_util must refuse a quantized LSF\_ACC (check 3) and a change of compression while check 8 fails. Passed on a 1600 x 1200 OSC test set, when both sides read the same cached frame statistics (see check 11).
+13. **Band parity.** The same commands run in one band and with a small forced band height (for example 37 rows), compressed and uncompressed, and including a grid expansion, must give bit-identical Stack, accumulator, count and ledger data.
+14. **Drizzle parity.** lsf\_init on a CFA sequence with CFADRIZ must give the same image as Siril's drizzle stack (seqapplyreg -drizzle, then stack) under the rules of check 11, at scale 1 and 2.
+15. **Registration methods.** The same batch registered by stars and by WCS must give transforms that agree within 0.1 pixel.
+16. **Rejection maps.** The counts that an append adds to LSF\_REJ must equal the counts behind its HISTORY percentages.
 
 ## 13. Open Questions
 
@@ -490,6 +522,8 @@ Nothing in this profile has been tested against real software yet, except the Si
 - **Export to FLIS.** FLIS is still in development. The intent is that the Stack becomes the base layer of a FLIS file, with LSFUID recorded in the layer METADATA as provenance, and that the LSF HDUs are not embedded in FLIS.
 - **float64 accumulators.** LSF\_ACC with BITPIX = −64, for very deep stacks (+16 B per pixel per channel).
 - **nbstack weighting**, for appending stacks rather than single frames.
+- **In-place append.** Updating an uncompressed file in place, flagged by LSFBUSY, would need no temporary copy. It would need header space reserved at initialization: otherwise the HISTORY cards added on every append eventually overflow a 2880-byte header block, and CFITSIO then shifts the rest of the file. It is also not crash-safe without a backup (Section 10.3).
+- **Registration with distortion correction.** Siril can undistort frames through their SIP terms, which is not a homography. A REG\_TYPE of 'WCS' could record it, with the exact map given by the frame's WCS (kept in ORIGHDR) and the Stack's WCS.
 
 ## 15. Known Limitations
 

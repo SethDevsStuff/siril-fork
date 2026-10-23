@@ -69,6 +69,22 @@ fail:
 	return 1;
 }
 
+/* rejection maps (Section 5.4), zero, counting from generation first_gen */
+int lsf_history_alloc_rej(lsf_history *h, int first_gen) {
+	size_t n = (size_t) h->rx * h->ry;
+	for (int d = 0; d < 2; d++)
+		for (int c = 0; c < h->nchan; c++) {
+			h->rej[d][c] = calloc(n, sizeof(WORD));
+			if (!h->rej[d][c]) {
+				PRINT_ALLOC_ERR;
+				return 1;
+			}
+		}
+	h->rej_saturated = FALSE;
+	h->rej_gen = first_gen;
+	return 0;
+}
+
 /* grid expansion (Section 10.6): pads every plane with zeros, one plane at a
  * time so that only one extra plane is in memory. W = 0 in the padding, so
  * no existing pixel changes. */
@@ -76,9 +92,12 @@ int lsf_history_grow(lsf_history *h, const int pad[4]) {
 	int nrx = h->rx + pad[LSF_PAD_LEFT] + pad[LSF_PAD_RIGHT];
 	int nry = h->ry + pad[LSF_PAD_FIRST] + pad[LSF_PAD_LAST];
 	size_t n = (size_t) nrx * nry;
+	gboolean has_rej = h->rej[0][0] != NULL;
 	for (int c = 0; c < h->nchan; c++) {
-		for (int k = 0; k <= LSF_NB_PL; k++) {
-			void **plane = k < LSF_NB_PL ? (void **) &h->plane[k][c] : (void **) &h->count[c];
+		/* the accumulator planes, the count, then the rejection maps */
+		for (int k = 0; k < LSF_NB_PL + (has_rej ? 3 : 1); k++) {
+			void **plane = k < LSF_NB_PL ? (void **) &h->plane[k][c] :
+				k == LSF_NB_PL ? (void **) &h->count[c] : (void **) &h->rej[k - LSF_NB_PL - 1][c];
 			size_t elsize = k < LSF_NB_PL ? sizeof(float) : sizeof(WORD);
 			void *grown = calloc(n, elsize);
 			if (!grown) {
@@ -103,6 +122,10 @@ void lsf_history_free(lsf_history *h) {
 		}
 		free(h->count[c]);
 		h->count[c] = NULL;
+		for (int d = 0; d < 2; d++) {
+			free(h->rej[d][c]);
+			h->rej[d][c] = NULL;
+		}
 	}
 }
 
@@ -143,6 +166,27 @@ static gchar *plane_name(int kind, int chan, int nchan) {
 	if (nchan == 1)
 		return g_strdup(plane_kind[kind]);
 	return g_strdup_printf("%s%s", plane_kind[kind], chan_suffix[chan]);
+}
+
+/* planes of LSF_REJ (Section 5.4): REJLO then REJHI, P channels each */
+static gchar *rej_plane_name(int dir, int chan, int nchan) {
+	const char *kind = dir ? "REJHI" : "REJLO";
+	if (nchan == 1)
+		return g_strdup(kind);
+	return g_strdup_printf("%s%s", kind, chan_suffix[chan]);
+}
+
+/* index of the plane named by an LSFPLn keyword of the current HDU (C6), or -1 */
+static int find_plane(fitsfile *fptr, int nplanes, const char *name) {
+	for (int p = 0; p < nplanes; p++) {
+		char key[FLEN_KEYWORD], val[FLEN_VALUE] = { 0 };
+		int status = 0;
+		g_snprintf(key, sizeof key, "LSFPL%d", p + 1);
+		fits_read_key(fptr, TSTRING, key, val, NULL, &status);
+		if (!status && !strcmp(g_strstrip(val), name))
+			return p;
+	}
+	return -1;
 }
 
 /***************************** reading *****************************/
@@ -292,16 +336,12 @@ int lsf_open_and_validate(const char *path, lsf_file *f, gboolean tolerate_edite
 		else if (!strcmp(extname, LSF_EXT_COUNT)) hdu_count = i;
 		else if (!strcmp(extname, LSF_EXT_SETTINGS)) hdu_settings = i;
 		else if (!strcmp(extname, LSF_EXT_LEDGER)) hdu_ledger = i;
-		else {
-			if (!strcmp(extname, "LSF_REJ")) hdu_rej = i;
-			if (!strcmp(extname, "LSF_REJ") || !strcmp(extname, "LSF_STARS")) {
-				/* optional LSF HDUs from a later writer: dropped, they would be
-				 * stale after this append */
-				siril_log_warning(_("LSF: %s is not supported by this version and will be dropped\n"), extname);
-				continue;
-			}
-			g_array_append_val(f->unknown_hdus, i);
+		else if (!strcmp(extname, LSF_EXT_REJ)) hdu_rej = i;
+		else if (!strcmp(extname, "LSF_STARS")) {
+			/* the star cache would be stale after this append (Section 10.5) */
+			siril_log_warning(_("LSF: %s is not supported by this version and will be dropped\n"), extname);
 		}
+		else g_array_append_val(f->unknown_hdus, i);
 	}
 	if (!hdu_acc || !hdu_count || !hdu_settings || !hdu_ledger) {
 		ret = validation_failure(3, path, _("a required LSF HDU is missing"));
@@ -336,16 +376,8 @@ int lsf_open_and_validate(const char *path, lsf_file *f, gboolean tolerate_edite
 	int plane_index[LSF_NB_PL][3];
 	for (int k = 0; k < LSF_NB_PL; k++)
 		for (int c = 0; c < f->nchan; c++) {
-			plane_index[k][c] = -1;
 			gchar *expected = plane_name(k, c, f->nchan);
-			for (int p = 0; p < anaxes[2]; p++) {
-				char key[FLEN_KEYWORD], val[FLEN_VALUE] = { 0 };
-				g_snprintf(key, sizeof key, "LSFPL%d", p + 1);
-				status = 0;
-				fits_read_key(fptr, TSTRING, key, val, NULL, &status);
-				if (!status && !strcmp(g_strstrip(val), expected))
-					plane_index[k][c] = p;
-			}
+			plane_index[k][c] = find_plane(fptr, anaxes[2], expected);
 			g_free(expected);
 			if (plane_index[k][c] < 0) {
 				if (k == LSF_PL_W2)
@@ -366,12 +398,42 @@ int lsf_open_and_validate(const char *path, lsf_file *f, gboolean tolerate_edite
 		ret = validation_failure(3, path, _("LSF_COUNT does not have the expected dimensions"));
 		goto end;
 	}
+	/* LSF_REJ, when present, is checked the same way (Section 8, check 3) */
+	int rej_index[2][3];
+	if (hdu_rej) {
+		long rnaxes[3] = { 0, 0, 0 };
+		int rnaxis = 0, rbitpix = 0, rtype = 0;
+		status = 0;
+		fits_movabs_hdu(fptr, hdu_rej, NULL, &status);
+		fits_get_img_param(fptr, 3, &rbitpix, &rnaxis, rnaxes, &status);
+		fits_get_img_equivtype(fptr, &rtype, &status);
+		if (status || rtype != USHORT_IMG || rnaxis != 3 || rnaxes[0] != f->rx || rnaxes[1] != f->ry
+				|| rnaxes[2] != 2 * f->nchan) {
+			ret = validation_failure(3, path, _("LSF_REJ does not have the expected dimensions"));
+			goto end;
+		}
+		for (int d = 0; d < 2; d++)
+			for (int c = 0; c < f->nchan; c++) {
+				gchar *expected = rej_plane_name(d, c, f->nchan);
+				rej_index[d][c] = find_plane(fptr, rnaxes[2], expected);
+				g_free(expected);
+				if (rej_index[d][c] < 0) {
+					ret = validation_failure(3, path, _("LSF_REJ does not hold the expected named planes"));
+					goto end;
+				}
+			}
+	}
 	/* only lossless compression, with a method Siril supports (Section 5.3) */
 	status = 0;
 	fits_movabs_hdu(fptr, hdu_acc, NULL, &status);
 	gboolean acc_ok = !status && read_hdu_compression(fptr, TRUE, f->acc_codec, &f->acc_bytes);
 	fits_movabs_hdu(fptr, hdu_count, NULL, &status);
 	gboolean count_ok = !status && read_hdu_compression(fptr, FALSE, f->count_codec, &f->count_bytes);
+	g_strlcpy(f->rej_codec, "none", sizeof f->rej_codec);
+	if (hdu_rej) {
+		fits_movabs_hdu(fptr, hdu_rej, NULL, &status);
+		count_ok = count_ok && !status && read_hdu_compression(fptr, FALSE, f->rej_codec, &f->rej_bytes);
+	}
 	if (!acc_ok || !count_ok) {
 		ret = validation_failure(3, path, _("an extension image is compressed with a method that is not "
 					"supported (RICE_1, GZIP_1, GZIP_2) or, for LSF_ACC, not lossless"));
@@ -381,10 +443,11 @@ int lsf_open_and_validate(const char *path, lsf_file *f, gboolean tolerate_edite
 		!strcmp(f->acc_codec, "GZIP_2") ? LSF_COMP_GZIP2 : LSF_COMP_NONE;
 
 	/* check 4: LSFUID and LSFGEN identical across all LSF HDUs */
-	int hdus[] = { 1, hdu_acc, hdu_count, hdu_settings, hdu_ledger };
+	int hdus[] = { 1, hdu_acc, hdu_count, hdu_settings, hdu_ledger, hdu_rej };
+	int nb_hdus = G_N_ELEMENTS(hdus) - (hdu_rej ? 0 : 1);
 	char uid0[FLEN_VALUE] = { 0 };
 	int gen0 = -1;
-	for (int i = 0; i < (int) G_N_ELEMENTS(hdus); i++) {
+	for (int i = 0; i < nb_hdus; i++) {
 		char uid[FLEN_VALUE] = { 0 };
 		int gen = -1;
 		status = 0;
@@ -554,6 +617,29 @@ int lsf_open_and_validate(const char *path, lsf_file *f, gboolean tolerate_edite
 		int sat = 0, st = 0;
 		fits_read_key(fptr, TLOGICAL, "LSFCSAT", &sat, NULL, &st);
 		f->hist.count_saturated = !st && sat;
+	}
+	if (hdu_rej) {
+		if (lsf_history_alloc_rej(&f->hist, 1)) {
+			ret = -1;
+			goto end;
+		}
+		fits_movabs_hdu(fptr, hdu_rej, NULL, &status);
+		for (int d = 0; d < 2 && !status; d++)
+			for (int c = 0; c < f->nchan && !status; c++) {
+				long fpixel[3] = { 1, 1, rej_index[d][c] + 1 };
+				fits_read_pix(fptr, TUSHORT, fpixel, npix, NULL, f->hist.rej[d][c], NULL, &status);
+			}
+		if (status) {
+			report_fits_error(status);
+			ret = -1;
+			goto end;
+		}
+		int sat = 0, rgen = 0, st = 0;
+		fits_read_key(fptr, TINT, "LSFRGEN", &rgen, NULL, &st);
+		f->hist.rej_gen = !st && rgen > 0 ? rgen : 1;
+		st = 0;
+		fits_read_key(fptr, TLOGICAL, "LSFRSAT", &sat, NULL, &st);
+		f->hist.rej_saturated = !st && sat;
 	}
 
 end:
@@ -953,11 +1039,40 @@ int lsf_write_file(const char *path, lsf_file *old, const lsf_settings *s, lsf_h
 		long fpixel[3] = { 1, 1, c + 1 };
 		fits_write_pix(fptr, TUSHORT, fpixel, npix, h->count[c], &status);
 	}
+
+	/* LSF_REJ, optional, compressed like LSF_COUNT (Section 5.4) */
+	gboolean has_rej = h->rej[0][0] != NULL;
+	if (has_rej && !status) {
+		long rnaxes[3] = { h->rx, h->ry, 2 * nchan };
+		fits_create_img(fptr, USHORT_IMG, 3, rnaxes, &status);
+		write_identity(fptr, LSF_EXT_REJ, uid, gen, &status);
+		for (int d = 0, p = 1; d < 2; d++)
+			for (int c = 0; c < nchan; c++, p++) {
+				char key[FLEN_KEYWORD];
+				gchar *name = rej_plane_name(d, c, nchan);
+				g_snprintf(key, sizeof key, "LSFPL%d", p);
+				fits_update_key(fptr, TSTRING, key, name, NULL, &status);
+				g_free(name);
+			}
+		fits_update_key(fptr, TINT, "LSFRGEN", &h->rej_gen, "first LSF generation counted", &status);
+		if (h->rej_saturated) {
+			int t = TRUE;
+			fits_update_key(fptr, TLOGICAL, "LSFRSAT", &t, "a rejection count saturated at 65535", &status);
+		}
+		write_cards(fptr, wcs, &status);
+		for (int d = 0, p = 1; d < 2 && !status; d++)
+			for (int c = 0; c < nchan && !status; c++, p++) {
+				long fpixel[3] = { 1, 1, p };
+				fits_write_pix(fptr, TUSHORT, fpixel, npix, h->rej[d][c], &status);
+			}
+	}
 	if (comp != LSF_COMP_NONE)
 		fits_set_compression_type(fptr, NOCOMPRESS, &status);
 
-	/* LSF_SETTINGS */
-	write_settings_hdu(fptr, s, nchan, uid, gen, &status);
+	/* LSF_SETTINGS. rejmaps.enabled mirrors the presence of LSF_REJ (Section 6) */
+	lsf_settings mirrored = *s;
+	mirrored.rejmaps = has_rej;
+	write_settings_hdu(fptr, &mirrored, nchan, uid, gen, &status);
 	if (status) {
 		report_fits_error(status);
 		goto end;

@@ -341,6 +341,13 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 	} else if (lsf_history_alloc(h, seq->rx, seq->ry, nchan)) {
 		return 1;
 	}
+	/* rejection maps asked for now: they count from this generation on (Section 5.4) */
+	if (s->rejmaps && !h->rej[0][0]) {
+		if (lsf_history_alloc_rej(h, args->gen))
+			return 1;
+		if (!args->init)
+			siril_log_message(_("LSF: rejection maps enabled, counting from generation %d\n"), args->gen);
+	}
 
 	/* 1. included frames, their metadata and the Section 7 checks */
 	int *cand = malloc(seq->number * sizeof(int));
@@ -588,7 +595,7 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 	gui_iface.set_progress(PROGRESS_RESET, _("LSF: merging the batch"));
 	guint64 irej[3][2] = { { 0 } }, hrej[3][2] = { { 0 } };
 	int err = 0, done_blocks = 0;
-	gboolean saturated = FALSE;
+	gboolean saturated = FALSE, rej_saturated = FALSE;
 	const long rx = naxes[0], ry = naxes[1];
 
 #ifdef _OPENMP
@@ -608,7 +615,7 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 		int layer = (int) blk->channel;
 		td->db.layer = layer;
 		guint64 brej[2] = { 0, 0 }, bhrej[2] = { 0, 0 };
-		gboolean bsat = FALSE;
+		gboolean bsat = FALSE, brsat = FALSE;
 
 		/* read the block from all frames */
 		rectangle area = { 0, (int) blk->start_row, (int) rx, (int) blk->height };
@@ -632,6 +639,7 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 		float *mean_h = h->plane[LSF_PL_MEAN][layer], *w_h = h->plane[LSF_PL_W][layer];
 		float *m2_h = h->plane[LSF_PL_M2][layer], *w2_h = h->plane[LSF_PL_W2][layer];
 		WORD *count_h = h->count[layer];
+		WORD *rlo_h = h->rej[0][layer], *rhi_h = h->rej[1][layer];	// NULL without LSF_REJ
 
 		for (long y = 0; y < blk->height; y++) {
 			/* line y of the block is stored at ry - y - 1, as in
@@ -648,8 +656,13 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 				int kept_pixels = apply_rejection_float(&td->db, nb, &rargs, rej);
 				brej[0] += rej[0];
 				brej[1] += rej[1];
-				if (kept_pixels <= 0)
+				if (kept_pixels <= 0) {
+					if (rlo_h) {
+						lsf_count_add(&rlo_h[pdata_idx], rej[0], &brsat);
+						lsf_count_add(&rhi_h[pdata_idx], rej[1], &brsat);
+					}
 					continue;	// no data here: nothing is added
+				}
 				/* survivors, identified as mean_and_reject() does: its weighted
 				 * branch takes the values of o_stack within the range of the kept
 				 * samples, its unweighted branch the kept samples themselves. They
@@ -679,7 +692,7 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 							}
 				}
 				double Wh = w_h[pdata_idx];
-				int n = 0;
+				int n = 0, hlo = 0, hhi = 0;
 				for (int f = 0; f < nb; f++) {
 					float val = o_stack[f];
 					if (!sel[f])
@@ -691,13 +704,20 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 						double sh = lsf_sigma_hist(sp2, clip_c, b.sframe[layer][f], margin);
 						if (sh > 0.0) {
 							double z = ((double) val - mean_h[pdata_idx]) / sh;
-							if (z < -s->hist_low) { bhrej[0]++; continue; }
-							if (z > s->hist_high) { bhrej[1]++; continue; }
+							if (z < -s->hist_low) { hlo++; continue; }
+							if (z > s->hist_high) { hhi++; continue; }
 						}
 					}
 					td->xbuf[n] = val;
 					td->wbufd[n] = wf;
 					n++;
+				}
+				bhrej[0] += hlo;
+				bhrej[1] += hhi;
+				/* both tests count in the rejection maps (Section 5.4) */
+				if (rlo_h) {
+					lsf_count_add(&rlo_h[pdata_idx], rej[0] + hlo, &brsat);
+					lsf_count_add(&rhi_h[pdata_idx], rej[1] + hhi, &brsat);
 				}
 				if (n == 0)
 					continue;
@@ -716,6 +736,7 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 			hrej[layer][0] += bhrej[0];
 			hrej[layer][1] += bhrej[1];
 			saturated |= bsat;
+			rej_saturated |= brsat;
 			done_blocks++;
 			gui_iface.set_progress((double) done_blocks / nb_blocks, NULL);
 		}
@@ -725,6 +746,7 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 		goto end;
 	}
 	h->count_saturated |= saturated;
+	h->rej_saturated |= rej_saturated;
 
 	double nb_tot = (double) rx * ry * nb;
 	for (int c = 0; c < nchan; c++) {
