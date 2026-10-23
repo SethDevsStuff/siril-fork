@@ -19,6 +19,10 @@
 #define LSF_LOW_STACK_WARN 25
 #define LSF_NEFF_MIN (1.0 + 1e-4)
 
+/* tile compression of the extension images (Section 5.3): LSF_ACC with
+ * GZIP_1 or GZIP_2 and no quantization, the count planes with RICE_1 */
+typedef enum { LSF_COMP_NONE, LSF_COMP_GZIP1, LSF_COMP_GZIP2 } lsf_compression;
+
 /* planes of the accumulator, in LSF_ACC order */
 enum { LSF_PL_MEAN, LSF_PL_W, LSF_PL_M2, LSF_PL_W2, LSF_NB_PL };
 
@@ -89,6 +93,9 @@ typedef struct {
 	gboolean stack_modified;	// check 8 failed (only when tolerated)
 	float *stack_data;		// HDU 0 pixels when stack_modified, file order
 	double xfrm_shift[2];		// grid expansion of this commit: shift of the REG_XFRM already in the ledger
+	lsf_compression compression;	// of LSF_ACC, as found in the file
+	gchar acc_codec[FLEN_VALUE], count_codec[FLEN_VALUE];	// ZCMPTYPE, "none" when not compressed
+	long long acc_bytes, count_bytes;	// size of the data units as stored
 } lsf_file;
 
 /* one frame of a batch, for the ledger */
@@ -169,7 +176,9 @@ void lsf_file_free(lsf_file *f);
 int lsf_open_and_validate(const char *path, lsf_file *f, gboolean tolerate_edited_stack);
 gchar *lsf_hash_float_data(const float *data, size_t n);
 int lsf_write_file(const char *path, lsf_file *old, const lsf_settings *s, lsf_history *h,
-		fits *primary, const char *uid, int gen, GPtrArray *new_rows, int batch, gboolean backup);
+		fits *primary, const char *uid, int gen, GPtrArray *new_rows, int batch, gboolean backup,
+		lsf_compression comp);
+const char *lsf_compression_name(lsf_compression comp);
 int lsf_export_master(const char *lsf_path, const char *out_path);
 void lsf_strip_lsf_keys(fits *fit);
 

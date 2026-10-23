@@ -193,6 +193,33 @@ static GPtrArray *read_settings_rows(fitsfile *fptr, int *status) {
 	return rows;
 }
 
+/* tile compression of the current image HDU (Section 5.3): codec receives
+ * ZCMPTYPE, or "none", and bytes the size of the data unit as stored.
+ * Returns FALSE for a method other than RICE_1, GZIP_1 and GZIP_2, the ones
+ * Siril supports, and for float data that is not compressed losslessly
+ * (gzip without quantization). */
+static gboolean read_hdu_compression(fitsfile *fptr, gboolean float_data, char *codec, long long *bytes) {
+	int status = 0;
+	LONGLONG head = 0, start = 0, end = 0;
+	fits_get_hduaddrll(fptr, &head, &start, &end, &status);
+	*bytes = status ? 0 : end - start;
+	status = 0;
+	if (!fits_is_compressed_image(fptr, &status)) {
+		g_strlcpy(codec, "none", FLEN_VALUE);
+		return !status;
+	}
+	char quant[FLEN_VALUE] = { 0 };
+	fits_read_key(fptr, TSTRING, "ZCMPTYPE", codec, NULL, &status);
+	if (status)
+		return FALSE;
+	g_strstrip(codec);
+	gboolean gzip = !strcmp(codec, "GZIP_1") || !strcmp(codec, "GZIP_2");
+	if (!float_data)
+		return gzip || !strcmp(codec, "RICE_1");
+	fits_read_key(fptr, TSTRING, "ZQUANTIZ", quant, NULL, &status);
+	return gzip && !status && !strcmp(g_strstrip(quant), "NONE");
+}
+
 static const char *find_row(GPtrArray *rows, const char *key) {
 	for (guint i = 0; i < rows->len; i++) {
 		lsf_setting_row *r = g_ptr_array_index(rows, i);
@@ -339,6 +366,19 @@ int lsf_open_and_validate(const char *path, lsf_file *f, gboolean tolerate_edite
 		ret = validation_failure(3, path, _("LSF_COUNT does not have the expected dimensions"));
 		goto end;
 	}
+	/* only lossless compression, with a method Siril supports (Section 5.3) */
+	status = 0;
+	fits_movabs_hdu(fptr, hdu_acc, NULL, &status);
+	gboolean acc_ok = !status && read_hdu_compression(fptr, TRUE, f->acc_codec, &f->acc_bytes);
+	fits_movabs_hdu(fptr, hdu_count, NULL, &status);
+	gboolean count_ok = !status && read_hdu_compression(fptr, FALSE, f->count_codec, &f->count_bytes);
+	if (!acc_ok || !count_ok) {
+		ret = validation_failure(3, path, _("an extension image is compressed with a method that is not "
+					"supported (RICE_1, GZIP_1, GZIP_2) or, for LSF_ACC, not lossless"));
+		goto end;
+	}
+	f->compression = !strcmp(f->acc_codec, "GZIP_1") ? LSF_COMP_GZIP1 :
+		!strcmp(f->acc_codec, "GZIP_2") ? LSF_COMP_GZIP2 : LSF_COMP_NONE;
 
 	/* check 4: LSFUID and LSFGEN identical across all LSF HDUs */
 	int hdus[] = { 1, hdu_acc, hdu_count, hdu_settings, hdu_ledger };
@@ -474,7 +514,7 @@ int lsf_open_and_validate(const char *path, lsf_file *f, gboolean tolerate_edite
 		if (!match) {
 			if (!tolerate_edited_stack) {
 				ret = validation_failure(8, path, _("the Stack (HDU 0) was modified outside Siril. "
-							"Run lsf_check with -repair to rebuild it from the accumulator, "
+							"Run lsf_util with -repair to rebuild it from the accumulator, "
 							"or with -adopt to keep the edit"));
 				goto end;
 			}
@@ -784,12 +824,21 @@ static gchar *now_utc_iso(void) {
 	return s;
 }
 
+const char *lsf_compression_name(lsf_compression comp) {
+	switch (comp) {
+	case LSF_COMP_GZIP1: return "GZIP_1";
+	case LSF_COMP_GZIP2: return "GZIP_2";
+	default: return "none";
+	}
+}
+
 /* Writes the complete new file to a temporary name, then atomically replaces
  * path with it (Section 10.2 steps 6 to 8). primary holds the header
  * metadata and the float pixels of HDU 0. old is the validated previous
  * file, or NULL on initialization. */
 int lsf_write_file(const char *path, lsf_file *old, const lsf_settings *s, lsf_history *h,
-		fits *primary, const char *uid, int gen, GPtrArray *new_rows, int batch, gboolean backup) {
+		fits *primary, const char *uid, int gen, GPtrArray *new_rows, int batch, gboolean backup,
+		lsf_compression comp) {
 	int status = 0;
 	fitsfile *fptr = NULL, *oldf = NULL;
 	gchar *tmp = g_strdup_printf("%s.lsf_tmp", path);
@@ -858,6 +907,13 @@ int lsf_write_file(const char *path, lsf_file *old, const lsf_settings *s, lsf_h
 	}
 	wcs = collect_wcs_cards(fptr);
 
+	/* the extension images may be tile-compressed, losslessly (Section 5.3).
+	 * Compression is set only now: requested before HDU 0, cfitsio would
+	 * write an empty primary followed by a compressed image (C1). */
+	if (comp != LSF_COMP_NONE && siril_fits_set_compression(fptr,
+				comp == LSF_COMP_GZIP1 ? GZIP1_COMP : GZIP2_COMP, 0.0, 0.0))
+		goto end;
+
 	/* LSF_ACC */
 	long anaxes[3] = { h->rx, h->ry, LSF_NB_PL * nchan };
 	fits_create_img(fptr, FLOAT_IMG, 3, anaxes, &status);
@@ -878,6 +934,8 @@ int lsf_write_file(const char *path, lsf_file *old, const lsf_settings *s, lsf_h
 		}
 
 	/* LSF_COUNT */
+	if (comp != LSF_COMP_NONE && !status && siril_fits_set_compression(fptr, RICE_COMP, 0.0, 0.0))
+		goto end;
 	long cnaxes[3] = { h->rx, h->ry, nchan };
 	fits_create_img(fptr, USHORT_IMG, naxis, cnaxes, &status);
 	write_identity(fptr, LSF_EXT_COUNT, uid, gen, &status);
@@ -895,6 +953,8 @@ int lsf_write_file(const char *path, lsf_file *old, const lsf_settings *s, lsf_h
 		long fpixel[3] = { 1, 1, c + 1 };
 		fits_write_pix(fptr, TUSHORT, fpixel, npix, h->count[c], &status);
 	}
+	if (comp != LSF_COMP_NONE)
+		fits_set_compression_type(fptr, NOCOMPRESS, &status);
 
 	/* LSF_SETTINGS */
 	write_settings_hdu(fptr, s, nchan, uid, gen, &status);
@@ -1021,9 +1081,11 @@ void lsf_strip_lsf_keys(fits *fit) {
 	fit->unknown_keys = g_string_free(kept, FALSE);
 }
 
-/* Flattened master (Section 10.9): HDU 0 without the LSF keywords */
+/* Flattened master (Section 10.9): HDU 0 without the LSF keywords, saved
+ * like any image Siril saves, so the extension and compression preferences
+ * apply */
 int lsf_export_master(const char *lsf_path, const char *out_path) {
-	fitsfile *in = NULL, *out = NULL;
+	fitsfile *in = NULL;
 	int status = 0, gen = 0;
 	char uid[FLEN_VALUE] = { 0 };
 	if (fits_open_diskfile(&in, lsf_path, READONLY, &status)) {
@@ -1031,25 +1093,15 @@ int lsf_export_master(const char *lsf_path, const char *out_path) {
 		return 1;
 	}
 	read_uid_gen(in, uid, &gen);
-	g_unlink(out_path);
-	if (siril_fits_create_diskfile(&out, out_path, &status)) {
-		report_fits_error(status);
-		fits_close_file(in, &status);
+	fits_close_file(in, &status);
+	fits fit = { 0 };
+	if (readfits(lsf_path, &fit, NULL, TRUE)) {
+		clearfits(&fit);
 		return 1;
 	}
-	fits_copy_hdu(in, out, 0, &status);
-	for (int i = 0; i < (int) G_N_ELEMENTS(lsf_keys); i++)
-		delete_key_quiet(out, lsf_keys[i]);
-	gchar *hist = g_strdup_printf("Exported from LSF file %s, generation %d", uid, gen);
-	fits_write_history(out, hist, &status);
-	g_free(hist);
-	fits_write_chksum(out, &status);
-	int st = 0;
-	fits_close_file(out, &status);
-	fits_close_file(in, &st);
-	if (status) {
-		report_fits_error(status);
-		return 1;
-	}
-	return 0;
+	lsf_strip_lsf_keys(&fit);
+	fit.history = g_slist_append(fit.history, g_strdup_printf("Exported from LSF file %s, generation %d", uid, gen));
+	int ret = savefits(out_path, &fit);
+	clearfits(&fit);
+	return ret;
 }

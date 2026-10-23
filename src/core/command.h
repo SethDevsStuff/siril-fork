@@ -124,10 +124,10 @@ int	process_load_seq(int nb);
 int	process_log(int nb);
 int	process_ls(int nb);
 int	process_lsf_append(int nb);
-int	process_lsf_check(int nb);
 int	process_lsf_export(int nb);
 int	process_lsf_init(int nb);
 int	process_lsf_maps(int nb);
+int	process_lsf_util(int nb);
 
 int	process_makepsf(int nb);
 int process_mask_bitpix(int nb);

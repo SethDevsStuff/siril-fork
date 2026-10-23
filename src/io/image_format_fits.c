@@ -1985,12 +1985,19 @@ int read_opened_fits_partial(sequence *seq, int layer, int index, void *buffer,
 }
 
 int siril_fits_compress(fits *f) {
+	return siril_fits_set_compression(f->fptr, com.pref.comp.fits_method,
+			com.pref.comp.fits_quantization, com.pref.comp.fits_hcompress_scale);
+}
+
+/* sets the tile compression of the image HDUs created next in fptr. method is
+ * a compression_mode; a quantization of 0 compresses floating point data
+ * losslessly, which only GZIP1 and GZIP2 support */
+int siril_fits_set_compression(fitsfile *fptr, int method, double quantization, double hcompress_scale) {
 	int status = 0;
 	int comp_type = -1;
 	siril_log_debug("Compressing FIT file with method %d and quantization %f\n",
-				com.pref.comp.fits_method,
-				com.pref.comp.fits_quantization);
-	comp_type = get_compression_type(com.pref.comp.fits_method);
+				method, quantization);
+	comp_type = get_compression_type(method);
 	siril_log_debug("cfitsio compression type %d\n",
 				comp_type);
 	if (comp_type < 0) {
@@ -2006,19 +2013,19 @@ int siril_fits_compress(fits *f) {
 	 * Here we need to use SUBTRACTIVE_DITHER in order to not have border artifacts at the
 	 * end of stacking with compressed images.
 	 */
-	if (fits_set_quantize_dither(f->fptr, SUBTRACTIVE_DITHER_2, &status)) {
+	if (fits_set_quantize_dither(fptr, SUBTRACTIVE_DITHER_2, &status)) {
 		report_fits_error(status);
 		return 1;
 	}
 	status = 0;
 
-	if (fits_set_compression_type(f->fptr, comp_type, &status)) {
+	if (fits_set_compression_type(fptr, comp_type, &status)) {
 		report_fits_error(status);
 		return 1;
 	}
 	status = 0;
 
-	if (fits_set_quantize_level(f->fptr, com.pref.comp.fits_quantization, &status)) {
+	if (fits_set_quantize_level(fptr, quantization, &status)) {
 		report_fits_error(status);
 		return 1;
 	}
@@ -2027,12 +2034,12 @@ int siril_fits_compress(fits *f) {
 
 	/* Set the Hcompress scale factor if relevant */
 	if (comp_type == HCOMPRESS_1) {
-		if (fits_set_hcomp_scale(f->fptr, com.pref.comp.fits_hcompress_scale, &status)) {
+		if (fits_set_hcomp_scale(fptr, hcompress_scale, &status)) {
 			report_fits_error(status);
 			return 1;
 		}
 		siril_log_debug("FITS HCompress scale factor %f\n",
-				com.pref.comp.fits_hcompress_scale);
+				hcompress_scale);
 		status = 0;
 	}
 	return status;

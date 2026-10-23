@@ -17,7 +17,7 @@
  * along with Siril. If not, see <http://www.gnu.org/licenses/>.
  */
 
-/* LSF commands: lsf_init, lsf_append, lsf_export, lsf_check, lsf_maps
+/* LSF commands: lsf_init, lsf_append, lsf_export, lsf_util, lsf_maps
  * (FITS profile v0.4, Sections 1, 8 and 10). These are the only paths that
  * write an LSF file. */
 
@@ -42,7 +42,7 @@
 #include "registration/registration.h"
 #include "lsf/lsf.h"
 
-typedef enum { LSF_CMD_INIT, LSF_CMD_APPEND, LSF_CMD_EXPORT, LSF_CMD_CHECK, LSF_CMD_MAPS } lsf_cmd_mode;
+typedef enum { LSF_CMD_INIT, LSF_CMD_APPEND, LSF_CMD_EXPORT, LSF_CMD_UTIL, LSF_CMD_MAPS } lsf_cmd_mode;
 
 /* maps of lsf_maps (Section 10.9) */
 enum { LSF_MAP_NEFF = 1 << 0, LSF_MAP_NOISE = 1 << 1, LSF_MAP_SIGMA = 1 << 2, LSF_MAP_SNR = 1 << 3,
@@ -61,7 +61,9 @@ struct lsf_cmd_args {
 	gboolean framing_set;
 	gboolean expand_force;
 	int expand_step;
-	gboolean repair, adopt;	// check
+	gboolean check, repair, adopt;	// util
+	lsf_compression compression;	// -compress=, -nocompress, -decompress (Section 5.3)
+	gboolean compression_set;	// append: keeps the compression of the file when not set
 	guint maps;		// maps, LSF_MAP_* flags
 };
 
@@ -239,7 +241,7 @@ static int lsf_init_run(struct lsf_cmd_args *a) {
 	if (lsf_build_primary(&primary, s, &h))
 		goto end;
 	uid = g_uuid_string_random();
-	if (lsf_write_file(a->path, NULL, s, &h, &primary, uid, 1, rows, 1, FALSE))
+	if (lsf_write_file(a->path, NULL, s, &h, &primary, uid, 1, rows, 1, FALSE, a->compression))
 		goto end;
 	siril_log_info(_("LSF file %s created: %u frames, generation 1\n"),
 			a->path, rows->len);
@@ -624,7 +626,12 @@ static int lsf_append_run(struct lsf_cmd_args *a) {
 	}
 	if (lsf_build_primary(&f.primary, &f.settings, &f.hist))
 		goto end;
-	if (lsf_write_file(a->path, &f, &f.settings, &f.hist, &f.primary, f.uid, gen, rows, batchnum, a->backup))
+	/* the file keeps its compression unless the command changes it */
+	lsf_compression comp = a->compression_set ? a->compression : f.compression;
+	if (comp != f.compression)
+		siril_log_message(_("LSF: compression of the extensions changed from %s to %s\n"),
+				lsf_compression_name(f.compression), lsf_compression_name(comp));
+	if (lsf_write_file(a->path, &f, &f.settings, &f.hist, &f.primary, f.uid, gen, rows, batchnum, a->backup, comp))
 		goto end;
 	siril_log_info(_("LSF: %u frames appended to %s, %ld frames in total, generation %d\n"),
 			rows->len, a->path, f.ledger_rows + rows->len, gen);
@@ -668,11 +675,17 @@ static void print_summary(const lsf_file *f) {
 	default:
 		siril_log_message(_("  weighting none\n"));
 	}
+	double raw = (double) f->rx * f->ry * f->nchan;
+	siril_log_message(_("  LSF_ACC %s, %.0f MB stored (%.0f%% of raw), LSF_COUNT %s, %.0f MB stored (%.0f%% of raw)\n"),
+			f->acc_codec, (double) f->acc_bytes / BYTES_IN_A_MB, 100.0 * f->acc_bytes / (raw * LSF_NB_PL * sizeof(float)),
+			f->count_codec, (double) f->count_bytes / BYTES_IN_A_MB, 100.0 * f->count_bytes / (raw * sizeof(WORD)));
 }
 
-/* lsf_check: Section 8 validation and a summary; Repair or Adopt when only
- * check 8 failed */
-static int lsf_check_run(struct lsf_cmd_args *a) {
+/* lsf_util: Section 8 validation and a summary (-check), Repair or Adopt
+ * when only check 8 failed, and a change of the compression of the
+ * extensions (Section 5.3). The actions combine into one rewrite, which
+ * increments the generation. */
+static int lsf_util_run(struct lsf_cmd_args *a) {
 	lsf_file f;
 	int retval = 1;
 	GPtrArray *none = NULL;
@@ -681,45 +694,83 @@ static int lsf_check_run(struct lsf_cmd_args *a) {
 		return 1;
 	}
 	print_summary(&f);
-	if (!f.stack_modified) {
+	if (!f.stack_modified)
 		siril_log_info(_("LSF: %s passed all the checks of Section 8\n"), a->path);
-		if (a->repair || a->adopt)
-			siril_log_message(_("LSF: the Stack matches the accumulator, there is nothing to repair or adopt\n"));
+	gboolean fix_stack = (a->repair || a->adopt) && f.stack_modified;
+	if ((a->repair || a->adopt) && !f.stack_modified)
+		siril_log_message(_("LSF: the Stack matches the accumulator, there is nothing to repair or adopt\n"));
+	gboolean recompress = a->compression_set && a->compression != f.compression;
+	if (a->compression_set && !recompress) {
+		if (f.compression == LSF_COMP_NONE)
+			siril_log_message(_("LSF: the extensions of %s are already uncompressed\n"), a->path);
+		else siril_log_message(_("LSF: the extensions of %s are already compressed with %s\n"), a->path,
+				lsf_compression_name(f.compression));
+	}
+	/* any rewrite rebuilds the Stack from MEAN, which would silently repair it */
+	if (f.stack_modified && !fix_stack) {
+		siril_log_error(_("LSF: %s fails check 8, its Stack was modified outside Siril. lsf_append will "
+					"refuse it, and lsf_util will not rewrite it, until lsf_util is run with -repair (rebuild "
+					"the Stack from the accumulator) or -adopt (keep the edit)\n"), a->path);
+		goto end;
+	}
+	/* -out writes the result to a new file and leaves the source untouched,
+	 * even when no action changes anything */
+	const char *target = a->out ? a->out : a->path;
+	if (!fix_stack && !recompress && !a->out) {
 		retval = 0;
 		goto end;
 	}
-	if (!a->repair && !a->adopt) {
-		siril_log_error(_("LSF: %s fails check 8, its Stack was modified outside Siril. lsf_append will "
-					"refuse it until lsf_check is run with -repair (rebuild the Stack from the "
-					"accumulator) or -adopt (keep the edit)\n"), a->path);
+	if (a->out && g_file_test(a->out, G_FILE_TEST_EXISTS) && !a->overwrite) {
+		siril_log_error(_("LSF: %s already exists, use -overwrite to replace it\n"), a->out);
 		goto end;
 	}
 	gchar *card;
 	int gen = f.gen + 1;
-	if (a->adopt) {
-		size_t n = (size_t) f.rx * f.ry, changed = 0;
-		gboolean norm = f.settings.outnorm;
-		if (norm && !(f.settings.outnorm_max > f.settings.outnorm_min)) {
-			siril_log_error(_("LSF: the output normalization range of %s is not valid, the edited Stack cannot be adopted\n"), a->path);
-			goto end;
+	if (a->out)
+		f.primary.history = g_slist_append(f.primary.history, g_strdup_printf(
+					"LSF generation %d: written from %s", gen, f.path));
+	if (fix_stack) {
+		if (a->adopt) {
+			size_t n = (size_t) f.rx * f.ry, changed = 0;
+			gboolean norm = f.settings.outnorm;
+			if (norm && !(f.settings.outnorm_max > f.settings.outnorm_min)) {
+				siril_log_error(_("LSF: the output normalization range of %s is not valid, the edited Stack cannot be adopted\n"), a->path);
+				goto end;
+			}
+			for (int c = 0; c < f.nchan; c++)
+				changed += lsf_adopt_plane(f.hist.plane[LSF_PL_MEAN][c], f.hist.plane[LSF_PL_W][c],
+						f.stack_data + c * n, n, norm, f.settings.outnorm_min, f.settings.outnorm_max);
+			siril_log_message(_("LSF: %zu edited pixel(s) adopted into MEAN, M2 is unchanged\n"), changed);
+			card = g_strdup_printf("LSF generation %d: adopted the Stack edited outside Siril, %zu pixels", gen, changed);
+		} else {
+			card = g_strdup_printf("LSF generation %d: Stack edited outside Siril, repaired from MEAN", gen);
 		}
-		for (int c = 0; c < f.nchan; c++)
-			changed += lsf_adopt_plane(f.hist.plane[LSF_PL_MEAN][c], f.hist.plane[LSF_PL_W][c],
-					f.stack_data + c * n, n, norm, f.settings.outnorm_min, f.settings.outnorm_max);
-		siril_log_message(_("LSF: %zu edited pixel(s) adopted into MEAN, M2 is unchanged\n"), changed);
-		card = g_strdup_printf("LSF generation %d: adopted the Stack edited outside Siril, %zu pixels", gen, changed);
-	} else {
-		card = g_strdup_printf("LSF generation %d: Stack edited outside Siril, repaired from MEAN", gen);
+		f.primary.history = g_slist_append(f.primary.history, card);
 	}
-	f.primary.history = g_slist_append(f.primary.history, card);
+	lsf_compression comp = a->compression_set ? a->compression : f.compression;
+	if (recompress) {
+		if (comp == LSF_COMP_NONE)
+			card = g_strdup_printf("LSF generation %d: extensions decompressed", gen);
+		else card = g_strdup_printf("LSF generation %d: extensions compressed with %s", gen, lsf_compression_name(comp));
+		f.primary.history = g_slist_append(f.primary.history, card);
+	}
 	if (lsf_build_primary(&f.primary, &f.settings, &f.hist))
 		goto end;
 	none = g_ptr_array_new();
-	if (lsf_write_file(a->path, &f, &f.settings, &f.hist, &f.primary, f.uid, gen, none, f.nb_batches, a->backup))
+	if (lsf_write_file(target, &f, &f.settings, &f.hist, &f.primary, f.uid, gen, none, f.nb_batches, a->backup, comp))
 		goto end;
-	if (a->adopt)
-		siril_log_info(_("LSF: edited Stack of %s adopted, generation %d\n"), a->path, gen);
-	else siril_log_info(_("LSF: Stack of %s repaired from the accumulator, generation %d\n"), a->path, gen);
+	if (fix_stack && a->adopt)
+		siril_log_info(_("LSF: edited Stack of %s adopted, generation %d\n"), target, gen);
+	else if (fix_stack)
+		siril_log_info(_("LSF: Stack of %s repaired from the accumulator, generation %d\n"), target, gen);
+	if (recompress && comp == LSF_COMP_NONE)
+		siril_log_info(_("LSF: extensions of %s decompressed, generation %d\n"), target, gen);
+	else if (recompress)
+		siril_log_info(_("LSF: extensions of %s compressed with %s, generation %d\n"), target,
+				lsf_compression_name(comp), gen);
+	if (a->out)
+		siril_log_info(_("LSF: %s written from %s, generation %d, %s left unchanged\n"), a->out, a->path,
+				gen, a->path);
 	retval = 0;
 end:
 	if (none)
@@ -806,16 +857,20 @@ static gpointer lsf_worker(gpointer p) {
 	case LSF_CMD_APPEND:
 		retval = lsf_append_run(a);
 		break;
-	case LSF_CMD_CHECK:
-		retval = lsf_check_run(a);
+	case LSF_CMD_UTIL:
+		retval = lsf_util_run(a);
 		break;
 	case LSF_CMD_MAPS:
 		retval = lsf_maps_run(a);
 		break;
 	default:
 		retval = lsf_export_master(a->path, a->out);
-		if (!retval)
-			siril_log_message(_("LSF: master of %s exported to %s\n"), a->path, a->out);
+		if (!retval) {
+			/* the name savefits gave the file */
+			gchar *name = set_right_extension(a->out);
+			siril_log_message(_("LSF: master of %s exported to %s\n"), a->path, name ? name : a->out);
+			g_free(name);
+		}
 		break;
 	}
 	free_cmd_args(a);
@@ -837,6 +892,31 @@ static gboolean parse_double_opt(const char *word_i, const char *prefix, double 
 	*out = v;
 	*set = TRUE;
 	return TRUE;
+}
+
+static int set_compression_opt(struct lsf_cmd_args *a, lsf_compression comp) {
+	if (a->compression_set) {
+		siril_log_error(_("LSF: give only one compression option\n"));
+		return -1;
+	}
+	a->compression = comp;
+	a->compression_set = TRUE;
+	return 1;
+}
+
+/* -compress[=gzip2|gzip1] (Section 5.3): the accumulator is float data, which
+ * only gzip compresses losslessly; returns 1 if consumed, -1 on error */
+static int parse_compress_option(struct lsf_cmd_args *a, const char *w) {
+	if (strcmp(w, "-compress") && !g_str_has_prefix(w, "-compress="))
+		return 0;
+	const char *v = w[9] == '=' ? w + 10 : "gzip2";
+	if (!g_ascii_strcasecmp(v, "gzip2"))
+		return set_compression_opt(a, LSF_COMP_GZIP2);
+	if (!g_ascii_strcasecmp(v, "gzip1"))
+		return set_compression_opt(a, LSF_COMP_GZIP1);
+	siril_log_error(_("LSF: compression %s is not supported. The accumulator must be compressed losslessly, "
+				"which only gzip1 and gzip2 do\n"), v);
+	return -1;
 }
 
 /* options common to lsf_init and lsf_append; returns 1 if consumed, -1 on error */
@@ -865,12 +945,14 @@ static int parse_common_option(struct lsf_cmd_args *a, const char *w) {
 		a->framing_set = TRUE;
 		return 1;
 	}
-	return 0;
+	if (!strcmp(w, "-nocompress"))
+		return set_compression_opt(a, LSF_COMP_NONE);
+	return parse_compress_option(a, w);
 }
 
 /* lsf_init sequencename file.lsf.fits [rej [type] sigma_low sigma_high] [-nonorm, -norm=] [-fastnorm]
  *   [-rgb_equal] [-weight=] [-output_norm] [-framing=max|current|min|cog] [-hist_low=] [-hist_high=] [-hist_margin=]
- *   [-overwrite] */
+ *   [-compress[=gzip2|gzip1]] [-overwrite] */
 int process_lsf_init(int nb) {
 	struct lsf_cmd_args *a = calloc(1, sizeof(struct lsf_cmd_args));
 	a->mode = LSF_CMD_INIT;
@@ -963,7 +1045,7 @@ failure:
 }
 
 /* lsf_append file.lsf.fits sequencename [-noreg] [-framing=max|current] [-noexpand] [-expand_step=] [-expand_force] [-backup]
- *   [-hist_low=] [-hist_high=] [-hist_margin=] */
+ *   [-hist_low=] [-hist_high=] [-hist_margin=] [-compress[=gzip2|gzip1] | -nocompress] */
 int process_lsf_append(int nb) {
 	struct lsf_cmd_args *a = calloc(1, sizeof(struct lsf_cmd_args));
 	a->mode = LSF_CMD_APPEND;
@@ -1022,20 +1104,40 @@ int process_lsf_export(int nb) {
 	return CMD_OK;
 }
 
-/* lsf_check file.lsf.fits [-repair | -adopt] [-backup] */
-int process_lsf_check(int nb) {
+/* lsf_util file.lsf.fits [-check] [-repair | -adopt] [-compress[=gzip2|gzip1] | -decompress] [-out=file.lsf.fits [-overwrite]] [-backup] */
+int process_lsf_util(int nb) {
 	struct lsf_cmd_args *a = calloc(1, sizeof(struct lsf_cmd_args));
-	a->mode = LSF_CMD_CHECK;
+	a->mode = LSF_CMD_UTIL;
 	a->path = g_strdup(word[1]);
 	for (int i = 2; i < nb && word[i]; i++) {
 		const char *w = word[i];
-		if (!strcmp(w, "-repair")) a->repair = TRUE;
+		int c = parse_compress_option(a, w);
+		if (c < 0) goto failure;
+		if (c > 0) continue;
+		if (!strcmp(w, "-check")) a->check = TRUE;
+		else if (!strcmp(w, "-repair")) a->repair = TRUE;
 		else if (!strcmp(w, "-adopt")) a->adopt = TRUE;
+		else if (!strcmp(w, "-decompress")) {
+			if (set_compression_opt(a, LSF_COMP_NONE) < 0) goto failure;
+		}
 		else if (!strcmp(w, "-backup")) a->backup = TRUE;
+		else if (!strcmp(w, "-overwrite")) a->overwrite = TRUE;
+		else if (g_str_has_prefix(w, "-out=") && w[5]) {
+			g_free(a->out);
+			a->out = g_strdup(w + 5);
+		}
 		else {
 			siril_log_error(_("Unknown parameter %s, aborting.\n"), w);
 			goto failure;
 		}
+	}
+	if (a->out && !strcmp(a->out, a->path)) {
+		g_free(a->out);	// the file itself: an update in place
+		a->out = NULL;
+	}
+	if (!a->check && !a->repair && !a->adopt && !a->compression_set && !a->out) {
+		siril_log_error(_("lsf_util needs an action: -check, -repair, -adopt, -compress, -decompress or -out=\n"));
+		goto failure;
 	}
 	if (a->repair && a->adopt) {
 		siril_log_error(_("-repair and -adopt cannot be used together\n"));

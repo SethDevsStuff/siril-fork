@@ -48,7 +48,7 @@ Stage parity <p>_parity.csv         lsf_set_k vs siril_set_k and lsf_cum_X vs si
              <p>_diff_<pair>.fit    LSF - Siril, written only for pairs that differ.
 Stage flip   <p>_flip.csv           Section 12 check 7, on a scratch copy of an LSF product: its
                                     Stack flipped with the old DATASUM kept; lsf_append must refuse
-                                    it, lsf_check -repair must restore it bit-exactly, and one
+                                    it, lsf_util -repair must restore it bit-exactly, and one
                                     pixel edited then kept with -adopt must change nothing else.
 Stage drift  <p>_drift.csv          Section 12 check 8, synthetic frames from a fixed noise model:
                                     lsf_init then --drift-appends appends; the history-test
@@ -60,7 +60,8 @@ The flip, drift and weights stages raise if their test fails.
 Stage stats  <p>_noise.csv          one row per file and channel; the .lsf.fits files are loaded
                                     directly (this also tests that Siril opens one as an image).
 
---export-fits additionally writes <name>.fit next to every LSF product with `lsf_export`.
+--export-fits additionally writes <name>.fit next to every LSF product with `lsf_export` (<name>.fit.fz
+when FITS compression is enabled in Siril's preferences).
 
 The stack of set 1 is the same frames with the same settings whichever way it is stacked, so it
 is computed once (lsf_set_1) and copied to lsf_cum_1 and lsf_1 (siril_set_1 -> siril_cum_1).
@@ -250,6 +251,19 @@ def _g(x) -> str:
 def plain_path(path: str) -> str:
     """Where the plain-FITS export of an LSF file goes: name.lsf.fits -> name.fit."""
     return (path[:-len(".lsf.fits")] if path.endswith(".lsf.fits") else path) + ".fit"
+
+
+def saved_path(path: str) -> str:
+    """Siril saves a plain image (lsf_export, stack) as path.fz when FITS compression is enabled in
+    its preferences: the one of the two that exists, path when neither does."""
+    return path + ".fz" if not os.path.exists(path) and os.path.exists(path + ".fz") else path
+
+
+def remove_saved(path: str) -> None:
+    """Removes path and path.fz, so that saved_path cannot find a stale file of an earlier run."""
+    for f in (path, path + ".fz"):
+        if os.path.exists(f):
+            os.remove(f)
 
 
 def cum_tag(k: int) -> str:
@@ -819,6 +833,7 @@ class Comparison:
                                f"(the frame selection was not honoured).")
 
     def register(self, label, kind, path, expected) -> None:
+        path = saved_path(path)
         if not os.path.exists(path):
             raise RuntimeError(f"{label}: the command reported success but {os.path.basename(path)} is missing.")
         self.check_count(path, expected, label)
@@ -828,13 +843,13 @@ class Comparison:
             self.export_plain(path)
 
     def export_plain(self, lsf_path: str) -> None:
-        """lsf_export of an LSF file to <name>.fit. A failed export is a warning."""
+        """lsf_export of an LSF file to <name>.fit (.fit.fz with Siril's FITS compression). A failed
+        export is a warning."""
         dest = plain_path(lsf_path)
         try:
-            if os.path.exists(dest):
-                os.remove(dest)
+            remove_saved(dest)
             run_cmd(self.siril, "lsf_export", _q(lsf_path), _q(dest))
-            self.log(f"  lsf_export -> {os.path.basename(dest)}")
+            self.log(f"  lsf_export -> {os.path.basename(saved_path(dest))}")
         except Exception as e:  # noqa: BLE001
             self.log(f"WARNING: lsf_export of {os.path.basename(lsf_path)} failed ({e}).", LogColor.SALMON)
 
@@ -877,8 +892,7 @@ class Comparison:
         for k in range(1, N_SETS + 1):
             step(f"Siril stack of set {k}")
             dest = self.p(f"siril_set_{k}.fit")
-            if os.path.exists(dest):
-                os.remove(dest)
+            remove_saved(dest)
             self.apply_selection(S[k - 1])
             self.timed(self.siril_stack_cmd(dest), f"siril_set_{k}", f"{len(S[k - 1])} frames stacked")
             self.register(f"siril_set_{k}", "siril", dest, len(S[k - 1]))
@@ -888,8 +902,7 @@ class Comparison:
             step(f"Siril stack of sets 1-{k}")
             frames = sorted(i for grp in S[:k] for i in grp)
             dest = self.p(f"siril_cum_{cum_tag(k)}.fit")
-            if os.path.exists(dest):
-                os.remove(dest)
+            remove_saved(dest)
             self.apply_selection(frames)
             self.timed(self.siril_stack_cmd(dest), f"siril_cum_{cum_tag(k)}", f"{len(frames)} frames stacked")
             self.register(f"siril_cum_{cum_tag(k)}", "siril", dest, len(frames))
@@ -1112,7 +1125,7 @@ class Comparison:
 
     def stage_flip(self, step) -> None:
         """Section 12 check 7: an LSF file whose Stack is flipped by an outside tool that keeps the old
-        DATASUM. lsf_append must refuse it, lsf_check -repair must restore the Stack bit-exactly, and an
+        DATASUM. lsf_append must refuse it, lsf_util -repair must restore the Stack bit-exactly, and an
         edit of one pixel kept with -adopt must leave the rest of the Stack unchanged."""
         src = next((self.p(n) for n in ("lsf_cum_1234.lsf.fits", "lsf_set_1.lsf.fits", "lsf_4.lsf.fits")
                     if os.path.exists(self.p(n))), None)
@@ -1133,10 +1146,10 @@ class Comparison:
         gen0 = header_int(work, "LSFGEN")
         edit_primary(work, lambda a: a[:, ::-1, :])
         chk("flipped_differs", primary_bytes(work) != orig, os.path.basename(src))
-        self.try_cmd("lsf_check", _q(work))
+        self.try_cmd("lsf_util", _q(work), "-check")
         self.try_cmd("lsf_append", _q(work), _q(self.seqname), "-noreg")
         chk("append_refused", header_int(work, "LSFGEN") == gen0, f"LSFGEN {header_int(work, 'LSFGEN')}")
-        self.try_cmd("lsf_check", _q(work), "-repair")
+        self.try_cmd("lsf_util", _q(work), "-repair")
         chk("repair_bit_exact", primary_bytes(work) == orig, "primary data compared byte by byte")
         chk("repair_new_generation", header_int(work, "LSFGEN") == gen0 + 1, f"LSFGEN {header_int(work, 'LSFGEN')}")
         chk("passes_after_repair", all(ok for _, ok, _ in check_lsf_file(work)[0]), "structure and LSFHASH")
@@ -1152,7 +1165,7 @@ class Comparison:
             return a
         edit_primary(work, poke)
         before = fits_image(work)
-        self.try_cmd("lsf_check", _q(work), "-adopt")
+        self.try_cmd("lsf_util", _q(work), "-adopt")
         after = fits_image(work)
         changed = np.argwhere(after != before)
         chk("adopt_keeps_the_edit", after[c, y, xx] == new_value, f"pixel ({c},{y},{xx})")
@@ -1431,7 +1444,7 @@ class Comparison:
         if min(len(x) for x in self.sets) < 5:
             self.log("WARNING: sets of fewer than 5 frames: sigma-type rejection does almost nothing there.",
                      LogColor.SALMON)
-        existing = [f for f in self.planned_files() if os.path.exists(f)]
+        existing = [saved_path(f) for f in self.planned_files() if os.path.exists(saved_path(f))]
         if existing and not a.overwrite:
             raise RuntimeError("These products already exist (use --overwrite to replace them): "
                                + ", ".join(os.path.basename(f) for f in existing))
