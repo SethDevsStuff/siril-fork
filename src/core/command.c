@@ -63,6 +63,7 @@
 #include "io/FITS_symlink.h"
 #include "io/gps_parser.h"
 #include "io/image_format_fits.h"
+#include "lsf/lsf.h"
 #include "io/local_catalogues.h"
 #include "io/path_parse.h"
 #include "io/sequence.h"
@@ -10673,6 +10674,7 @@ int process_register(int nb) {
 	struct registration_method *method = NULL;
 	char *msg = NULL;
 	gboolean drizzle = FALSE;
+	gboolean transf_set = FALSE, pairs_set = FALSE;	// kept over the settings of a Living Stack reference
 
 	sequence *seq = load_sequence(word[1], NULL);
 	if (!seq) {
@@ -10721,6 +10723,7 @@ int process_register(int nb) {
 		} else if (!strcmp(word[i], "-selected")) {
 			regargs->filters.filter_included = TRUE;
 		} else if (g_str_has_prefix(word[i], "-transf=")) {
+			transf_set = TRUE;
 			char *current = word[i], *value;
 			value = current + 8;
 			if (value[0] == '\0') {
@@ -10791,6 +10794,7 @@ int process_register(int nb) {
 				goto terminate_register_on_error;
 			}
 			regargs->min_pairs = min_pairs;
+			pairs_set = TRUE;
 		} else if (g_str_has_prefix(word[i], "-maxstars=")) {
 			char *current = word[i], *value;
 			value = current + 10;
@@ -11089,6 +11093,12 @@ int process_register(int nb) {
 	if (regargs->clamp)
 		siril_log_message(_("Interpolation clamping active\n"));
 
+	/* a Living Stack as reference: transforms only, applied by lsf_append,
+	 * with the registration settings stored in the file unless given here */
+	if (regargs->use_external_ref && fits_file_is_lsf(regargs->external_ref_path)
+			&& lsf_prepare_registration(regargs, transf_set, pairs_set, FALSE))
+		goto terminate_register_on_error;
+
 	gui_iface.set_progress(PROGRESS_RESET, msg);
 
 	if (!start_in_new_thread(register_thread_func, regargs)) {
@@ -11098,6 +11108,10 @@ int process_register(int nb) {
 	return CMD_OK;
 
 terminate_register_on_error:
+	if (regargs->end_hook) {	// frees its data
+		regargs->retval = 1;
+		regargs->end_hook(regargs);
+	}
 	free(regargs->prefix);
 	g_free(regargs->external_ref_path);
 	free(regargs);

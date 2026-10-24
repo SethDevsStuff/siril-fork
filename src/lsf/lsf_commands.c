@@ -74,6 +74,19 @@ void lsf_cmd_args_free(struct lsf_cmd_args *a) {
 	free(a);
 }
 
+static void add_message(struct lsf_cmd_args *a, const char *fmt, ...);
+
+/* keeps the result of lsf_write_file() for the GUI: a failed replace puts
+ * what the user should do in the message of the job. Returns status. */
+static int note_write(struct lsf_cmd_args *a, int status, gchar *replace_msg) {
+	a->write_status = status;
+	if (replace_msg) {
+		add_message(a, "%s", replace_msg);
+		g_free(replace_msg);
+	}
+	return status;
+}
+
 /* adds a line to the message of the job, which the GUI shows */
 static void add_message(struct lsf_cmd_args *a, const char *fmt, ...) {
 	va_list args;
@@ -211,6 +224,15 @@ static int lsf_init_run(struct lsf_cmd_args *a) {
 	sequence *batch = seq;
 	int batch_ref = ref;
 	if (layer_has_usable_registration(seq, get_registration_layer(seq))) {
+		/* transforms computed with distortion correction (UI plan, B3) are
+		 * applied here without it: a Living Stack has no undistorted grid yet */
+		int rl = get_registration_layer(seq);
+		if (seq->distoparam && rl >= 0 && seq->distoparam[rl].index != DISTO_UNDEF
+				&& seq->distoparam[rl].index != DISTO_FILE_COMET)
+			siril_log_warning(_("LSF: %s was registered with distortion correction, which a Living Stack does not "
+						"use: the transforms are applied without undistorting the frames, so they may not line up "
+						"toward the edges. Registering again without distortion correction is recommended\n"),
+					a->seqname);
 		rseq = apply_init_registration(seq, a, &ref, origin, &base);
 		if (!rseq || !(src_index = map_to_sources(seq, rseq)))
 			goto end;
@@ -277,7 +299,9 @@ static int lsf_init_run(struct lsf_cmd_args *a) {
 	if (lsf_build_primary(&primary, s, &h))
 		goto end;
 	uid = g_uuid_string_random();
-	if (lsf_write_file(a->path, NULL, s, &h, &primary, uid, 1, rows, 1, FALSE, a->compression))
+	gchar *replace_msg = NULL;
+	int written = lsf_write_file(a->path, NULL, s, &h, &primary, uid, 1, rows, 1, FALSE, a->compression, &replace_msg);
+	if (note_write(a, written, replace_msg))
 		goto end;
 	siril_log_info(_("LSF file %s created: %u frames, generation 1\n"),
 			a->path, rows->len);
@@ -364,23 +388,19 @@ static int plan_expansion(const lsf_file *f, const struct lsf_cmd_args *a, const
 	return 0;
 }
 
-/* registers the batch against HDU 0 of the LSF file (Section 10.4) in two
- * passes: Siril's global star alignment with an external reference computes
- * the transforms, then the footprint of the registered frames decides the
- * expansion of the grid (pad), and the registration is applied onto the
- * grid, expanded or not. Returns the registered sequence, written with the
- * lsf_r_ prefix. The transforms in seq stay relative to the grid before the
- * expansion. */
-static sequence *register_against_stack(sequence *seq, const lsf_file *f, const struct lsf_cmd_args *a, int pad[4]) {
+/* first pass of the registration against HDU 0 of the LSF file (Section
+ * 10.4): Siril's global star alignment with the file as external
+ * reference, with the star detection, transform and pairs stored in the
+ * file. The transforms stay in memory, in seq->regparam[*layer]: the .seq
+ * file of the batch and its cached star lists are left as the user made
+ * them. A registration made beforehand (UI plan, B3) replaces this pass. */
+static int compute_against_stack(sequence *seq, const lsf_file *f, int *layer) {
 	const lsf_settings *s = &f->settings;
 	/* the star detection settings stored in the file, over a copy of the
 	 * preferences for what they do not hold; the preferences are not changed */
 	star_finder_params sf = com.pref.starfinder_conf;
 	findstar_from_json(s->findstar_json, &sf);
 
-	/* the registration against the Stack stays in memory and in the
-	 * temporary lsf_r_ sequence: the .seq file of the batch and its cached
-	 * star lists are left as the user made them */
 	struct registration_args *regargs = new_regargs(seq, s);
 	regargs->func = register_star_alignment;
 	regargs->no_output = TRUE;
@@ -393,10 +413,24 @@ static sequence *register_against_stack(sequence *seq, const lsf_file *f, const 
 
 	siril_log_message(_("LSF: registering %d frames against the Stack of %s\n"), seq->selnum, f->path);
 	int ret = register_star_alignment(regargs);
-	int layer = regargs->layer;
+	*layer = regargs->layer;
 	free_regargs(regargs);
-	if (ret || !seq->regparam[layer]) {
+	if (ret || !seq->regparam[*layer]) {
 		siril_log_error(_("LSF: registration against the Stack failed\n"));
+		return 1;
+	}
+	return 0;
+}
+
+/* second pass: the footprint of the transforms of seq->regparam[layer]
+ * decides the expansion of the grid (pad), and the registration is applied
+ * onto the grid, expanded or not. Returns the registered sequence, written
+ * with the lsf_r_ prefix. The transforms in seq stay relative to the grid
+ * before the expansion. */
+static sequence *apply_onto_grid(sequence *seq, const lsf_file *f, const struct lsf_cmd_args *a, int layer, int pad[4]) {
+	const lsf_settings *s = &f->settings;
+	if (!seq->regparam || !seq->regparam[layer]) {
+		siril_log_error(_("LSF: the sequence has no registration on layer %d\n"), layer);
 		return NULL;
 	}
 
@@ -421,10 +455,11 @@ static sequence *register_against_stack(sequence *seq, const lsf_file *f, const 
 	if (plan_expansion(f, a, box, pad))
 		return NULL;
 
-	/* second pass. Apply checks the reference frame of the sequence, which
-	 * plays no part with an external reference: use a registered one. */
-	regargs = new_regargs(seq, s);
+	/* Apply checks the reference frame of the sequence, which plays no part
+	 * with an external reference: use a registered one. */
+	struct registration_args *regargs = new_regargs(seq, s);
 	regargs->func = register_apply_reg;
+	regargs->layer = layer;
 	regargs->no_output = FALSE;
 	if (any_pad(pad))
 		regargs->canvas =(framing_roi) { -pad[LSF_PAD_LEFT], -pad[LSF_PAD_LAST],
@@ -432,7 +467,7 @@ static sequence *register_against_stack(sequence *seq, const lsf_file *f, const 
 	int seq_ref = seq->reference_image;
 	seq->reference_image = first;
 	regargs->reference_image = first;
-	ret = register_apply_reg(regargs);
+	int ret = register_apply_reg(regargs);
 	seq->reference_image = seq_ref;
 	free_regargs(regargs);
 	if (ret) {
@@ -443,6 +478,214 @@ static sequence *register_against_stack(sequence *seq, const lsf_file *f, const 
 	sequence *rseq = load_batch(rname);
 	g_free(rname);
 	return rseq;
+}
+
+/* both passes */
+static sequence *register_against_stack(sequence *seq, const lsf_file *f, const struct lsf_cmd_args *a, int pad[4]) {
+	int layer;
+	if (compute_against_stack(seq, f, &layer))
+		return NULL;
+	return apply_onto_grid(seq, f, a, layer, pad);
+}
+
+/***** registration made beforehand against an LSF file (UI plan, B3) *****/
+
+/* The binding: a sidecar file beside the .seq file, naming the LSF file a
+ * sequence was registered against and its grid then. The .seq file holds
+ * the transforms and the path of the external reference, but not what an
+ * append needs to trust them. */
+#define LSF_BINDING_GROUP "lsf_registration"
+
+static gchar *binding_path(const sequence *seq) {
+	return g_strdup_printf("%s.lsfreg", seq->seqname);
+}
+
+/* the transforms of seq on layer as the .seq file stores them (%g), so the
+ * fingerprint is the same before and after the file is written and read:
+ * it changes when the sequence is registered again */
+static gchar *transforms_fingerprint(const sequence *seq, int layer) {
+	if (layer < 0 || layer >= seq->nb_layers || !seq->regparam || !seq->regparam[layer])
+		return NULL;
+	GChecksum *ck = g_checksum_new(G_CHECKSUM_SHA256);
+	for (int i = 0; i < seq->number; i++) {
+		const Homography *H = &seq->regparam[layer][i].H;
+		gchar *t = g_strdup_printf("%g %g %g %g %g %g %g %g %g\n", H->h00, H->h01, H->h02,
+				H->h10, H->h11, H->h12, H->h20, H->h21, H->h22);
+		g_checksum_update(ck, (const guchar *) t, strlen(t));
+		g_free(t);
+	}
+	gchar *hex = g_strdup(g_checksum_get_string(ck));
+	g_checksum_free(ck);
+	return hex;
+}
+
+/* what a registration against an LSF file keeps until it ends */
+struct lsf_reg_data {
+	gchar *path, *uid;
+	int gen, rx, ry, origin_x, origin_y;
+	star_finder_params sf;	// the star detection stored in the file
+};
+
+static void free_reg_data(struct lsf_reg_data *d) {
+	if (!d)
+		return;
+	g_free(d->path);
+	g_free(d->uid);
+	g_free(d);
+}
+
+/* end_hook of the registration, in its thread after the .seq file is written */
+static void lsf_registration_end(struct registration_args *regargs) {
+	struct lsf_reg_data *d = regargs->hook_data;
+	regargs->hook_data = NULL;
+	regargs->end_hook = NULL;
+	if (!d)
+		return;
+	/* for the GUI, which then sets the stacking tab to append to it */
+	if (!regargs->retval)
+		regargs->lsf_registered = g_strdup(d->path);
+	gchar *fp = regargs->retval ? NULL : transforms_fingerprint(regargs->seq, regargs->layer);
+	if (fp) {
+		GKeyFile *kf = g_key_file_new();
+		gchar *date = lsf_now_utc_iso();
+		g_key_file_set_string(kf, LSF_BINDING_GROUP, "file", d->path);
+		g_key_file_set_string(kf, LSF_BINDING_GROUP, "uid", d->uid);
+		g_key_file_set_integer(kf, LSF_BINDING_GROUP, "generation", d->gen);
+		g_key_file_set_integer(kf, LSF_BINDING_GROUP, "width", d->rx);
+		g_key_file_set_integer(kf, LSF_BINDING_GROUP, "height", d->ry);
+		g_key_file_set_integer(kf, LSF_BINDING_GROUP, "origin_x", d->origin_x);
+		g_key_file_set_integer(kf, LSF_BINDING_GROUP, "origin_y", d->origin_y);
+		g_key_file_set_integer(kf, LSF_BINDING_GROUP, "layer", regargs->layer);
+		g_key_file_set_string(kf, LSF_BINDING_GROUP, "transforms", fp);
+		g_key_file_set_string(kf, LSF_BINDING_GROUP, "date", date);
+		gchar *bpath = binding_path(regargs->seq);
+		GError *err = NULL;
+		if (g_key_file_save_to_file(kf, bpath, &err))
+			siril_log_info(_("LSF: %s is registered against %s, generation %d. lsf_append uses this registration "
+						"while the grid of the file does not change; do not apply it before appending\n"),
+					regargs->seq->seqname, d->path, d->gen);
+		else {
+			siril_log_error(_("LSF: could not save %s: %s. lsf_append will register the frames again\n"),
+					bpath, err ? err->message : "");
+			g_clear_error(&err);
+		}
+		g_free(bpath);
+		g_free(date);
+		g_key_file_free(kf);
+	}
+	g_free(fp);
+	free_reg_data(d);
+}
+
+/* Prepares a registration (register command or Registration tab) whose
+ * external reference is an LSF file: global star alignment, compute only,
+ * no star lists, no distortion correction, with the transform, the minimum
+ * pairs and the star detection stored in the file unless the caller set
+ * them (keep_*). Its end writes the binding. Returns 0, or 1 with the
+ * reason logged. */
+int lsf_prepare_registration(struct registration_args *regargs, gboolean keep_type, gboolean keep_pairs,
+		gboolean keep_findstar) {
+	lsf_info info;
+	const char *path = regargs->external_ref_path;
+	if (lsf_read_info(path, &info)) {
+		siril_log_error(_("LSF: %s cannot be registered against: %s\n"), path, info.problem);
+		lsf_info_free(&info);
+		return 1;
+	}
+	int ret = 1;
+	const lsf_settings *s = &info.file.settings;
+	if (info.no_append)
+		siril_log_error(_("LSF: frames cannot be appended to %s with this version (%s), so registering against it "
+					"is not useful\n"), path, info.no_append);
+	else if (regargs->func != register_star_alignment)
+		siril_log_error(_("LSF: only the global star alignment registers against a Living Stack, without the "
+					"two-pass option\n"));
+	else if (regargs->undistort != DISTO_UNDEF)
+		siril_log_error(_("LSF: distortion correction cannot be used with a Living Stack: the append applies the "
+					"transforms without undistorting the frames, which would then not line up with the stack "
+					"toward the edges\n"));
+	else if (regargs->seq->nb_layers != info.file.nchan)
+		siril_log_error(_("LSF: the Living Stack has %d channel(s) and the sequence %d\n"),
+				info.file.nchan, regargs->seq->nb_layers);
+	else ret = 0;
+	if (ret) {
+		lsf_info_free(&info);
+		return ret;
+	}
+	struct lsf_reg_data *d = g_new0(struct lsf_reg_data, 1);
+	d->path = g_canonicalize_filename(path, NULL);
+	d->uid = g_strdup(info.file.uid);
+	d->gen = info.file.gen;
+	d->rx = info.file.rx;
+	d->ry = info.file.ry;
+	d->origin_x = s->origin_x;
+	d->origin_y = s->origin_y;
+	/* applying belongs to lsf_append, which grows the grid as needed */
+	regargs->no_output = TRUE;
+	regargs->no_starlist = TRUE;
+	if (!keep_type)
+		regargs->type = s->transform;
+	if (!keep_pairs)
+		regargs->min_pairs = s->min_pairs;
+	if (!keep_findstar) {
+		d->sf = com.pref.starfinder_conf;
+		findstar_from_json(s->findstar_json, &d->sf);
+		regargs->sf_params = &d->sf;
+	}
+	regargs->hook_data = d;
+	regargs->end_hook = lsf_registration_end;
+	siril_log_message(_("LSF: registering against the Living Stack %s (generation %d, %dx%d grid): transforms "
+				"only, applied by lsf_append\n"), path, info.file.gen, info.file.rx, info.file.ry);
+	lsf_info_free(&info);
+	return 0;
+}
+
+/* Whether the transforms of seq were computed against this file on its
+ * current grid (UI plan, B3): the same LSFUID, grid size and origin, and
+ * transforms unchanged since. A later generation with the same grid keeps
+ * them valid; a grid grown since does not. Returns TRUE with the layer and,
+ * if wanted, the date of the registration; otherwise FALSE with why, or no
+ * why when the sequence was never registered against an LSF file. */
+gboolean lsf_binding_check(const sequence *seq, const lsf_file *f, int *layer, gchar **date, gchar **why) {
+	if (date)
+		*date = NULL;
+	if (why)
+		*why = NULL;
+	gchar *bpath = binding_path(seq);
+	GKeyFile *kf = g_key_file_new();
+	gboolean loaded = g_key_file_load_from_file(kf, bpath, G_KEY_FILE_NONE, NULL);
+	g_free(bpath);
+	if (!loaded) {
+		g_key_file_free(kf);
+		return FALSE;
+	}
+	gchar *uid = g_key_file_get_string(kf, LSF_BINDING_GROUP, "uid", NULL);
+	gchar *fp = g_key_file_get_string(kf, LSF_BINDING_GROUP, "transforms", NULL);
+	int rx = g_key_file_get_integer(kf, LSF_BINDING_GROUP, "width", NULL);
+	int ry = g_key_file_get_integer(kf, LSF_BINDING_GROUP, "height", NULL);
+	int ox = g_key_file_get_integer(kf, LSF_BINDING_GROUP, "origin_x", NULL);
+	int oy = g_key_file_get_integer(kf, LSF_BINDING_GROUP, "origin_y", NULL);
+	int l = g_key_file_get_integer(kf, LSF_BINDING_GROUP, "layer", NULL);
+	gchar *current = transforms_fingerprint(seq, l);
+	const char *reason = NULL;
+	if (!uid || strcmp(uid, f->uid))
+		reason = _("the sequence was registered against another Living Stack");
+	else if (rx != f->rx || ry != f->ry || ox != f->settings.origin_x || oy != f->settings.origin_y)
+		reason = _("the grid of the Living Stack has grown since the sequence was registered against it");
+	else if (!fp || !current || strcmp(fp, current))
+		reason = _("the sequence was registered again since it was registered against the Living Stack");
+	gboolean ok = reason == NULL;
+	if (ok) {
+		*layer = l;
+		if (date)
+			*date = g_key_file_get_string(kf, LSF_BINDING_GROUP, "date", NULL);
+	} else if (why)
+		*why = g_strdup(reason);
+	g_free(uid);
+	g_free(fp);
+	g_free(current);
+	g_key_file_free(kf);
+	return ok;
 }
 
 /* grows the grid of the file in memory before merging (Section 10.5): the
@@ -602,6 +845,13 @@ static int lsf_append_run(struct lsf_cmd_args *a) {
 	int retval = 1;
 	sequence *seq = NULL, *rseq = NULL;
 	int *src_index = NULL;
+	/* -out writes the appended stack to a new file and leaves the source as
+	 * it was, as lsf_util -out does */
+	const char *target = a->out ? a->out : a->path;
+	if (a->out && g_file_test(a->out, G_FILE_TEST_EXISTS) && !a->overwrite) {
+		siril_log_error(_("LSF: %s already exists, use -overwrite to replace it\n"), a->out);
+		return 1;
+	}
 	GPtrArray *rows = g_ptr_array_new_with_free_func(lsf_ledger_row_free);
 
 	if (lsf_open_and_validate(a->path, &f, FALSE)) {
@@ -609,6 +859,9 @@ static int lsf_append_run(struct lsf_cmd_args *a) {
 		g_ptr_array_free(rows, TRUE);
 		return 1;
 	}
+	if (a->out)
+		f.primary.history = g_slist_append(f.primary.history, g_strdup_printf(
+					"LSF generation %d: written from %s", f.gen + 1, f.path));
 	/* this writer merges onto a grid at the frames' own scale only: frames
 	 * merged onto a drizzled grid (Section 6) would land on the wrong pixels */
 	if (f.settings.oversample != 1) {
@@ -664,7 +917,22 @@ static int lsf_append_run(struct lsf_cmd_args *a) {
 	int gen = f.gen + 1, batchnum = f.nb_batches + 1;
 	int pad[4] = { 0 };
 	if (!a->noreg) {
-		rseq = register_against_stack(seq, &f, a, pad);
+		/* a registration made beforehand against this file (UI plan, B3)
+		 * replaces the first pass, unless -reg asks for a new one */
+		int layer = 0;
+		gchar *date = NULL, *why = NULL;
+		gboolean reuse = !a->force_reg && lsf_binding_check(seq, &f, &layer, &date, &why);
+		if (reuse) {
+			siril_log_message(_("LSF: using the registration of %s against this file, made %s\n"),
+					a->seqname, date ? date : "");
+			rseq = apply_onto_grid(seq, &f, a, layer, pad);
+		} else {
+			if (why && !a->force_reg)
+				siril_log_message(_("LSF: %s: registering the frames again\n"), why);
+			rseq = register_against_stack(seq, &f, a, pad);
+		}
+		g_free(date);
+		g_free(why);
 		if (!rseq)
 			goto end;
 		if (any_pad(pad)) {
@@ -716,9 +984,16 @@ static int lsf_append_run(struct lsf_cmd_args *a) {
 	if (comp != f.compression)
 		siril_log_message(_("LSF: compression of the extensions changed from %s to %s\n"),
 				lsf_compression_name(f.compression), lsf_compression_name(comp));
-	if (lsf_write_file(a->path, &f, &f.settings, &f.hist, &f.primary, f.uid, gen, rows, batchnum, a->backup, comp))
+	gchar *replace_msg = NULL;
+	int written = lsf_write_file(target, &f, &f.settings, &f.hist, &f.primary, f.uid, gen, rows, batchnum,
+			a->backup && !a->out, comp, &replace_msg);
+	if (note_write(a, written, replace_msg))
 		goto end;
-	siril_log_info(_("LSF: %u frames appended to %s, %ld frames in total, generation %d\n"),
+	if (a->out)
+		siril_log_info(_("LSF: %u frames appended to %s and written to %s, %ld frames in total, generation %d. "
+					"%s is unchanged: append to one of the two files only\n"), rows->len, a->path, a->out,
+				f.ledger_rows + rows->len, gen, a->path);
+	else siril_log_info(_("LSF: %u frames appended to %s, %ld frames in total, generation %d\n"),
 			rows->len, a->path, f.ledger_rows + rows->len, gen);
 	retval = 0;
 end:
@@ -839,10 +1114,11 @@ static gint64 free_space_of(const char *path, gchar **fs_id) {
 /* Before an append, from lsf_read_info: memory for the accumulator, which
  * stays in memory during the merge, and disk for the registered frames
  * (written in the working directory, unless noreg) and for the new file,
- * written beside the old one before it replaces it (Section 10.2). The grid
- * may still grow, which is known only after the registration. Returns a
- * message or NULL, *fatal when the append cannot run. */
-gchar *lsf_append_preflight(const lsf_info *info, const char *wd, int nb_frames, gboolean noreg,
+ * written beside the old one before it replaces it (Section 10.2), or as
+ * out when not NULL. The grid may still grow, which is known only after the
+ * registration. Returns a message or NULL, *fatal when the append cannot
+ * run. */
+gchar *lsf_append_preflight(const lsf_info *info, const char *wd, const char *out, int nb_frames, gboolean noreg,
 		gboolean add_rejmaps, gboolean *fatal) {
 	const lsf_file *f = &info->file;
 	*fatal = FALSE;
@@ -865,7 +1141,7 @@ gchar *lsf_append_preflight(const lsf_info *info, const char *wd, int nb_frames,
 	/* the new file is about the size of the old one, plus the growth */
 	gint64 need_file = info->file_bytes;
 	gint64 need_frames = noreg ? 0 : (gint64) nb_frames * (gint64) (npix * sizeof(float));
-	gchar *dir = g_path_get_dirname(f->path), *fs_file = NULL, *fs_wd = NULL;
+	gchar *dir = g_path_get_dirname(out ? out : f->path), *fs_file = NULL, *fs_wd = NULL;
 	gint64 free_file = free_space_of(dir, &fs_file), free_wd = free_space_of(wd, &fs_wd);
 	g_free(dir);
 	gboolean same_fs = fs_file && fs_wd && !strcmp(fs_file, fs_wd);
@@ -874,8 +1150,59 @@ gchar *lsf_append_preflight(const lsf_info *info, const char *wd, int nb_frames,
 	if (short_file || short_wd) {
 		*fatal = TRUE;
 		gchar *nf = g_format_size(need_file), *nr = g_format_size(need_frames);
-		g_string_printf(msg, _("Not enough free disk space: the append writes the registered frames (%s, in the "
+		if (out)
+			g_string_printf(msg, _("Not enough free disk space: the append writes the registered frames (%s, in the "
+						"working directory) and the new Living Stack file (%s)."), nr, nf);
+		else g_string_printf(msg, _("Not enough free disk space: the append writes the registered frames (%s, in the "
 					"working directory) and a new copy of the Living Stack (%s, beside it) before replacing it."), nr, nf);
+		g_free(nf);
+		g_free(nr);
+	}
+	g_free(fs_file);
+	g_free(fs_wd);
+	return msg->len ? g_string_free(msg, FALSE) : (g_string_free(msg, TRUE), NULL);
+}
+
+/* Before lsf_init, from the sequence alone: memory for the accumulator of
+ * the new grid, and disk for the registered frames, written in the working
+ * directory when the registration is not applied yet, and for the file.
+ * The grid is known only once the registration is applied: the size of the
+ * frames stands for it, and max framing makes it larger. Returns a message
+ * or NULL, *fatal when the creation cannot run. */
+gchar *lsf_init_preflight(sequence *seq, const char *wd, const char *path, int nb_frames, gboolean rejmaps,
+		gboolean *fatal) {
+	*fatal = FALSE;
+	int nchan = seq->nb_layers;
+	guint64 npix = (guint64) seq->rx * seq->ry * nchan;
+	guint64 hist = npix * (LSF_NB_PL * sizeof(float) + (rejmaps ? 3 : 1) * sizeof(WORD));
+	guint64 max_mem = (guint64) get_max_memory_in_MB() * BYTES_IN_A_MB;
+	if (hist >= max_mem) {
+		*fatal = TRUE;
+		return g_strdup_printf(_("The accumulator of this Living Stack needs at least %.0f MB of memory, and Siril may "
+					"use %.0f MB. Raise the memory limit in the preferences."),
+				(double) hist / BYTES_IN_A_MB, (double) max_mem / BYTES_IN_A_MB);
+	}
+	GString *msg = g_string_new(NULL);
+	if (hist > max_mem / 4 * 3)
+		g_string_append_printf(msg, _("The accumulator needs at least %.0f MB of the %.0f MB Siril may use, which "
+					"leaves little memory for the frames: the creation may be slow or fail. "),
+				(double) hist / BYTES_IN_A_MB, (double) max_mem / BYTES_IN_A_MB);
+
+	/* the file: the Stack (float32) and the accumulator, uncompressed */
+	gint64 need_file = (gint64) (npix * sizeof(float) + hist);
+	gboolean applied = !layer_has_usable_registration(seq, get_registration_layer(seq));
+	gint64 need_frames = applied ? 0 : (gint64) nb_frames * (gint64) (npix * sizeof(float));
+	gchar *dir = g_path_get_dirname(path), *fs_file = NULL, *fs_wd = NULL;
+	gint64 free_file = free_space_of(dir, &fs_file), free_wd = free_space_of(wd, &fs_wd);
+	g_free(dir);
+	gboolean same_fs = fs_file && fs_wd && !strcmp(fs_file, fs_wd);
+	gboolean short_file = free_file >= 0 && free_file < need_file + (same_fs ? need_frames : 0);
+	gboolean short_wd = !same_fs && free_wd >= 0 && free_wd < need_frames;
+	if (short_file || short_wd) {
+		*fatal = TRUE;
+		gchar *nf = g_format_size(need_file), *nr = g_format_size(need_frames);
+		g_string_printf(msg, _("Not enough free disk space: the creation writes the registered frames (%s, in the "
+					"working directory) and the Living Stack (about %s) at least."), nr, nf);
 		g_free(nf);
 		g_free(nr);
 	}
@@ -978,7 +1305,10 @@ static int lsf_util_run(struct lsf_cmd_args *a) {
 	if (lsf_build_primary(&f.primary, &f.settings, &f.hist))
 		goto end;
 	none = g_ptr_array_new();
-	if (lsf_write_file(target, &f, &f.settings, &f.hist, &f.primary, f.uid, gen, none, f.nb_batches, a->backup, comp))
+	gchar *replace_msg = NULL;
+	int written = lsf_write_file(target, &f, &f.settings, &f.hist, &f.primary, f.uid, gen, none, f.nb_batches,
+			a->backup, comp, &replace_msg);
+	if (note_write(a, written, replace_msg))
 		goto end;
 	if (fix_stack && !a->out)
 		a->stack_modified = FALSE;	// the file now passes check 8
@@ -1146,6 +1476,7 @@ static gboolean lsf_end_job(gpointer p) {
 	stop_processing_thread();
 	r->end_func(r);
 	g_free(r->path);
+	g_free(r->out);
 	g_free(r->export_out);
 	g_free(r->message);
 	free(r);
@@ -1174,20 +1505,24 @@ static gpointer lsf_worker(gpointer p) {
 	}
 	/* the plain image of the new Stack, as lsf_export makes it */
 	gboolean commit = a->mode == LSF_CMD_INIT || a->mode == LSF_CMD_APPEND;
+	const char *written = a->mode == LSF_CMD_APPEND && a->out ? a->out : a->path;
 	gchar *export_name = commit && a->export_out ? set_right_extension(a->export_out) : NULL;
 	if (!retval && export_name)
-		retval = lsf_export_run(a->path, a->export_out);
+		retval = lsf_export_run(written, a->export_out);
 	if (!retval && commit && a->load_result)
-		lsf_load_result(a->path, export_name);
+		lsf_load_result(written, export_name);
 	lsf_job_result *r = a->end_func ? calloc(1, sizeof(lsf_job_result)) : NULL;
 	if (r) {
 		r->mode = a->mode;
 		r->retval = retval;
 		r->path = g_strdup(a->path);
+		if (a->mode == LSF_CMD_APPEND || a->mode == LSF_CMD_UTIL)
+			r->out = g_strdup(a->out);
 		r->export_out = export_name;
 		r->message = a->message;
 		a->message = NULL;
 		r->stack_modified = a->stack_modified;
+		r->write_status = a->write_status;
 		r->end_func = a->end_func;
 		r->end_data = a->end_data;
 	} else g_free(export_name);
@@ -1269,12 +1604,20 @@ gchar *lsf_cmd_args_to_command(const struct lsf_cmd_args *a) {
 		}
 		if (a->noreg)
 			g_string_append(cmd, " -noreg");
+		else if (a->force_reg)
+			g_string_append(cmd, " -reg");
 		add_hist_and_common_args(cmd, a);
 		if (a->expand_step != LSF_EXPAND_STEP)
 			g_string_append_printf(cmd, " -expand_step=%d", a->expand_step);
 		if (a->expand_force)
 			g_string_append(cmd, " -expand_force");
-		if (a->backup)
+		if (a->out) {
+			gchar *opt = g_strdup_printf("-out=%s", a->out);
+			add_arg(cmd, opt);
+			g_free(opt);
+			if (a->overwrite)
+				g_string_append(cmd, " -overwrite");
+		} else if (a->backup)
 			g_string_append(cmd, " -backup");
 		break;
 	case LSF_CMD_EXPORT:
@@ -1472,9 +1815,26 @@ failure:
 	return CMD_ARG_ERROR;
 }
 
+/* the same file under two spellings, so that -out= naming the source is an
+ * update in place */
+gboolean lsf_same_file(const char *p1, const char *p2) {
+	gchar *c1 = g_canonicalize_filename(p1, NULL), *c2 = g_canonicalize_filename(p2, NULL);
+#ifdef _WIN32
+	gchar *f1 = g_utf8_casefold(c1, -1), *f2 = g_utf8_casefold(c2, -1);
+	gboolean same = !strcmp(f1, f2);
+	g_free(f1);
+	g_free(f2);
+#else
+	gboolean same = !strcmp(c1, c2);
+#endif
+	g_free(c1);
+	g_free(c2);
+	return same;
+}
+
 /* lsf_append file.lsf.fits sequencename [rej [type] sigma_low sigma_high] [-noreg] [-framing=max|current]
- *   [-noexpand] [-expand_step=] [-expand_force] [-backup] [-hist_low=] [-hist_high=] [-hist_margin=] [-rejmaps]
- *   [-compress[=gzip2|gzip1] | -nocompress] */
+ *   [-noexpand] [-expand_step=] [-expand_force] [-out=file.lsf.fits [-overwrite] | -backup] [-hist_low=]
+ *   [-hist_high=] [-hist_margin=] [-rejmaps] [-compress[=gzip2|gzip1] | -nocompress] */
 int process_lsf_append(int nb) {
 	struct lsf_cmd_args *a = lsf_cmd_args_new(LSF_CMD_APPEND);
 	if (!a)
@@ -1492,6 +1852,7 @@ int process_lsf_append(int nb) {
 		if (c < 0) goto failure;
 		if (c > 0) continue;
 		if (!strcmp(w, "-noreg")) a->noreg = TRUE;
+		else if (!strcmp(w, "-reg")) a->force_reg = TRUE;
 		else if (!strcmp(w, "-noexpand")) a->framing = FRAMING_CURRENT;	// same as -framing=current
 		else if (!strcmp(w, "-expand_force")) a->expand_force = TRUE;
 		else if (g_str_has_prefix(w, "-expand_step=")) {
@@ -1504,10 +1865,32 @@ int process_lsf_append(int nb) {
 			a->expand_step = (int) v;
 		}
 		else if (!strcmp(w, "-backup")) a->backup = TRUE;
+		else if (!strcmp(w, "-overwrite")) a->overwrite = TRUE;
+		else if (g_str_has_prefix(w, "-out=") && w[5]) {
+			g_free(a->out);
+			a->out = g_strdup(w + 5);
+		}
 		else {
 			siril_log_error(_("Unknown parameter %s, aborting.\n"), w);
 			goto failure;
 		}
+	}
+	if (a->overwrite && !a->out) {
+		siril_log_error(_("-overwrite only applies to the file given with -out=\n"));
+		goto failure;
+	}
+	if (a->out && lsf_same_file(a->out, a->path)) {
+		g_free(a->out);	// the file itself: an append in place
+		a->out = NULL;
+		a->overwrite = FALSE;
+	}
+	if (a->out && a->backup) {
+		siril_log_error(_("-backup keeps the previous file when it is rewritten; with -out= it is not rewritten\n"));
+		goto failure;
+	}
+	if (a->noreg && a->force_reg) {
+		siril_log_error(_("-noreg and -reg cannot be used together\n"));
+		goto failure;
 	}
 	if (a->framing == FRAMING_MIN || a->framing == FRAMING_COG) {
 		siril_log_error(_("LSF: lsf_append supports -framing=max or -framing=current only. The grid of an LSF "
@@ -1563,7 +1946,7 @@ int process_lsf_util(int nb) {
 			goto failure;
 		}
 	}
-	if (a->out && !strcmp(a->out, a->path)) {
+	if (a->out && lsf_same_file(a->out, a->path)) {
 		g_free(a->out);	// the file itself: an update in place
 		a->out = NULL;
 	}

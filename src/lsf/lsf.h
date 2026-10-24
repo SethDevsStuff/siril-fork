@@ -218,9 +218,12 @@ void lsf_ledger_view_free(gpointer p);
 GPtrArray *lsf_read_history(const char *path);
 gchar *lsf_hash_float_data(const float *data, size_t n);
 gchar *lsf_now_utc_iso(void);
+/* results of lsf_write_file: the two replace failures leave a file the
+ * user has to deal with (Section 10.10) */
+enum { LSF_WRITE_OK, LSF_WRITE_FAILED, LSF_WRITE_KEPT_TMP, LSF_WRITE_LEFT_AS_BAK };
 int lsf_write_file(const char *path, lsf_file *old, const lsf_settings *s, lsf_history *h,
 		fits *primary, const char *uid, int gen, GPtrArray *new_rows, int batch, gboolean backup,
-		lsf_compression comp);
+		lsf_compression comp, gchar **replace_msg);
 const char *lsf_compression_name(lsf_compression comp);
 int lsf_export_master(const char *lsf_path, const char *out_path);
 void lsf_strip_lsf_keys(fits *fit);
@@ -241,9 +244,11 @@ struct lsf_job_result {
 	lsf_cmd_mode mode;
 	int retval;		// 0 on success
 	gchar *path;		// the LSF file
+	gchar *out;		// util and append: the new file written instead of rewriting path, or NULL
 	gchar *export_out;	// the plain image written with it, as named on disk, or NULL
 	gchar *message;		// util: what was found or done, for the user, or NULL
 	gboolean stack_modified;	// util: check 8 found the Stack edited outside Siril
+	int write_status;	// LSF_WRITE_* of the file written; on a failed replace, message says what to do
 	lsf_end_func end_func;
 	gpointer end_data;	// of the caller
 };
@@ -252,7 +257,7 @@ struct lsf_cmd_args {
 	lsf_cmd_mode mode;
 	gchar *seqname;
 	gchar *path;
-	gchar *out;		// export, or the maps prefix
+	gchar *out;		// export, the maps prefix, or for util and append the file to write instead of rewriting path
 	lsf_settings settings;	// init: requested settings
 	gboolean hist_low_set, hist_high_set, hist_margin_set;
 	double hist_low, hist_high, hist_margin;
@@ -269,10 +274,12 @@ struct lsf_cmd_args {
 	gchar *export_out;	// init and append: also export the new Stack to this plain image (GUI)
 	gboolean load_result;	// init and append: the new Stack becomes the result image (GUI)
 	gboolean rej_set;	// append: settings.rej and sig override the rejection stored in the file
+	gboolean force_reg;	// append: -reg, register again even with a registration made against the file
 	int *image_indices;	// init and append: frames chosen by the GUI's stacking filters, or NULL
 	int nb_images;
-	gchar *message;		// out, util: passed to lsf_job_result
+	gchar *message;		// out, util and a failed replace: passed to lsf_job_result
 	gboolean stack_modified;	// out, util
+	int write_status;	// out: LSF_WRITE_* of the file written
 	lsf_end_func end_func;	// GUI: called when the job is over, or NULL
 	gpointer end_data;
 };
@@ -282,8 +289,14 @@ void lsf_cmd_args_free(struct lsf_cmd_args *a);
 gchar *lsf_cmd_args_to_command(const struct lsf_cmd_args *a);
 int lsf_start(struct lsf_cmd_args *a);
 gchar *lsf_check_batch(const lsf_info *info, sequence *seq, gboolean *fatal);
-gchar *lsf_append_preflight(const lsf_info *info, const char *wd, int nb_frames, gboolean noreg,
+int lsf_prepare_registration(struct registration_args *regargs, gboolean keep_type, gboolean keep_pairs,
+		gboolean keep_findstar);
+gboolean lsf_binding_check(const sequence *seq, const lsf_file *f, int *layer, gchar **date, gchar **why);
+gchar *lsf_append_preflight(const lsf_info *info, const char *wd, const char *out, int nb_frames, gboolean noreg,
 		gboolean add_rejmaps, gboolean *fatal);
+gboolean lsf_same_file(const char *p1, const char *p2);
+gchar *lsf_init_preflight(sequence *seq, const char *wd, const char *path, int nb_frames, gboolean rejmaps,
+		gboolean *fatal);
 
 /* lsf_stack.c */
 struct lsf_batch_args {

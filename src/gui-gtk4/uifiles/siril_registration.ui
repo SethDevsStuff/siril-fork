@@ -172,6 +172,64 @@
                       <object class="GtkFrame">
                         <property name="child">
                           <object class="GtkBox">
+                            <property name="margin-bottom">5</property>
+                            <property name="margin-end">5</property>
+                            <property name="margin-start">5</property>
+                            <property name="margin-top">5</property>
+                            <property name="orientation">vertical</property>
+                            <property name="spacing">5</property>
+                            <child>
+                              <object class="GtkCheckButton" id="reg_lsf_check">
+                                <property name="focusable">1</property>
+                                <property name="label" translatable="yes">Register to an existing Living Stack</property>
+                                <property name="tooltip-text" translatable="yes">Registers the sequence against the stacked image of a Living Stack (.lsf.fits), so the results can be checked and bad frames deselected before appending them. Only the transforms are computed, with global star alignment and the registration settings stored in the file, which can be changed. The append to that Living Stack then uses them instead of registering the frames again, as long as its grid has not grown. Do not apply this registration before appending: the append does it.</property>
+                                <signal name="toggled" handler="on_reg_lsf_check_toggled"/>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="GtkBox" id="reg_lsf_box">
+                                <property name="sensitive">0</property>
+                                <property name="spacing">5</property>
+                                <child>
+                                  <object class="GtkEntry" id="reg_lsf_entry">
+                                    <property name="focusable">1</property>
+                                    <property name="hexpand">1</property>
+                                    <property name="input-hints">no-emoji|none</property>
+                                    <property name="tooltip-text" translatable="yes">The Living Stack file (.lsf.fits) to register against.</property>
+                                    <signal name="changed" handler="on_reg_lsf_entry_changed"/>
+                                  </object>
+                                </child>
+                                <child>
+                                  <object class="GtkButton" id="reg_lsf_button">
+                                    <property name="focusable">1</property>
+                                    <property name="tooltip-text" translatable="yes">Browse for the Living Stack file.</property>
+                                    <signal name="clicked" handler="on_reg_lsf_button_clicked"/>
+                                    <child>
+                                      <object class="GtkImage">
+                                        <property name="icon-name">document-open-symbolic</property>
+                                      </object>
+                                    </child>
+                                  </object>
+                                </child>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="GtkLabel" id="reg_lsf_info">
+                                <property name="halign">start</property>
+                                <property name="selectable">1</property>
+                                <property name="visible">0</property>
+                                <property name="wrap">1</property>
+                                <property name="xalign">0</property>
+                              </object>
+                            </child>
+                          </object>
+                        </property>
+                      </object>
+                    </child>
+                    <child>
+                      <object class="GtkFrame">
+                        <property name="child">
+                          <object class="GtkBox">
                             <property name="margin-top">6</property>
                             <property name="orientation">vertical</property>
                             <property name="spacing">5</property>

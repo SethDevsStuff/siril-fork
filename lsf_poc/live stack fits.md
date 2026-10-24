@@ -327,7 +327,7 @@ If the first batch has fewer than 25 frames, the writer SHOULD warn the user bef
    - LSF\_REJ is updated if present.
 6. Rebuild HDU 0 from MEAN, update the Section 7 keywords and append the ledger rows. Increment LSFGEN in every LSF HDU, and recompute LSFHASH and the checksums.
 7. Write the complete new file to a temporary name in the same directory.
-8. Flush to disk, then atomically replace the original (Section 10.10). A writer SHOULD offer to keep the previous file as a backup.
+8. Flush to disk, then atomically replace the original (Section 10.10). A writer SHOULD offer to write the result to a new file instead, leaving the original untouched (lsf\_append -out=), or to keep the previous file as a backup (-backup). As with lsf\_util -out= (Section 8), the new file keeps the LSFUID of its source, with the incremented LSFGEN and a HISTORY card naming the source, and only one of the two files should be appended to.
 
 ### 10.3 Frame weights
 
@@ -459,11 +459,7 @@ The format keeps no per-batch history planes, because they would grow the file w
 
 ## 12. Possible Future Improvements
 
-- **Exposure map and mosaics.** An optional float32 plane holding the per-pixel sum of exposure time over accepted samples (+4 B per pixel per channel). It gives the true integration time when sub lengths differ or for mosaics.
-- **Export to FLIS.** FLIS is still in development. The intent is that the Stack becomes the base layer of a FLIS file, with LSFUID recorded in the layer METADATA as provenance, and that the LSF HDUs are not embedded in FLIS.
-- **nbstack weighting**, for appending stacks rather than single frames.
-- **In-place append.** Updating an uncompressed file in place, flagged by LSFBUSY, would need no temporary copy. It would need header space reserved at initialization: otherwise the HISTORY cards added on every append eventually overflow a 2880-byte header block, and CFITSIO then shifts the rest of the file. It is also not crash-safe without a backup.
-- **Registration with distortion correction.** Siril can undistort frames through their SIP terms, which is not a homography. A REG\_TYPE of 'WCS' could record it, with the exact map given by the frame's WCS (kept in ORIGHDR) and the Stack's WCS.
+Possible future improvements are kept outside this profile, in `Future work.md` (beside this file), until they are taken up. They include an exposure map, export to FLIS, nbstack weighting, in-place append, registration with distortion correction and frame filters in the commands.
 
 ## 13. Known Limitations
 

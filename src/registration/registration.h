@@ -127,6 +127,9 @@ struct registration_args {
 	double filtering_parameter;	// and its parameter (seqapplyreg only)
 	gboolean no_starlist;		// disable star list creation (2pass only)
 	const star_finder_params *sf_params;	// star detection settings for global and 2pass, NULL to use the preferences
+	void (*end_hook)(struct registration_args *args);	// in the thread once the .seq file is written, success or not; frees hook_data
+	gpointer hook_data;
+	gchar *lsf_registered;		// the Living Stack the sequence was registered against, set by its end_hook on success; freed by end_register_idle
 	float output_scale;		// scaling factor
 	disto_source undistort;		// type of undistortion to apply
 	disto_params distoparam;		// type of undistortion to apply

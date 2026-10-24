@@ -244,10 +244,9 @@
                       </object>
                     </child>
                     <child>
-                      <object class="GtkCheckButton" id="lsfm_backup">
-                        <property name="active">1</property>
-                        <property name="label" translatable="yes">Keep the previous file as .bak when the file is rewritten</property>
-                        <property name="tooltip-text" translatable="yes">Repair, Adopt and Compression rewrite the file. With this, the file as it was is kept beside it as file.lsf.fits.bak.</property>
+                      <object class="GtkCheckButton" id="lsfm_newfile">
+                        <property name="label" translatable="yes">Save Repair, Adopt and Compression to a new file</property>
+                        <property name="tooltip-text" translatable="yes">Repair, Adopt and Compression rewrite the file. With this, they ask for the name of a new file to write, and the file is left as it was; the dialog then shows the new file. Without it, the file is overwritten. The new file continues the same stack: append to one of the two files only.</property>
                       </object>
                     </child>
                     <child>

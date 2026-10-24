@@ -1369,13 +1369,55 @@ The &lt;b&gt;Generalized Extreme Studentized Deviate Test&lt;/b&gt; algorithm [3
                               </object>
                             </child>
                             <child>
-                              <object class="GtkCheckButton" id="stack_lsf_backup">
-                                <property name="focusable">1</property>
-                                <property name="label" translatable="yes">Keep the previous file as .bak</property>
-                                <property name="tooltip-text" translatable="yes">An append cannot be undone. With this, the file as it was before the append is kept beside it as file.lsf.fits.bak, which takes as much disk space as the file. Without it, an append that turns out bad can only be removed by stacking the frames again.</property>
+                              <object class="GtkBox">
+                                <property name="spacing">5</property>
                                 <layout>
                                   <property name="column">0</property>
                                   <property name="row">4</property>
+                                  <property name="column-span">3</property>
+                                </layout>
+                                <child>
+                                  <object class="GtkCheckButton" id="stack_lsf_append_newfile">
+                                    <property name="focusable">1</property>
+                                    <property name="label" translatable="yes">Save to a new file:</property>
+                                    <property name="tooltip-text" translatable="yes">An append cannot be undone. With this, the appended stack is written to a new Living Stack file and the chosen file is left as it was, so an append that turns out bad can be dropped. Without it, the chosen file is overwritten. The new file continues the same stack: append to one of the two files only.</property>
+                                    <signal name="toggled" handler="on_stack_lsf_append_newfile_toggled"/>
+                                  </object>
+                                </child>
+                                <child>
+                                  <object class="GtkEntry" id="stack_lsf_append_out">
+                                    <property name="focusable">1</property>
+                                    <property name="hexpand">1</property>
+                                    <property name="sensitive">0</property>
+                                    <property name="input-hints">no-emoji|none</property>
+                                    <property name="tooltip-text" translatable="yes">Name of the new Living Stack file. It may use $seqname$ and header keys such as $FILTER:%s$, taken from the reference frame. The .lsf.fits extension is added when it is missing.</property>
+                                    <signal name="changed" handler="on_stack_lsf_append_out_changed"/>
+                                  </object>
+                                </child>
+                                <child>
+                                  <object class="GtkButton" id="stack_lsf_append_out_button">
+                                    <property name="focusable">1</property>
+                                    <property name="sensitive">0</property>
+                                    <property name="tooltip-text" translatable="yes">Choose the name of the new Living Stack file.</property>
+                                    <signal name="clicked" handler="on_stack_lsf_append_out_button_clicked"/>
+                                    <child>
+                                      <object class="GtkImage">
+                                        <property name="icon-name">document-save-symbolic</property>
+                                      </object>
+                                    </child>
+                                  </object>
+                                </child>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="GtkCheckButton" id="stack_lsf_force_reg">
+                                <property name="focusable">1</property>
+                                <property name="label" translatable="yes">Register again</property>
+                                <property name="tooltip-text" translatable="yes">The sequence was registered against this Living Stack in the Registration tab, and the append uses that registration. Check this to register the frames again instead.</property>
+                                <property name="visible">0</property>
+                                <layout>
+                                  <property name="column">0</property>
+                                  <property name="row">6</property>
                                   <property name="column-span">3</property>
                                 </layout>
                               </object>

@@ -1109,11 +1109,12 @@ static int flush_to_disk(const char *path) {
 }
 
 /* atomic replace of target by source (Section 10.10), keeping the previous
- * target as backup when backup is not NULL. target always holds either the
- * previous or the new file, also when this fails. On Windows a file that was
- * just written can be held for a moment by another process, such as a virus
+ * target as backup when backup is not NULL. On Windows a file that was just
+ * written can be held for a moment by another process, such as a virus
  * scanner: a sharing or access error is retried for about 2 s before giving
- * up. */
+ * up. Returns 0, 1 when target is unchanged, or 2 in the rare case where
+ * target was renamed to backup and could not be renamed back: it then
+ * exists only as backup. source is kept on failure. */
 static int replace_file(const char *source, const char *target, const char *backup) {
 #ifdef _WIN32
 	wchar_t *wsrc = g_utf8_to_utf16(source, -1, NULL, NULL, NULL);
@@ -1121,6 +1122,7 @@ static int replace_file(const char *source, const char *target, const char *back
 	wchar_t *wbak = backup ? g_utf8_to_utf16(backup, -1, NULL, NULL, NULL) : NULL;
 	DWORD err = 0;
 	BOOL ok = FALSE;
+	int left_as_backup = 0;
 	for (int attempt = 0; attempt < 20 && !ok; attempt++) {
 		/* ReplaceFileW renames target to backup and source to target in one call */
 		ok = wbak ? ReplaceFileW(wdst, wsrc, wbak, 0, NULL, NULL) :
@@ -1132,6 +1134,7 @@ static int replace_file(const char *source, const char *target, const char *back
 			 * put target back before anything else */
 			if (!MoveFileExW(wbak, wdst, MOVEFILE_WRITE_THROUGH)) {
 				siril_log_error(_("LSF: %s could not be replaced and is now %s, rename it back\n"), target, backup);
+				left_as_backup = 1;
 				break;
 			}
 		} else if (err != ERROR_SHARING_VIOLATION && err != ERROR_ACCESS_DENIED && err != ERROR_LOCK_VIOLATION)
@@ -1143,15 +1146,17 @@ static int replace_file(const char *source, const char *target, const char *back
 	g_free(wbak);
 	if (!ok)
 		siril_log_warning(_("LSF: replacing %s failed with Windows error %lu\n"), target, (unsigned long) err);
-	return ok ? 0 : 1;
+	return ok ? 0 : left_as_backup ? 2 : 1;
 #else
 	if (backup && link(target, backup)) {
 		/* no hard links on this file system: rename, and rename back on failure */
 		if (g_rename(target, backup))
 			return 1;
 		if (g_rename(source, target)) {
-			if (g_rename(backup, target))
+			if (g_rename(backup, target)) {
 				siril_log_error(_("LSF: %s could not be replaced and is now %s, rename it back\n"), target, backup);
+				return 2;
+			}
 			return 1;
 		}
 		return 0;
@@ -1184,10 +1189,12 @@ const char *lsf_compression_name(lsf_compression comp) {
 /* Writes the complete new file to a temporary name, then atomically replaces
  * path with it (Section 10.2 steps 6 to 8). primary holds the header
  * metadata and the float pixels of HDU 0. old is the validated previous
- * file, or NULL on initialization. */
+ * file, or NULL on initialization. Returns LSF_WRITE_OK, LSF_WRITE_FAILED,
+ * or when the replace fails LSF_WRITE_KEPT_TMP or LSF_WRITE_LEFT_AS_BAK,
+ * with what the user should do in replace_msg when it is not NULL. */
 int lsf_write_file(const char *path, lsf_file *old, const lsf_settings *s, lsf_history *h,
 		fits *primary, const char *uid, int gen, GPtrArray *new_rows, int batch, gboolean backup,
-		lsf_compression comp) {
+		lsf_compression comp, gchar **replace_msg) {
 	int status = 0;
 	fitsfile *fptr = NULL, *oldf = NULL;
 	gchar *tmp = g_strdup_printf("%s.lsf_tmp", path);
@@ -1404,9 +1411,31 @@ int lsf_write_file(const char *path, lsf_file *old, const lsf_settings *s, lsf_h
 		bak = g_strdup_printf("%s.bak", path);
 		g_unlink(bak);
 	}
-	if (replace_file(tmp, path, bak)) {
-		siril_log_error(_("LSF: could not replace %s (is it open in another program?). "
-					"It was not changed, and the new file was kept as %s\n"), path, tmp);
+	int replaced = replace_file(tmp, path, bak);
+	if (replaced == 2) {
+		gchar *msg = g_strdup_printf(_("%s could not be replaced, and its previous version could not be put back: "
+					"it now exists only as %s, and the new version is %s. Rename %s back to %s to keep the "
+					"previous version, or rename %s to %s to keep the new one."),
+				path, bak, tmp, bak, path, tmp, path);
+		siril_log_error("LSF: %s\n", msg);
+		if (replace_msg)
+			*replace_msg = msg;
+		else g_free(msg);
+		retval = LSF_WRITE_LEFT_AS_BAK;
+		g_free(bak);
+		g_free(tmp);
+		tmp = NULL;
+		goto end;
+	}
+	if (replaced) {
+		gchar *msg = g_strdup_printf(_("%s could not be replaced, probably because another program has it open. "
+					"It is unchanged, and the new version was kept as %s. Close the other program, then run "
+					"the operation again, or rename %s to %s to keep the new version."), path, tmp, tmp, path);
+		siril_log_error("LSF: %s\n", msg);
+		if (replace_msg)
+			*replace_msg = msg;
+		else g_free(msg);
+		retval = LSF_WRITE_KEPT_TMP;
 		g_free(bak);
 		g_free(tmp);
 		tmp = NULL;

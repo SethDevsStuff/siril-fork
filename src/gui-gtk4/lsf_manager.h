@@ -11,4 +11,7 @@ void lsf_manager_open(const gchar *path);
 /* what the GUI says of an LSF file, from lsf_read_info */
 gchar *lsf_gui_describe(const lsf_info *info);
 
+/* a dialog when an LSF job could not replace its file */
+void lsf_gui_report_write(const lsf_job_result *res);
+
 #endif

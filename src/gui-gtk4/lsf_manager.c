@@ -349,15 +349,37 @@ void on_lsfm_browse_clicked(GtkButton *button, gpointer user_data) {
 
 /* ── jobs ──────────────────────────────────────────────────────────────── */
 
+/* a file left for the user to deal with when replacing it failed (Section
+ * 10.10): the message of the job says which files and what to do */
+void lsf_gui_report_write(const lsf_job_result *res) {
+	if (res->write_status == LSF_WRITE_KEPT_TMP)
+		siril_message_dialog(GTK_MESSAGE_WARNING, _("The Living Stack was not updated"),
+				res->message ? res->message : _("The file could not be replaced, see the log."));
+	else if (res->write_status == LSF_WRITE_LEFT_AS_BAK)
+		siril_message_dialog(GTK_MESSAGE_ERROR, _("The Living Stack must be renamed back"),
+				res->message ? res->message : _("The file could not be replaced, see the log."));
+}
+
+/* Repair, Adopt or Compression written to a new file: the dialog then shows
+ * it. A copy leaves the dialog on its source. */
+static gboolean show_new_file = FALSE;
+
 static void end_util(const lsf_job_result *res) {
 	set_cursor_waiting(FALSE);
+	lsf_gui_report_write(res);
 	if (res->mode == LSF_CMD_UTIL)
 		stack_edited = res->stack_modified;
 	gchar *text = res->message ? g_strdup(res->message) :
 		g_strdup(res->retval ? _("The operation failed, see the log.") : _("Done."));
+	if (!res->retval && res->out && show_new_file) {
+		/* loaded by the changed handler, which clears the result */
+		gchar *path = g_canonicalize_filename(res->out, NULL);
+		gtk_editable_set_text(GTK_EDITABLE(w("lsfm_entry")), path);
+		gtk_editable_set_position(GTK_EDITABLE(w("lsfm_entry")), -1);
+		g_free(path);
+	} else load_file();
 	gtk_label_set_text(GTK_LABEL(w("lsfm_result")), text);
 	g_free(text);
-	load_file();
 }
 
 static void end_export(const lsf_job_result *res) {
@@ -423,9 +445,66 @@ static struct lsf_cmd_args *new_util_args() {
 	if (!a)
 		return NULL;
 	a->path = g_strdup(info->file.path);
-	a->backup = siril_toggle_get_active(w("lsfm_backup"));
 	a->end_func = end_util;
+	show_new_file = FALSE;
 	gtk_label_set_text(GTK_LABEL(w("lsfm_result")), _("Working…"));
+	return a;
+}
+
+static gchar *choose_save_name(const char *title_filter, const char *pattern, const char *suggested);
+
+/* the file name without .lsf.fits */
+static gchar *lsf_stem(const char *path) {
+	gchar *base = g_path_get_basename(path);
+	gchar *stem = g_str_has_suffix(base, ".lsf.fits") ? g_strndup(base, strlen(base) - strlen(".lsf.fits")) : g_strdup(base);
+	g_free(base);
+	return stem;
+}
+
+/* With lsfm_newfile, Repair, Adopt and Compression write a new file, whose
+ * name is asked here; otherwise they overwrite the file (*out NULL).
+ * Returns FALSE when the user cancels. */
+static gboolean ask_new_file(gchar **out) {
+	*out = NULL;
+	if (!info || !siril_toggle_get_active(w("lsfm_newfile")))
+		return TRUE;
+	gchar *stem = lsf_stem(info->file.path);
+	gchar *gen = g_strrstr(stem, "_gen");	// a previous suggestion
+	if (gen && gen[4] && strspn(gen + 4, "0123456789") == strlen(gen + 4))
+		*gen = '\0';
+	gchar *suggested = g_strdup_printf("%s_gen%d.lsf.fits", stem, info->file.gen + 1);
+	gchar *file = choose_save_name(_("Living Stack files (*.lsf.fits)"), "*.lsf.fits", suggested);
+	g_free(stem);
+	g_free(suggested);
+	if (!file)
+		return FALSE;
+	if (!g_str_has_suffix(file, ".lsf.fits")) {
+		gchar *named = g_strdup_printf("%s.lsf.fits", file);
+		g_free(file);
+		file = named;
+	}
+	*out = file;
+	return TRUE;
+}
+
+/* an lsf_util job that rewrites the file, or writes a new one */
+static struct lsf_cmd_args *new_rewrite_args() {
+	gchar *out;
+	if (!info || processing_is_job_active() || !ask_new_file(&out)) {
+		if (info && processing_is_job_active())
+			PRINT_ANOTHER_THREAD_RUNNING;
+		return NULL;
+	}
+	struct lsf_cmd_args *a = new_util_args();
+	if (!a) {
+		g_free(out);
+		return NULL;
+	}
+	if (out && lsf_same_file(out, a->path))
+		g_clear_pointer(&out, g_free);	// the file itself
+	a->out = out;
+	a->overwrite = out != NULL;	// the file chooser asked before replacing a file
+	show_new_file = out != NULL;
 	return a;
 }
 
@@ -434,7 +513,6 @@ void on_lsfm_check_clicked(GtkButton *button, gpointer user_data) {
 	if (!a)
 		return;
 	a->check = TRUE;
-	a->backup = FALSE;
 	start_job(a);
 }
 
@@ -442,7 +520,7 @@ void on_lsfm_repair_clicked(GtkButton *button, gpointer user_data) {
 	if (!siril_confirm_dialog(_("Repair the stack?"), _("The stacked image of the file is rebuilt from the "
 					"accumulator, which undoes the edit made outside Siril."), _("Repair")))
 		return;
-	struct lsf_cmd_args *a = new_util_args();
+	struct lsf_cmd_args *a = new_rewrite_args();
 	if (!a)
 		return;
 	a->repair = TRUE;
@@ -455,7 +533,7 @@ void on_lsfm_adopt_clicked(GtkButton *button, gpointer user_data) {
 					"stacked this way. This is meant for small cosmetic fixes; process an exported image "
 					"for anything else."), _("Adopt")))
 		return;
-	struct lsf_cmd_args *a = new_util_args();
+	struct lsf_cmd_args *a = new_rewrite_args();
 	if (!a)
 		return;
 	a->adopt = TRUE;
@@ -463,7 +541,7 @@ void on_lsfm_adopt_clicked(GtkButton *button, gpointer user_data) {
 }
 
 void on_lsfm_compress_clicked(GtkButton *button, gpointer user_data) {
-	struct lsf_cmd_args *a = new_util_args();
+	struct lsf_cmd_args *a = new_rewrite_args();
 	if (!a)
 		return;
 	/* lsfm_compression: none, gzip2, gzip1 */
@@ -487,11 +565,9 @@ static gchar *choose_save_name(const char *title_filter, const char *pattern, co
 void on_lsfm_copy_clicked(GtkButton *button, gpointer user_data) {
 	if (!info)
 		return;
-	gchar *base = g_path_get_basename(info->file.path);
-	gchar *stem = g_str_has_suffix(base, ".lsf.fits") ? g_strndup(base, strlen(base) - strlen(".lsf.fits")) : g_strdup(base);
+	gchar *stem = lsf_stem(info->file.path);
 	gchar *suggested = g_strdup_printf("%s_copy.lsf.fits", stem);
 	gchar *out = choose_save_name(_("Living Stack files (*.lsf.fits)"), "*.lsf.fits", suggested);
-	g_free(base);
 	g_free(stem);
 	g_free(suggested);
 	if (!out)
@@ -508,7 +584,6 @@ void on_lsfm_copy_clicked(GtkButton *button, gpointer user_data) {
 	}
 	a->out = out;
 	a->overwrite = TRUE;	// the file chooser asked before replacing a file
-	a->backup = FALSE;	// the source is not rewritten
 	start_job(a);
 }
 

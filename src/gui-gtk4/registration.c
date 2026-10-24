@@ -30,6 +30,7 @@
 #include "gui-gtk4/dialogs.h"
 #include "gui-gtk4/image_display.h"
 #include "gui-gtk4/image_interactions.h"
+#include "gui-gtk4/lsf_manager.h"
 #include "gui-gtk4/message_dialog.h"
 #include "gui-gtk4/mpp_shift_viewer.h"
 #include "gui-gtk4/plot.h"
@@ -42,6 +43,7 @@
 #include "io/path_parse.h"
 #include "io/sequence.h"
 #include "io/single_image.h"
+#include "lsf/lsf.h"
 #include "opencv/opencv.h"
 #include "registration/3stars.h"
 #include "registration/mpp.h"
@@ -561,6 +563,130 @@ void on_reg_reference_button_clicked(GtkButton *button, gpointer user_data) {
 	}
 	siril_fc_destroy(fc);
 	update_reg_interface(TRUE);
+}
+
+/* Registration to an existing Living Stack (UI plan, B3): global star
+ * alignment against the stacked image of the file, transforms only, with
+ * the registration settings stored in it. The external reference of the
+ * sequence is set to the file, and lsf_prepare_registration() does the rest,
+ * as for the register command. lsf_append then uses these transforms. */
+static lsf_info *reg_lsf = NULL;	// the file chosen, read by lsf_read_info, or NULL
+static gchar *reg_lsf_problem = NULL;	// why it cannot be used, or NULL
+
+static gboolean reg_lsf_mode() {
+	return siril_toggle_get_active(GTK_WIDGET(gtk_builder_get_object(gui.builder, "reg_lsf_check")));
+}
+
+static const gchar *reg_lsf_path() {
+	return gtk_editable_get_text(GTK_EDITABLE(gtk_builder_get_object(gui.builder, "reg_lsf_entry")));
+}
+
+/* reads the file chosen, and sets the transform and the minimum pairs to
+ * those stored in it, which the user may change */
+static void load_reg_lsf() {
+	registration_init_statics();
+	if (reg_lsf) {
+		lsf_info_free(reg_lsf);
+		g_free(reg_lsf);
+		reg_lsf = NULL;
+	}
+	g_clear_pointer(&reg_lsf_problem, g_free);
+	gchar *path = g_strstrip(g_strdup(reg_lsf_path()));
+	if (!path[0])
+		reg_lsf_problem = g_strdup(_("Choose a Living Stack file."));
+	else if (!g_file_test(path, G_FILE_TEST_IS_REGULAR))
+		reg_lsf_problem = g_strdup(_("This file does not exist."));
+	else {
+		lsf_info *info = g_new0(lsf_info, 1);
+		if (lsf_read_info(path, info)) {
+			reg_lsf_problem = g_strdup_printf(_("This is not a Living Stack that can be used: %s."), info->problem);
+			lsf_info_free(info);
+			g_free(info);
+		} else {
+			reg_lsf = info;
+			if (info->no_append)
+				reg_lsf_problem = g_strdup_printf(_("Frames cannot be appended to this file with this version: %s."),
+						info->no_append);
+			gtk_drop_down_set_selected(GTK_DROP_DOWN(comboreg_transfo), info->file.settings.transform);
+			gtk_spin_button_set_value(spinbut_minpairs, info->file.settings.min_pairs);
+		}
+	}
+	g_free(path);
+	update_reg_interface(TRUE);
+}
+
+void on_reg_lsf_check_toggled(GtkCheckButton *button, gpointer user_data) {
+	if (gtk_check_button_get_active(button))
+		load_reg_lsf();
+	else update_reg_interface(TRUE);
+}
+
+void on_reg_lsf_entry_changed(GtkEditable *editable, gpointer user_data) {
+	load_reg_lsf();
+}
+
+void on_reg_lsf_button_clicked(GtkButton *button, gpointer user_data) {
+	GtkWindow *control_window = GTK_WINDOW(GTK_APPLICATION_WINDOW(gtk_builder_get_object(gui.builder, "control_window")));
+	SirilFileChooser *fc = siril_fc_open(control_window, GTK_FILE_CHOOSER_ACTION_OPEN);
+	siril_fc_set_current_folder_path(fc, com.wd);
+	siril_fc_set_select_multiple(fc, FALSE);
+	siril_fc_add_filter_pattern(fc, _("Living Stack files (*.lsf.fits)"), "*.lsf.fits;*.LSF.FITS", TRUE);
+	if (siril_fc_run(fc) == GTK_RESPONSE_ACCEPT) {
+		gchar *file = siril_fc_get_filename(fc);
+		if (file) {
+			GtkEditable *entry = GTK_EDITABLE(gtk_builder_get_object(gui.builder, "reg_lsf_entry"));
+			gtk_editable_set_text(entry, file);	// loaded by the changed handler
+			gtk_editable_set_position(entry, -1);
+			g_free(file);
+		}
+	}
+	siril_fc_destroy(fc);
+}
+
+/* the state of the tab in Living Stack mode, after update_reg_interface()
+ * set it for the method: returns whether a registration can start */
+static gboolean update_reg_lsf_widgets() {
+	GtkWidget *info = GTK_WIDGET(gtk_builder_get_object(gui.builder, "reg_lsf_info"));
+	gboolean lsf = reg_lsf_mode();
+	gtk_widget_set_sensitive(GTK_WIDGET(gtk_builder_get_object(gui.builder, "reg_lsf_box")), lsf);
+	gtk_widget_set_visible(info, lsf);
+	gtk_widget_set_sensitive(GTK_WIDGET(comboboxregmethod), !lsf);
+	gtk_widget_set_sensitive(GTK_WIDGET(reg_2pass), !lsf);
+	if (!lsf) {
+		gtk_widget_set_sensitive(GTK_WIDGET(comboreg_undistort), TRUE);
+		return TRUE;
+	}
+	/* the external reference of the sequence is the file */
+	const gchar *path = reg_lsf_path();
+	gtk_check_button_set_active(reg_reference_checkbutton, TRUE);
+	if (g_strcmp0(gtk_editable_get_text(GTK_EDITABLE(reg_reference_entry)), path))
+		gtk_editable_set_text(GTK_EDITABLE(reg_reference_entry), path);
+	gtk_widget_set_sensitive(GTK_WIDGET(reg_reference_checkbutton), FALSE);
+	gtk_widget_set_sensitive(GTK_WIDGET(reg_referencefilechooser_box), FALSE);
+	/* no distortion correction, and no output: the append applies */
+	if (gtk_drop_down_get_selected(GTK_DROP_DOWN(comboreg_undistort)) != DISTO_UNDEF)
+		gtk_drop_down_set_selected(GTK_DROP_DOWN(comboreg_undistort), DISTO_UNDEF);
+	gtk_widget_set_sensitive(GTK_WIDGET(comboreg_undistort), FALSE);
+	gtk_widget_set_visible(GTK_WIDGET(output_reg_frame), FALSE);
+
+	gboolean fatal = reg_lsf == NULL || reg_lsf_problem != NULL;
+	gchar *batch = NULL;
+	if (reg_lsf && !reg_lsf_problem)
+		batch = lsf_check_batch(reg_lsf, &com.seq, &fatal);
+	gchar *summary = reg_lsf ? lsf_gui_describe(reg_lsf) : NULL;
+	GString *text = g_string_new(summary ? summary : "");
+	if (reg_lsf_problem)
+		g_string_append_printf(text, "%s%s", text->len ? "\n" : "", reg_lsf_problem);
+	if (batch)
+		g_string_append_printf(text, "%s%s", text->len ? "\n" : "", batch);
+	if (!fatal)
+		g_string_append_printf(text, "%s%s", text->len ? "\n" : "", _("Only the transforms are computed: the append "
+					"to this Living Stack applies them. Do not apply them before appending."));
+	gtk_label_set_text(GTK_LABEL(info), text->str);
+	g_string_free(text, TRUE);
+	g_free(summary);
+	g_free(batch);
+	return !fatal;
 }
 
 /* GTK4 stack-switcher refresh: instead of intercepting clicks on the
@@ -1084,6 +1210,17 @@ void update_reg_interface(gboolean dont_change_reg_radio) {
 		return;
 	}
 
+	/* a Living Stack is registered against with global star alignment only;
+	 * the handlers of these widgets come back here */
+	gboolean lsf = reg_lsf_mode();
+	if (lsf && regindex != REG_GLOBAL) {
+		if (siril_toggle_get_active(GTK_WIDGET(reg_2pass)))
+			siril_toggle_set_active(GTK_WIDGET(reg_2pass), FALSE);
+		if (gtk_drop_down_get_selected(GTK_DROP_DOWN(comboboxregmethod)) != REG_GLOBAL)
+			gtk_drop_down_set_selected(GTK_DROP_DOWN(comboboxregmethod), REG_GLOBAL);
+		return;
+	}
+
 	/* specific methods */
 	isapplyreg = regindex == REG_APPLY;
 	is_global = regindex == REG_GLOBAL;
@@ -1091,8 +1228,9 @@ void update_reg_interface(gboolean dont_change_reg_radio) {
 
 	/* registration data exists for the selected layer */
 	has_reg = layer_has_registration(&com.seq, gtk_drop_down_get_selected(GTK_DROP_DOWN(comboboxreglayer)));
-	/* registration will produce output */
-	has_output = isapplyreg || is_global;
+	/* registration will produce output, except the transforms against a
+	 * Living Stack, which the append applies */
+	has_output = (isapplyreg || is_global) && !lsf;
 	/* drizzle is selected */
 	has_drizzle = has_output && gtk_stack_get_visible_child(interp_drizzle_stack) == GTK_WIDGET(grid_drizzle_controls);
 	/* must enforce drizzle/interp */
@@ -1132,6 +1270,16 @@ void update_reg_interface(gboolean dont_change_reg_radio) {
 		}
 		gtk_widget_set_sensitive(GTK_WIDGET(checkStarSelect), !com.seq.is_variable);
 	}
+	/* a sequence registered against a Living Stack shows it again */
+	if (!dont_change_reg_radio && com.seq.ext_ref && com.seq.ext_ref_path && fits_file_is_lsf(com.seq.ext_ref_path)) {
+		GtkEditable *lsf_entry = GTK_EDITABLE(gtk_builder_get_object(gui.builder, "reg_lsf_entry"));
+		if (g_strcmp0(gtk_editable_get_text(lsf_entry), com.seq.ext_ref_path))
+			gtk_editable_set_text(lsf_entry, com.seq.ext_ref_path);	// its handler reads the file
+		if (!lsf) {
+			siril_toggle_set_active(GTK_WIDGET(gtk_builder_get_object(gui.builder, "reg_lsf_check")), TRUE);
+			return;	// the handler comes back here
+		}
+	}
 	/* external reference image: available for global and 2-pass star alignment */
 	if (!dont_change_reg_radio && com.seq.ext_ref && com.seq.ext_ref_path) {
 		gtk_check_button_set_active(reg_reference_checkbutton, TRUE);
@@ -1157,6 +1305,10 @@ void update_reg_interface(gboolean dont_change_reg_radio) {
 	} else {
 		gtk_widget_set_sensitive(GTK_WIDGET(comboreg_framing), TRUE);
 	}
+	/* after the external reference and the output frame, which it overrides */
+	gboolean lsf_ready = update_reg_lsf_widgets();
+	if (lsf)
+		disto_source_index = DISTO_UNDEF;
 	if (must_have_drizzle) {
 		gtk_stack_set_visible_child(interp_drizzle_stack, GTK_WIDGET(grid_drizzle_controls));
 		has_drizzle = TRUE;
@@ -1229,7 +1381,8 @@ void update_reg_interface(gboolean dont_change_reg_radio) {
 			check_comet(regindex) &&
 			check_3stars(regindex) &&
 			check_disto(disto_source_index) &&
-			check_ext_ref(disto_source_index);
+			check_ext_ref(disto_source_index) &&
+			lsf_ready;
 
 	if (!ready) { // all the other cases not set by the checkers
 		if (method->sel > REQUIRES_NO_SELECTION && !selection_is_done ) {
@@ -1486,7 +1639,19 @@ static int fill_registration_structure_from_GUI(struct registration_args *regarg
 	}
 #endif
 
-	if (regindex == REG_GLOBAL && regargs->interpolation == OPENCV_NONE) { // seqpplyreg case is dealt with in the sanity checks of the method
+	/* to an existing Living Stack (UI plan, B3): transforms only, with the
+	 * star detection stored in the file; the transform and the minimum pairs
+	 * are those of the widgets, which load_reg_lsf() set from the file */
+	if (reg_lsf_mode()) {
+		g_free(regargs->external_ref_path);
+		regargs->external_ref_path = g_strdup(reg_lsf_path());
+		regargs->use_external_ref = TRUE;
+		regargs->undistort = DISTO_UNDEF;
+		if (lsf_prepare_registration(regargs, TRUE, TRUE, FALSE))
+			return 1;
+	}
+
+	if (regindex == REG_GLOBAL && regargs->interpolation == OPENCV_NONE && !reg_lsf_mode()) { // seqpplyreg case is dealt with in the sanity checks of the method
 		if (regargs->output_scale != 1.f || com.seq.is_variable) {
 			siril_log_error(_("When interpolation is set to None, the images must be of same size and no scaling can be applied. Aborting\n"));
 			return 1;
@@ -1535,6 +1700,10 @@ void on_seqregister_button_clicked(GtkButton *button, gpointer user_data) {
 	int ret = seq_read_frame_metadata(regargs->seq, regargs->reference_image, &fit_ref);
 	if (ret) {
 		siril_log_message(_("Error: unable to read reference frame metadata\n"));
+		if (regargs->end_hook) {	// frees its data
+			regargs->retval = 1;
+			regargs->end_hook(regargs);
+		}
 		free(regargs->mpp_cfg);
 		free(regargs);
 		unreserve_thread();
@@ -1558,6 +1727,10 @@ void on_seqregister_button_clicked(GtkButton *button, gpointer user_data) {
 	set_progress_bar_data(msg, PROGRESS_RESET);
 
 	if (!start_in_reserved_thread(register_thread_func, regargs)) {
+		if (regargs->end_hook) {	// frees its data
+			regargs->retval = 1;
+			regargs->end_hook(regargs);
+		}
 		free(regargs->mpp_cfg);
 		free(regargs);
 		unreserve_thread();
@@ -1912,6 +2085,11 @@ gboolean end_register_idle(gpointer p) {
 	args->seq->reg_invalidated = FALSE;
 	drawPlot();
 	update_stack_interface(TRUE);
+	/* registered against a Living Stack: the stacking appends to it */
+	if (args->lsf_registered) {
+		stack_set_lsf_append(args->lsf_registered);
+		g_free(args->lsf_registered);
+	}
 	adjust_sellabel();
 
 	set_cursor_waiting(FALSE);

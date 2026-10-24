@@ -256,6 +256,9 @@ gpointer register_thread_func(gpointer p) {
 	}
 	if (!args->retval)
 		writeseqfile(args->seq);
+	/* e.g. the binding of a registration against a Living Stack */
+	if (args->end_hook)
+		args->end_hook(args);
 	retval = args->retval;
 	if (args->disto) {
 		free_disto_args(args->disto);
@@ -280,6 +283,7 @@ gpointer register_thread_func(gpointer p) {
 		stop_processing_thread();
 		if (args->seq->type != SEQ_INTERNAL && !check_seq_is_comseq(args->seq)) // RGB align needs the sequence preserved
 			free_sequence(args->seq, TRUE);
+		g_free(args->lsf_registered);
 		free(args);
 	}
 	return GINT_TO_POINTER(retval);

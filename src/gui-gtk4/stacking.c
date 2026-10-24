@@ -269,6 +269,7 @@ void on_stack_lsf_hist_same_toggled(GtkCheckButton *button, gpointer user_data) 
 /* shows the new Stack, which lsf_load_result put in gfit, as stacking does */
 static void end_lsf_stacking(const lsf_job_result *res) {
 	set_cursor_waiting(FALSE);
+	lsf_gui_report_write(res);
 	if (res->retval) {
 		siril_log_error(_("The Living Stack was not created, please check the log to fix your issue.\n"));
 		return;
@@ -298,8 +299,29 @@ static void fill_widgets_from_lsf(const lsf_settings *s) {
 	com.pref.stack = saved;
 }
 
+/* the name suggested for the new file of an append: the file's, with the
+ * generation it will have, replacing the one an earlier suggestion added */
+static gchar *suggest_append_out(const lsf_info *info) {
+	const char *path = info->file.path;
+	gchar *stem = g_str_has_suffix(path, ".lsf.fits") ? g_strndup(path, strlen(path) - strlen(".lsf.fits")) : g_strdup(path);
+	gchar *gen = g_strrstr(stem, "_gen");
+	if (gen && gen[4] && strspn(gen + 4, "0123456789") == strlen(gen + 4))
+		*gen = '\0';
+	gchar *name = g_strdup_printf("%s_gen%d.lsf.fits", stem, info->file.gen + 1);
+	g_free(stem);
+	return name;
+}
+
+/* the file an append writes instead of overwriting the chosen one, or NULL */
+static gchar *append_out_path() {
+	if (!siril_toggle_get_active(GTK_WIDGET(gtk_builder_get_object(gui.builder, "stack_lsf_append_newfile"))))
+		return NULL;
+	return parse_lsf_name(gtk_editable_get_text(GTK_EDITABLE(gtk_builder_get_object(gui.builder, "stack_lsf_append_out"))));
+}
+
 /* reads the file of stack_lsf_append_entry and shows it; with fill, also
- * sets the widgets of the method expander to its settings */
+ * sets the widgets of the method expander to its settings and suggests a
+ * name for a new file */
 static void load_append_info(gboolean fill) {
 	GtkEditable *entry = GTK_EDITABLE(gtk_builder_get_object(gui.builder, "stack_lsf_append_entry"));
 	if (append_info) {
@@ -323,8 +345,12 @@ static void load_append_info(gboolean fill) {
 		} else {
 			append_info = info;
 			append_summary = lsf_gui_describe(info);
-			if (fill)
+			if (fill) {
 				fill_widgets_from_lsf(&info->file.settings);
+				gchar *out = suggest_append_out(info);
+				gtk_editable_set_text(GTK_EDITABLE(gtk_builder_get_object(gui.builder, "stack_lsf_append_out")), out);
+				g_free(out);
+			}
 		}
 	}
 	g_free(path);
@@ -357,6 +383,60 @@ void on_stack_lsf_append_button_clicked(GtkButton *button, gpointer user_data) {
 	siril_fc_destroy(fc);
 }
 
+/* the new file chosen with the file chooser, which already asked before
+ * replacing it */
+static gchar *append_out_chosen = NULL;
+
+void on_stack_lsf_append_newfile_toggled(GtkCheckButton *button, gpointer user_data) {
+	gboolean on = gtk_check_button_get_active(button);
+	gtk_widget_set_sensitive(GTK_WIDGET(gtk_builder_get_object(gui.builder, "stack_lsf_append_out")), on);
+	gtk_widget_set_sensitive(GTK_WIDGET(gtk_builder_get_object(gui.builder, "stack_lsf_append_out_button")), on);
+	update_stack_interface(TRUE);
+}
+
+void on_stack_lsf_append_out_changed(GtkEditable *editable, gpointer user_data) {
+	update_stack_interface(TRUE);
+}
+
+void on_stack_lsf_append_out_button_clicked(GtkButton *button, gpointer user_data) {
+	GtkWindow *control_window = GTK_WINDOW(GTK_APPLICATION_WINDOW(gtk_builder_get_object(gui.builder, "control_window")));
+	GtkEditable *entry = GTK_EDITABLE(gtk_builder_get_object(gui.builder, "stack_lsf_append_out"));
+	SirilFileChooser *fc = siril_fc_save(control_window, GTK_FILE_CHOOSER_ACTION_SAVE);
+	siril_fc_set_current_folder_path(fc, com.wd);
+	siril_fc_add_filter_pattern(fc, _("Living Stack files (*.lsf.fits)"), "*.lsf.fits;*.LSF.FITS", TRUE);
+	gchar *suggested = g_path_get_basename(gtk_editable_get_text(entry));
+	if (suggested[0] && strcmp(suggested, "."))
+		siril_fc_set_current_name(fc, suggested);
+	g_free(suggested);
+	if (siril_fc_run(fc) == GTK_RESPONSE_ACCEPT) {
+		gchar *file = siril_fc_get_filename(fc);
+		if (file) {
+			g_free(append_out_chosen);
+			append_out_chosen = parse_lsf_name(file);
+			gtk_editable_set_text(entry, file);
+			gtk_editable_set_position(entry, -1);
+			g_free(file);
+		}
+	}
+	siril_fc_destroy(fc);
+}
+
+/* after a registration of the sequence against a Living Stack (UI plan, B3):
+ * the next stacking appends to it */
+void stack_set_lsf_append(const gchar *path) {
+	GtkEditable *entry = GTK_EDITABLE(gtk_builder_get_object(gui.builder, "stack_lsf_append_entry"));
+	GtkDropDown *mode = GTK_DROP_DOWN(gtk_builder_get_object(gui.builder, "stack_result_mode"));
+	gboolean same_file = !g_strcmp0(gtk_editable_get_text(entry), path);
+	if (!same_file) {
+		gtk_editable_set_text(entry, path);	// loaded by the changed handler
+		gtk_editable_set_position(entry, -1);
+	}
+	if (stack_result_mode() != STACK_RESULT_APPEND)
+		gtk_drop_down_set_selected(mode, STACK_RESULT_APPEND);	// loaded by the mode handler
+	else if (same_file)
+		load_append_info(TRUE);	// the file's binding note changed
+}
+
 /* the problems update_stack_interface shows and start_lsf_append checks:
  * the file, the batch and the pre-flight. Returns a message or NULL. */
 static gchar *append_problems(gboolean *fatal) {
@@ -371,8 +451,10 @@ static gchar *append_problems(gboolean *fatal) {
 		return batch;
 	GtkWidget *noreg = GTK_WIDGET(gtk_builder_get_object(gui.builder, "stack_lsf_noreg"));
 	GtkWidget *rejmaps = GTK_WIDGET(gtk_builder_get_object(gui.builder, "stack_lsf_rejmaps"));
-	gchar *flight = lsf_append_preflight(append_info, com.wd, stackparam.nb_images_to_stack, siril_toggle_get_active(noreg),
+	gchar *out = append_out_path();
+	gchar *flight = lsf_append_preflight(append_info, com.wd, out, stackparam.nb_images_to_stack, siril_toggle_get_active(noreg),
 			gtk_widget_get_visible(rejmaps) && siril_toggle_get_active(rejmaps), &flight_fatal);
+	g_free(out);
 	*fatal = flight_fatal;
 	if (flight_fatal) {
 		g_free(batch);
@@ -384,12 +466,42 @@ static gchar *append_problems(gboolean *fatal) {
 	return msg;
 }
 
+/* a registration of the sequence against the file, made in the Registration
+ * tab or with register -extref= (UI plan, B3): what the append does with it.
+ * Returns a note for the info label or NULL; *reusable when it is used. */
+static gchar *append_registration_note(gboolean *reusable) {
+	*reusable = FALSE;
+	if (!append_info)
+		return NULL;
+	int layer;
+	gchar *date = NULL, *why = NULL, *msg = NULL;
+	*reusable = lsf_binding_check(&com.seq, &append_info->file, &layer, &date, &why);
+	if (*reusable)
+		msg = g_strdup_printf(_("The sequence was registered against this Living Stack (%s): the append uses "
+					"that registration."), date ? date : "");
+	else if (why)
+		msg = g_strdup_printf(_("Earlier registration not used, as %s: the append registers the frames again."), why);
+	g_free(date);
+	g_free(why);
+	return msg;
+}
+
 /* shows the Stack after the append and the file as it is now */
 static void end_lsf_append(const lsf_job_result *res) {
 	set_cursor_waiting(FALSE);
+	lsf_gui_report_write(res);
 	if (res->retval)
 		siril_log_error(_("The frames were not appended, please check the log to fix your issue.\n"));
 	else gui_iface.on_stack_complete();
+	if (!res->retval && res->out) {
+		/* as after Save As, the next append goes to the new file */
+		siril_toggle_set_active(GTK_WIDGET(gtk_builder_get_object(gui.builder, "stack_lsf_append_newfile")), FALSE);
+		g_clear_pointer(&append_out_chosen, g_free);
+		gchar *path = g_canonicalize_filename(res->out, NULL);
+		stack_set_lsf_append(path);
+		g_free(path);
+		return;
+	}
 	load_append_info(TRUE);
 }
 
@@ -434,7 +546,7 @@ static void start_lsf_append() {
 	GtkWidget *force = GTK_WIDGET(gtk_builder_get_object(gui.builder, "stack_lsf_expand_force"));
 	GtkWidget *noreg = GTK_WIDGET(gtk_builder_get_object(gui.builder, "stack_lsf_noreg"));
 	GtkWidget *rejmaps = GTK_WIDGET(gtk_builder_get_object(gui.builder, "stack_lsf_rejmaps"));
-	GtkWidget *backup = GTK_WIDGET(gtk_builder_get_object(gui.builder, "stack_lsf_backup"));
+	GtkWidget *newfile = GTK_WIDGET(gtk_builder_get_object(gui.builder, "stack_lsf_append_newfile"));
 	GtkWidget *export_image = GTK_WIDGET(gtk_builder_get_object(gui.builder, "stack_lsf_append_export"));
 	GtkDropDown *rejec_combo = GTK_DROP_DOWN(gtk_builder_get_object(gui.builder, "comborejection"));
 	GtkSpinButton *siglow = GTK_SPIN_BUTTON(gtk_builder_get_object(gui.builder, "stack_siglow_button"));
@@ -456,6 +568,28 @@ static void start_lsf_append() {
 		siril_message_dialog(GTK_MESSAGE_ERROR, _("No Living Stack"), append_summary);
 		return;
 	}
+	/* a new file, or the chosen one overwritten */
+	gchar *out = append_out_path();
+	if (siril_toggle_get_active(newfile) && !out) {
+		siril_message_dialog(GTK_MESSAGE_ERROR, _("No file name"), _("Enter the name of the new Living Stack file, "
+					"or uncheck \"Save to a new file\" to overwrite the chosen one."));
+		return;
+	}
+	if (out && lsf_same_file(out, append_info->file.path))
+		g_clear_pointer(&out, g_free);	// the chosen file itself
+	gboolean overwrite = FALSE;
+	if (out && g_file_test(out, G_FILE_TEST_EXISTS)) {
+		gchar *msg = g_strdup_printf(_("%s already exists. It is replaced by the chosen Living Stack with the frames "
+					"appended."), out);
+		gboolean go = !g_strcmp0(out, append_out_chosen) ||
+			siril_confirm_dialog(_("Replace the file?"), msg, _("Replace"));
+		g_free(msg);
+		if (!go) {
+			g_free(out);
+			return;
+		}
+		overwrite = TRUE;
+	}
 	gboolean fatal;
 	gchar *problems = append_problems(&fatal);
 	if (problems) {
@@ -463,8 +597,10 @@ static void start_lsf_append() {
 		if (fatal)
 			siril_message_dialog(GTK_MESSAGE_ERROR, _("Cannot append"), problems);
 		g_free(problems);
-		if (!go)
+		if (!go) {
+			g_free(out);
 			return;
+		}
 	}
 
 	/* overrides of the rejection (UI plan, C2) and of the history test (B2)
@@ -495,8 +631,10 @@ static void start_lsf_append() {
 					"affected."));
 		gboolean go = siril_confirm_dialog(_("Change the settings of the Living Stack?"), changes->str, _("Append"));
 		g_string_free(changes, TRUE);
-		if (!go)
+		if (!go) {
+			g_free(out);
 			return;
+		}
 	}
 
 	/* lsf_append reads the sequence from its file: saved with the state
@@ -504,8 +642,12 @@ static void start_lsf_append() {
 	writeseqfile(&com.seq);
 
 	struct lsf_cmd_args *a = lsf_cmd_args_new(LSF_CMD_APPEND);
-	if (!a)
+	if (!a) {
+		g_free(out);
 		return;
+	}
+	a->out = out;	// freed with a
+	a->overwrite = overwrite;
 	if (!set_lsf_frames(a)) {
 		siril_message_dialog(GTK_MESSAGE_ERROR, _("No frames"), _("The stacking filters leave no frame to append."));
 		lsf_cmd_args_free(a);
@@ -520,6 +662,9 @@ static void start_lsf_append() {
 	}
 	a->seqname = g_strdup(com.seq.seqname);
 	a->noreg = siril_toggle_get_active(noreg);
+	/* shown when a registration against the file can be reused (UI plan, B3) */
+	GtkWidget *force_reg = GTK_WIDGET(gtk_builder_get_object(gui.builder, "stack_lsf_force_reg"));
+	a->force_reg = !a->noreg && gtk_widget_get_visible(force_reg) && siril_toggle_get_active(force_reg);
 	a->framing = gtk_drop_down_get_selected(framing_combo) == 1 ? FRAMING_CURRENT : FRAMING_MAX;
 	a->framing_set = a->framing != FRAMING_MAX;
 	a->expand_step = gtk_spin_button_get_value_as_int(step);
@@ -537,10 +682,10 @@ static void start_lsf_append() {
 		a->compression = comp == 1 ? LSF_COMP_NONE : comp == 2 ? LSF_COMP_GZIP2 : LSF_COMP_GZIP1;
 		a->compression_set = TRUE;
 	}
-	a->backup = siril_toggle_get_active(backup);
-	/* the plain image of the updated stack, named like the file (UI plan, C10) */
-	if (siril_toggle_get_active(export_image) && g_str_has_suffix(a->path, ".lsf.fits"))
-		a->export_out = g_strndup(a->path, strlen(a->path) - strlen(".lsf.fits"));
+	/* the plain image of the updated stack, named like the file written (UI plan, C10) */
+	const char *target = a->out ? a->out : a->path;
+	if (siril_toggle_get_active(export_image) && g_str_has_suffix(target, ".lsf.fits"))
+		a->export_out = g_strndup(target, strlen(target) - strlen(".lsf.fits"));
 	a->load_result = TRUE;
 	a->end_func = end_lsf_append;
 	log_and_start_lsf(a);
@@ -590,6 +735,21 @@ static void start_lsf_stacking() {
 	if (weighting == NOISE_WEIGHT && norm == NO_NORM) {
 		siril_log_error(_("Weighting by noise is allowed only if normalization has been activated, ignoring weights.\n"));
 		weighting = NO_WEIGHT;
+	}
+
+	/* memory and disk first (UI plan, A6) */
+	gboolean fatal = FALSE;
+	gchar *flight = lsf_init_preflight(&com.seq, com.wd, path, stackparam.nb_images_to_stack,
+			siril_toggle_get_active(rejmaps), &fatal);
+	if (flight) {
+		gboolean go = !fatal && siril_confirm_dialog(_("Create anyway?"), flight, _("Create"));
+		if (fatal)
+			siril_message_dialog(GTK_MESSAGE_ERROR, _("Cannot create the Living Stack"), flight);
+		g_free(flight);
+		if (!go) {
+			g_free(path);
+			return;
+		}
 	}
 
 	if (stackparam.nb_images_to_stack < LSF_LOW_STACK_WARN) {
@@ -1346,7 +1506,7 @@ void update_stack_interface(gboolean dont_change_stack_type) {
 	static GtkWidget *append_box = NULL, *output_box = NULL, *lsf_framing_label = NULL, *lsf_comp_label = NULL,
 			*lsf_comp = NULL, *lsf_hist_same = NULL, *lsf_rejmaps = NULL, *weighing_combo = NULL,
 			*siglow = NULL, *sighigh = NULL, *append_framing = NULL, *append_noreg = NULL,
-			*expand_step = NULL, *expand_force = NULL, *info_label = NULL;
+			*expand_step = NULL, *expand_force = NULL, *info_label = NULL, *force_reg = NULL;
 	static GtkDropDown *rejec_combo = NULL;
 	static GtkDropDown *method_combo = NULL, *filter_combo = NULL;
 	static GtkLabel *result_label = NULL;
@@ -1392,6 +1552,7 @@ void update_stack_interface(gboolean dont_change_stack_type) {
 		expand_step = GTK_WIDGET(gtk_builder_get_object(gui.builder, "stack_lsf_expand_step"));
 		expand_force = GTK_WIDGET(gtk_builder_get_object(gui.builder, "stack_lsf_expand_force"));
 		info_label = GTK_WIDGET(gtk_builder_get_object(gui.builder, "stack_lsf_info_label"));
+		force_reg = GTK_WIDGET(gtk_builder_get_object(gui.builder, "stack_lsf_force_reg"));
 	}
 	gboolean seqloaded = sequence_is_loaded();
 	gtk_widget_set_sensitive(GTK_WIDGET(stack_expander_method), seqloaded);
@@ -1563,13 +1724,19 @@ void update_stack_interface(gboolean dont_change_stack_type) {
 		gtk_widget_set_sensitive(append_framing, !noreg);
 		gtk_widget_set_sensitive(expand_step, grow && !noreg);
 		gtk_widget_set_sensitive(expand_force, grow && !noreg);
-		gboolean fatal = TRUE;
+		gboolean fatal = TRUE, reusable = FALSE;
 		gchar *problems = append_problems(&fatal);
-		gchar *text = problems ? g_strdup_printf("%s\n%s", append_summary ? append_summary : "", problems) :
-			g_strdup(append_summary ? append_summary : _("Choose a Living Stack file."));
-		gtk_label_set_text(GTK_LABEL(info_label), text);
-		g_free(text);
+		gchar *note = noreg ? NULL : append_registration_note(&reusable);
+		gtk_widget_set_visible(force_reg, reusable);
+		GString *text = g_string_new(append_summary ? append_summary : _("Choose a Living Stack file."));
+		if (problems)
+			g_string_append_printf(text, "\n%s", problems);
+		if (note)
+			g_string_append_printf(text, "\n%s", note);
+		gtk_label_set_text(GTK_LABEL(info_label), text->str);
+		g_string_free(text, TRUE);
 		g_free(problems);
+		g_free(note);
 		labelbuffer = g_strdup_printf(_("Appending %d images of the %d of the sequence"),
 				stackparam.nb_images_to_stack, com.seq.number);
 		gtk_label_set_text(result_label, labelbuffer);
