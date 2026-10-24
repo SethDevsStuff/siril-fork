@@ -120,7 +120,7 @@ static command commands[] = {
 	{"lsf_export", 2, "lsf_export file.lsf.fits output_filename", process_lsf_export, STR_LSF_EXPORT, TRUE, REQ_CMD_NONE},
 	{"lsf_init", 2, "lsf_init sequencename file.lsf.fits [rej [rejection type] [sigma_low sigma_high]] [-nonorm, -norm=] [-fastnorm] [-rgb_equal] [-weight={noise|wfwhm|nbstars}] [-output_norm] [-framing={max|current|min|cog}] [-hist_low=] [-hist_high=] [-hist_margin=] [-rejmaps] [-compress[={gzip2|gzip1}]] [-overwrite]", process_lsf_init, STR_LSF_INIT, TRUE, REQ_CMD_NONE},
 	{"lsf_maps", 2, "lsf_maps file.lsf.fits prefix [-neff] [-noise] [-sigma] [-snr] [-rejlo] [-rejhi]", process_lsf_maps, STR_LSF_MAPS, TRUE, REQ_CMD_NONE},
-	{"lsf_util", 2, "lsf_util file.lsf.fits [-check] [-repair | -adopt] [-compress[={gzip2|gzip1}] | -decompress] [-out=file.lsf.fits [-overwrite]] [-backup]", process_lsf_util, STR_LSF_UTIL, TRUE, REQ_CMD_NONE},
+	{"lsf_util", 2, "lsf_util file.lsf.fits [-info | -check] [-repair | -adopt] [-compress[={gzip2|gzip1}] | -decompress] [-out=file.lsf.fits [-overwrite]] [-backup]", process_lsf_util, STR_LSF_UTIL, TRUE, REQ_CMD_NONE},
 	{"makepsf", 1, "makepsf clear\n"
 				"makepsf load filename\n"
 				"makepsf save [filename]\n"

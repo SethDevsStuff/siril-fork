@@ -19,6 +19,7 @@
 #define LSF_COUNT_MAX 65535
 #define LSF_LOW_STACK_WARN 25
 #define LSF_NEFF_MIN (1.0 + 1e-4)
+#define LSF_EXPAND_STEP 64	// default step of a grid expansion, px per side (Section 10.5)
 /* least wfwhm or nbstars weight before normalization (Section 10.3), 1 being
  * the best frame of the first batch: a frame at or beyond its worst still counts */
 #define LSF_WEIGHT_FLOOR 0.01
@@ -108,6 +109,19 @@ typedef struct {
 	long long acc_bytes, count_bytes, rej_bytes;	// size of the data units as stored
 } lsf_file;
 
+/* what a user interface shows of an LSF file, read by lsf_read_info without
+ * the planes or the checksums, so fast enough to run when a file is chosen */
+typedef struct {
+	lsf_file file;			// as lsf_open_and_validate, without hist and stack_data
+	int failed_check;		// 0, or the check of Section 8 that failed (1 to 4, 6, 7)
+	gchar *problem;			// what failed, NULL when the checks pass
+	gchar *no_append;		// why this version cannot append to the file, or NULL
+	double exposure;		// sum of EXPTIME over the ledger, s
+	gchar *first_date, *last_date;	// DATE_OBS range of the ledger, NULL when unknown
+	gchar *last_added;		// ADDED_UTC of the last ledger row, NULL when unknown
+	gint64 file_bytes;
+} lsf_info;
+
 /* one frame of a batch, for the ledger */
 typedef struct {
 	gchar *frame_id;
@@ -186,6 +200,8 @@ int lsf_history_grow(lsf_history *h, const int pad[4]);
 void lsf_history_free(lsf_history *h);
 void lsf_file_free(lsf_file *f);
 int lsf_open_and_validate(const char *path, lsf_file *f, gboolean tolerate_edited_stack);
+int lsf_read_info(const char *path, lsf_info *info);
+void lsf_info_free(lsf_info *info);
 gchar *lsf_hash_float_data(const float *data, size_t n);
 gchar *lsf_now_utc_iso(void);
 int lsf_write_file(const char *path, lsf_file *old, const lsf_settings *s, lsf_history *h,
@@ -194,6 +210,59 @@ int lsf_write_file(const char *path, lsf_file *old, const lsf_settings *s, lsf_h
 const char *lsf_compression_name(lsf_compression comp);
 int lsf_export_master(const char *lsf_path, const char *out_path);
 void lsf_strip_lsf_keys(fits *fit);
+
+/* lsf_commands.c: the commands, and the same jobs started by the GUI */
+typedef enum { LSF_CMD_INIT, LSF_CMD_APPEND, LSF_CMD_EXPORT, LSF_CMD_UTIL, LSF_CMD_MAPS } lsf_cmd_mode;
+
+/* maps of lsf_maps (Section 10.8) */
+enum { LSF_MAP_NEFF = 1 << 0, LSF_MAP_NOISE = 1 << 1, LSF_MAP_SIGMA = 1 << 2, LSF_MAP_SNR = 1 << 3,
+	LSF_MAP_REJLO = 1 << 4, LSF_MAP_REJHI = 1 << 5 };
+
+typedef struct lsf_job_result lsf_job_result;
+/* called on the main thread when the job is over, after the processing
+ * thread is released, so it may start another job */
+typedef void (*lsf_end_func)(const lsf_job_result *res);
+
+struct lsf_job_result {
+	lsf_cmd_mode mode;
+	int retval;		// 0 on success
+	gchar *path;		// the LSF file
+	gchar *export_out;	// the plain image written with it, as named on disk, or NULL
+	lsf_end_func end_func;
+	gpointer end_data;	// of the caller
+};
+
+struct lsf_cmd_args {
+	lsf_cmd_mode mode;
+	gchar *seqname;
+	gchar *path;
+	gchar *out;		// export, or the maps prefix
+	lsf_settings settings;	// init: requested settings
+	gboolean hist_low_set, hist_high_set, hist_margin_set;
+	double hist_low, hist_high, hist_margin;
+	gboolean noreg, backup, overwrite;
+	gboolean rejmaps;		// init and append: -rejmaps (Section 5.4)
+	framing_type framing;		// init and append: -framing=, FRAMING_MAX by default (Sections 10.1, 10.5)
+	gboolean framing_set;
+	gboolean expand_force;
+	int expand_step;
+	gboolean check, repair, adopt, info;	// util
+	lsf_compression compression;	// -compress=, -nocompress, -decompress (Section 5.3)
+	gboolean compression_set;	// append: keeps the compression of the file when not set
+	guint maps;		// maps, LSF_MAP_* flags
+	gchar *export_out;	// init and append: also export the new Stack to this plain image (GUI)
+	gboolean load_result;	// init and append: the new Stack becomes the result image (GUI)
+	lsf_end_func end_func;	// GUI: called when the job is over, or NULL
+	gpointer end_data;
+};
+
+struct lsf_cmd_args *lsf_cmd_args_new(lsf_cmd_mode mode);
+void lsf_cmd_args_free(struct lsf_cmd_args *a);
+gchar *lsf_cmd_args_to_command(const struct lsf_cmd_args *a);
+int lsf_start(struct lsf_cmd_args *a);
+gchar *lsf_check_batch(const lsf_info *info, sequence *seq, gboolean *fatal);
+gchar *lsf_append_preflight(const lsf_info *info, const char *wd, int nb_frames, gboolean noreg,
+		gboolean add_rejmaps, gboolean *fatal);
 
 /* lsf_stack.c */
 struct lsf_batch_args {
@@ -216,6 +285,7 @@ struct lsf_batch_args {
 };
 int lsf_process_batch(struct lsf_batch_args *args);
 void lsf_ledger_row_free(gpointer p);
+const char *lsf_frame_mismatch(const fits *primary, const fits *frame);
 int lsf_build_primary(fits *primary, lsf_settings *s, const lsf_history *h);
 
 #endif /* SRC_LSF_LSF_H_ */

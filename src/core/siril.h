@@ -519,6 +519,7 @@ struct sequ {
 typedef struct {
 	char *filename;		// the name of the file
 	gboolean fileexist;// flag of existing file
+	gboolean is_lsf;	// the file is a Living Stack: a view of its Stack, never saved over
 	char *comment;		// comment on how the file got there (user load, result...)
 	int nb_layers;		// number of layers embedded in each image file
 	fits *fit;		// the fits is still gfit, but a reference doesn't hurt

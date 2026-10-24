@@ -106,8 +106,9 @@ static gboolean differ_str(const char *a, const char *b) {
 	return a[0] != '\0' && b[0] != '\0' && strcmp(a, b);
 }
 
-/* Section 7, keywords set at initialization then checked on append */
-static const char *check_frame_keywords(const fits *primary, const fits *frame) {
+/* Section 7, keywords set at initialization then checked on append: the
+ * first that differs, or NULL. The GUI checks a batch with it beforehand. */
+const char *lsf_frame_mismatch(const fits *primary, const fits *frame) {
 	const fkeywords *p = &primary->keywords, *f = &frame->keywords;
 	if (p->binning_x && f->binning_x && (p->binning_x != f->binning_x || p->binning_y != f->binning_y))
 		return "XBINNING/YBINNING";
@@ -372,7 +373,7 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 			goto end;
 		}
 		if (!args->init) {
-			const char *bad = check_frame_keywords(args->primary, &metas[i]);
+			const char *bad = lsf_frame_mismatch(args->primary, &metas[i]);
 			if (bad) {
 				siril_log_warning(_("LSF: frame %d not merged, %s differs from the LSF file\n"),
 						seq->imgparam[i].filenum, bad);

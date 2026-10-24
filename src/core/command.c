@@ -421,6 +421,7 @@ int process_save(int nb){
 			com.uniq->filename = strdup(savename);
 		}
 		com.uniq->fileexist = TRUE;
+		com.uniq->is_lsf = fits_file_is_lsf(com.uniq->filename);
 		if (!com.headless) {
 			gui_iface.display_filename();
 			gui_iface.adjust_sellabel();

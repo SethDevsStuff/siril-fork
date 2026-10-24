@@ -22,6 +22,7 @@
  * write an LSF file. */
 
 #include <string.h>
+#include <stddef.h>
 #include <math.h>
 #include <glib/gstdio.h>
 
@@ -36,42 +37,36 @@
 #include "core/processing_thread.h"
 #include "io/sequence.h"
 #include "io/image_format_fits.h"
+#include "io/single_image.h"
 #include "algos/siril_wcs.h"
 #include "algos/astrometry_solver.h"
 #include "opencv/opencv.h"
 #include "registration/registration.h"
 #include "lsf/lsf.h"
 
-typedef enum { LSF_CMD_INIT, LSF_CMD_APPEND, LSF_CMD_EXPORT, LSF_CMD_UTIL, LSF_CMD_MAPS } lsf_cmd_mode;
+/* the defaults of the commands, which the parsers then change */
+struct lsf_cmd_args *lsf_cmd_args_new(lsf_cmd_mode mode) {
+	struct lsf_cmd_args *a = calloc(1, sizeof(struct lsf_cmd_args));
+	if (!a) {
+		PRINT_ALLOC_ERR;
+		return NULL;
+	}
+	a->mode = mode;
+	a->framing = FRAMING_MAX;
+	a->expand_step = LSF_EXPAND_STEP;
+	lsf_settings_init(&a->settings);
+	a->settings.norm = NO_NORM;	// as the stack command
+	a->settings.rej = NO_REJEC;
+	return a;
+}
 
-/* maps of lsf_maps (Section 10.8) */
-enum { LSF_MAP_NEFF = 1 << 0, LSF_MAP_NOISE = 1 << 1, LSF_MAP_SIGMA = 1 << 2, LSF_MAP_SNR = 1 << 3,
-	LSF_MAP_REJLO = 1 << 4, LSF_MAP_REJHI = 1 << 5 };
-
-struct lsf_cmd_args {
-	lsf_cmd_mode mode;
-	gchar *seqname;
-	gchar *path;
-	gchar *out;		// export, or the maps prefix
-	lsf_settings settings;	// init: requested settings
-	gboolean hist_low_set, hist_high_set, hist_margin_set;
-	double hist_low, hist_high, hist_margin;
-	gboolean noreg, backup, overwrite;
-	gboolean rejmaps;		// init and append: -rejmaps (Section 5.4)
-	framing_type framing;		// init and append: -framing=, FRAMING_MAX by default (Sections 10.1, 10.5)
-	gboolean framing_set;
-	gboolean expand_force;
-	int expand_step;
-	gboolean check, repair, adopt;	// util
-	lsf_compression compression;	// -compress=, -nocompress, -decompress (Section 5.3)
-	gboolean compression_set;	// append: keeps the compression of the file when not set
-	guint maps;		// maps, LSF_MAP_* flags
-};
-
-static void free_cmd_args(struct lsf_cmd_args *a) {
+void lsf_cmd_args_free(struct lsf_cmd_args *a) {
+	if (!a)
+		return;
 	g_free(a->seqname);
 	g_free(a->path);
 	g_free(a->out);
+	g_free(a->export_out);
 	lsf_settings_free(&a->settings);
 	free(a);
 }
@@ -699,7 +694,7 @@ static void print_summary(const lsf_file *f) {
 	siril_log_message(_("  LSF_ACC %s, %.0f MB stored (%.0f%% of raw), LSF_COUNT %s, %.0f MB stored (%.0f%% of raw)\n"),
 			f->acc_codec, (double) f->acc_bytes / BYTES_IN_A_MB, 100.0 * f->acc_bytes / (raw * LSF_NB_PL * sizeof(float)),
 			f->count_codec, (double) f->count_bytes / BYTES_IN_A_MB, 100.0 * f->count_bytes / (raw * sizeof(WORD)));
-	if (f->hist.rej[0][0])
+	if (s->rejmaps)	// LSF_REJ is present, check 7
 		siril_log_message(_("  LSF_REJ %s, %.0f MB stored (%.0f%% of raw), rejections counted since generation %d%s\n"),
 				f->rej_codec, (double) f->rej_bytes / BYTES_IN_A_MB, 100.0 * f->rej_bytes / (raw * 2 * sizeof(WORD)),
 				f->hist.rej_gen, f->hist.rej_saturated ? ", some counts saturated" : "");
@@ -710,10 +705,119 @@ static void print_summary(const lsf_file *f) {
  * when only check 8 failed, and a change of the compression of the
  * extensions (Section 5.3). The actions combine into one rewrite, which
  * increments the generation. */
+/* lsf_util -info: the summary from the headers alone (lsf_read_info) */
+static int lsf_info_run(struct lsf_cmd_args *a) {
+	lsf_info info;
+	if (lsf_read_info(a->path, &info)) {
+		siril_log_error(_("LSF: %s cannot be used, %s\n"), a->path, info.problem);
+		lsf_info_free(&info);
+		return 1;
+	}
+	print_summary(&info.file);
+	siril_log_message(_("  %.1f s of exposure, frames from %s to %s, last commit %s, file %.0f MB\n"), info.exposure,
+			info.first_date ? info.first_date : "?", info.last_date ? info.last_date : "?",
+			info.last_added ? info.last_added : "?", (double) info.file_bytes / BYTES_IN_A_MB);
+	if (info.no_append)
+		siril_log_warning(_("LSF: this version cannot append to %s: %s\n"), a->path, info.no_append);
+	siril_log_info(_("LSF: %s passed checks 1 to 4, 6 and 7 of Section 8; -check runs them all\n"), a->path);
+	lsf_info_free(&info);
+	return 0;
+}
+
+/* The checks lsf_append makes of a batch, for the GUI before it runs:
+ * a channel count that differs is refused, and frames whose Section 7
+ * keywords differ from the file are skipped, which the reference frame
+ * shows. Returns a message for the user or NULL, *fatal when refused. */
+gchar *lsf_check_batch(const lsf_info *info, sequence *seq, gboolean *fatal) {
+	*fatal = FALSE;
+	if (seq->nb_layers != info->file.nchan) {
+		*fatal = TRUE;
+		return g_strdup_printf(_("The Living Stack has %d channel(s) and the sequence %d."),
+				info->file.nchan, seq->nb_layers);
+	}
+	fits meta = { 0 };
+	gchar *msg = NULL;
+	if (!seq_read_frame_metadata(seq, sequence_find_refimage(seq), &meta)) {
+		const char *bad = lsf_frame_mismatch(&info->file.primary, &meta);
+		if (bad)
+			msg = g_strdup_printf(_("The %s of the reference frame differs from the Living Stack. Frames "
+						"that differ are not merged."), bad);
+	}
+	clearfits(&meta);
+	return msg;
+}
+
+/* free space of the file system holding path, or -1 */
+static gint64 free_space_of(const char *path, gchar **fs_id) {
+	GFile *file = g_file_new_for_path(path);
+	GFileInfo *fi = g_file_query_filesystem_info(file, G_FILE_ATTRIBUTE_FILESYSTEM_FREE "," G_FILE_ATTRIBUTE_ID_FILESYSTEM,
+			NULL, NULL);
+	gint64 space = -1;
+	if (fi) {
+		if (g_file_info_has_attribute(fi, G_FILE_ATTRIBUTE_FILESYSTEM_FREE))
+			space = (gint64) g_file_info_get_attribute_uint64(fi, G_FILE_ATTRIBUTE_FILESYSTEM_FREE);
+		if (fs_id)
+			*fs_id = g_strdup(g_file_info_get_attribute_string(fi, G_FILE_ATTRIBUTE_ID_FILESYSTEM));
+		g_object_unref(fi);
+	}
+	g_object_unref(file);
+	return space;
+}
+
+/* Before an append, from lsf_read_info: memory for the accumulator, which
+ * stays in memory during the merge, and disk for the registered frames
+ * (written in the working directory, unless noreg) and for the new file,
+ * written beside the old one before it replaces it (Section 10.2). The grid
+ * may still grow, which is known only after the registration. Returns a
+ * message or NULL, *fatal when the append cannot run. */
+gchar *lsf_append_preflight(const lsf_info *info, const char *wd, int nb_frames, gboolean noreg,
+		gboolean add_rejmaps, gboolean *fatal) {
+	const lsf_file *f = &info->file;
+	*fatal = FALSE;
+	gboolean rej = f->settings.rejmaps || add_rejmaps;
+	guint64 npix = (guint64) f->rx * f->ry * f->nchan;
+	guint64 hist = npix * (LSF_NB_PL * sizeof(float) + (rej ? 3 : 1) * sizeof(WORD));
+	guint64 max_mem = (guint64) get_max_memory_in_MB() * BYTES_IN_A_MB;
+	if (hist >= max_mem) {
+		*fatal = TRUE;
+		return g_strdup_printf(_("The accumulator of this Living Stack needs %.0f MB of memory, and Siril may use "
+					"%.0f MB. Raise the memory limit in the preferences."),
+				(double) hist / BYTES_IN_A_MB, (double) max_mem / BYTES_IN_A_MB);
+	}
+	GString *msg = g_string_new(NULL);
+	if (hist > max_mem / 4 * 3)
+		g_string_append_printf(msg, _("The accumulator needs %.0f MB of the %.0f MB Siril may use, which leaves "
+					"little memory for the frames: the append may be slow or fail. "),
+				(double) hist / BYTES_IN_A_MB, (double) max_mem / BYTES_IN_A_MB);
+
+	/* the new file is about the size of the old one, plus the growth */
+	gint64 need_file = info->file_bytes;
+	gint64 need_frames = noreg ? 0 : (gint64) nb_frames * (gint64) (npix * sizeof(float));
+	gchar *dir = g_path_get_dirname(f->path), *fs_file = NULL, *fs_wd = NULL;
+	gint64 free_file = free_space_of(dir, &fs_file), free_wd = free_space_of(wd, &fs_wd);
+	g_free(dir);
+	gboolean same_fs = fs_file && fs_wd && !strcmp(fs_file, fs_wd);
+	gboolean short_file = free_file >= 0 && free_file < need_file + (same_fs ? need_frames : 0);
+	gboolean short_wd = !same_fs && free_wd >= 0 && free_wd < need_frames;
+	if (short_file || short_wd) {
+		*fatal = TRUE;
+		gchar *nf = g_format_size(need_file), *nr = g_format_size(need_frames);
+		g_string_printf(msg, _("Not enough free disk space: the append writes the registered frames (%s, in the "
+					"working directory) and a new copy of the Living Stack (%s, beside it) before replacing it."), nr, nf);
+		g_free(nf);
+		g_free(nr);
+	}
+	g_free(fs_file);
+	g_free(fs_wd);
+	return msg->len ? g_string_free(msg, FALSE) : (g_string_free(msg, TRUE), NULL);
+}
+
 static int lsf_util_run(struct lsf_cmd_args *a) {
 	lsf_file f;
 	int retval = 1;
 	GPtrArray *none = NULL;
+	if (a->info)
+		return lsf_info_run(a);
 	if (lsf_open_and_validate(a->path, &f, TRUE)) {
 		lsf_file_free(&f);
 		return 1;
@@ -888,6 +992,62 @@ static int lsf_maps_run(struct lsf_cmd_args *a) {
 	return retval;
 }
 
+static int lsf_export_run(const char *path, const char *out) {
+	int retval = lsf_export_master(path, out);
+	if (!retval) {
+		/* the name savefits gave the file */
+		gchar *name = set_right_extension(out);
+		siril_log_message(_("LSF: master of %s exported to %s\n"), path, name ? name : out);
+		g_free(name);
+	}
+	return retval;
+}
+
+/* the new Stack becomes the result image, as stacking leaves its result in
+ * gfit with the sequence still loaded. It is a view of the LSF file, which
+ * is never saved over (Section 13), or of the plain image exported with it. */
+static void lsf_load_result(const char *path, const char *export_name) {
+	fits fit = { 0 };
+	if (readfits(export_name ? export_name : path, &fit, NULL, TRUE)) {
+		clearfits(&fit);
+		return;
+	}
+	lsf_strip_lsf_keys(&fit);
+	single *uniq = calloc(1, sizeof(single));
+	if (!uniq) {
+		PRINT_ALLOC_ERR;
+		clearfits(&fit);
+		return;
+	}
+	g_rw_lock_writer_lock(&gfit->rwlock);
+	clearfits(gfit);
+	memcpy(gfit, &fit, offsetof(fits, rwlock));
+	com.seq.current = RESULT_IMAGE;
+	/* as stacking does, the previous com.uniq is not freed: the main thread
+	 * may still be reading it */
+	uniq->filename = strdup(export_name ? export_name : path);
+	uniq->fileexist = TRUE;
+	uniq->is_lsf = !export_name;
+	uniq->comment = strdup(_("Living Stack result image"));
+	uniq->nb_layers = gfit->naxes[2];
+	uniq->fit = gfit;
+	com.uniq = uniq;
+	g_rw_lock_writer_unlock(&gfit->rwlock);
+	/* with the writer lock released, as after stacking */
+	notify_gfit_data_modified();
+}
+
+/* on the main thread when a job with an end function is over */
+static gboolean lsf_end_job(gpointer p) {
+	lsf_job_result *r = p;
+	stop_processing_thread();
+	r->end_func(r);
+	g_free(r->path);
+	g_free(r->export_out);
+	free(r);
+	return FALSE;
+}
+
 static gpointer lsf_worker(gpointer p) {
 	struct lsf_cmd_args *a = p;
 	int retval;
@@ -905,18 +1065,121 @@ static gpointer lsf_worker(gpointer p) {
 		retval = lsf_maps_run(a);
 		break;
 	default:
-		retval = lsf_export_master(a->path, a->out);
-		if (!retval) {
-			/* the name savefits gave the file */
-			gchar *name = set_right_extension(a->out);
-			siril_log_message(_("LSF: master of %s exported to %s\n"), a->path, name ? name : a->out);
-			g_free(name);
-		}
+		retval = lsf_export_run(a->path, a->out);
 		break;
 	}
-	free_cmd_args(a);
-	siril_add_idle(end_generic, NULL);
+	/* the plain image of the new Stack, as lsf_export makes it */
+	gboolean commit = a->mode == LSF_CMD_INIT || a->mode == LSF_CMD_APPEND;
+	gchar *export_name = commit && a->export_out ? set_right_extension(a->export_out) : NULL;
+	if (!retval && export_name)
+		retval = lsf_export_run(a->path, a->export_out);
+	if (!retval && commit && a->load_result)
+		lsf_load_result(a->path, export_name);
+	lsf_job_result *r = a->end_func ? calloc(1, sizeof(lsf_job_result)) : NULL;
+	if (r) {
+		r->mode = a->mode;
+		r->retval = retval;
+		r->path = g_strdup(a->path);
+		r->export_out = export_name;
+		r->end_func = a->end_func;
+		r->end_data = a->end_data;
+	} else g_free(export_name);
+	lsf_cmd_args_free(a);
+	if (r)
+		siril_add_idle(lsf_end_job, r);
+	else siril_add_idle(end_generic, NULL);
 	return GINT_TO_POINTER(retval);
+}
+
+/* starts the job of a in the processing thread, which takes it. Returns
+ * non-zero, with a freed, when another job is running. */
+int lsf_start(struct lsf_cmd_args *a) {
+	if (!start_in_new_thread(lsf_worker, a)) {
+		lsf_cmd_args_free(a);
+		return 1;
+	}
+	return 0;
+}
+
+static void add_arg(GString *cmd, const char *arg) {
+	if (strchr(arg, ' '))
+		g_string_append_printf(cmd, " \"%s\"", arg);
+	else g_string_append_printf(cmd, " %s", arg);
+}
+
+static void add_hist_and_common_args(GString *cmd, const struct lsf_cmd_args *a) {
+	if (a->hist_low_set)
+		g_string_append_printf(cmd, " -hist_low=%g", a->hist_low);
+	if (a->hist_high_set)
+		g_string_append_printf(cmd, " -hist_high=%g", a->hist_high);
+	if (a->hist_margin_set)
+		g_string_append_printf(cmd, " -hist_margin=%g", a->hist_margin);
+	if (a->framing_set || a->framing != FRAMING_MAX)
+		g_string_append_printf(cmd, " -framing=%s", lsf_framing_name(a->framing));
+	if (a->rejmaps)
+		g_string_append(cmd, " -rejmaps");
+	if (a->compression_set)
+		g_string_append(cmd, a->compression == LSF_COMP_NONE ? " -nocompress" :
+				a->compression == LSF_COMP_GZIP1 ? " -compress=gzip1" : " -compress");
+}
+
+/* the command line of a, for the log of a GUI run, so it can be repeated
+ * in a script. Returns NULL for the modes that have no GUI yet. */
+gchar *lsf_cmd_args_to_command(const struct lsf_cmd_args *a) {
+	/* the rejection letters of the stack command, in rejection order */
+	static const char *rej_letters[] = { "n", "p", "s", "a", "m", "w", "l", "g" };
+	GString *cmd = g_string_new(NULL);
+	const lsf_settings *s = &a->settings;
+	switch (a->mode) {
+	case LSF_CMD_INIT:
+		g_string_append(cmd, "lsf_init");
+		add_arg(cmd, a->seqname);
+		add_arg(cmd, a->path);
+		if (s->rej != NO_REJEC && s->rej < (int) G_N_ELEMENTS(rej_letters))
+			g_string_append_printf(cmd, " rej %s %g %g", rej_letters[s->rej], s->sig[0], s->sig[1]);
+		if (s->norm != NO_NORM)
+			g_string_append_printf(cmd, " -norm=%s", lsf_norm_name(s->norm));
+		if (s->lite_norm)
+			g_string_append(cmd, " -fastnorm");
+		if (s->rgb_equal)
+			g_string_append(cmd, " -rgb_equal");
+		if (s->weighting != NO_WEIGHT)
+			g_string_append_printf(cmd, " -weight=%s", lsf_weight_name(s->weighting));
+		if (s->outnorm)
+			g_string_append(cmd, " -output_norm");
+		add_hist_and_common_args(cmd, a);
+		if (a->overwrite)
+			g_string_append(cmd, " -overwrite");
+		break;
+	case LSF_CMD_APPEND:
+		g_string_append(cmd, "lsf_append");
+		add_arg(cmd, a->path);
+		add_arg(cmd, a->seqname);
+		if (a->noreg)
+			g_string_append(cmd, " -noreg");
+		add_hist_and_common_args(cmd, a);
+		if (a->expand_step != LSF_EXPAND_STEP)
+			g_string_append_printf(cmd, " -expand_step=%d", a->expand_step);
+		if (a->expand_force)
+			g_string_append(cmd, " -expand_force");
+		if (a->backup)
+			g_string_append(cmd, " -backup");
+		break;
+	case LSF_CMD_EXPORT:
+		g_string_append(cmd, "lsf_export");
+		add_arg(cmd, a->path);
+		add_arg(cmd, a->out);
+		break;
+	default:
+		g_string_free(cmd, TRUE);
+		return NULL;
+	}
+	if (a->export_out && (a->mode == LSF_CMD_INIT || a->mode == LSF_CMD_APPEND)) {
+		g_string_append(cmd, "\nlsf_export");
+		add_arg(cmd, a->path);
+		add_arg(cmd, a->export_out);
+	}
+	return g_string_free(cmd, FALSE);
 }
 
 static gboolean parse_double_opt(const char *word_i, const char *prefix, double *out, gboolean *set) {
@@ -1000,15 +1263,12 @@ static int parse_common_option(struct lsf_cmd_args *a, const char *w) {
  *   [-rgb_equal] [-weight=] [-output_norm] [-framing=max|current|min|cog] [-hist_low=] [-hist_high=] [-hist_margin=]
  *   [-rejmaps] [-compress[=gzip2|gzip1]] [-overwrite] */
 int process_lsf_init(int nb) {
-	struct lsf_cmd_args *a = calloc(1, sizeof(struct lsf_cmd_args));
-	a->mode = LSF_CMD_INIT;
-	a->framing = FRAMING_MAX;
+	struct lsf_cmd_args *a = lsf_cmd_args_new(LSF_CMD_INIT);
+	if (!a)
+		return CMD_ALLOC_ERROR;
 	a->seqname = g_strdup(word[1]);
 	a->path = g_strdup(word[2]);
 	lsf_settings *s = &a->settings;
-	lsf_settings_init(s);
-	s->norm = NO_NORM;	// as the stack command
-	s->rej = NO_REJEC;
 
 	int i = 3;
 	if (word[i] && (!strcmp(word[i], "rej") || !strcmp(word[i], "mean"))) {
@@ -1080,25 +1340,22 @@ int process_lsf_init(int nb) {
 		s->lite_norm = FALSE;
 		s->rgb_equal = FALSE;
 	}
-	if (!start_in_new_thread(lsf_worker, a)) {
-		free_cmd_args(a);
+	if (lsf_start(a))
 		return CMD_GENERIC_ERROR;
-	}
 	return CMD_OK;
 failure:
-	free_cmd_args(a);
+	lsf_cmd_args_free(a);
 	return CMD_ARG_ERROR;
 }
 
 /* lsf_append file.lsf.fits sequencename [-noreg] [-framing=max|current] [-noexpand] [-expand_step=] [-expand_force] [-backup]
  *   [-hist_low=] [-hist_high=] [-hist_margin=] [-rejmaps] [-compress[=gzip2|gzip1] | -nocompress] */
 int process_lsf_append(int nb) {
-	struct lsf_cmd_args *a = calloc(1, sizeof(struct lsf_cmd_args));
-	a->mode = LSF_CMD_APPEND;
+	struct lsf_cmd_args *a = lsf_cmd_args_new(LSF_CMD_APPEND);
+	if (!a)
+		return CMD_ALLOC_ERROR;
 	a->path = g_strdup(word[1]);
 	a->seqname = g_strdup(word[2]);
-	a->expand_step = 64;
-	a->framing = FRAMING_MAX;
 	for (int i = 3; i < nb && word[i]; i++) {
 		const char *w = word[i];
 		int c = parse_common_option(a, w);
@@ -1127,33 +1384,31 @@ int process_lsf_append(int nb) {
 					"file never shrinks or moves (Section 10.5), so min and cog framing apply to lsf_init\n"));
 		goto failure;
 	}
-	if (!start_in_new_thread(lsf_worker, a)) {
-		free_cmd_args(a);
+	if (lsf_start(a))
 		return CMD_GENERIC_ERROR;
-	}
 	return CMD_OK;
 failure:
-	free_cmd_args(a);
+	lsf_cmd_args_free(a);
 	return CMD_ARG_ERROR;
 }
 
 /* lsf_export file.lsf.fits output.fit */
 int process_lsf_export(int nb) {
-	struct lsf_cmd_args *a = calloc(1, sizeof(struct lsf_cmd_args));
-	a->mode = LSF_CMD_EXPORT;
+	struct lsf_cmd_args *a = lsf_cmd_args_new(LSF_CMD_EXPORT);
+	if (!a)
+		return CMD_ALLOC_ERROR;
 	a->path = g_strdup(word[1]);
 	a->out = g_strdup(word[2]);
-	if (!start_in_new_thread(lsf_worker, a)) {
-		free_cmd_args(a);
+	if (lsf_start(a))
 		return CMD_GENERIC_ERROR;
-	}
 	return CMD_OK;
 }
 
 /* lsf_util file.lsf.fits [-check] [-repair | -adopt] [-compress[=gzip2|gzip1] | -decompress] [-out=file.lsf.fits [-overwrite]] [-backup] */
 int process_lsf_util(int nb) {
-	struct lsf_cmd_args *a = calloc(1, sizeof(struct lsf_cmd_args));
-	a->mode = LSF_CMD_UTIL;
+	struct lsf_cmd_args *a = lsf_cmd_args_new(LSF_CMD_UTIL);
+	if (!a)
+		return CMD_ALLOC_ERROR;
 	a->path = g_strdup(word[1]);
 	for (int i = 2; i < nb && word[i]; i++) {
 		const char *w = word[i];
@@ -1161,6 +1416,7 @@ int process_lsf_util(int nb) {
 		if (c < 0) goto failure;
 		if (c > 0) continue;
 		if (!strcmp(w, "-check")) a->check = TRUE;
+		else if (!strcmp(w, "-info")) a->info = TRUE;
 		else if (!strcmp(w, "-repair")) a->repair = TRUE;
 		else if (!strcmp(w, "-adopt")) a->adopt = TRUE;
 		else if (!strcmp(w, "-decompress")) {
@@ -1181,28 +1437,31 @@ int process_lsf_util(int nb) {
 		g_free(a->out);	// the file itself: an update in place
 		a->out = NULL;
 	}
-	if (!a->check && !a->repair && !a->adopt && !a->compression_set && !a->out) {
-		siril_log_error(_("lsf_util needs an action: -check, -repair, -adopt, -compress, -decompress or -out=\n"));
+	if (!a->check && !a->info && !a->repair && !a->adopt && !a->compression_set && !a->out) {
+		siril_log_error(_("lsf_util needs an action: -info, -check, -repair, -adopt, -compress, -decompress or -out=\n"));
+		goto failure;
+	}
+	if (a->info && (a->check || a->repair || a->adopt || a->compression_set || a->out)) {
+		siril_log_error(_("-info only reads the file and cannot be used with other actions\n"));
 		goto failure;
 	}
 	if (a->repair && a->adopt) {
 		siril_log_error(_("-repair and -adopt cannot be used together\n"));
 		goto failure;
 	}
-	if (!start_in_new_thread(lsf_worker, a)) {
-		free_cmd_args(a);
+	if (lsf_start(a))
 		return CMD_GENERIC_ERROR;
-	}
 	return CMD_OK;
 failure:
-	free_cmd_args(a);
+	lsf_cmd_args_free(a);
 	return CMD_ARG_ERROR;
 }
 
 /* lsf_maps file.lsf.fits prefix [-neff] [-noise] [-sigma] [-snr] [-rejlo] [-rejhi] */
 int process_lsf_maps(int nb) {
-	struct lsf_cmd_args *a = calloc(1, sizeof(struct lsf_cmd_args));
-	a->mode = LSF_CMD_MAPS;
+	struct lsf_cmd_args *a = lsf_cmd_args_new(LSF_CMD_MAPS);
+	if (!a)
+		return CMD_ALLOC_ERROR;
 	a->path = g_strdup(word[1]);
 	a->out = g_strdup(word[2]);
 	for (int i = 3; i < nb && word[i]; i++) {
@@ -1215,15 +1474,13 @@ int process_lsf_maps(int nb) {
 		else if (!strcmp(w, "-rejhi")) a->maps |= LSF_MAP_REJHI;
 		else {
 			siril_log_error(_("Unknown parameter %s, aborting.\n"), w);
-			free_cmd_args(a);
+			lsf_cmd_args_free(a);
 			return CMD_ARG_ERROR;
 		}
 	}
 	if (!a->maps)
 		a->maps = LSF_MAP_NEFF | LSF_MAP_NOISE | LSF_MAP_SIGMA | LSF_MAP_SNR;
-	if (!start_in_new_thread(lsf_worker, a)) {
-		free_cmd_args(a);
+	if (lsf_start(a))
 		return CMD_GENERIC_ERROR;
-	}
 	return CMD_OK;
 }

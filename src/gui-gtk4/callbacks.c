@@ -1171,7 +1171,8 @@ gboolean update_MenuItem(gpointer user_data) {
 	/* save and save as */
 	GAction *action_save = g_action_map_lookup_action (G_ACTION_MAP(gtk_window_get_application(GTK_WINDOW(app_win))), "save");
 	GAction *action_save_as = g_action_map_lookup_action (G_ACTION_MAP(gtk_window_get_application(GTK_WINDOW(app_win))), "save-as");
-	g_simple_action_set_enabled(G_SIMPLE_ACTION(action_save), is_a_single_image_loaded && com.uniq->fileexist);
+	g_simple_action_set_enabled(G_SIMPLE_ACTION(action_save), is_a_single_image_loaded && com.uniq->fileexist
+			&& !com.uniq->is_lsf);
 	g_simple_action_set_enabled(G_SIMPLE_ACTION(action_save_as), any_image_is_loaded);
 
 	/* popup menu */
@@ -1511,6 +1512,11 @@ void display_filename() {
 	gchar *base_name = g_path_get_basename(filename);
 	if (strlen(base_name) > 4096) // Prevent manifestly excessive lengths
 		base_name[4095] = 0;
+	if (single_image_is_loaded() && com.uniq->is_lsf) {
+		gchar *lsf_name = g_strdup_printf(_("%s (Living Stack, read-only)"), base_name);
+		g_free(base_name);
+		base_name = lsf_name;
+	}
 	gchar *orig_base_name = NULL;
 	GString *concat_base_name = NULL;
 	if (orig_filename && orig_filename[0] != '\0') {
@@ -1772,7 +1778,7 @@ void initialize_FITS_name_entries() {
 			str[3] = g_strdup_printf("stack_result%s", com.pref.ext);
 	}
 	if (str[3]) {
-		gtk_editable_set_text(GTK_EDITABLE(final_stack), str[3]);
+		stack_set_image_output_name(str[3]);
 	}
 
 	for (int i = 0; i < 4; i++)
@@ -1782,14 +1788,13 @@ void initialize_FITS_name_entries() {
 /* when a sequence is loaded, the processing (stacking) output file name is
  * modified to include the name of the sequence */
 void set_output_filename_to_sequence_name() {
-	static GtkEntry *output_file = NULL;
 	gchar *msg;
 	if (!com.seq.seqname || *com.seq.seqname == '\0')
 		return;
-	output_file = GTK_ENTRY(lookup_widget("entryresultfile"));
+	/* the image mode's name, kept apart while the Living Stack pattern is shown */
 	if (com.pref.prepro.stack_default) {
 		if (com.pref.prepro.use_stack_default) {
-			gtk_editable_set_text(GTK_EDITABLE(output_file), com.pref.prepro.stack_default);
+			stack_set_image_output_name(com.pref.prepro.stack_default);
 			return;
 		}
 	}
@@ -1798,7 +1803,7 @@ void set_output_filename_to_sequence_name() {
 	msg = g_strdup_printf("%s%sstacked%s", com.seq.seqname,
 			g_str_has_suffix(com.seq.seqname, "_") ?
 			"" : (g_str_has_suffix(com.seq.seqname, "-") ? "" : "_"), com_ext);
-	gtk_editable_set_text(GTK_EDITABLE(output_file), msg);
+	stack_set_image_output_name(msg);
 
 	g_free(msg);
 }

@@ -1030,7 +1030,7 @@ mouse_function_metadata save_on_click_action = { save_on_click,
 	NAME_SAVE_ON_CLICK_ACTION, N_("This action saves the current image"), FALSE, MOUSE_REF_SAVE };
 
 	gboolean save_on_click(mouse_data *data) {
-	if (single_image_is_loaded() && com.uniq->fileexist) {
+	if (single_image_is_loaded() && com.uniq->fileexist && !com.uniq->is_lsf) {
 		savefits(com.uniq->filename, gfit);
 	} else {
 		start_in_new_thread(mouse_save_as, NULL);

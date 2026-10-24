@@ -191,9 +191,16 @@ static int find_plane(fitsfile *fptr, int nplanes, const char *name) {
 
 /***************************** reading *****************************/
 
-static int validation_failure(int check, const char *path, const char *what) {
-	siril_log_error(_("LSF validation of %s failed at check %d (Section 8): %s. "
-				"The file was not modified.\n"), path, check, what);
+/* a failed check of Section 8 is logged, or kept in problem for a caller
+ * that shows it itself (lsf_read_info) */
+static int validation_failure(int check, const char *path, gchar **problem, const char *what) {
+	if (problem) {
+		g_free(*problem);
+		*problem = g_strdup_printf(_("check %d (Section 8) failed: %s"), check, what);
+	} else {
+		siril_log_error(_("LSF validation of %s failed at check %d (Section 8): %s. "
+					"The file was not modified.\n"), path, check, what);
+	}
 	return check;
 }
 
@@ -285,11 +292,15 @@ static const char *find_row(GPtrArray *rows, const char *key) {
  * With tolerate_edited_stack, a failure of check 8 alone (the Stack was
  * modified outside Siril, the accumulator is intact) is not an error: the
  * file is loaded, f->stack_modified is set and f->stack_data holds the
- * edited Stack, for Repair and Adopt. */
-int lsf_open_and_validate(const char *path, lsf_file *f, gboolean tolerate_edited_stack) {
+ * edited Stack, for Repair and Adopt.
+ * With problem set, the light mode of lsf_read_info: checks 5 and 8 and
+ * the planes, which read the whole file, are skipped, and a failure is
+ * described in problem instead of being logged. */
+static int open_and_validate(const char *path, lsf_file *f, gboolean tolerate_edited_stack, gchar **problem) {
 	fitsfile *fptr = NULL;
 	int status = 0, hdunum = 0;
 	int ret = 0;
+	gboolean light = problem != NULL;
 	memset(f, 0, sizeof(lsf_file));
 	f->path = g_strdup(path);
 	f->unknown_hdus = g_array_new(FALSE, FALSE, sizeof(int));
@@ -298,8 +309,9 @@ int lsf_open_and_validate(const char *path, lsf_file *f, gboolean tolerate_edite
 	float *primary_data = NULL;
 
 	if (fits_open_diskfile(&fptr, path, READONLY, &status)) {
-		report_fits_error(status);
-		return validation_failure(1, path, _("cannot open the file"));
+		if (!light)
+			report_fits_error(status);
+		return validation_failure(1, path, problem, _("cannot open the file"));
 	}
 
 	/* check 1: LSF = T and supported version */
@@ -309,13 +321,13 @@ int lsf_open_and_validate(const char *path, lsf_file *f, gboolean tolerate_edite
 	fits_read_key(fptr, TLOGICAL, "LSF", &lsf, NULL, &status);
 	fits_read_key(fptr, TSTRING, "LSFVER", ver, NULL, &status);
 	if (status || !lsf) {
-		ret = validation_failure(1, path, _("not an LSF file (LSF keyword missing or false)"));
+		ret = validation_failure(1, path, problem, _("not an LSF file (LSF keyword missing or false)"));
 		goto end;
 	}
 	if (strcmp(ver, LSF_VERSION)) {
 		if (!strcmp(ver, "0.3"))
-			ret = validation_failure(1, path, _("LSF version 0.3 files must be converted to 0.4 first"));
-		else ret = validation_failure(1, path, _("unsupported LSF version"));
+			ret = validation_failure(1, path, problem, _("LSF version 0.3 files must be converted to 0.4 first"));
+		else ret = validation_failure(1, path, problem, _("unsupported LSF version"));
 		goto end;
 	}
 
@@ -324,7 +336,7 @@ int lsf_open_and_validate(const char *path, lsf_file *f, gboolean tolerate_edite
 	status = 0;
 	fits_read_key(fptr, TLOGICAL, "LSFBUSY", &busy, NULL, &status);
 	if (!status && busy) {
-		ret = validation_failure(2, path, _("LSFBUSY is set: an update was interrupted, restore a backup"));
+		ret = validation_failure(2, path, problem, _("LSFBUSY is set: an update was interrupted, restore a backup"));
 		goto end;
 	}
 
@@ -345,12 +357,13 @@ int lsf_open_and_validate(const char *path, lsf_file *f, gboolean tolerate_edite
 		else if (!strcmp(extname, LSF_EXT_REJ)) hdu_rej = i;
 		else if (!strcmp(extname, "LSF_STARS")) {
 			/* the star cache would be stale after this append (Section 10.4) */
-			siril_log_warning(_("LSF: %s is not supported by this version and will be dropped\n"), extname);
+			if (!light)
+				siril_log_warning(_("LSF: %s is not supported by this version and will be dropped\n"), extname);
 		}
 		else g_array_append_val(f->unknown_hdus, i);
 	}
 	if (!hdu_acc || !hdu_count || !hdu_settings || !hdu_ledger) {
-		ret = validation_failure(3, path, _("a required LSF HDU is missing"));
+		ret = validation_failure(3, path, problem, _("a required LSF HDU is missing"));
 		goto end;
 	}
 	f->ledger_hdu = hdu_ledger;
@@ -361,7 +374,7 @@ int lsf_open_and_validate(const char *path, lsf_file *f, gboolean tolerate_edite
 	fits_movabs_hdu(fptr, 1, NULL, &status);
 	fits_get_img_param(fptr, 3, &bitpix, &naxis, naxes, &status);
 	if (status || bitpix != FLOAT_IMG || (naxis != 2 && !(naxis == 3 && naxes[2] == 3))) {
-		ret = validation_failure(3, path, _("the primary is not a float32 mono or RGB image"));
+		ret = validation_failure(3, path, problem, _("the primary is not a float32 mono or RGB image"));
 		goto end;
 	}
 	f->rx = naxes[0];
@@ -375,7 +388,7 @@ int lsf_open_and_validate(const char *path, lsf_file *f, gboolean tolerate_edite
 	fits_get_img_param(fptr, 3, &abitpix, &anaxis, anaxes, &status);
 	if (status || abitpix != FLOAT_IMG || anaxis != 3 || anaxes[0] != f->rx || anaxes[1] != f->ry
 			|| anaxes[2] != LSF_NB_PL * f->nchan) {
-		ret = validation_failure(3, path, _("LSF_ACC does not have the expected dimensions"));
+		ret = validation_failure(3, path, problem, _("LSF_ACC does not have the expected dimensions"));
 		goto end;
 	}
 	/* map the planes by name (C6) */
@@ -387,8 +400,8 @@ int lsf_open_and_validate(const char *path, lsf_file *f, gboolean tolerate_edite
 			g_free(expected);
 			if (plane_index[k][c] < 0) {
 				if (k == LSF_PL_W2)
-					ret = validation_failure(3, path, _("the file has no W2 plane, appending is refused (Section 11)"));
-				else ret = validation_failure(3, path, _("LSF_ACC does not hold the expected named planes"));
+					ret = validation_failure(3, path, problem, _("the file has no W2 plane, appending is refused (Section 11)"));
+				else ret = validation_failure(3, path, problem, _("LSF_ACC does not hold the expected named planes"));
 				goto end;
 			}
 		}
@@ -402,7 +415,7 @@ int lsf_open_and_validate(const char *path, lsf_file *f, gboolean tolerate_edite
 	if (status || ctype != USHORT_IMG || cnaxes[0] != f->rx || cnaxes[1] != f->ry ||
 			(f->nchan == 1 && cnaxis != 2) ||
 			(f->nchan == 3 && !(cnaxis == 3 && (cnaxes[2] == 3 || cnaxes[2] == 1)))) {
-		ret = validation_failure(3, path, _("LSF_COUNT does not have the expected dimensions"));
+		ret = validation_failure(3, path, problem, _("LSF_COUNT does not have the expected dimensions"));
 		goto end;
 	}
 	/* LSF_REJ, when present, is checked the same way (Section 8, check 3) */
@@ -416,7 +429,7 @@ int lsf_open_and_validate(const char *path, lsf_file *f, gboolean tolerate_edite
 		fits_get_img_equivtype(fptr, &rtype, &status);
 		if (status || rtype != USHORT_IMG || rnaxis != 3 || rnaxes[0] != f->rx || rnaxes[1] != f->ry
 				|| rnaxes[2] != 2 * f->nchan) {
-			ret = validation_failure(3, path, _("LSF_REJ does not have the expected dimensions"));
+			ret = validation_failure(3, path, problem, _("LSF_REJ does not have the expected dimensions"));
 			goto end;
 		}
 		for (int d = 0; d < 2; d++)
@@ -425,7 +438,7 @@ int lsf_open_and_validate(const char *path, lsf_file *f, gboolean tolerate_edite
 				rej_index[d][c] = find_plane(fptr, rnaxes[2], expected);
 				g_free(expected);
 				if (rej_index[d][c] < 0) {
-					ret = validation_failure(3, path, _("LSF_REJ does not hold the expected named planes"));
+					ret = validation_failure(3, path, problem, _("LSF_REJ does not hold the expected named planes"));
 					goto end;
 				}
 			}
@@ -442,7 +455,7 @@ int lsf_open_and_validate(const char *path, lsf_file *f, gboolean tolerate_edite
 		count_ok = count_ok && !status && read_hdu_compression(fptr, FALSE, f->rej_codec, &f->rej_bytes);
 	}
 	if (!acc_ok || !count_ok) {
-		ret = validation_failure(3, path, _("an extension image is compressed with a method that is not "
+		ret = validation_failure(3, path, problem, _("an extension image is compressed with a method that is not "
 					"supported (RICE_1, GZIP_1, GZIP_2) or, for LSF_ACC, not lossless"));
 		goto end;
 	}
@@ -460,14 +473,14 @@ int lsf_open_and_validate(const char *path, lsf_file *f, gboolean tolerate_edite
 		status = 0;
 		fits_movabs_hdu(fptr, hdus[i], NULL, &status);
 		if (status || read_uid_gen(fptr, uid, &gen)) {
-			ret = validation_failure(4, path, _("LSFUID or LSFGEN missing in an LSF HDU"));
+			ret = validation_failure(4, path, problem, _("LSFUID or LSFGEN missing in an LSF HDU"));
 			goto end;
 		}
 		if (i == 0) {
 			g_strlcpy(uid0, uid, sizeof uid0);
 			gen0 = gen;
 		} else if (strcmp(uid, uid0) || gen != gen0) {
-			ret = validation_failure(4, path, _("LSFUID or LSFGEN differ between LSF HDUs"));
+			ret = validation_failure(4, path, problem, _("LSFUID or LSFGEN differ between LSF HDUs"));
 			goto end;
 		}
 	}
@@ -475,13 +488,13 @@ int lsf_open_and_validate(const char *path, lsf_file *f, gboolean tolerate_edite
 	f->gen = gen0;
 
 	/* check 5: DATASUM and CHECKSUM on every extension where present */
-	for (int i = 2; i <= hdunum; i++) {
+	for (int i = 2; i <= hdunum && !light; i++) {
 		int dataok = 0, hduok = 0;
 		status = 0;
 		fits_movabs_hdu(fptr, i, NULL, &status);
 		fits_verify_chksum(fptr, &dataok, &hduok, &status);
 		if (status || dataok == -1 || hduok == -1) {
-			ret = validation_failure(5, path, _("a checksum does not match, the accumulator cannot be trusted"));
+			ret = validation_failure(5, path, problem, _("a checksum does not match, the accumulator cannot be trusted"));
 			goto end;
 		}
 	}
@@ -493,7 +506,7 @@ int lsf_open_and_validate(const char *path, lsf_file *f, gboolean tolerate_edite
 	int cgen = 0, cbatch = 0;
 	fits_get_colnum(fptr, CASEINSEN, "GEN", &cgen, &status);
 	if (status) {
-		ret = validation_failure(6, path, _("the ledger has no GEN column"));
+		ret = validation_failure(6, path, problem, _("the ledger has no GEN column"));
 		goto end;
 	}
 	f->max_ledger_gen = 0;
@@ -511,7 +524,7 @@ int lsf_open_and_validate(const char *path, lsf_file *f, gboolean tolerate_edite
 	}
 	/* a generation without ledger rows changed no frame (Repair, Adopt) */
 	if (status || f->max_ledger_gen > f->gen) {
-		ret = validation_failure(6, path, _("ledger generations do not match LSFGEN"));
+		ret = validation_failure(6, path, problem, _("ledger generations do not match LSFGEN"));
 		goto end;
 	}
 
@@ -520,11 +533,11 @@ int lsf_open_and_validate(const char *path, lsf_file *f, gboolean tolerate_edite
 	fits_movabs_hdu(fptr, hdu_settings, NULL, &status);
 	rows = read_settings_rows(fptr, &status);
 	if (status || !rows) {
-		ret = validation_failure(7, path, _("LSF_SETTINGS cannot be read"));
+		ret = validation_failure(7, path, problem, _("LSF_SETTINGS cannot be read"));
 		goto end;
 	}
 	if (lsf_settings_from_rows(&f->settings, rows, f->nchan)) {
-		ret = validation_failure(7, path, _("LSF_SETTINGS holds unsupported or malformed values"));
+		ret = validation_failure(7, path, problem, _("LSF_SETTINGS holds unsupported or malformed values"));
 		goto end;
 	}
 	{
@@ -558,9 +571,20 @@ int lsf_open_and_validate(const char *path, lsf_file *f, gboolean tolerate_edite
 		if (!bad && (f->settings.rejmaps != (hdu_rej != 0)))
 			bad = TRUE;
 		if (bad) {
-			ret = validation_failure(7, path, _("primary header keywords disagree with LSF_SETTINGS"));
+			ret = validation_failure(7, path, problem, _("primary header keywords disagree with LSF_SETTINGS"));
 			goto end;
 		}
+	}
+
+	if (light) {
+		/* the generation the rejection maps count from, without the maps */
+		if (hdu_rej) {
+			int rgen = 0, st = 0;
+			fits_movabs_hdu(fptr, hdu_rej, NULL, &st);
+			fits_read_key(fptr, TINT, "LSFRGEN", &rgen, NULL, &st);
+			f->hist.rej_gen = !st && rgen > 0 ? rgen : 1;
+		}
+		goto end;
 	}
 
 	/* check 8: the primary data still matches LSFHASH */
@@ -583,7 +607,7 @@ int lsf_open_and_validate(const char *path, lsf_file *f, gboolean tolerate_edite
 		g_free(computed);
 		if (!match) {
 			if (!tolerate_edited_stack) {
-				ret = validation_failure(8, path, _("the Stack (HDU 0) was modified outside Siril. "
+				ret = validation_failure(8, path, problem, _("the Stack (HDU 0) was modified outside Siril. "
 							"Run lsf_util with -repair to rebuild it from the accumulator, "
 							"or with -adopt to keep the edit"));
 				goto end;
@@ -659,11 +683,114 @@ end:
 	if (!ret) {
 		/* header metadata of the primary, for the next write */
 		if (read_fits_metadata_from_path(path, &f->primary)) {
-			siril_log_error(_("LSF: could not read the primary header of %s\n"), path);
+			if (light) {
+				g_free(*problem);
+				*problem = g_strdup(_("the primary header cannot be read"));
+			} else siril_log_error(_("LSF: could not read the primary header of %s\n"), path);
 			ret = -1;
 		}
 	}
 	return ret;
+}
+
+int lsf_open_and_validate(const char *path, lsf_file *f, gboolean tolerate_edited_stack) {
+	return open_and_validate(path, f, tolerate_edited_stack, NULL);
+}
+
+/* the ledger summary of lsf_read_info: exposure, DATE_OBS range and the
+ * time of the last commit, from the ledger columns written in Section 9 */
+static void read_ledger_summary(const char *path, int ledger_hdu, lsf_info *info) {
+	fitsfile *fptr = NULL;
+	int status = 0, cexp = 0, cdate = 0, cadded = 0;
+	long nrows = 0;
+	if (fits_open_diskfile(&fptr, path, READONLY, &status))
+		return;
+	fits_movabs_hdu(fptr, ledger_hdu, NULL, &status);
+	fits_get_num_rows(fptr, &nrows, &status);
+	if (status) {
+		status = 0;
+		fits_close_file(fptr, &status);
+		return;
+	}
+	int st = 0;
+	gboolean has_exp = !fits_get_colnum(fptr, CASEINSEN, "EXPTIME", &cexp, &st);
+	st = 0;
+	gboolean has_date = !fits_get_colnum(fptr, CASEINSEN, "DATE_OBS", &cdate, &st);
+	st = 0;
+	gboolean has_added = !fits_get_colnum(fptr, CASEINSEN, "ADDED_UTC", &cadded, &st);
+	char buf[FLEN_VALUE];
+	char *pbuf = buf;
+	for (long r = 1; r <= nrows; r++) {
+		if (has_exp) {
+			double e = 0.0;
+			st = 0;
+			fits_read_col(fptr, TDOUBLE, cexp, r, 1, 1, NULL, &e, NULL, &st);
+			if (!st && e > 0.0)
+				info->exposure += e;
+		}
+		if (has_date) {
+			buf[0] = '\0';
+			st = 0;
+			fits_read_col_str(fptr, cdate, r, 1, 1, "", &pbuf, NULL, &st);
+			g_strstrip(buf);
+			/* ISO 8601 strings sort in time order */
+			if (!st && buf[0]) {
+				if (!info->first_date || strcmp(buf, info->first_date) < 0) {
+					g_free(info->first_date);
+					info->first_date = g_strdup(buf);
+				}
+				if (!info->last_date || strcmp(buf, info->last_date) > 0) {
+					g_free(info->last_date);
+					info->last_date = g_strdup(buf);
+				}
+			}
+		}
+	}
+	if (has_added && nrows > 0) {
+		buf[0] = '\0';
+		st = 0;
+		fits_read_col_str(fptr, cadded, nrows, 1, 1, "", &pbuf, NULL, &st);
+		g_strstrip(buf);
+		if (!st && buf[0])
+			info->last_added = g_strdup(buf);
+	}
+	status = 0;
+	fits_close_file(fptr, &status);
+}
+
+/* Reads what a user interface shows of an LSF file before any operation:
+ * the cheap checks of Section 8 (1 to 4, 6 and 7), the settings, the HDUs
+ * and a ledger summary, without the planes or the checksums, so it is fast
+ * on any file size. Returns 0 when the checks pass. Otherwise info->problem
+ * says why; nothing is logged. info->no_append says why this version cannot
+ * append to a file that passes them. */
+int lsf_read_info(const char *path, lsf_info *info) {
+	memset(info, 0, sizeof(lsf_info));
+	int ret = open_and_validate(path, &info->file, FALSE, &info->problem);
+	if (ret) {
+		info->failed_check = ret;
+		if (!info->problem)
+			info->problem = g_strdup(_("the file cannot be read"));
+		return ret;
+	}
+	GStatBuf st;
+	if (!g_stat(path, &st))
+		info->file_bytes = st.st_size;
+	read_ledger_summary(path, info->file.ledger_hdu, info);
+	if (info->file.settings.oversample != 1)
+		info->no_append = g_strdup_printf(_("the grid is drizzled at scale %d, and this version can append "
+					"only to a grid at the frames' own scale"), info->file.settings.oversample);
+	return 0;
+}
+
+void lsf_info_free(lsf_info *info) {
+	lsf_file_free(&info->file);
+	g_free(info->problem);
+	g_free(info->no_append);
+	g_free(info->first_date);
+	g_free(info->last_date);
+	g_free(info->last_added);
+	memset(info, 0, sizeof(lsf_info));
 }
 
 /***************************** writing *****************************/

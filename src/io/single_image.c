@@ -31,6 +31,7 @@
 #include "io/image_format_fits.h"
 #include "io/sequence.h"
 #include "io/single_image.h"
+#include "lsf/lsf.h"
 
 /* Progress gate for image readers.  The FITS / TIFF / PNG / JPEG readers are
  * shared between the interactive single-image open and batch paths (stacking,
@@ -224,6 +225,14 @@ int create_uniq_from_gfit(char *filename, gboolean exists) {
 	}
 	com.uniq->filename = filename;
 	com.uniq->fileexist = exists;
+	com.uniq->is_lsf = exists && fits_file_is_lsf(filename);
+	if (com.uniq->is_lsf) {
+		/* the LSF keywords describe the file, not the image: without them an
+		 * image saved from the view is a plain image, as lsf_export makes */
+		lsf_strip_lsf_keys(gfit);
+		siril_log_warning(_("LSF: %s is a Living Stack file, opened as a view of its Stack. It cannot be saved "
+					"over: Save As writes a plain image, and the lsf_* commands maintain the file\n"), filename);
+	}
 	com.uniq->nb_layers = gfit->naxes[2];
 	com.uniq->fit = gfit;
 	return 0;

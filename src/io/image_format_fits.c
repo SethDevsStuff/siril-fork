@@ -2094,6 +2094,23 @@ gchar *set_right_extension(const char *name) {
 	return filename;
 }
 
+/* TRUE when filename is a Living Stack Format file, with LSF = T in its
+ * primary header. Saving an image over it would replace it by a plain image
+ * and lose its accumulator (Section 13 of the LSF profile), so callers that
+ * overwrite files refuse to. */
+gboolean fits_file_is_lsf(const char *filename) {
+	fitsfile *fptr = NULL;
+	int status = 0, lsf = 0;
+	if (!filename || !g_file_test(filename, G_FILE_TEST_IS_REGULAR))
+		return FALSE;
+	if (fits_open_diskfile(&fptr, filename, READONLY, &status))
+		return FALSE;
+	fits_read_key(fptr, TLOGICAL, "LSF", &lsf, NULL, &status);
+	status = 0;
+	fits_close_file(fptr, &status);
+	return lsf != 0;
+}
+
 /* creates, saves and closes the file associated to f, overwriting previous  */
 int savefits(const char *name, fits *f) {
 	int status;
@@ -2108,6 +2125,13 @@ int savefits(const char *name, fits *f) {
 
 	gchar *filename = set_right_extension(name);
 	if (!filename) return 1;
+
+	if (fits_file_is_lsf(filename)) {
+		siril_log_error(_("LSF: %s is a Living Stack file and is not overwritten, as saving an image over it "
+					"would lose its accumulator. Save under another name, or use lsf_export\n"), filename);
+		g_free(filename);
+		return 1;
+	}
 
 	if (g_unlink(filename))
 		siril_log_debug("g_unlink() failed\n"); /* Delete old file if it already exists */
