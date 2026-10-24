@@ -309,6 +309,7 @@ gui_filenames = [
   'histogram.c',
   'histogram_utils.c',
   'keywords_tree.c',
+  'lsf_manager.c',
   'icc_profile.c',
   'image_display.c',
   'image_interactions.c',

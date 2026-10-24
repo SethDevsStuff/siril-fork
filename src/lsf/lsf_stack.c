@@ -427,7 +427,9 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 			goto end;
 		}
 	}
-	writeseqfile(seq);
+	/* caches the statistics, unless the selection was changed in memory */
+	if (!args->keep_seq_file)
+		writeseqfile(seq);
 
 	/* 3. normalization against the frozen baseline */
 	if (args->init && s->norm != NO_NORM) {

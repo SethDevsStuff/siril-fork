@@ -22,6 +22,7 @@
  * write an LSF file. */
 
 #include <string.h>
+#include <stdarg.h>
 #include <stddef.h>
 #include <math.h>
 #include <glib/gstdio.h>
@@ -67,8 +68,22 @@ void lsf_cmd_args_free(struct lsf_cmd_args *a) {
 	g_free(a->path);
 	g_free(a->out);
 	g_free(a->export_out);
+	g_free(a->message);
+	g_free(a->image_indices);
 	lsf_settings_free(&a->settings);
 	free(a);
+}
+
+/* adds a line to the message of the job, which the GUI shows */
+static void add_message(struct lsf_cmd_args *a, const char *fmt, ...) {
+	va_list args;
+	va_start(args, fmt);
+	gchar *line = g_strdup_vprintf(fmt, args);
+	va_end(args);
+	gchar *msg = a->message ? g_strdup_printf("%s\n%s", a->message, line) : g_strdup(line);
+	g_free(line);
+	g_free(a->message);
+	a->message = msg;
 }
 
 static gchar *findstar_to_json(const star_finder_params *sf) {
@@ -112,6 +127,35 @@ static sequence *load_batch(const char *name) {
 		return NULL;
 	}
 	return seq;
+}
+
+/* the rejection as the log and the HISTORY cards show it: the method, then
+ * its two values unless it is none */
+static gchar *rejection_text(rejection r, const double sig[2]) {
+	if (r == NO_REJEC)
+		return g_strdup(lsf_rejection_name(r));
+	return g_strdup_printf("%s %g %g", lsf_rejection_name(r), sig[0], sig[1]);
+}
+
+/* The frames the GUI's stacking filters chose (UI plan, A4), in place of
+ * the selection saved in the sequence file. The change stays in memory:
+ * the caller keeps lsf_process_batch() from writing it to the .seq file
+ * of the user. Returns TRUE when a list was applied. */
+static gboolean apply_frame_list(sequence *seq, const struct lsf_cmd_args *a) {
+	if (!a->image_indices || a->nb_images < 1)
+		return FALSE;
+	for (int i = 0; i < seq->number; i++)
+		seq->imgparam[i].incl = FALSE;
+	int n = 0;
+	for (int k = 0; k < a->nb_images; k++) {
+		int i = a->image_indices[k];
+		if (i >= 0 && i < seq->number && !seq->imgparam[i].incl) {
+			seq->imgparam[i].incl = TRUE;
+			n++;
+		}
+	}
+	seq->selnum = n;
+	return TRUE;
 }
 
 static void apply_hist_overrides(struct lsf_cmd_args *a, lsf_settings *s) {
@@ -160,6 +204,7 @@ static int lsf_init_run(struct lsf_cmd_args *a) {
 		g_ptr_array_free(rows, TRUE);
 		return 1;
 	}
+	gboolean listed = apply_frame_list(seq, a);
 	/* registration computed but not applied: lsf_init applies it, by default
 	 * onto the union of all the frames (Section 10.1) */
 	int ref = sequence_find_refimage(seq);
@@ -222,6 +267,7 @@ static int lsf_init_run(struct lsf_cmd_args *a) {
 	bargs.seq_name = seq->seqname;
 	bargs.rows = rows;
 	bargs.primary = &primary;
+	bargs.keep_seq_file = listed && batch == seq;
 	if (lsf_process_batch(&bargs))
 		goto end;
 	if (rseq)
@@ -570,15 +616,37 @@ static int lsf_append_run(struct lsf_cmd_args *a) {
 					"Only grid.oversample 1 is supported\n"), a->path, f.settings.oversample);
 		goto end;
 	}
+	/* overrides of the defaults stored in the file apply from this append on
+	 * and are saved for the following ones (Section 6). A HISTORY card
+	 * records each change with the generation that made it. */
 	double hist_before[3] = { f.settings.hist_low, f.settings.hist_high, f.settings.hist_margin };
 	apply_hist_overrides(a, &f.settings);
 	if (hist_before[0] != f.settings.hist_low || hist_before[1] != f.settings.hist_high
-			|| hist_before[2] != f.settings.hist_margin)
+			|| hist_before[2] != f.settings.hist_margin) {
 		siril_log_message(_("LSF: history test changed from low %g high %g margin %g to low %g high %g margin %g. "
 					"It applies from this append on and is saved in the file for the following ones; "
 					"the frames already in the stack are not affected\n"),
 				hist_before[0], hist_before[1], hist_before[2],
 				f.settings.hist_low, f.settings.hist_high, f.settings.hist_margin);
+		f.primary.history = g_slist_append(f.primary.history, g_strdup_printf(
+					"LSF gen %d: history test low %g high %g margin %g, was %g %g %g", f.gen + 1,
+					f.settings.hist_low, f.settings.hist_high, f.settings.hist_margin,
+					hist_before[0], hist_before[1], hist_before[2]));
+	}
+	/* without rejection the two values mean nothing */
+	if (a->rej_set && (a->settings.rej != f.settings.rej || (a->settings.rej != NO_REJEC
+					&& (a->settings.sig[0] != f.settings.sig[0] || a->settings.sig[1] != f.settings.sig[1])))) {
+		gchar *was = rejection_text(f.settings.rej, f.settings.sig), *now = rejection_text(a->settings.rej, a->settings.sig);
+		siril_log_message(_("LSF: rejection changed from %s to %s. It applies from this append on and is saved in "
+					"the file for the following ones; the frames already in the stack are not affected\n"), was, now);
+		f.primary.history = g_slist_append(f.primary.history, g_strdup_printf(
+					"LSF gen %d: rejection %s, was %s", f.gen + 1, now, was));
+		g_free(was);
+		g_free(now);
+		f.settings.rej = a->settings.rej;
+		f.settings.sig[0] = a->settings.sig[0];
+		f.settings.sig[1] = a->settings.sig[1];
+	}
 	if (a->rejmaps && f.settings.rejmaps)
 		siril_log_message(_("LSF: %s already has rejection maps, counted since generation %d\n"),
 				a->path, f.hist.rej_gen);
@@ -590,6 +658,7 @@ static int lsf_append_run(struct lsf_cmd_args *a) {
 		siril_log_error(_("LSF: the file has %d channel(s), the batch has %d\n"), f.nchan, seq->nb_layers);
 		goto end;
 	}
+	gboolean listed = apply_frame_list(seq, a);
 
 	sequence *batch = seq;
 	int gen = f.gen + 1, batchnum = f.nb_batches + 1;
@@ -632,6 +701,7 @@ static int lsf_append_run(struct lsf_cmd_args *a) {
 	bargs.seq_name = seq->seqname;
 	bargs.rows = rows;
 	bargs.primary = &f.primary;
+	bargs.keep_seq_file = listed && batch == seq;
 	if (lsf_process_batch(&bargs))
 		goto end;
 	/* the transforms of the new rows were computed onto the grid before its expansion */
@@ -672,8 +742,10 @@ static void print_summary(const lsf_file *f) {
 			f->nb_batches, k->stackcnt, k->livetime > 0.0 ? k->livetime : 0.0);
 	siril_log_message(_("  grid %dx%d, %d channel(s), sensor %s%s%s\n"), f->rx, f->ry, f->nchan,
 			s->is_cfa ? "CFA " : "mono", s->is_cfa ? s->bayer : "", s->is_cfa ? " (debayered)" : "");
-	siril_log_message(_("  rejection %s %g %g, history test low %g high %g margin %g\n"),
-			lsf_rejection_name(s->rej), s->sig[0], s->sig[1], s->hist_low, s->hist_high, s->hist_margin);
+	gchar *rej = rejection_text(s->rej, s->sig);
+	siril_log_message(_("  rejection %s, history test low %g high %g margin %g\n"),
+			rej, s->hist_low, s->hist_high, s->hist_margin);
+	g_free(rej);
 	siril_log_message(_("  normalization %s%s%s, output normalization %s\n"), lsf_norm_name(s->norm),
 			s->lite_norm ? " (fast)" : "", s->rgb_equal ? " (RGB equalized)" : "", s->outnorm ? "on" : "off");
 	switch (s->weighting) {
@@ -818,28 +890,42 @@ static int lsf_util_run(struct lsf_cmd_args *a) {
 	GPtrArray *none = NULL;
 	if (a->info)
 		return lsf_info_run(a);
-	if (lsf_open_and_validate(a->path, &f, TRUE)) {
+	gchar *problem = NULL;
+	if (lsf_open_and_validate_msg(a->path, &f, TRUE, &problem)) {
+		add_message(a, _("The file failed the checks: %s. It was not modified."), problem ? problem : _("see the log"));
+		g_free(problem);
 		lsf_file_free(&f);
 		return 1;
 	}
 	print_summary(&f);
-	if (!f.stack_modified)
+	a->stack_modified = f.stack_modified;
+	if (!f.stack_modified) {
 		siril_log_info(_("LSF: %s passed all the checks of Section 8\n"), a->path);
+		if (a->check)
+			add_message(a, _("The file passed all the checks."));
+	}
 	gboolean fix_stack = (a->repair || a->adopt) && f.stack_modified;
-	if ((a->repair || a->adopt) && !f.stack_modified)
+	if ((a->repair || a->adopt) && !f.stack_modified) {
 		siril_log_message(_("LSF: the Stack matches the accumulator, there is nothing to repair or adopt\n"));
+		add_message(a, _("The Stack matches the accumulator, there is nothing to repair or adopt."));
+	}
 	gboolean recompress = a->compression_set && a->compression != f.compression;
 	if (a->compression_set && !recompress) {
 		if (f.compression == LSF_COMP_NONE)
 			siril_log_message(_("LSF: the extensions of %s are already uncompressed\n"), a->path);
 		else siril_log_message(_("LSF: the extensions of %s are already compressed with %s\n"), a->path,
 				lsf_compression_name(f.compression));
+		add_message(a, _("The compression is already %s."), lsf_compression_name(f.compression));
 	}
 	/* any rewrite rebuilds the Stack from MEAN, which would silently repair it */
 	if (f.stack_modified && !fix_stack) {
 		siril_log_error(_("LSF: %s fails check 8, its Stack was modified outside Siril. lsf_append will "
 					"refuse it, and lsf_util will not rewrite it, until lsf_util is run with -repair (rebuild "
 					"the Stack from the accumulator) or -adopt (keep the edit)\n"), a->path);
+		add_message(a, _("The Stack (the image of the file) was modified outside Siril; the accumulator is intact. "
+					"Appending is refused until the Stack is repaired, which undoes the edit, or adopted, "
+					"which keeps it."));
+		retval = a->check && !a->repair && !a->adopt && !a->compression_set && !a->out ? 0 : 1;
 		goto end;
 	}
 	/* -out writes the result to a new file and leaves the source untouched,
@@ -855,6 +941,7 @@ static int lsf_util_run(struct lsf_cmd_args *a) {
 	}
 	gchar *card;
 	int gen = f.gen + 1;
+	size_t adopted = 0, adopted_nonfinite = 0;
 	if (a->out)
 		f.primary.history = g_slist_append(f.primary.history, g_strdup_printf(
 					"LSF generation %d: written from %s", gen, f.path));
@@ -874,6 +961,8 @@ static int lsf_util_run(struct lsf_cmd_args *a) {
 				siril_log_warning(_("LSF: %zu edited pixel(s) are NaN or infinite and were not adopted, "
 							"they keep the value of the accumulator\n"), nonfinite);
 			card = g_strdup_printf("LSF generation %d: adopted the Stack edited outside Siril, %zu pixels", gen, changed);
+			adopted = changed;
+			adopted_nonfinite = nonfinite;
 		} else {
 			card = g_strdup_printf("LSF generation %d: Stack edited outside Siril, repaired from MEAN", gen);
 		}
@@ -891,18 +980,32 @@ static int lsf_util_run(struct lsf_cmd_args *a) {
 	none = g_ptr_array_new();
 	if (lsf_write_file(target, &f, &f.settings, &f.hist, &f.primary, f.uid, gen, none, f.nb_batches, a->backup, comp))
 		goto end;
-	if (fix_stack && a->adopt)
+	if (fix_stack && !a->out)
+		a->stack_modified = FALSE;	// the file now passes check 8
+	if (fix_stack && a->adopt) {
 		siril_log_info(_("LSF: edited Stack of %s adopted, generation %d\n"), target, gen);
-	else if (fix_stack)
+		add_message(a, _("The edited Stack was adopted: %zu pixels changed the mean, the variance is unchanged."),
+				adopted);
+		if (adopted_nonfinite)
+			add_message(a, _("%zu edited pixels are NaN or infinite and kept the value of the accumulator."),
+					adopted_nonfinite);
+	} else if (fix_stack) {
 		siril_log_info(_("LSF: Stack of %s repaired from the accumulator, generation %d\n"), target, gen);
-	if (recompress && comp == LSF_COMP_NONE)
+		add_message(a, _("The Stack was rebuilt from the accumulator."));
+	}
+	if (recompress && comp == LSF_COMP_NONE) {
 		siril_log_info(_("LSF: extensions of %s decompressed, generation %d\n"), target, gen);
-	else if (recompress)
+		add_message(a, _("The extensions are no longer compressed."));
+	} else if (recompress) {
 		siril_log_info(_("LSF: extensions of %s compressed with %s, generation %d\n"), target,
 				lsf_compression_name(comp), gen);
-	if (a->out)
+		add_message(a, _("The extensions are compressed with %s."), lsf_compression_name(comp));
+	}
+	if (a->out) {
 		siril_log_info(_("LSF: %s written from %s, generation %d, %s left unchanged\n"), a->out, a->path,
 				gen, a->path);
+		add_message(a, _("Written to %s; the original file is unchanged."), a->out);
+	}
 	retval = 0;
 end:
 	if (none)
@@ -1044,6 +1147,7 @@ static gboolean lsf_end_job(gpointer p) {
 	r->end_func(r);
 	g_free(r->path);
 	g_free(r->export_out);
+	g_free(r->message);
 	free(r);
 	return FALSE;
 }
@@ -1081,6 +1185,9 @@ static gpointer lsf_worker(gpointer p) {
 		r->retval = retval;
 		r->path = g_strdup(a->path);
 		r->export_out = export_name;
+		r->message = a->message;
+		a->message = NULL;
+		r->stack_modified = a->stack_modified;
 		r->end_func = a->end_func;
 		r->end_data = a->end_data;
 	} else g_free(export_name);
@@ -1155,6 +1262,11 @@ gchar *lsf_cmd_args_to_command(const struct lsf_cmd_args *a) {
 		g_string_append(cmd, "lsf_append");
 		add_arg(cmd, a->path);
 		add_arg(cmd, a->seqname);
+		if (a->rej_set && s->rej < (int) G_N_ELEMENTS(rej_letters)) {
+			if (s->rej == NO_REJEC)
+				g_string_append(cmd, " rej n");
+			else g_string_append_printf(cmd, " rej %s %g %g", rej_letters[s->rej], s->sig[0], s->sig[1]);
+		}
 		if (a->noreg)
 			g_string_append(cmd, " -noreg");
 		add_hist_and_common_args(cmd, a);
@@ -1259,6 +1371,49 @@ static int parse_common_option(struct lsf_cmd_args *a, const char *w) {
 	return parse_compress_option(a, w);
 }
 
+/* [rej [type] sigma_low sigma_high] at word[*pi], as the stack command takes
+ * it, into the rejection of a->settings, advancing *pi. Returns 1 when
+ * given, 0 when not, -1 on error. */
+static int parse_rejection(struct lsf_cmd_args *a, int *pi) {
+	lsf_settings *s = &a->settings;
+	int i = *pi;
+	if (!word[i] || (strcmp(word[i], "rej") && strcmp(word[i], "mean")))
+		return 0;
+	i++;
+	int shift = 1;
+	const char *t = word[i] ? word[i] : "";
+	if (!strcmp(t, "p") || !strcmp(t, "percentile")) s->rej = PERCENTILE;
+	else if (!strcmp(t, "s") || !strcmp(t, "sigma")) s->rej = SIGMA;
+	else if (!strcmp(t, "a") || !strcmp(t, "mad")) s->rej = MAD;
+	else if (!strcmp(t, "m") || !strcmp(t, "median")) s->rej = SIGMEDIAN;
+	else if (!strcmp(t, "l") || !strcmp(t, "linear")) s->rej = LINEARFIT;
+	else if (!strcmp(t, "w") || !strcmp(t, "winsorized")) s->rej = WINSORIZED;
+	else if (!strcmp(t, "g") || !strcmp(t, "generalized")) s->rej = GESDT;
+	else if (!strcmp(t, "n") || !strcmp(t, "none")) s->rej = NO_REJEC;
+	else { s->rej = WINSORIZED; shift = 0; }
+	i += shift;
+	if (s->rej != NO_REJEC || (word[i] && string_is_a_number(word[i]))) {
+		gchar *end1 = NULL, *end2 = NULL;
+		if (!word[i] || !word[i + 1] || !string_is_a_number(word[i]) || !string_is_a_number(word[i + 1])) {
+			siril_log_error(_("The average stacking with rejection requires two extra arguments: sigma low and high.\n"));
+			return -1;
+		}
+		s->sig[0] = g_ascii_strtod(word[i], &end1);
+		s->sig[1] = g_ascii_strtod(word[i + 1], &end2);
+		if (s->sig[0] < 0.0 || s->sig[1] < 0.0) {
+			siril_log_error(_("The average stacking with rejection requires two extra arguments: sigma low and high.\n"));
+			return -1;
+		}
+		if ((s->rej == GESDT || s->rej == PERCENTILE) && (s->sig[0] > 1.0 || s->sig[1] > 1.0)) {
+			siril_log_error(_("Extra parameters of this rejection algorithm must be between 0 and 1.\n"));
+			return -1;
+		}
+		i += 2;
+	}
+	*pi = i;
+	return 1;
+}
+
 /* lsf_init sequencename file.lsf.fits [rej [type] sigma_low sigma_high] [-nonorm, -norm=] [-fastnorm]
  *   [-rgb_equal] [-weight=] [-output_norm] [-framing=max|current|min|cog] [-hist_low=] [-hist_high=] [-hist_margin=]
  *   [-rejmaps] [-compress[=gzip2|gzip1]] [-overwrite] */
@@ -1271,39 +1426,8 @@ int process_lsf_init(int nb) {
 	lsf_settings *s = &a->settings;
 
 	int i = 3;
-	if (word[i] && (!strcmp(word[i], "rej") || !strcmp(word[i], "mean"))) {
-		i++;
-		int shift = 1;
-		const char *t = word[i] ? word[i] : "";
-		if (!strcmp(t, "p") || !strcmp(t, "percentile")) s->rej = PERCENTILE;
-		else if (!strcmp(t, "s") || !strcmp(t, "sigma")) s->rej = SIGMA;
-		else if (!strcmp(t, "a") || !strcmp(t, "mad")) s->rej = MAD;
-		else if (!strcmp(t, "m") || !strcmp(t, "median")) s->rej = SIGMEDIAN;
-		else if (!strcmp(t, "l") || !strcmp(t, "linear")) s->rej = LINEARFIT;
-		else if (!strcmp(t, "w") || !strcmp(t, "winsorized")) s->rej = WINSORIZED;
-		else if (!strcmp(t, "g") || !strcmp(t, "generalized")) s->rej = GESDT;
-		else if (!strcmp(t, "n") || !strcmp(t, "none")) s->rej = NO_REJEC;
-		else { s->rej = WINSORIZED; shift = 0; }
-		i += shift;
-		if (s->rej != NO_REJEC || (word[i] && string_is_a_number(word[i]))) {
-			gchar *end1 = NULL, *end2 = NULL;
-			if (!word[i] || !word[i + 1] || !string_is_a_number(word[i]) || !string_is_a_number(word[i + 1])) {
-				siril_log_error(_("The average stacking with rejection requires two extra arguments: sigma low and high.\n"));
-				goto failure;
-			}
-			s->sig[0] = g_ascii_strtod(word[i], &end1);
-			s->sig[1] = g_ascii_strtod(word[i + 1], &end2);
-			if (s->sig[0] < 0.0 || s->sig[1] < 0.0) {
-				siril_log_error(_("The average stacking with rejection requires two extra arguments: sigma low and high.\n"));
-				goto failure;
-			}
-			if ((s->rej == GESDT || s->rej == PERCENTILE) && (s->sig[0] > 1.0 || s->sig[1] > 1.0)) {
-				siril_log_error(_("Extra parameters of this rejection algorithm must be between 0 and 1.\n"));
-				goto failure;
-			}
-			i += 2;
-		}
-	}
+	if (parse_rejection(a, &i) < 0)
+		goto failure;
 	for (; i < nb && word[i]; i++) {
 		const char *w = word[i];
 		int c = parse_common_option(a, w);
@@ -1348,15 +1472,21 @@ failure:
 	return CMD_ARG_ERROR;
 }
 
-/* lsf_append file.lsf.fits sequencename [-noreg] [-framing=max|current] [-noexpand] [-expand_step=] [-expand_force] [-backup]
- *   [-hist_low=] [-hist_high=] [-hist_margin=] [-rejmaps] [-compress[=gzip2|gzip1] | -nocompress] */
+/* lsf_append file.lsf.fits sequencename [rej [type] sigma_low sigma_high] [-noreg] [-framing=max|current]
+ *   [-noexpand] [-expand_step=] [-expand_force] [-backup] [-hist_low=] [-hist_high=] [-hist_margin=] [-rejmaps]
+ *   [-compress[=gzip2|gzip1] | -nocompress] */
 int process_lsf_append(int nb) {
 	struct lsf_cmd_args *a = lsf_cmd_args_new(LSF_CMD_APPEND);
 	if (!a)
 		return CMD_ALLOC_ERROR;
 	a->path = g_strdup(word[1]);
 	a->seqname = g_strdup(word[2]);
-	for (int i = 3; i < nb && word[i]; i++) {
+	int i = 3;
+	int rej = parse_rejection(a, &i);	// overrides the rejection stored in the file
+	if (rej < 0)
+		goto failure;
+	a->rej_set = rej > 0;
+	for (; i < nb && word[i]; i++) {
 		const char *w = word[i];
 		int c = parse_common_option(a, w);
 		if (c < 0) goto failure;

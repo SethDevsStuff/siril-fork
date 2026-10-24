@@ -116,7 +116,7 @@ static command commands[] = {
 #ifndef _WIN32
 	{"ls", 0, "ls", process_ls, STR_LS, FALSE, REQ_CMD_NONE},
 #endif
-	{"lsf_append", 2, "lsf_append file.lsf.fits sequencename [-noreg] [-framing={max|current}] [-noexpand] [-expand_step=] [-expand_force] [-backup] [-hist_low=] [-hist_high=] [-hist_margin=] [-rejmaps] [-compress[={gzip2|gzip1}] | -nocompress]", process_lsf_append, STR_LSF_APPEND, TRUE, REQ_CMD_NONE},
+	{"lsf_append", 2, "lsf_append file.lsf.fits sequencename [rej [type] sigma_low sigma_high] [-noreg] [-framing={max|current}] [-noexpand] [-expand_step=] [-expand_force] [-backup] [-hist_low=] [-hist_high=] [-hist_margin=] [-rejmaps] [-compress[={gzip2|gzip1}] | -nocompress]", process_lsf_append, STR_LSF_APPEND, TRUE, REQ_CMD_NONE},
 	{"lsf_export", 2, "lsf_export file.lsf.fits output_filename", process_lsf_export, STR_LSF_EXPORT, TRUE, REQ_CMD_NONE},
 	{"lsf_init", 2, "lsf_init sequencename file.lsf.fits [rej [rejection type] [sigma_low sigma_high]] [-nonorm, -norm=] [-fastnorm] [-rgb_equal] [-weight={noise|wfwhm|nbstars}] [-output_norm] [-framing={max|current|min|cog}] [-hist_low=] [-hist_high=] [-hist_margin=] [-rejmaps] [-compress[={gzip2|gzip1}]] [-overwrite]", process_lsf_init, STR_LSF_INIT, TRUE, REQ_CMD_NONE},
 	{"lsf_maps", 2, "lsf_maps file.lsf.fits prefix [-neff] [-noise] [-sigma] [-snr] [-rejlo] [-rejhi]", process_lsf_maps, STR_LSF_MAPS, TRUE, REQ_CMD_NONE},

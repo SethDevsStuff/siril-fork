@@ -1841,6 +1841,17 @@ Current state: linked.</property>
                     <property name="label" translatable="yes">Image Information...</property>
                   </object>
                 </child>
+                <child>
+                  <object class="GtkSeparator"/>
+                </child>
+                <child>
+                  <object class="GtkButton" id="info_menu_lsf_manager">
+                    <property name="action-name">win.lsf-manager</property>
+                    <property name="halign">start</property>
+                    <property name="label" translatable="yes">Living Stack...</property>
+                    <property name="tooltip-text" translatable="yes">Frames, history, checks, repair, compression, export and maps of a Living Stack (.lsf.fits) file</property>
+                  </object>
+                </child>
               </object>
             </property>
             <property name="name">root</property>

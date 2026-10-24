@@ -2,7 +2,8 @@
 """
 lsf_compare.py -- end-to-end test of Siril's native Living Stack Format (LSF v0.4) commands
 (lsf_init, lsf_append, lsf_export): fresh LSF stacks versus iterative appends, parity against
-Siril's own `stack` command, v0.4 structural checks, and a noise estimate for every product.
+Siril's own `stack` command, v0.4 structural checks, SSIM / MS-SSIM between the full stacks, and a
+noise estimate for every product.
 
 Author: (fill in your name here before distributing)
 License: (fill in a license here before distributing, e.g. GPL-3.0)
@@ -46,7 +47,11 @@ Stage parity <p>_parity.csv         lsf_set_k vs siril_set_k and lsf_cum_X vs si
                                     exceptions (logged): wfwhm / nbstars weighting, and sigmedian
                                     rejection without weights.
              <p>_diff_<pair>.fit    LSF - Siril, written only for pairs that differ.
-Stage flip   <p>_flip.csv           On a scratch copy of an LSF product: its
+Stage ssim   <p>_ssim.csv           SSIM and MS-SSIM, per channel, between every pair of the four full
+                                    stacks: lsf_cum_1234 (fresh), lsf_4 (iterative), lsf_sos (stack on
+                                    stack) and siril_cum_1234. See SSIM below.
+             <p>_ssim_<pair>.fit    1 - SSIM map, only with --ssim-maps.
+Stage flip  <p>_flip.csv           On a scratch copy of an LSF product: its
                                     Stack flipped with the old DATASUM kept; lsf_append must refuse
                                     it, lsf_util -repair must restore it bit-exactly, and one
                                     pixel edited then kept with -adopt must change nothing else.
@@ -71,6 +76,19 @@ a plain `stat`, run first when --cfa or --stat-main is set. The raw statistic is
 column. The script also measures an independent per-pixel noise (robust MAD of neighbour
 differences on a few horizontal bands; --no-own-noise to skip).
 
+SSIM
+----
+Structural similarity (Wang et al. 2004: 11x11 Gaussian window, sigma 1.5, K1 0.01, K2 0.03) and
+MS-SSIM (Wang, Simoncelli & Bovik 2003: 5 scales, 2x2 averaging between them), pure numpy, one
+channel and one strip of rows at a time. Only windows whose pixels all hold data in both images
+count (0 or NaN is no data). SSIM's constants assume a known data range, which linear stacks do not
+fill, so both images of every pair go through the same transform, set once per channel from
+siril_cum_1234 (else the first of the four found): --ssim-domain stretch (default) applies a
+Siril-style autostretch (shadows at median - 2.8 x normalized MAD, median to 0.25) and uses range 1;
+--ssim-domain linear keeps the data and uses the 0.1-99.9 percentile range. The images share their
+frames, and so their noise, so scores sit close to 1: read 1 - SSIM, the 0.1 percentile and the
+worst 64x64 blocks (file row and column of the block centre, 1-based) more than the mean.
+
 CLEAN-UP
 --------
 Scratch files (the stack-on-stack sequence) live in a private sub-folder and are deleted. On ANY
@@ -94,6 +112,7 @@ import argparse
 import csv
 import gc
 import hashlib
+import itertools
 import math
 import os
 import re
@@ -117,7 +136,7 @@ except ImportError:
 N_SETS = 4
 STAT_FIELDS = ("total", "ngoodpix", "mean", "median", "sigma", "avgDev", "mad", "sqrtbwmv",
                "location", "scale", "min", "max", "normValue", "bgnoise")
-STAGES = ("base", "siril", "sos", "iter", "check", "flip", "parity", "stats")   # run order
+STAGES = ("base", "siril", "sos", "iter", "check", "flip", "parity", "ssim", "stats")   # run order
 SKIPPABLE = STAGES
 
 # Siril's 8 rejection methods -> `stack` / lsf_init token, and Siril's default low/high
@@ -134,6 +153,11 @@ REJECTION = {
 NORMS = ("none", "add", "addscale", "mul", "mulscale")
 WEIGHTS = ("none", "noise", "wfwhm", "nbstars")
 LSF_EXTS = ("LSF_ACC", "LSF_COUNT", "LSF_SETTINGS", "LSF_LEDGER")
+SSIM_K1, SSIM_K2 = 0.01, 0.03
+SSIM_SIGMA, SSIM_RADIUS = 1.5, 5                                # 11x11 Gaussian window
+MSSSIM_WEIGHTS = (0.0448, 0.2856, 0.3001, 0.2363, 0.1333)      # scales 1 (full size) .. 5
+SSIM_STRIP = 256                                                # map rows computed at a time
+SSIM_BLOCK = 64                                                 # block size of the worst-area report
 
 
 # --------------------------------------------------------------------------
@@ -449,6 +473,191 @@ def parity_breakdown(x, y, count=None, stackcnt=None) -> list:
     return out
 
 
+def fits_memmap(path: str):
+    """The primary image as (read-only memory map (channels, h, w) in file row order, BSCALE, BZERO),
+    so that one channel at a time is read; None when it is tile-compressed or not an image."""
+    h = read_hdus(path)[0]
+    c = h["cards"]
+    if c.get("ZIMAGE") == "T" or int(c.get("NAXIS", 0)) < 2:
+        return None
+    dims = tuple(int(c[f"NAXIS{i}"]) for i in range(int(c["NAXIS"]), 0, -1))
+    mm = np.memmap(path, dtype=_FITS_DTYPES[int(c["BITPIX"])], mode="r", offset=h["data_offset"], shape=dims)
+    return (mm[None] if mm.ndim == 2 else mm), float(c.get("BSCALE", 1)), float(c.get("BZERO", 0))
+
+
+def channel_f32(img, c: int) -> np.ndarray:
+    """Channel c of an image from fits_memmap (or (array, 1, 0)) as a new native float32 array."""
+    a, bscale, bzero = img
+    x = np.array(a[c], dtype=np.float32)
+    if bscale != 1:
+        x *= np.float32(bscale)
+    if bzero:
+        x += np.float32(bzero)
+    return x
+
+
+def mtf(x, m):
+    """Midtones transfer function: 0 -> 0, m -> 0.5, 1 -> 1."""
+    return (m - 1) * x / ((2 * m - 1) * x - m)
+
+
+def ssim_reference(values, domain: str) -> tuple:
+    """(shadows, midtones, data range L) for one channel, from the valid pixels of the reference
+    image. stretch: Siril-style autostretch, shadows at median - 2.8 x normalized MAD and the median
+    taken to 0.25, L = 1. linear: no transform (None, None) and L = 99.9th - 0.1th percentile."""
+    v = np.asarray(values[::max(1, values.size // 2_000_000)], dtype=np.float64)
+    if not v.size:
+        raise RuntimeError("the reference channel has no data")
+    if domain == "linear":
+        lo, hi = np.percentile(v, (0.1, 99.9))
+        return None, None, float(hi - lo) if hi > lo else 1.0
+    med = float(np.median(v))
+    mad = 1.4826 * float(np.median(np.abs(v - med)))
+    c0 = min(max(med - 2.8 * mad, 0.0), med)
+    b = (med - c0) / (1 - c0) if c0 < 1 else 0.0
+    return c0, (float(mtf(b, 0.25)) if 0 < b < 1 else 0.5), 1.0
+
+
+def apply_stretch(x: np.ndarray, c0, m) -> np.ndarray:
+    """ssim_reference's transform on float32 x (changed in place for the shadows step)."""
+    if c0 is None:
+        return x
+    x -= np.float32(c0)
+    x *= np.float32(1 / (1 - c0))
+    np.clip(x, 0, 1, out=x)
+    return mtf(x, np.float32(m)).astype(np.float32, copy=False)
+
+
+def _filter_valid(a: np.ndarray, taps: np.ndarray) -> np.ndarray:
+    """Separable correlation of the last two axes with `taps`, 'valid' mode: each shrinks by
+    len(taps) - 1."""
+    n = len(taps)
+    w = a.shape[-1] - n + 1
+    h = a[..., :w] * taps[0]
+    tmp = np.empty_like(h)
+    for k in range(1, n):
+        np.multiply(a[..., k:k + w], taps[k], out=tmp)
+        h += tmp
+    rows = h.shape[-2] - n + 1
+    v = h[..., :rows, :] * taps[0]
+    tmp = tmp[..., :rows, :]
+    for k in range(1, n):
+        np.multiply(h[..., k:k + rows, :], taps[k], out=tmp)
+        v += tmp
+    return v
+
+
+def ssim_scale(x, y, valid, c1: float, c2: float, keep_map: bool = False):
+    """SSIM of two float32 images (h, w) at one scale, strip by strip: (mean SSIM, mean
+    contrast-structure term, number of windows, SSIM map or None). Only windows that lie wholly on
+    `valid` pixels count; the map is (h - 10, w - 10), window centres from pixel (5, 5), NaN at the
+    other windows. None when the image is smaller than the window."""
+    n = 2 * SSIM_RADIUS + 1
+    hh, ww = x.shape[0] - n + 1, x.shape[1] - n + 1
+    if hh < 1 or ww < 1:
+        return None
+    k = np.arange(-SSIM_RADIUS, SSIM_RADIUS + 1)
+    taps = np.exp(-k * k / (2 * SSIM_SIGMA ** 2))
+    taps = (taps / taps.sum()).astype(np.float32)
+    box = np.ones(n, np.float32)
+    smap = np.full((hh, ww), np.nan, np.float32) if keep_map else None
+    s_sum = cs_sum = 0.0
+    count = 0
+    for r0 in range(0, hh, SSIM_STRIP):
+        r1 = min(hh, r0 + SSIM_STRIP)
+        xs, ys, vs = x[r0:r1 + n - 1], y[r0:r1 + n - 1], valid[r0:r1 + n - 1]
+        mx, my, xx, yy, xy = _filter_valid(np.stack((xs, ys, xs * xs, ys * ys, xs * ys)), taps)
+        ok = (np.ones((r1 - r0, ww), bool) if vs.all()
+              else _filter_valid(vs.astype(np.float32), box) > n * n - 0.5)
+        mxy = mx * my
+        mx *= mx
+        my *= my
+        cs = (2 * (xy - mxy) + c2) / ((xx - mx) + (yy - my) + c2)
+        s = (2 * mxy + c1) / (mx + my + c1) * cs
+        count += int(ok.sum())
+        s_sum += float(s[ok].sum(dtype=np.float64))
+        cs_sum += float(cs[ok].sum(dtype=np.float64))
+        if smap is not None:
+            smap[r0:r1][ok] = s[ok]
+    if not count:
+        return float("nan"), float("nan"), 0, smap
+    return s_sum / count, cs_sum / count, count, smap
+
+
+def _halve(x, valid) -> tuple:
+    """2x2 average (MS-SSIM's downsampling); a pixel keeps data only if all four had it."""
+    h, w = x.shape[0] // 2 * 2, x.shape[1] // 2 * 2
+    xd = (x[0:h:2, 0:w:2] + x[1:h:2, 0:w:2] + x[0:h:2, 1:w:2] + x[1:h:2, 1:w:2]) * np.float32(0.25)
+    vd = valid[0:h:2, 0:w:2] & valid[1:h:2, 0:w:2] & valid[0:h:2, 1:w:2] & valid[1:h:2, 1:w:2]
+    return xd, vd
+
+
+def ms_ssim(x, y, valid, c1: float, c2: float, first) -> float:
+    """MS-SSIM: contrast-structure at scales 1-4 and full SSIM at scale 5, weighted by MSSSIM_WEIGHTS
+    (terms below 0 count as 0). `first` is ssim_scale's result at full size. NaN when the image is
+    too small for 5 scales or a scale has no valid window."""
+    if first is None or not first[2]:
+        return float("nan")
+    terms = [first[1]]
+    last = len(MSSSIM_WEIGHTS) - 1
+    for j in range(1, last + 1):
+        (x, valid), (y, _) = _halve(x, valid), _halve(y, valid)
+        r = ssim_scale(x, y, valid, c1, c2)
+        if r is None or not r[2]:
+            return float("nan")
+        terms.append(r[0] if j == last else r[1])
+    return float(np.prod([max(t, 0.0) ** wt for t, wt in zip(terms, MSSSIM_WEIGHTS)]))
+
+
+def worst_blocks(smap, size: int = SSIM_BLOCK, k: int = 3) -> list:
+    """The k SSIM_BLOCK-square blocks of the SSIM map with the lowest mean (blocks with at least half
+    their windows valid), as (file row, file column, mean SSIM), centre pixel, 1-based."""
+    hh, ww = smap.shape[0] // size * size, smap.shape[1] // size * size
+    if not hh or not ww:
+        return []
+    b = smap[:hh, :ww].reshape(hh // size, size, ww // size, size)
+    ok = np.isfinite(b)
+    cnt = ok.sum(axis=(1, 3))
+    mean = np.where(cnt >= size * size // 2,
+                    np.where(ok, b, 0).sum(axis=(1, 3), dtype=np.float64) / np.maximum(cnt, 1), np.inf)
+    out = []
+    for i in np.argsort(mean, axis=None)[:k]:
+        bi, bj = divmod(int(i), mean.shape[1])
+        if np.isfinite(mean[bi, bj]):
+            out.append((bi * size + size // 2 + SSIM_RADIUS + 1, bj * size + size // 2 + SSIM_RADIUS + 1,
+                        float(mean[bi, bj])))
+    return out
+
+
+def ssim_channel(x, y, transform: tuple, keep_map: bool = False) -> dict:
+    """SSIM, its 0.1 percentile and minimum over the windows, MS-SSIM and the worst blocks of one
+    channel pair (float32 (h, w), consumed). transform = ssim_reference(...). With keep_map, also
+    "dissim": 1 - SSIM at the window centres, image size, 0 where no window counts."""
+    c0, m, L = transform
+    valid = np.isfinite(x) & np.isfinite(y) & (x != 0) & (y != 0)
+    x, y = apply_stretch(x, c0, m), apply_stretch(y, c0, m)
+    x[~valid] = 0
+    y[~valid] = 0
+    c1, c2 = (SSIM_K1 * L) ** 2, (SSIM_K2 * L) ** 2
+    first = ssim_scale(x, y, valid, c1, c2, keep_map=True)
+    if first is None:
+        raise RuntimeError(f"image {x.shape} is smaller than the SSIM window")
+    smap = first[3]
+    v = smap[np.isfinite(smap)]
+    r = {"ssim": first[0], "windows": first[2], "data_range": L,
+         "ssim_p0_1": float(np.percentile(v, 0.1)) if v.size else float("nan"),
+         "ssim_min": float(v.min()) if v.size else float("nan")}
+    del v
+    r["ms_ssim"] = ms_ssim(x, y, valid, c1, c2, first)
+    r["worst"] = worst_blocks(smap)
+    if keep_map:
+        d = np.zeros(x.shape, np.float32)
+        d[SSIM_RADIUS:SSIM_RADIUS + smap.shape[0], SSIM_RADIUS:SSIM_RADIUS + smap.shape[1]] = \
+            np.nan_to_num(1 - smap, nan=0.0)
+        r["dissim"] = d
+    return r
+
+
 def check_lsf_file(path: str) -> tuple:
     """v0.4 structural checks of one LSF file. Returns (results, info) where results is a list of
     (check, ok, detail) and info = {uid, gen}."""
@@ -606,7 +815,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--skip", nargs="+", choices=SKIPPABLE, default=[],
                    help="Leave out stages: base (lsf_init per-set + running stacks), siril (native stack), "
                         "sos (stack on stack), iter (lsf_append chain), check (v0.4 structure), "
-                        "flip (repair/adopt test), parity (LSF vs Siril), stats (noise export).")
+                        "flip (repair/adopt test), parity (LSF vs Siril), ssim (SSIM of the full stacks), "
+                        "stats (noise export).")
     p.add_argument("--export-fits", action="store_true",
                    help="Also write <name>.fit next to every LSF file with lsf_export.")
     g = p.add_argument_group("stacking settings (shared by lsf_init and stack)")
@@ -628,6 +838,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Use `stat main` (faster, but without Siril's noise estimate).")
     g.add_argument("--no-own-noise", dest="own_noise", action="store_false", default=True,
                    help="Skip the independent neighbour-difference noise estimate.")
+    g = p.add_argument_group("SSIM")
+    g.add_argument("--ssim-domain", choices=["stretch", "linear"], default="stretch",
+                   help="Compare autostretched images (range 1, default) or the linear data (range = "
+                        "0.1-99.9 percentile of siril_cum_1234).")
+    g.add_argument("--ssim-maps", action="store_true", help="Also write a 1 - SSIM map for every pair.")
     return p
 
 
@@ -673,7 +888,7 @@ class Comparison:
         if a.export_fits:
             out += [plain_path(f) for f in out if f.endswith(".lsf.fits")]
         for st, name in (("check", "check.csv"), ("flip", "flip.csv"), ("parity", "parity.csv"),
-                         ("stats", "noise.csv")):
+                         ("ssim", "ssim.csv"), ("stats", "noise.csv")):
             if st not in a.skip:
                 out.append(self.p(name))
         return out
@@ -1017,6 +1232,85 @@ class Comparison:
                      + (" (known exceptions apply)" if exc else " -- unexpected, see the diff_*.fit images"),
                      LogColor.SALMON if exc else LogColor.RED)
 
+    SSIM_FILES = (("lsf_cum_1234", "lsf_cum_1234.lsf.fits"), ("lsf_4", "lsf_4.lsf.fits"),
+                  ("lsf_sos", "lsf_sos.lsf.fits"), ("siril_cum_1234", "siril_cum_1234.fit"))
+    SSIM_FIELDS = ("ssim", "one_minus_ssim", "ssim_p0_1", "ssim_min", "ms_ssim", "windows")
+
+    def siril_image(self, path: str) -> tuple:
+        """A tile-compressed file, read through Siril, in fits_memmap's form."""
+        run_cmd(self.siril, "load", _q(path))
+        a = np.asarray(self.siril.get_image_pixeldata(), dtype=np.float32)
+        return (a[None] if a.ndim == 2 else a), 1.0, 0.0
+
+    def stage_ssim(self, step) -> None:
+        """SSIM and MS-SSIM, per channel, between every pair of the four full stacks (SSIM_FILES). The
+        transform and data range come from siril_cum_1234 (else the first file found), so every pair
+        is scored the same way. Files are read one channel at a time; when one is tile-compressed,
+        all are read through Siril so that they share one orientation."""
+        a = self.a
+        files = [(lbl, saved_path(self.p(name))) for lbl, name in self.SSIM_FILES]
+        for lbl, path in files:
+            if not os.path.exists(path):
+                self.log(f"  ssim: {os.path.basename(path)} missing, left out", LogColor.SALMON)
+        files = [(lbl, path) for lbl, path in files if os.path.exists(path)]
+        if len(files) < 2:
+            self.log("ssim: fewer than two of the full stacks exist, skipped.", LogColor.SALMON)
+            return
+        via_siril = any(fits_memmap(path) is None for _, path in files)
+        open_image = self.siril_image if via_siril else fits_memmap
+        ref_label, ref_path = next(((lbl, p) for lbl, p in files if lbl == "siril_cum_1234"), files[0])
+        step(f"SSIM reference transform from {ref_label}")
+        ref = open_image(ref_path)
+        transforms = []
+        for c in range(ref[0].shape[0]):
+            x = channel_f32(ref, c)
+            transforms.append(ssim_reference(x[np.isfinite(x) & (x != 0)], a.ssim_domain))
+        del ref, x
+        self.log(f"SSIM in the {a.ssim_domain} domain, transform from {ref_label}: "
+                 + "  ".join(f"c{c} range {L:.4g}" + ("" if c0 is None else f" shadows {c0:.4g} midtones {m:.4g}")
+                             for c, (c0, m, L) in enumerate(transforms)))
+        csv_path = self.p("ssim.csv")
+        with open(csv_path, "w", newline="", encoding="utf-8") as fh:
+            w = csv.writer(fh)
+            w.writerow(["pair", "file_a", "file_b", "channel", "domain", "data_range"] + list(self.SSIM_FIELDS)
+                       + ["worst_blocks", "seconds"])
+            for (la, pa), (lb, pb) in itertools.combinations(files, 2):
+                tag = f"{la}_vs_{lb}"
+                step(f"SSIM {tag}")
+                names = [os.path.basename(pa), os.path.basename(pb)]
+                try:
+                    A, B = open_image(pa), open_image(pb)
+                    if A[0].shape != B[0].shape:
+                        raise RuntimeError(f"shape mismatch {A[0].shape} vs {B[0].shape}")
+                    maps = []
+                    for c in range(A[0].shape[0]):
+                        t = time.perf_counter()
+                        r = ssim_channel(channel_f32(A, c), channel_f32(B, c), transforms[min(c, len(transforms) - 1)],
+                                         keep_map=a.ssim_maps)
+                        r["one_minus_ssim"] = 1 - r["ssim"]
+                        if a.ssim_maps:
+                            maps.append(r.pop("dissim"))
+                        dt = time.perf_counter() - t
+                        worst = "; ".join(f"{y}:{x}={v:.6f}" for y, x, v in r["worst"])
+                        w.writerow([tag] + names + [c, a.ssim_domain, repr(r["data_range"])]
+                                   + [repr(r[k]) for k in self.SSIM_FIELDS] + [worst, f"{dt:.1f}"])
+                        self.log(f"  ssim {tag} c{c}: SSIM {r['ssim']:.6f} (1-SSIM {r['one_minus_ssim']:.3g}, "
+                                 f"0.1% {r['ssim_p0_1']:.4f}, min {r['ssim_min']:.4f})  MS-SSIM {r['ms_ssim']:.6f}"
+                                 f"  [{dt:.1f} s]")
+                        if r["worst"] and r["ssim_min"] < 1:
+                            self.log("      lowest 64x64 blocks (file row:column = mean SSIM): " + worst)
+                    del A, B
+                    if maps:
+                        write_fits_float32(self.p(f"ssim_{tag}.fit"), np.stack(maps),
+                                           (f"1 - SSIM ({a.ssim_domain}): {names[0]} vs {names[1]}",))
+                        del maps
+                except Exception as e:  # noqa: BLE001
+                    self.log(f"  ssim {tag}: failed ({e})", LogColor.SALMON)
+                    w.writerow([tag] + names + ["", a.ssim_domain, ""] + [""] * len(self.SSIM_FIELDS) + ["", ""])
+                fh.flush()
+                gc.collect()
+        self.log(f"SSIM table written to {csv_path}", LogColor.GREEN)
+
     # ---- behaviour tests --------------------------------------------------------
     def try_cmd(self, *parts) -> bool:
         """A command that may be refused: True if Siril reports success. The tests below judge the
@@ -1299,10 +1593,11 @@ class Comparison:
             if "base" not in a.skip or "siril" not in a.skip:
                 self.prime_stats_cache()
 
-            weights = {"base": 7, "siril": 7, "sos": 1, "iter": 4, "check": 1, "flip": 1, "parity": 8, "stats": 21}
+            weights = {"base": 7, "siril": 7, "sos": 1, "iter": 4, "check": 1, "flip": 1, "parity": 8, "ssim": 7,
+                       "stats": 21}
             stages = {"base": self.stage_base, "siril": self.stage_siril, "sos": self.stage_sos,
                       "iter": self.stage_iter, "check": self.stage_check, "parity": self.stage_parity,
-                      "stats": self.stage_stats, "flip": self.stage_flip}
+                      "ssim": self.stage_ssim, "stats": self.stage_stats, "flip": self.stage_flip}
             todo = [st for st in STAGES if st not in a.skip]
             total_steps = sum(weights[st] for st in todo)
             done = [0]
@@ -1349,7 +1644,7 @@ def confirm_gui(cmp_: Comparison) -> bool:
         msg = (f"Sequence '{cmp_.seqname}': {len(cmp_.original_selected)} selected frames, sets of "
                + ", ".join(str(len(x)) for x in cmp_.sets)
                + f".\n\nThis will build LSF and Siril per-set and cumulative stacks, a stack of stacks and 4 "
-                 f"iterative LSF files, check them and export parity and noise tables to:\n{cmp_.outdir}\n\n"
+                 f"iterative LSF files, check them and export parity, SSIM and noise tables to:\n{cmp_.outdir}\n\n"
                  f"This can take a long time. Continue?")
         ok = messagebox.askokcancel("LSF compare", msg)
         root.destroy()

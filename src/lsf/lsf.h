@@ -122,6 +122,16 @@ typedef struct {
 	gint64 file_bytes;
 } lsf_info;
 
+/* one ledger row as the LSF Manager shows it (Section 9) */
+typedef struct {
+	int batch, gen;
+	gchar *filename, *date_obs, *filter;
+	double exptime;
+	double weight[3];		// per channel
+	float fwhm, wfwhm, noise[3];
+	int nstars;
+} lsf_ledger_view;
+
 /* one frame of a batch, for the ledger */
 typedef struct {
 	gchar *frame_id;
@@ -200,8 +210,12 @@ int lsf_history_grow(lsf_history *h, const int pad[4]);
 void lsf_history_free(lsf_history *h);
 void lsf_file_free(lsf_file *f);
 int lsf_open_and_validate(const char *path, lsf_file *f, gboolean tolerate_edited_stack);
+int lsf_open_and_validate_msg(const char *path, lsf_file *f, gboolean tolerate_edited_stack, gchar **problem);
 int lsf_read_info(const char *path, lsf_info *info);
 void lsf_info_free(lsf_info *info);
+GPtrArray *lsf_read_ledger_view(const lsf_info *info);
+void lsf_ledger_view_free(gpointer p);
+GPtrArray *lsf_read_history(const char *path);
 gchar *lsf_hash_float_data(const float *data, size_t n);
 gchar *lsf_now_utc_iso(void);
 int lsf_write_file(const char *path, lsf_file *old, const lsf_settings *s, lsf_history *h,
@@ -228,6 +242,8 @@ struct lsf_job_result {
 	int retval;		// 0 on success
 	gchar *path;		// the LSF file
 	gchar *export_out;	// the plain image written with it, as named on disk, or NULL
+	gchar *message;		// util: what was found or done, for the user, or NULL
+	gboolean stack_modified;	// util: check 8 found the Stack edited outside Siril
 	lsf_end_func end_func;
 	gpointer end_data;	// of the caller
 };
@@ -252,6 +268,11 @@ struct lsf_cmd_args {
 	guint maps;		// maps, LSF_MAP_* flags
 	gchar *export_out;	// init and append: also export the new Stack to this plain image (GUI)
 	gboolean load_result;	// init and append: the new Stack becomes the result image (GUI)
+	gboolean rej_set;	// append: settings.rej and sig override the rejection stored in the file
+	int *image_indices;	// init and append: frames chosen by the GUI's stacking filters, or NULL
+	int nb_images;
+	gchar *message;		// out, util: passed to lsf_job_result
+	gboolean stack_modified;	// out, util
 	lsf_end_func end_func;	// GUI: called when the job is over, or NULL
 	gpointer end_data;
 };
@@ -281,6 +302,7 @@ struct lsf_batch_args {
 	const char *seq_name;
 	GPtrArray *rows;		// out: lsf_ledger_row* of the merged frames
 	fits *primary;			// in/out: header metadata for HDU 0 (built from the reference frame on init)
+	gboolean keep_seq_file;		// the selection of seq was changed in memory: do not write its .seq file
 	guint64 rejected[3][2], hist_rejected[3][2];
 };
 int lsf_process_batch(struct lsf_batch_args *args);

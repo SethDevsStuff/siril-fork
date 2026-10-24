@@ -34,6 +34,40 @@ Section A covers what the GUI needs from the core first, section B the user-faci
   - **Checks:** `lsf_check_batch()` refuses a channel mismatch and warns when the reference frame's Section 7 keywords differ, through `lsf_frame_mismatch()`, the same check lsf_append makes. Problems show in the info label and disable Run when fatal.
   - **After the run:** the Stack becomes the result image and the file is read again. The last appended file is proposed again for the session only; the per-directory memory is not done.
 
+- **B4 done, waiting for a GUI test.** Tools > Living Stack... opens `lsf_manager_dialog` (gui-gtk4/lsf_manager.c, uifiles/lsf_manager.ui). By default it shows the LSF file loaded as the current image.
+  - **Summary:** `lsf_gui_describe()`, now shared with the stacking tab.
+  - **Frames tab:** a sortable ledger table (`lsf_read_ledger_view()`) with a summary line per batch. Weights at the floor are marked under wfwhm/nbstars weighting.
+  - **History tab:** the LSF HISTORY cards of HDU 0 (`lsf_read_history()`).
+  - **Maintenance tab:**
+    - Check, with Repair and Adopt enabled only after a check finds check 8 failed; both are confirmed first.
+    - Compression, Save a copy (-out), Export, and a backup option.
+    - Results show in the dialog. `lsf_util` fills `lsf_job_result.message` and `stack_modified`, and `lsf_open_and_validate_msg()` returns the failure text.
+  - **Maps tab:** the six maps (rejlo/rejhi only with LSF_REJ), a prefix, and an option to open the first map, which closes the sequence.
+  - C4 and C5 resolved as: one dialog, and maps saved to files (viewing in memory without files is not done).
+  - `lsf_util -check` on a file that only fails check 8 now ends without error.
+
+- **Changes from the decisions of 2026-10-24.**
+  - **Built, and tested headless on 2026-10-24:**
+    - the rejection override: winsorized override, history-test override, a plain append keeping the new defaults, `rej n`, and invalid `rej` arguments refused;
+    - the HISTORY cards and LSF_SETTINGS were read back;
+    - the command regression (init, append with growth and crop, check, export, maps), with the users' `.seq` files unchanged.
+  - **Not tested:** the frame list from the stacking filters, which only the GUI can pass.
+  - The log, HISTORY cards and summary write "none" without values when rejection is off.
+  - **C8:** append mode no longer pre-fills the file field; `last_append_path` is removed.
+  - **C7, defaults without the preferences page:**
+    - the LSF name defaults to the stack-name preference (`$seqname$stacked` when unset) with `.lsf.fits` (`default_lsf_pattern()`), replacing `$seqname$$FILTER:%s$`;
+    - rejection maps are on by default for a new file, and set off when append mode is shown;
+    - "Keep the previous file as .bak" is off by default.
+  - **C10:** "Also save the updated stack as an image" (`stack_lsf_append_export`) in the append panel, through `export_out`.
+  - **C2:** in append mode, the rejection method and sigmas are editable.
+    - A rejection or history-test change is confirmed in one dialog, which says it overwrites the file's settings for this append and the next ones.
+    - Core: `lsf_append` takes `rej [type] low high` (`parse_rejection()`, shared with lsf_init) and saves it in LSF_SETTINGS.
+    - Each rejection or history-test change adds a HISTORY card ("LSF gen N: rejection … , was …"), the per-batch record. The help text is updated.
+  - **C6 / A4:** the stacking filters work in LSF modes.
+    - The GUI passes `stackparam.image_indices` as `image_indices`. `apply_frame_list()` applies them to the sequence loaded from disk, and `keep_seq_file` keeps `lsf_process_batch` from writing that selection to the user's `.seq`.
+    - The logged command notes when the filters chose frames other than the selection, since the commands have no filters.
+  - **Bug fixed on the way:** start_lsf_append read the history spin buttons after `load_append_info()` had refilled them from the file, so a GUI override of the history test was always lost. `load_append_info(FALSE)` now re-reads the file without touching the widgets, and the choices are read first.
+
 ## A. Core prerequisites
 
 These come first, because every UI item below depends on them.
@@ -194,16 +228,34 @@ This needs no other LSF UI and protects users today, since they can already open
 - **CFADRIZ (Sections 10.3 and 10.4).** Today the reader refuses cfa.mode = CFADRIZ, and lsf_append refuses grid.oversample other than 1. When CFADRIZ lands, the LSF panel needs the drizzle scale, pixfrac and kernel. Leave room for them in the panel layout rather than re-using the hidden "upscale at stacking" widgets.
 - **Live stacking (later).** livestacking_gui is the obvious long-term consumer: commit to an LSF every N frames. Keep the A2 API free of tab-specific state so it can be driven from there.
 
-## C. Decisions needed
+## C. Decisions
 
-1. **Where the LSF modes live on the stacking tab.**
-   - (a) A result drop-down (Image / LSF / LSF + image / Append), as in B1 and B2. Recommended.
-   - (b) A separate LSF expander that switches the tab into LSF mode.
-2. **Rejection override on append.** The rule for overrides is decided: an override is saved as the new default (B2). The history thresholds follow it. What is still open is whether the rejection method and sigmas can be overridden too; lsf_append has no option for them.
-   - (a) Lock the widgets, matching the code today.
-   - (b) Add `rej`/sigma override to lsf_append, so the widgets stay editable. The ledger, or a HISTORY card as proposed for the history test in B2, would then need to record per batch the rejection that was used.
-3. **Registration tab flow (B3):** phase 2, or not at all.
-4. **Tools:** one LSF Manager dialog (recommended), or separate menu entries per action.
-5. **Maps:** in-memory viewing (needs the refactor in B4), or saving to files only.
+Decided with the user, 2026-10-23 and 2026-10-24.
 
-Suggested order: B5 → A1 → A2 + A3 → B1 → A4 + A5 + A6 → B2 → B4 → B6 → B3.
+1. **Stacking tab layout:** one result drop-down (Image / LSF / LSF + image / Append). Done (B1, B2).
+2. **Rejection override on append: allowed.**
+   - The rejection method and sigmas become editable in append mode.
+   - A change is saved in the file as the new default, as for the history test.
+   - Before the run, the user is warned that the change overwrites the file's settings.
+   - Needs a `rej`/sigma override in lsf_append, and a per-batch record of what was used (ledger or HISTORY card).
+3. **Registration tab flow (B3):** deferred.
+4. **Tools:** one Living Stack dialog. Done (B4).
+5. **Maps:** saved as files, with "open the first map". Viewing a map in memory is not needed; closed.
+6. **Stacking filters in LSF mode (A4): supported**, for parity with Siril's stacking. The filtered frame list is passed to the LSF job without rewriting the user's `.seq` (see A4 for why the selection in memory cannot be used as it is).
+7. **LSF preferences (B6):** a Living Stack group in the Stacking preferences page.
+   - **Name:** the same default pattern as a normal stack (the stack-name preference, `$seqname$stacked` by default), with `.lsf.fits` added. This replaces `$seqname$$FILTER:%s$`.
+   - **Compression:** default off.
+   - **Rejection maps:** default on.
+   - **Backup on append:** default off. The GUI has it on today; that changes.
+8. **Last LSF file in append mode:** not pre-filled. The session-only proposal of the last appended file is removed.
+9. **Leaving append mode:** the rejection, normalization and weighting widgets keep the file's values. No change.
+10. **Append + image:** yes. An option in the append panel exports the updated stack as a plain image named like the LSF file, as the create mode does.
+11. **Stacking tab and the Tools > Living Stack window:** not connected. No "open in" button; the window does not follow the loaded image while open.
+12. **Writing a WCS into an LSF** (needed by -wcsreg): deferred.
+13. **E1 (frame-edge seams):** deferred until most of the core UI works (LSF edge cases.md).
+
+Suggested order: B5 → A1 → A2 + A3 → B1 → A4 + A5 + A6 → B2 → B4 → B6 → B3. Next, from the decisions above:
+- C8 and C10 (small changes to the append panel);
+- C7 (preferences, and the new name default);
+- C6 / A4 (filters);
+- C2 (rejection override, which needs the core option).

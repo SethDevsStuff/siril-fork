@@ -1198,7 +1198,7 @@ The &lt;b&gt;Generalized Extreme Studentized Deviate Test&lt;/b&gt; algorithm [3
 
 &lt;b&gt;Living Stack file and image&lt;/b&gt;: also saves the stack as a plain image, named like the LSF file.
 
-&lt;b&gt;Append to a Living Stack&lt;/b&gt;: merges the selected frames into an existing .lsf.fits file. They are registered against its stacked image and processed with the settings stored in it, which are shown and locked above.</property>
+&lt;b&gt;Append to a Living Stack&lt;/b&gt;: merges the selected frames into an existing .lsf.fits file. They are registered against its stacked image and processed with the settings stored in it, shown above. Normalization and weighting are locked; changing the rejection or the history test overwrites the file's settings for this append and the next ones.</property>
                             <signal name="notify::selected" handler="on_stack_result_mode_changed"/>
                           </object>
                         </child>
@@ -1370,13 +1370,24 @@ The &lt;b&gt;Generalized Extreme Studentized Deviate Test&lt;/b&gt; algorithm [3
                             </child>
                             <child>
                               <object class="GtkCheckButton" id="stack_lsf_backup">
-                                <property name="active">1</property>
                                 <property name="focusable">1</property>
                                 <property name="label" translatable="yes">Keep the previous file as .bak</property>
                                 <property name="tooltip-text" translatable="yes">An append cannot be undone. With this, the file as it was before the append is kept beside it as file.lsf.fits.bak, which takes as much disk space as the file. Without it, an append that turns out bad can only be removed by stacking the frames again.</property>
                                 <layout>
                                   <property name="column">0</property>
                                   <property name="row">4</property>
+                                  <property name="column-span">3</property>
+                                </layout>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="GtkCheckButton" id="stack_lsf_append_export">
+                                <property name="focusable">1</property>
+                                <property name="label" translatable="yes">Also save the updated stack as an image</property>
+                                <property name="tooltip-text" translatable="yes">After the append, also saves the stacked image as a plain FITS image named like the Living Stack file, without its Living Stack data, with the FITS extension and compression of the preferences. Process this image, not the Living Stack file.</property>
+                                <layout>
+                                  <property name="column">0</property>
+                                  <property name="row">5</property>
                                   <property name="column-span">3</property>
                                 </layout>
                               </object>
@@ -1645,6 +1656,7 @@ WARNING: This option should not be checked for master stacking.</property>
                         </child>
                         <child>
                           <object class="GtkCheckButton" id="stack_lsf_rejmaps">
+                            <property name="active">1</property>
                             <property name="focusable">1</property>
                             <property name="halign">start</property>
                             <property name="label" translatable="yes">Keep rejection maps in the file</property>

@@ -47,6 +47,7 @@
 #include "gui-gtk4/icc_profile.h"
 #include "gui-gtk4/image_display.h"
 #include "gui-gtk4/image_interactions.h"
+#include "gui-gtk4/lsf_manager.h"
 #include "gui-gtk4/menu_gray_geometry.h"
 #include "gui-gtk4/mpp_ap_editor.h"
 #include "gui-gtk4/open_dialog.h"
@@ -977,6 +978,10 @@ void merge_cfa_activate(GSimpleAction *action, GVariant *parameter, gpointer use
 void hdr_activate(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
 	hdr_dialog_init_statics();
 	siril_open_dialog("hdr_dialog");
+}
+
+void lsf_manager_activate(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
+	lsf_manager_open(NULL);
 }
 
 void star_desaturate_activate(GSimpleAction *action, GVariant *parameter, gpointer user_data) {

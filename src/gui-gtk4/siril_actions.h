@@ -152,6 +152,7 @@ void align_dft_activate(GSimpleAction *action, GVariant *parameter, gpointer use
 void align_psf_activate(GSimpleAction *action, GVariant *parameter, gpointer user_data);
 void merge_cfa_activate(GSimpleAction *action, GVariant *parameter, gpointer user_data);
 void hdr_activate(GSimpleAction *action, GVariant *parameter, gpointer user_data);
+void lsf_manager_activate(GSimpleAction *action, GVariant *parameter, gpointer user_data);
 void icc_activate(GSimpleAction *action, GVariant *parameter, gpointer user_data);
 void set_roi(GSimpleAction *action, GVariant *parameter, gpointer user_data);
 void clear_roi(GSimpleAction *action, GVariant *parameter, gpointer user_data);
