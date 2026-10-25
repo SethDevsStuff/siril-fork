@@ -127,9 +127,9 @@ struct registration_args {
 	double filtering_parameter;	// and its parameter (seqapplyreg only)
 	gboolean no_starlist;		// disable star list creation (2pass only)
 	const star_finder_params *sf_params;	// star detection settings for global and 2pass, NULL to use the preferences
-	void (*end_hook)(struct registration_args *args);	// in the thread once the .seq file is written, success or not; frees hook_data
-	gpointer hook_data;
-	gchar *lsf_registered;		// the Living Stack the sequence was registered against, set by its end_hook on success; freed by end_register_idle
+	void (*end_hook)(struct registration_args *args);	// in the thread once the .seq file is written, success or not
+	gpointer hook_data;		// data of end_hook, which the end of the registration may still read
+	GDestroyNotify hook_free;	// frees hook_data, with the args (free_registration_hook_data)
 	float output_scale;		// scaling factor
 	disto_source undistort;		// type of undistortion to apply
 	disto_params distoparam;		// type of undistortion to apply
@@ -194,6 +194,7 @@ int get_comet_shift(GDateTime *ref, GDateTime *img, pointf px_per_hour, pointf *
 void compute_fitting_selection(rectangle *area, int hsteps, int vsteps, int preserve_square);
 void get_the_registration_area(struct registration_args *regargs, const struct registration_method *method); // for compositing
 gpointer register_thread_func(gpointer p);
+void free_registration_hook_data(struct registration_args *args);
 
 // getters - checkers
 int get_registration_layer(const sequence *seq);

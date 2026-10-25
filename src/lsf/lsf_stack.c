@@ -27,27 +27,34 @@
  * are merged into the accumulator with the weighted pairwise update.
  * Siril's stacking code is not modified. */
 
-#include <string.h>
-#include <math.h>
-#include <limits.h>
 #include <float.h>
+#include <limits.h>
+#include <math.h>
+#include <string.h>
+
 #include <gsl/gsl_cdf.h>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
 
-#include "core/siril.h"
-#include "core/proto.h"
-#include "core/processing.h"
-#include "core/siril_log.h"
-#include "core/OS_utils.h"
-#include "core/gui_iface.h"
 #include "algos/statistics.h"
-#include "io/sequence.h"
+#include "core/gui_iface.h"
+#include "core/OS_utils.h"
+#include "core/processing.h"
+#include "core/proto.h"
+#include "core/siril.h"
+#include "core/siril_alloc.h"
+#include "core/siril_log.h"
 #include "io/image_format_fits.h"
+#include "io/sequence.h"
+#include "lsf/lsf.h"
+#include "lsf/lsf_fits.h"
+#include "lsf/lsf_math.h"
+#include "lsf/lsf_settings.h"
+#include "lsf/lsf_stack.h"
+#include "lsf/lsf_weights.h"
 #include "opencv/opencv.h"
 #include "registration/registration.h"
-#include "lsf/lsf.h"
 
 void lsf_ledger_row_free(gpointer p) {
 	lsf_ledger_row *r = p;
@@ -256,7 +263,7 @@ typedef struct {
 static int alloc_thread_data(lsf_thread_data *t, int nb, size_t block_pix, gboolean ushort_input, rejection rej) {
 	memset(t, 0, sizeof(lsf_thread_data));
 	t->pix = malloc(nb * sizeof(float *));
-	t->mem = malloc((size_t) nb * block_pix * sizeof(float));
+	t->mem = siril_malloc((size_t) nb * block_pix * sizeof(float));
 	t->db.stack = malloc(nb * sizeof(float));
 	t->db.o_stack = malloc(nb * sizeof(float));
 	t->db.w_stack = malloc(nb * sizeof(float));
@@ -289,7 +296,7 @@ static int alloc_thread_data(lsf_thread_data *t, int nb, size_t block_pix, gbool
 }
 
 static void free_thread_data(lsf_thread_data *t) {
-	free(t->pix); free(t->mem); free(t->wbuf); free(t->xbuf); free(t->wbufd); free(t->sel);
+	free(t->pix); siril_free(t->mem); free(t->wbuf); free(t->xbuf); free(t->wbufd); free(t->sel);
 	free(t->db.stack); free(t->db.o_stack); free(t->db.w_stack); free(t->db.rejected);
 	free(t->db.xf);
 }
@@ -326,6 +333,7 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 	lsf_thread_data *tdata = NULL;
 	struct _image_block *blocks = NULL;
 	int nb_threads = 1;
+	const int max_threads = MAX(args->max_threads, 1);	// the budget of the job, not com.max_thread
 	gboolean opened = FALSE;
 	fits refmeta = { 0 };
 	struct stacking_args rargs = { 0 };	// rejection arguments for apply_rejection_float()
@@ -411,7 +419,7 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 			goto end;
 		}
 		if (compute_all_channels_statistics_seqimage(seq, i, NULL, s->lite_norm ? STATS_LITENORM : STATS_NORM,
-					MULTI_THREADED, -1, stats[i])) {
+					max_threads, -1, stats[i])) {
 			siril_log_error(_("LSF: could not compute the statistics of frame %d\n"), seq->imgparam[i].filenum);
 			free(cand);
 			goto end;
@@ -593,7 +601,7 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 
 	/* 6. blocks of rows, memory-bounded */
 #ifdef _OPENMP
-	nb_threads = com.max_thread;
+	nb_threads = max_threads;
 	if (nb_threads > 1 && (seq->type == SEQ_REGULAR || seq->type == SEQ_FITSEQ) && !fits_is_reentrant())
 		nb_threads = 1;
 #endif
@@ -642,8 +650,8 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 #pragma omp parallel for num_threads(nb_threads) schedule(dynamic) if (nb_threads > 1)
 #endif
 	for (int bi = 0; bi < nb_blocks; bi++) {
-		if (err || !processing_should_continue()) {
-			err = 1;
+		if (g_atomic_int_get(&err) || !processing_should_continue()) {
+			g_atomic_int_set(&err, 1);
 			continue;
 		}
 		int tid = 0;
@@ -659,20 +667,24 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 
 		/* read the block from all frames */
 		rectangle area = { 0, (int) blk->start_row, (int) rx, (int) blk->height };
+		gboolean block_err = FALSE;
 		size_t npix = (size_t) blk->height * rx;
-		for (int f = 0; f < nb && !err; f++) {
+		for (int f = 0; f < nb && !block_err; f++) {
 			void *buffer = ushort_input ? (void *) td->wbuf : (void *) td->pix[f];
 			if (seq_opened_read_region(seq, layer, b.idx[f], buffer, &area, tid)) {
 				siril_log_error(_("Error reading one of the image areas (%d: %d %d %d %d)\n"),
 						b.idx[f] + 1, area.x, area.y, area.w, area.h);
-				err = 1;
+				block_err = TRUE;
 				break;
 			}
 			if (ushort_input)
 				for (size_t p = 0; p < npix; p++)
 					td->pix[f][p] = (float) (td->wbuf[p] * INV_USHRT_MAX_DOUBLE);
 		}
-		if (err) continue;
+		if (block_err) {
+			g_atomic_int_set(&err, 1);
+			continue;
+		}
 
 		float *stack = (float *) td->db.stack;
 		float *o_stack = (float *) td->db.o_stack;
@@ -916,22 +928,15 @@ int lsf_build_primary(fits *primary, lsf_settings *s, const lsf_history *h) {
 	s->outnorm_min = norm ? mini : 0.0;
 	s->outnorm_max = norm ? maxi : 0.0;
 	s->outnorm = norm;
-	free(primary->data);
-	free(primary->fdata);
-	primary->data = NULL;
-	for (int c = 0; c < 3; c++)
-		primary->pdata[c] = NULL;
-	primary->fdata = data;
-	for (int c = 0; c < 3; c++)
-		primary->fpdata[c] = data + (c < h->nchan ? c : 0) * n;
-	primary->type = DATA_FLOAT;
-	primary->bitpix = FLOAT_IMG;
-	primary->orig_bitpix = FLOAT_IMG;
 	primary->rx = h->rx;
 	primary->ry = h->ry;
 	primary->naxes[0] = h->rx;
 	primary->naxes[1] = h->ry;
 	primary->naxes[2] = h->nchan;
 	primary->naxis = h->nchan == 3 ? 3 : 2;
+	/* fit_replace_buffer() frees the buffer of the other type only */
+	free(primary->fdata);
+	primary->fdata = NULL;
+	fit_replace_buffer(primary, data, DATA_FLOAT);
 	return 0;
 }

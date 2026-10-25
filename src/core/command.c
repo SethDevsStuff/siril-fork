@@ -63,7 +63,6 @@
 #include "io/FITS_symlink.h"
 #include "io/gps_parser.h"
 #include "io/image_format_fits.h"
-#include "lsf/lsf.h"
 #include "io/local_catalogues.h"
 #include "io/path_parse.h"
 #include "io/sequence.h"
@@ -118,6 +117,7 @@
 #include "io/healpix/healpix_cat.h"
 #include "io/healpix/healpix_image.h"
 #include "livestacking/livestacking.h"
+#include "lsf/lsf_commands.h"
 #include "pixelMath/pixel_math_runner.h"
 #include "registration/mpp.h"
 #include "registration/mpp/mpp_ap.h"
@@ -11108,10 +11108,7 @@ int process_register(int nb) {
 	return CMD_OK;
 
 terminate_register_on_error:
-	if (regargs->end_hook) {	// frees its data
-		regargs->retval = 1;
-		regargs->end_hook(regargs);
-	}
+	free_registration_hook_data(regargs);
 	free(regargs->prefix);
 	g_free(regargs->external_ref_path);
 	free(regargs);
@@ -11541,6 +11538,59 @@ terminate_register_on_error:
 	free(regargs->new_seq_name);
 	free(regargs);
 	return errval;
+}
+
+/* the [type] of rej in the stack command: letter and name of each rejection */
+static const struct {
+	const char *letter, *name;
+	rejection type;
+} rejection_args[] = {
+	{ "n", "none", NO_REJEC },
+	{ "p", "percentile", PERCENTILE },
+	{ "s", "sigma", SIGMA },
+	{ "a", "mad", MAD },
+	{ "m", "median", SIGMEDIAN },
+	{ "w", "winsorized", WINSORIZED },
+	{ "l", "linear", LINEARFIT },
+	{ "g", "generalized", GESDT },
+};
+
+/* the rejection named by arg, its letter or its name; none only when
+ * allow_none. Returns FALSE when arg names no rejection. */
+gboolean parse_rejection_type(const char *arg, gboolean allow_none, rejection *type) {
+	if (!arg)
+		return FALSE;
+	for (int i = 0; i < (int) G_N_ELEMENTS(rejection_args); i++) {
+		if (rejection_args[i].type == NO_REJEC && !allow_none)
+			continue;
+		if (!strcmp(arg, rejection_args[i].letter) || !strcmp(arg, rejection_args[i].name)) {
+			*type = rejection_args[i].type;
+			return TRUE;
+		}
+	}
+	return FALSE;
+}
+
+/* the letter of the rejection in the stack command, for a command line */
+const char *rejection_type_letter(rejection type) {
+	for (int i = 0; i < (int) G_N_ELEMENTS(rejection_args); i++)
+		if (rejection_args[i].type == type)
+			return rejection_args[i].letter;
+	return "w";
+}
+
+/* the two values of GESDT and percentile rejection are in [0, 1]. Returns
+ * FALSE with the reason logged when they are not. */
+gboolean check_rejection_values(rejection type, double low, double high) {
+	if (type == GESDT && (low > 1.0 || high > 1.0)) {
+		siril_log_error(_("Extra parameters of GESDT rejection algorithm must be between 0 and 1, default is 0.3 and 0.05.\n"));
+		return FALSE;
+	}
+	if (type == PERCENTILE && (low > 1.0 || high > 1.0)) {
+		siril_log_error(_("Extra parameters of percentile rejection algorithm must be between 0 and 1, default is 0.2 and 0.1.\n"));
+		return FALSE;
+	}
+	return TRUE;
 }
 
 // parse normalization and filters from the stack command line, starting at word `first'
@@ -12069,23 +12119,7 @@ int process_stackone(int nb) {
 				siril_log_error(_("Missing arguments for rejection stacking.\n"));
 				goto failure;
 			}
-			if (!strcmp(word[3], "p") || !strcmp(word[3], "percentile")) {
-				arg->type_of_rejection = PERCENTILE;
-			} else if (!strcmp(word[3], "s") || !strcmp(word[3], "sigma")) {
-				arg->type_of_rejection = SIGMA;
-			} else if (!strcmp(word[3], "a") || !strcmp(word[3], "mad")) {
-				arg->type_of_rejection = MAD;
-			} else if (!strcmp(word[3], "m") || !strcmp(word[3], "median")) {
-				arg->type_of_rejection = SIGMEDIAN;
-			} else if (!strcmp(word[3], "l") || !strcmp(word[3], "linear")) {
-				arg->type_of_rejection = LINEARFIT;
-			} else if (!strcmp(word[3], "w") || !strcmp(word[3], "winsorized")) {
-				arg->type_of_rejection = WINSORIZED;
-			} else if (!strcmp(word[3], "g") || !strcmp(word[3], "generalized")) {
-				arg->type_of_rejection = GESDT;
-			} else if (!strcmp(word[3], "n") || !strcmp(word[3], "none")) {
-				arg->type_of_rejection = NO_REJEC;
-			} else {
+			if (!parse_rejection_type(word[3], TRUE, &arg->type_of_rejection)) {
 				arg->type_of_rejection = WINSORIZED;
 				shift = 0;
 			}
@@ -12102,16 +12136,8 @@ int process_stackone(int nb) {
 					base_shift = 3;
 				}
 			}
-			if (((arg->type_of_rejection == GESDT))
-					&& (arg->sig[0] > 1.0 || (arg->sig[1] > 1.0))) {
-				siril_log_error(_("Extra parameters of GESDT rejection algorithm must be between 0 and 1, default is 0.3 and 0.05.\n"));
+			if (!check_rejection_values(arg->type_of_rejection, arg->sig[0], arg->sig[1]))
 				goto failure;
-			}
-			if (((arg->type_of_rejection == PERCENTILE))
-					&& (arg->sig[0] > 1.0 || (arg->sig[1] > 1.0))) {
-				siril_log_error(_("Extra parameters of percentile rejection algorithm must be between 0 and 1, default is 0.2 and 0.1.\n"));
-				goto failure;
-			}
 			arg->method = stack_mean_with_rejection;
 			start_arg_opt = base_shift + shift;
 			allow_med_options = TRUE;

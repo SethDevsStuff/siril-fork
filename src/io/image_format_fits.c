@@ -2097,12 +2097,35 @@ gchar *set_right_extension(const char *name) {
 /* TRUE when filename is a Living Stack Format file, with LSF = T in its
  * primary header. Saving an image over it would replace it by a plain image
  * and lose its accumulator (Section 13 of the LSF profile), so callers that
- * overwrite files refuse to. */
+ * overwrite files refuse to. savefits() asks before every overwrite, so a
+ * plain FITS file is read card by card up to END, which is cheaper than
+ * opening it with cfitsio; other files, such as gzipped ones, are opened. */
 gboolean fits_file_is_lsf(const char *filename) {
 	fitsfile *fptr = NULL;
 	int status = 0, lsf = 0;
 	if (!filename || !g_file_test(filename, G_FILE_TEST_IS_REGULAR))
 		return FALSE;
+	FILE *f = g_fopen(filename, "rb");
+	if (!f)
+		return FALSE;
+	char card[FLEN_CARD] = { 0 };
+	gboolean plain = FALSE;
+	for (int i = 0; i < 36 * 1000 && fread(card, 1, 80, f) == 80; i++) {	// at most 1000 header blocks
+		if (i == 0 && !(plain = !strncmp(card, "SIMPLE  =", 9)))
+			break;
+		if (!strncmp(card, "END     ", 8))
+			break;
+		if (!strncmp(card, "LSF     =", 9)) {
+			const char *v = card + 9;
+			while (*v == ' ')
+				v++;
+			lsf = *v == 'T';
+			break;
+		}
+	}
+	fclose(f);
+	if (plain)
+		return lsf != 0;
 	if (fits_open_diskfile(&fptr, filename, READONLY, &status))
 		return FALSE;
 	fits_read_key(fptr, TLOGICAL, "LSF", &lsf, NULL, &status);

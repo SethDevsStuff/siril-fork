@@ -21,10 +21,15 @@
 
 #include <math.h>
 #include <string.h>
+
 #include <criterion/criterion.h>
 
 #include "core/siril.h"
 #include "lsf/lsf.h"
+#include "lsf/lsf_fits.h"
+#include "lsf/lsf_math.h"
+#include "lsf/lsf_settings.h"
+#include "lsf/lsf_weights.h"
 
 cominfo com;	// the core data struct
 fits *gfit;	// currently loaded image

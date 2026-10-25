@@ -37,6 +37,7 @@ typedef struct {
 } NumProcsInfo;
 
 
+gint64 find_space(const gchar *name);
 gboolean is_space_disk_available(const gchar *disk);
 gboolean update_displayed_memory(gpointer data);
 int test_available_space(gint64 req_size);

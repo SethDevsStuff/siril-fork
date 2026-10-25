@@ -22,12 +22,15 @@
 #ifdef HAVE_CONFIG_H
 #include <config.h>
 #endif
-#include <string.h>
-#include <stdlib.h>
 
-#include "yyjson.h"
+#include <stdlib.h>
+#include <string.h>
+
 #include "core/siril_log.h"
 #include "lsf/lsf.h"
+#include "lsf/lsf_settings.h"
+
+#include "yyjson.h"
 
 static const char *rej_names[] = { "none", "percentile", "sigma", "mad", "sigmedian",
 	"winsorized", "linearfit", "gesdt" };

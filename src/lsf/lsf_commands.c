@@ -21,29 +21,36 @@
  * (FITS profile v0.4, Sections 1, 8 and 10). These are the only paths that
  * write an LSF file. */
 
-#include <string.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stddef.h>
-#include <math.h>
+#include <string.h>
+
 #include <glib/gstdio.h>
 
-#include "yyjson.h"
-#include "core/siril.h"
-#include "core/proto.h"
-#include "core/siril_log.h"
-#include "core/OS_utils.h"
+#include "algos/astrometry_solver.h"
+#include "algos/siril_wcs.h"
 #include "core/command.h"
 #include "core/command_line_processor.h"
+#include "core/OS_utils.h"
 #include "core/processing.h"
 #include "core/processing_thread.h"
-#include "io/sequence.h"
+#include "core/proto.h"
+#include "core/siril.h"
+#include "core/siril_log.h"
 #include "io/image_format_fits.h"
+#include "io/sequence.h"
 #include "io/single_image.h"
-#include "algos/siril_wcs.h"
-#include "algos/astrometry_solver.h"
+#include "lsf/lsf.h"
+#include "lsf/lsf_commands.h"
+#include "lsf/lsf_fits.h"
+#include "lsf/lsf_math.h"
+#include "lsf/lsf_settings.h"
+#include "lsf/lsf_stack.h"
 #include "opencv/opencv.h"
 #include "registration/registration.h"
-#include "lsf/lsf.h"
+
+#include "yyjson.h"
 
 /* the defaults of the commands, which the parsers then change */
 struct lsf_cmd_args *lsf_cmd_args_new(lsf_cmd_mode mode) {
@@ -55,6 +62,7 @@ struct lsf_cmd_args *lsf_cmd_args_new(lsf_cmd_mode mode) {
 	a->mode = mode;
 	a->framing = FRAMING_MAX;
 	a->expand_step = LSF_EXPAND_STEP;
+	a->max_threads = com.max_thread;
 	lsf_settings_init(&a->settings);
 	a->settings.norm = NO_NORM;	// as the stack command
 	a->settings.rej = NO_REJEC;
@@ -150,7 +158,7 @@ static gchar *rejection_text(rejection r, const double sig[2]) {
 	return g_strdup_printf("%s %g %g", lsf_rejection_name(r), sig[0], sig[1]);
 }
 
-/* The frames the GUI's stacking filters chose (UI plan, A4), in place of
+/* The frames the GUI's stacking filters chose, in place of
  * the selection saved in the sequence file. The change stays in memory:
  * the caller keeps lsf_process_batch() from writing it to the .seq file
  * of the user. Returns TRUE when a list was applied. */
@@ -224,7 +232,7 @@ static int lsf_init_run(struct lsf_cmd_args *a) {
 	sequence *batch = seq;
 	int batch_ref = ref;
 	if (layer_has_usable_registration(seq, get_registration_layer(seq))) {
-		/* transforms computed with distortion correction (UI plan, B3) are
+		/* transforms computed with distortion correction are
 		 * applied here without it: a Living Stack has no undistorted grid yet */
 		int rl = get_registration_layer(seq);
 		if (seq->distoparam && rl >= 0 && seq->distoparam[rl].index != DISTO_UNDEF
@@ -290,6 +298,7 @@ static int lsf_init_run(struct lsf_cmd_args *a) {
 	bargs.rows = rows;
 	bargs.primary = &primary;
 	bargs.keep_seq_file = listed && batch == seq;
+	bargs.max_threads = a->max_threads;
 	if (lsf_process_batch(&bargs))
 		goto end;
 	if (rseq)
@@ -320,16 +329,25 @@ end:
 	return retval;
 }
 
-/* registration arguments for Siril's star alignment and apply steps */
+/* registration arguments for Siril's star alignment and apply steps, or NULL */
 static struct registration_args *new_regargs(sequence *seq, const lsf_settings *s) {
 	struct registration_args *regargs = calloc(1, sizeof(struct registration_args));
+	if (!regargs) {
+		PRINT_ALLOC_ERR;
+		return NULL;
+	}
+	regargs->prefix = strdup(LSF_REG_PREFIX);
+	if (!regargs->prefix) {
+		PRINT_ALLOC_ERR;
+		free(regargs);
+		return NULL;
+	}
 	regargs->seq = seq;
 	regargs->reference_image = sequence_find_refimage(seq);
 	regargs->layer = seq->nb_layers == 3 ? 1 : 0;
 	regargs->filters.filter_included = TRUE;
 	regargs->run_in_thread = FALSE;
 	regargs->output_scale = 1.f;
-	regargs->prefix = strdup(LSF_REG_PREFIX);
 	regargs->type = s->transform;
 	regargs->interpolation = s->interpolation;
 	regargs->clamp = s->interpolation == OPENCV_CUBIC || s->interpolation == OPENCV_LANCZOS4;
@@ -393,7 +411,7 @@ static int plan_expansion(const lsf_file *f, const struct lsf_cmd_args *a, const
  * reference, with the star detection, transform and pairs stored in the
  * file. The transforms stay in memory, in seq->regparam[*layer]: the .seq
  * file of the batch and its cached star lists are left as the user made
- * them. A registration made beforehand (UI plan, B3) replaces this pass. */
+ * them. A registration made beforehand replaces this pass. */
 static int compute_against_stack(sequence *seq, const lsf_file *f, int *layer) {
 	const lsf_settings *s = &f->settings;
 	/* the star detection settings stored in the file, over a copy of the
@@ -402,6 +420,8 @@ static int compute_against_stack(sequence *seq, const lsf_file *f, int *layer) {
 	findstar_from_json(s->findstar_json, &sf);
 
 	struct registration_args *regargs = new_regargs(seq, s);
+	if (!regargs)
+		return 1;
 	regargs->func = register_star_alignment;
 	regargs->no_output = TRUE;
 	regargs->no_starlist = TRUE;
@@ -458,6 +478,8 @@ static sequence *apply_onto_grid(sequence *seq, const lsf_file *f, const struct 
 	/* Apply checks the reference frame of the sequence, which plays no part
 	 * with an external reference: use a registered one. */
 	struct registration_args *regargs = new_regargs(seq, s);
+	if (!regargs)
+		return NULL;
 	regargs->func = register_apply_reg;
 	regargs->layer = layer;
 	regargs->no_output = FALSE;
@@ -488,7 +510,7 @@ static sequence *register_against_stack(sequence *seq, const lsf_file *f, const 
 	return apply_onto_grid(seq, f, a, layer, pad);
 }
 
-/***** registration made beforehand against an LSF file (UI plan, B3) *****/
+/***** registration made beforehand against an LSF file *****/
 
 /* The binding: a sidecar file beside the .seq file, naming the LSF file a
  * sequence was registered against and its grid then. The .seq file holds
@@ -500,33 +522,40 @@ static gchar *binding_path(const sequence *seq) {
 	return g_strdup_printf("%s.lsfreg", seq->seqname);
 }
 
-/* the transforms of seq on layer as the .seq file stores them (%g), so the
- * fingerprint is the same before and after the file is written and read:
- * it changes when the sequence is registered again */
+/* the transforms of seq on layer at the precision the .seq file stores them
+ * (%g), so the fingerprint is the same before and after the file is written
+ * and read: it changes when the sequence is registered again. Formatted
+ * without the locale, so that a GUI and a CLI run agree. */
 static gchar *transforms_fingerprint(const sequence *seq, int layer) {
 	if (layer < 0 || layer >= seq->nb_layers || !seq->regparam || !seq->regparam[layer])
 		return NULL;
 	GChecksum *ck = g_checksum_new(G_CHECKSUM_SHA256);
+	gchar buf[G_ASCII_DTOSTR_BUF_SIZE];
 	for (int i = 0; i < seq->number; i++) {
 		const Homography *H = &seq->regparam[layer][i].H;
-		gchar *t = g_strdup_printf("%g %g %g %g %g %g %g %g %g\n", H->h00, H->h01, H->h02,
-				H->h10, H->h11, H->h12, H->h20, H->h21, H->h22);
-		g_checksum_update(ck, (const guchar *) t, strlen(t));
-		g_free(t);
+		const double h[9] = { H->h00, H->h01, H->h02, H->h10, H->h11, H->h12, H->h20, H->h21, H->h22 };
+		for (int k = 0; k < 9; k++) {
+			g_ascii_formatd(buf, sizeof buf, "%g", h[k]);
+			g_checksum_update(ck, (const guchar *) buf, strlen(buf));
+			g_checksum_update(ck, (const guchar *) (k < 8 ? " " : "\n"), 1);
+		}
 	}
 	gchar *hex = g_strdup(g_checksum_get_string(ck));
 	g_checksum_free(ck);
 	return hex;
 }
 
-/* what a registration against an LSF file keeps until it ends */
+/* what a registration against an LSF file keeps until its args are freed:
+ * the hook_data of the registration */
 struct lsf_reg_data {
 	gchar *path, *uid;
 	int gen, rx, ry, origin_x, origin_y;
-	star_finder_params sf;	// the star detection stored in the file
+	star_finder_params sf;	// the star detection stored in the file, regargs->sf_params
+	gboolean registered;	// the registration succeeded
 };
 
-static void free_reg_data(struct lsf_reg_data *d) {
+static void free_reg_data(gpointer p) {
+	struct lsf_reg_data *d = p;
 	if (!d)
 		return;
 	g_free(d->path);
@@ -534,16 +563,22 @@ static void free_reg_data(struct lsf_reg_data *d) {
 	g_free(d);
 }
 
+/* the Living Stack the args registered against, if the registration
+ * succeeded, or NULL; for the GUI, which then sets the stacking tab to
+ * append to it. Valid until free_registration_hook_data(). */
+const gchar *lsf_registration_result(const struct registration_args *regargs) {
+	if (regargs->hook_free != free_reg_data || !regargs->hook_data)
+		return NULL;
+	const struct lsf_reg_data *d = regargs->hook_data;
+	return d->registered ? d->path : NULL;
+}
+
 /* end_hook of the registration, in its thread after the .seq file is written */
 static void lsf_registration_end(struct registration_args *regargs) {
-	struct lsf_reg_data *d = regargs->hook_data;
-	regargs->hook_data = NULL;
-	regargs->end_hook = NULL;
+	struct lsf_reg_data *d = regargs->hook_free == free_reg_data ? regargs->hook_data : NULL;
 	if (!d)
 		return;
-	/* for the GUI, which then sets the stacking tab to append to it */
-	if (!regargs->retval)
-		regargs->lsf_registered = g_strdup(d->path);
+	d->registered = !regargs->retval;
 	gchar *fp = regargs->retval ? NULL : transforms_fingerprint(regargs->seq, regargs->layer);
 	if (fp) {
 		GKeyFile *kf = g_key_file_new();
@@ -574,7 +609,6 @@ static void lsf_registration_end(struct registration_args *regargs) {
 		g_key_file_free(kf);
 	}
 	g_free(fp);
-	free_reg_data(d);
 }
 
 /* Prepares a registration (register command or Registration tab) whose
@@ -633,6 +667,7 @@ int lsf_prepare_registration(struct registration_args *regargs, gboolean keep_ty
 		regargs->sf_params = &d->sf;
 	}
 	regargs->hook_data = d;
+	regargs->hook_free = free_reg_data;
 	regargs->end_hook = lsf_registration_end;
 	siril_log_message(_("LSF: registering against the Living Stack %s (generation %d, %dx%d grid): transforms "
 				"only, applied by lsf_append\n"), path, info.file.gen, info.file.rx, info.file.ry);
@@ -641,7 +676,7 @@ int lsf_prepare_registration(struct registration_args *regargs, gboolean keep_ty
 }
 
 /* Whether the transforms of seq were computed against this file on its
- * current grid (UI plan, B3): the same LSFUID, grid size and origin, and
+ * current grid: the same LSFUID, grid size and origin, and
  * transforms unchanged since. A later generation with the same grid keeps
  * them valid; a grid grown since does not. Returns TRUE with the layer and,
  * if wanted, the date of the registration; otherwise FALSE with why, or no
@@ -734,6 +769,10 @@ static void check_expanded_wcs(sequence *rseq, fits *primary) {
 /* index in seq of each frame of the registered sequence rseq, or NULL */
 static int *map_to_sources(sequence *seq, sequence *rseq) {
 	int *src_index = malloc(rseq->number * sizeof(int));
+	if (!src_index) {
+		PRINT_ALLOC_ERR;
+		return NULL;
+	}
 	for (int i = 0; i < rseq->number; i++) {
 		src_index[i] = -1;
 		for (int j = 0; j < seq->number; j++)
@@ -804,6 +843,8 @@ static sequence *apply_init_registration(sequence *seq, const struct lsf_cmd_arg
 		lsf_grid_overhang(box, rx, ry, pad);
 	}
 	struct registration_args *regargs = new_regargs(seq, &a->settings);
+	if (!regargs)
+		return NULL;
 	regargs->func = register_apply_reg;
 	regargs->layer = layer;
 	regargs->no_output = FALSE;
@@ -917,7 +958,7 @@ static int lsf_append_run(struct lsf_cmd_args *a) {
 	int gen = f.gen + 1, batchnum = f.nb_batches + 1;
 	int pad[4] = { 0 };
 	if (!a->noreg) {
-		/* a registration made beforehand against this file (UI plan, B3)
+		/* a registration made beforehand against this file
 		 * replaces the first pass, unless -reg asks for a new one */
 		int layer = 0;
 		gchar *date = NULL, *why = NULL;
@@ -970,6 +1011,7 @@ static int lsf_append_run(struct lsf_cmd_args *a) {
 	bargs.rows = rows;
 	bargs.primary = &f.primary;
 	bargs.keep_seq_file = listed && batch == seq;
+	bargs.max_threads = a->max_threads;
 	if (lsf_process_batch(&bargs))
 		goto end;
 	/* the transforms of the new rows were computed onto the grid before its expansion */
@@ -1015,14 +1057,15 @@ static void print_summary(const lsf_file *f) {
 	siril_log_message(_("LSF file %s: version %s, id %s, generation %d\n"), f->path, LSF_VERSION, f->uid, f->gen);
 	siril_log_message(_("  %ld frames in %d batch(es), STACKCNT %u, live time %.1f s\n"), f->ledger_rows,
 			f->nb_batches, k->stackcnt, k->livetime > 0.0 ? k->livetime : 0.0);
-	siril_log_message(_("  grid %dx%d, %d channel(s), sensor %s%s%s\n"), f->rx, f->ry, f->nchan,
-			s->is_cfa ? "CFA " : "mono", s->is_cfa ? s->bayer : "", s->is_cfa ? " (debayered)" : "");
+	if (s->is_cfa)
+		siril_log_message(_("  grid %dx%d, %d channel(s), CFA sensor %s (debayered)\n"), f->rx, f->ry, f->nchan, s->bayer);
+	else siril_log_message(_("  grid %dx%d, %d channel(s), mono sensor\n"), f->rx, f->ry, f->nchan);
 	gchar *rej = rejection_text(s->rej, s->sig);
 	siril_log_message(_("  rejection %s, history test low %g high %g margin %g\n"),
 			rej, s->hist_low, s->hist_high, s->hist_margin);
 	g_free(rej);
 	siril_log_message(_("  normalization %s%s%s, output normalization %s\n"), lsf_norm_name(s->norm),
-			s->lite_norm ? " (fast)" : "", s->rgb_equal ? " (RGB equalized)" : "", s->outnorm ? "on" : "off");
+			s->lite_norm ? _(" (fast)") : "", s->rgb_equal ? _(" (RGB equalized)") : "", s->outnorm ? _("on") : _("off"));
 	switch (s->weighting) {
 	case NOISE_WEIGHT:
 		siril_log_message(_("  weighting noise, frozen norm %g %g %g\n"), s->noise_norm[0],
@@ -1094,21 +1137,20 @@ gchar *lsf_check_batch(const lsf_info *info, sequence *seq, gboolean *fatal) {
 	return msg;
 }
 
-/* free space of the file system holding path, or -1 */
+/* free space of the file system holding the directory path, as Siril
+ * measures it (find_space), or -1. fs_id identifies that file system, so that
+ * two directories on the same one are not counted twice. */
 static gint64 free_space_of(const char *path, gchar **fs_id) {
-	GFile *file = g_file_new_for_path(path);
-	GFileInfo *fi = g_file_query_filesystem_info(file, G_FILE_ATTRIBUTE_FILESYSTEM_FREE "," G_FILE_ATTRIBUTE_ID_FILESYSTEM,
-			NULL, NULL);
-	gint64 space = -1;
-	if (fi) {
-		if (g_file_info_has_attribute(fi, G_FILE_ATTRIBUTE_FILESYSTEM_FREE))
-			space = (gint64) g_file_info_get_attribute_uint64(fi, G_FILE_ATTRIBUTE_FILESYSTEM_FREE);
-		if (fs_id)
+	if (fs_id) {
+		GFile *file = g_file_new_for_path(path);
+		GFileInfo *fi = g_file_query_info(file, G_FILE_ATTRIBUTE_ID_FILESYSTEM, G_FILE_QUERY_INFO_NONE, NULL, NULL);
+		if (fi) {
 			*fs_id = g_strdup(g_file_info_get_attribute_string(fi, G_FILE_ATTRIBUTE_ID_FILESYSTEM));
-		g_object_unref(fi);
+			g_object_unref(fi);
+		}
+		g_object_unref(file);
 	}
-	g_object_unref(file);
-	return space;
+	return find_space(path);
 }
 
 /* Before an append, from lsf_read_info: memory for the accumulator, which
@@ -1348,12 +1390,12 @@ end:
  * noise and sigma maps are in the units of the Stack. */
 static int lsf_maps_run(struct lsf_cmd_args *a) {
 	static const struct { guint flag; int rej; const char *suffix, *what; } kinds[] = {
-		{ LSF_MAP_NEFF, -1, "neff", "effective number of frames" },
-		{ LSF_MAP_NOISE, -1, "noise", "standard deviation of the mean" },
-		{ LSF_MAP_SIGMA, -1, "sigma", "standard deviation of one frame" },
-		{ LSF_MAP_SNR, -1, "snr", "mean over its standard deviation" },
-		{ LSF_MAP_REJLO, 0, "rejlo", "samples rejected low" },
-		{ LSF_MAP_REJHI, 1, "rejhi", "samples rejected high" },
+		{ LSF_MAP_NEFF, -1, "neff", N_("effective number of frames") },
+		{ LSF_MAP_NOISE, -1, "noise", N_("standard deviation of the mean") },
+		{ LSF_MAP_SIGMA, -1, "sigma", N_("standard deviation of one frame") },
+		{ LSF_MAP_SNR, -1, "snr", N_("mean over its standard deviation") },
+		{ LSF_MAP_REJLO, 0, "rejlo", N_("samples rejected low") },
+		{ LSF_MAP_REJHI, 1, "rejhi", N_("samples rejected high") },
 	};
 	lsf_file f;
 	int retval = 0;
@@ -1416,7 +1458,7 @@ static int lsf_maps_run(struct lsf_cmd_args *a) {
 		if (savefits(name, fit)) {
 			siril_log_error(_("LSF: could not save the %s map\n"), kinds[m].suffix);
 			retval = 1;
-		} else siril_log_message(_("LSF: %s map (%s) saved as %s\n"), kinds[m].suffix, kinds[m].what, name);
+		} else siril_log_message(_("LSF: %s map (%s) saved as %s\n"), kinds[m].suffix, _(kinds[m].what), name);
 		g_free(name);
 		clearfits(fit);
 		free(fit);
@@ -1543,10 +1585,14 @@ int lsf_start(struct lsf_cmd_args *a) {
 	return 0;
 }
 
+/* arg as parse_line() reads it back: quoted when it has blanks or starts with
+ * a quote, with the quote it does not contain, as there is no escape */
 static void add_arg(GString *cmd, const char *arg) {
-	if (strchr(arg, ' '))
+	if (!strpbrk(arg, " \t") && arg[0] != '"' && arg[0] != '\'')
+		g_string_append_printf(cmd, " %s", arg);
+	else if (!strchr(arg, '"'))
 		g_string_append_printf(cmd, " \"%s\"", arg);
-	else g_string_append_printf(cmd, " %s", arg);
+	else g_string_append_printf(cmd, " '%s'", arg);
 }
 
 static void add_hist_and_common_args(GString *cmd, const struct lsf_cmd_args *a) {
@@ -1568,8 +1614,6 @@ static void add_hist_and_common_args(GString *cmd, const struct lsf_cmd_args *a)
 /* the command line of a, for the log of a GUI run, so it can be repeated
  * in a script. Returns NULL for the modes that have no GUI yet. */
 gchar *lsf_cmd_args_to_command(const struct lsf_cmd_args *a) {
-	/* the rejection letters of the stack command, in rejection order */
-	static const char *rej_letters[] = { "n", "p", "s", "a", "m", "w", "l", "g" };
 	GString *cmd = g_string_new(NULL);
 	const lsf_settings *s = &a->settings;
 	switch (a->mode) {
@@ -1577,8 +1621,8 @@ gchar *lsf_cmd_args_to_command(const struct lsf_cmd_args *a) {
 		g_string_append(cmd, "lsf_init");
 		add_arg(cmd, a->seqname);
 		add_arg(cmd, a->path);
-		if (s->rej != NO_REJEC && s->rej < (int) G_N_ELEMENTS(rej_letters))
-			g_string_append_printf(cmd, " rej %s %g %g", rej_letters[s->rej], s->sig[0], s->sig[1]);
+		if (s->rej != NO_REJEC)
+			g_string_append_printf(cmd, " rej %s %g %g", rejection_type_letter(s->rej), s->sig[0], s->sig[1]);
 		if (s->norm != NO_NORM)
 			g_string_append_printf(cmd, " -norm=%s", lsf_norm_name(s->norm));
 		if (s->lite_norm)
@@ -1597,10 +1641,10 @@ gchar *lsf_cmd_args_to_command(const struct lsf_cmd_args *a) {
 		g_string_append(cmd, "lsf_append");
 		add_arg(cmd, a->path);
 		add_arg(cmd, a->seqname);
-		if (a->rej_set && s->rej < (int) G_N_ELEMENTS(rej_letters)) {
+		if (a->rej_set) {
 			if (s->rej == NO_REJEC)
 				g_string_append(cmd, " rej n");
-			else g_string_append_printf(cmd, " rej %s %g %g", rej_letters[s->rej], s->sig[0], s->sig[1]);
+			else g_string_append_printf(cmd, " rej %s %g %g", rejection_type_letter(s->rej), s->sig[0], s->sig[1]);
 		}
 		if (a->noreg)
 			g_string_append(cmd, " -noreg");
@@ -1637,21 +1681,22 @@ gchar *lsf_cmd_args_to_command(const struct lsf_cmd_args *a) {
 	return g_string_free(cmd, FALSE);
 }
 
-static gboolean parse_double_opt(const char *word_i, const char *prefix, double *out, gboolean *set) {
+/* -name=value with a value above 0, into out and set: 1 when consumed, 0 when
+ * word_i is another option, -1 on a wrong value */
+static int parse_double_opt(const char *word_i, const char *prefix, double *out, gboolean *set) {
 	if (!g_str_has_prefix(word_i, prefix))
-		return FALSE;
+		return 0;
 	const char *value = word_i + strlen(prefix);
 	gchar *end;
 	double v = g_ascii_strtod(value, &end);
 	/* thresholds in sigma units: 0 would reject every sample on that side of the mean */
 	if (end == value || *end || !(v > 0.0) || !isfinite(v)) {
 		siril_log_error(_("Wrong parameter values. %s is not valid, aborting.\n"), word_i);
-		*set = -1;
-		return TRUE;
+		return -1;
 	}
 	*out = v;
 	*set = TRUE;
-	return TRUE;
+	return 1;
 }
 
 static int set_compression_opt(struct lsf_cmd_args *a, lsf_compression comp) {
@@ -1681,17 +1726,16 @@ static int parse_compress_option(struct lsf_cmd_args *a, const char *w) {
 
 /* options common to lsf_init and lsf_append; returns 1 if consumed, -1 on error */
 static int parse_common_option(struct lsf_cmd_args *a, const char *w) {
-	if (parse_double_opt(w, "-hist_low=", &a->hist_low, &a->hist_low_set))
-		return a->hist_low_set == TRUE ? 1 : -1;
-	if (parse_double_opt(w, "-hist_high=", &a->hist_high, &a->hist_high_set))
-		return a->hist_high_set == TRUE ? 1 : -1;
-	if (parse_double_opt(w, "-hist_margin=", &a->hist_margin, &a->hist_margin_set)) {
-		if (a->hist_margin_set == TRUE && a->hist_margin < 1.0) {
-			siril_log_error(_("-hist_margin must be at least 1\n"));
-			return -1;
-		}
-		return a->hist_margin_set == TRUE ? 1 : -1;
+	int c = parse_double_opt(w, "-hist_low=", &a->hist_low, &a->hist_low_set);
+	if (!c)
+		c = parse_double_opt(w, "-hist_high=", &a->hist_high, &a->hist_high_set);
+	if (!c && (c = parse_double_opt(w, "-hist_margin=", &a->hist_margin, &a->hist_margin_set)) > 0
+			&& a->hist_margin < 1.0) {
+		siril_log_error(_("-hist_margin must be at least 1\n"));
+		return -1;
 	}
+	if (c)
+		return c;
 	if (g_str_has_prefix(w, "-framing=")) {
 		const char *v = w + 9;
 		if (!strcmp(v, "max")) a->framing = FRAMING_MAX;
@@ -1724,16 +1768,10 @@ static int parse_rejection(struct lsf_cmd_args *a, int *pi) {
 		return 0;
 	i++;
 	int shift = 1;
-	const char *t = word[i] ? word[i] : "";
-	if (!strcmp(t, "p") || !strcmp(t, "percentile")) s->rej = PERCENTILE;
-	else if (!strcmp(t, "s") || !strcmp(t, "sigma")) s->rej = SIGMA;
-	else if (!strcmp(t, "a") || !strcmp(t, "mad")) s->rej = MAD;
-	else if (!strcmp(t, "m") || !strcmp(t, "median")) s->rej = SIGMEDIAN;
-	else if (!strcmp(t, "l") || !strcmp(t, "linear")) s->rej = LINEARFIT;
-	else if (!strcmp(t, "w") || !strcmp(t, "winsorized")) s->rej = WINSORIZED;
-	else if (!strcmp(t, "g") || !strcmp(t, "generalized")) s->rej = GESDT;
-	else if (!strcmp(t, "n") || !strcmp(t, "none")) s->rej = NO_REJEC;
-	else { s->rej = WINSORIZED; shift = 0; }
+	if (!parse_rejection_type(word[i], TRUE, &s->rej)) {
+		s->rej = WINSORIZED;	// as the stack command, without a type
+		shift = 0;
+	}
 	i += shift;
 	if (s->rej != NO_REJEC || (word[i] && string_is_a_number(word[i]))) {
 		gchar *end1 = NULL, *end2 = NULL;
@@ -1747,10 +1785,8 @@ static int parse_rejection(struct lsf_cmd_args *a, int *pi) {
 			siril_log_error(_("The average stacking with rejection requires two extra arguments: sigma low and high.\n"));
 			return -1;
 		}
-		if ((s->rej == GESDT || s->rej == PERCENTILE) && (s->sig[0] > 1.0 || s->sig[1] > 1.0)) {
-			siril_log_error(_("Extra parameters of this rejection algorithm must be between 0 and 1.\n"));
+		if (!check_rejection_values(s->rej, s->sig[0], s->sig[1]))
 			return -1;
-		}
 		i += 2;
 	}
 	*pi = i;

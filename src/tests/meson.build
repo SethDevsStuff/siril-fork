@@ -75,7 +75,7 @@ if criterion_dep.found()
                                        c_args : siril_c_flag,
                                        cpp_args : siril_cpp_flag)
 
-     test('wavelet_denoise_test', wavelet_denoise_exec, suite: 'science', timeout: 120)
+     test('wavelet_denoise_test', wavelet_denoise_exec, suite: 'science')
 
      photometry_exec = executable('photometry_test',
                                   'photometry_test.c',
@@ -182,7 +182,7 @@ if criterion_dep.found()
                            c_args : siril_c_flag,
                            cpp_args : siril_cpp_flag)
 
-     test('streaks_test', streaks_exec, timeout: 120)
+     test('streaks_test', streaks_exec)
 
      banding_exec = executable('unbanding_test',
                            ['unbanding_test.c', 'download_files.c'],

@@ -241,6 +241,14 @@ void get_the_registration_area(struct registration_args *regargs, const struct r
 	}
 }
 
+/* frees the data of end_hook, wherever the registration args are freed */
+void free_registration_hook_data(struct registration_args *args) {
+	if (args->hook_free && args->hook_data)
+		args->hook_free(args->hook_data);
+	args->hook_data = NULL;
+	args->hook_free = NULL;
+}
+
 // worker thread function for the registration
 gpointer register_thread_func(gpointer p) {
 	struct registration_args *args = (struct registration_args *) p;
@@ -283,7 +291,7 @@ gpointer register_thread_func(gpointer p) {
 		stop_processing_thread();
 		if (args->seq->type != SEQ_INTERNAL && !check_seq_is_comseq(args->seq)) // RGB align needs the sequence preserved
 			free_sequence(args->seq, TRUE);
-		g_free(args->lsf_registered);
+		free_registration_hook_data(args);
 		free(args);
 	}
 	return GINT_TO_POINTER(retval);

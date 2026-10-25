@@ -24,12 +24,13 @@
  * comparable across appends, and with a floor (LSF_WEIGHT_FLOOR) where
  * Siril gives the worst frame 0. Siril's own functions are not changed. */
 
-#include <math.h>
 #include <float.h>
 #include <limits.h>
+#include <math.h>
 
 #include "core/siril_log.h"
 #include "lsf/lsf.h"
+#include "lsf/lsf_weights.h"
 
 double lsf_noise_raw_weight(double pscale, double bgnoise) {
 	double d = pscale * pscale * bgnoise * bgnoise;

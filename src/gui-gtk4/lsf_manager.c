@@ -18,16 +18,16 @@
  * along with Siril. If not, see <http://www.gnu.org/licenses/>.
  */
 
-/* The Living Stack dialog (UI plan, B4): one LSF file's summary, ledger and
+/* The Living Stack dialog: one LSF file's summary, ledger and
  * history, and the lsf_util, lsf_export and lsf_maps jobs on it. Everything
  * that changes the file goes through the same jobs as the commands. */
 
 #include <string.h>
 
-#include "core/siril.h"
-#include "core/proto.h"
-#include "core/siril_log.h"
 #include "core/processing.h"
+#include "core/proto.h"
+#include "core/siril.h"
+#include "core/siril_log.h"
 #include "gui-gtk4/dialogs.h"
 #include "gui-gtk4/lsf_manager.h"
 #include "gui-gtk4/message_dialog.h"
@@ -36,6 +36,8 @@
 #include "io/image_format_fits.h"
 #include "io/single_image.h"
 #include "lsf/lsf.h"
+#include "lsf/lsf_commands.h"
+#include "lsf/lsf_fits.h"
 
 static lsf_info *info = NULL;		// the file shown, or NULL
 static gboolean stack_edited = FALSE;	// the last check of this file found check 8 failed

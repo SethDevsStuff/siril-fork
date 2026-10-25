@@ -31,7 +31,7 @@
 #include "io/image_format_fits.h"
 #include "io/sequence.h"
 #include "io/single_image.h"
-#include "lsf/lsf.h"
+#include "lsf/lsf_fits.h"
 
 /* Progress gate for image readers.  The FITS / TIFF / PNG / JPEG readers are
  * shared between the interactive single-image open and batch paths (stacking,

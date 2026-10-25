@@ -41,6 +41,7 @@
 #include "gui-gtk4/cut.h"
 #include "gui-gtk4/icc_profile.h"
 #include "gui-gtk4/keywords_tree.h"
+#include "gui-gtk4/lsf_stacking.h"
 #include "gui-gtk4/mpp_ap_editor.h"
 #include "gui-gtk4/mpp_shift_viewer.h"
 #include "gui-gtk4/open_dialog.h"

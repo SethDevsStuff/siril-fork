@@ -20,9 +20,10 @@
 /* LSF file I/O (FITS profile v0.4): validation (Section 8), writing
  * (Sections 3 to 9) and the commit protocol (Section 10.2, 10.10) */
 
-#include <string.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <math.h>
+#include <string.h>
 #ifdef _WIN32
 /* must come before fitsio.h: it #defines TBYTE, which clashes with winnt.h */
 #include <windows.h>
@@ -30,14 +31,18 @@
 #else
 #include <unistd.h>
 #endif
+
 #include <fitsio.h>
 #include <glib/gstdio.h>
-#include <fcntl.h>
 
 #include "core/siril.h"
+#include "core/siril_alloc.h"
 #include "core/siril_log.h"
 #include "io/image_format_fits.h"
 #include "lsf/lsf.h"
+#include "lsf/lsf_fits.h"
+#include "lsf/lsf_math.h"
+#include "lsf/lsf_settings.h"
 
 static const char *plane_kind[LSF_NB_PL] = { "MEAN", "W", "M2", "W2" };
 static const char *chan_suffix[3] = { "_R", "_G", "_B" };
@@ -56,10 +61,10 @@ int lsf_history_alloc(lsf_history *h, int rx, int ry, int nchan) {
 	size_t n = (size_t) rx * ry;
 	for (int c = 0; c < nchan; c++) {
 		for (int k = 0; k < LSF_NB_PL; k++) {
-			h->plane[k][c] = calloc(n, sizeof(float));
+			h->plane[k][c] = siril_calloc(n, sizeof(float));
 			if (!h->plane[k][c]) goto fail;
 		}
-		h->count[c] = calloc(n, sizeof(WORD));
+		h->count[c] = siril_calloc(n, sizeof(WORD));
 		if (!h->count[c]) goto fail;
 	}
 	return 0;
@@ -74,7 +79,7 @@ int lsf_history_alloc_rej(lsf_history *h, int first_gen) {
 	size_t n = (size_t) h->rx * h->ry;
 	for (int d = 0; d < 2; d++)
 		for (int c = 0; c < h->nchan; c++) {
-			h->rej[d][c] = calloc(n, sizeof(WORD));
+			h->rej[d][c] = siril_calloc(n, sizeof(WORD));
 			if (!h->rej[d][c]) {
 				PRINT_ALLOC_ERR;
 				return 1;
@@ -99,13 +104,13 @@ int lsf_history_grow(lsf_history *h, const int pad[4]) {
 			void **plane = k < LSF_NB_PL ? (void **) &h->plane[k][c] :
 				k == LSF_NB_PL ? (void **) &h->count[c] : (void **) &h->rej[k - LSF_NB_PL - 1][c];
 			size_t elsize = k < LSF_NB_PL ? sizeof(float) : sizeof(WORD);
-			void *grown = calloc(n, elsize);
+			void *grown = siril_calloc(n, elsize);
 			if (!grown) {
 				PRINT_ALLOC_ERR;
 				return 1;	// planes already grown and not: the history is unusable
 			}
 			lsf_pad_plane(*plane, grown, elsize, h->rx, h->ry, pad);
-			free(*plane);
+			siril_free(*plane);
 			*plane = grown;
 		}
 	}
@@ -117,13 +122,13 @@ int lsf_history_grow(lsf_history *h, const int pad[4]) {
 void lsf_history_free(lsf_history *h) {
 	for (int c = 0; c < 3; c++) {
 		for (int k = 0; k < LSF_NB_PL; k++) {
-			free(h->plane[k][c]);
+			siril_free(h->plane[k][c]);
 			h->plane[k][c] = NULL;
 		}
-		free(h->count[c]);
+		siril_free(h->count[c]);
 		h->count[c] = NULL;
 		for (int d = 0; d < 2; d++) {
-			free(h->rej[d][c]);
+			siril_free(h->rej[d][c]);
 			h->rej[d][c] = NULL;
 		}
 	}

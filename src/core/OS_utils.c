@@ -82,7 +82,7 @@
  * @return the disk space remaining in bytes, or a negative value if error
  */
 #ifdef OS_OSX
-static gint64 find_space(const gchar *name) {
+gint64 find_space(const gchar *name) {
 	gint64 result = -1;
 	@autoreleasepool {
 		// Check input parameter
@@ -218,7 +218,7 @@ static gint64 find_space(const gchar *name) {
 	return result;
 }
 #elif HAVE_SYS_STATVFS_H
-static gint64 find_space(const gchar *name) {
+gint64 find_space(const gchar *name) {
 	struct statvfs st;
 	gint64 available;
 	if (statvfs (name, &st))
@@ -227,7 +227,7 @@ static gint64 find_space(const gchar *name) {
 	return available * st.f_frsize;
 }
 #elif (HAVE_SYS_VFS_H || HAVE_SYS_MOUNT_H)
-static gint64 find_space(const gchar *name) {
+gint64 find_space(const gchar *name) {
 	struct statfs st;
 	gint64 available;
 	if (statfs (name, &st))
@@ -236,7 +236,7 @@ static gint64 find_space(const gchar *name) {
 	return available * st.f_bsize;
 }
 #elif defined _WIN32
-static gint64 find_space(const gchar *name) {
+gint64 find_space(const gchar *name) {
 	ULARGE_INTEGER avail;
 	gint64 sz;
 
@@ -253,7 +253,7 @@ static gint64 find_space(const gchar *name) {
 	return sz;
 }
 #else
-static gint64 find_space(const gchar *name) {
+gint64 find_space(const gchar *name) {
 	return (gint64) -1;
 }
 #endif /*HAVE_SYS_STATVFS_H*/

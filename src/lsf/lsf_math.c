@@ -20,12 +20,14 @@
 /* LSF accumulator arithmetic (FITS profile v0.4, Sections 10.2, 10.5, 10.6, 10.7).
  * Pure functions, no I/O. */
 
-#include <math.h>
 #include <float.h>
+#include <math.h>
 #include <string.h>
+
 #include <gsl/gsl_cdf.h>
 
 #include "lsf/lsf.h"
+#include "lsf/lsf_math.h"
 
 /* weighted mean, sum of weights, M2 and sum of squared weights of n samples,
  * two-pass for accuracy */
