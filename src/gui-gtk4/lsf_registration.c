@@ -24,8 +24,6 @@
  * does the rest, as for the register command. lsf_append then uses these
  * transforms. registration.c calls the lsf_registration_* functions. */
 
-#include <string.h>
-
 #include <glib/gstdio.h>
 
 #include "core/siril.h"
