@@ -1030,9 +1030,23 @@ char* siril_real_path(const char *source) {
 		return NULL;
 	}
 
-	GetFinalPathNameByHandleW(hFile, wFilePath, maxchar, 0);
+	DWORD ret = GetFinalPathNameByHandleW(hFile, wFilePath, maxchar, 0);
 
-	gchar *gFilePath = g_utf16_to_utf8(wFilePath + 4, -1, NULL, NULL, NULL); // +4 = enleve les 4 caracteres du prefixe "//?/"
+	// GetFinalPathNameByHandleW returns the path prefixed with "\\?\" (4 chars),
+	// or "\\?\UNC\" (8 chars) for a UNC target, where "\\?\UNC\" must be rewritten
+	// to "\\" (so \\?\UNC\server\share -> \\server\share). Blindly skipping 4
+	// characters would mangle UNC paths into "UNC\server\share".
+	gchar *gFilePath = NULL;
+	if (ret > 0 && ret <= maxchar) {
+		if (wcsncmp(wFilePath, L"\\\\?\\UNC\\", 8) == 0) {
+			wFilePath[6] = L'\\';                  // wFilePath+6 now reads "\\server\share"
+			gFilePath = g_utf16_to_utf8(wFilePath + 6, -1, NULL, NULL, NULL);
+		} else if (wcsncmp(wFilePath, L"\\\\?\\", 4) == 0) {
+			gFilePath = g_utf16_to_utf8(wFilePath + 4, -1, NULL, NULL, NULL);
+		} else {
+			gFilePath = g_utf16_to_utf8(wFilePath, -1, NULL, NULL, NULL);
+		}
+	}
 	g_free(wsource);
 	g_free(wFilePath);
 	CloseHandle(hFile);
@@ -1094,9 +1108,10 @@ gchar *get_siril_bundle_path() {
 // will find an executable in PATH if path is set to NULL
 // will find an executable in passed path otherwise
 gchar *find_executable_in_path(const char *exe_name, const char *path) {
-	char full_path[MAX_PATH];
+	wchar_t full_path[MAX_PATH];
 	DWORD result;
 	const gchar *path_value;
+	gboolean free_path_value = FALSE;
 	if (!path) { // we need to remove mingw64 tokens from PATH
 		const gchar *tmp_path_value = g_getenv("PATH");
 		// siril_debug_print("Unfiltered: %s\n", tmp_path_value);
@@ -1109,6 +1124,7 @@ gchar *find_executable_in_path(const char *exe_name, const char *path) {
 		}
 		g_ptr_array_add(filtered_tokens, NULL);
 		path_value = g_strjoinv(";", (gchar **)filtered_tokens->pdata);
+		free_path_value = TRUE;
 		// siril_debug_print("Filtered: %s\n", path_value);
 		// Free memory
 		g_strfreev(tokens);
@@ -1116,19 +1132,28 @@ gchar *find_executable_in_path(const char *exe_name, const char *path) {
 	} else
 		path_value = path;
 
-	// Use SearchPath to find the executable in PATH
-	result = SearchPath(
-		path_value,		// Search in PATH directories
-		exe_name,	// The executable name
-		".exe",		// Default extension (NULL if no default extension)
+	// Use SearchPathW (not SearchPathA) so that PATH directories and the
+	// executable name containing non-ASCII characters are handled correctly:
+	// the ANSI variant would interpret the UTF-8 inputs, and return its result,
+	// in the legacy code page and fail on national characters.
+	wchar_t *wpath_value = g_utf8_to_utf16(path_value, -1, NULL, NULL, NULL);
+	wchar_t *wexe_name = g_utf8_to_utf16(exe_name, -1, NULL, NULL, NULL);
+	result = SearchPathW(
+		wpath_value,	// Search in PATH directories
+		wexe_name,	// The executable name
+		L".exe",	// Default extension (NULL if no default extension)
 		MAX_PATH,	// Buffer size
 		full_path,	// Buffer to store the full path
 		NULL		// Address of a pointer to the file part of the path (can be NULL)
 	);
+	g_free(wpath_value);
+	g_free(wexe_name);
+	if (free_path_value)
+		g_free((gchar *)path_value);
 
 	if (result > 0 && result < MAX_PATH) {
-		// Found the executable, so return a copy of the path
-		return g_strdup(full_path);
+		// Found the executable, so return a copy of the path as UTF-8
+		return g_utf16_to_utf8(full_path, -1, NULL, NULL, NULL);
 	} else {
 		// Executable not found
 		return NULL;

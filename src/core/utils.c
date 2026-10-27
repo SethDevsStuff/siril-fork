@@ -324,6 +324,22 @@ gboolean string_is_a_path(const char *file) {
 	return FALSE;
 }
 
+#ifdef _WIN32
+/* Returns TRUE if filename is a reparse point (symlink/junction). Uses the
+ * wide API so that non-ASCII (UTF-8) paths are handled correctly; GetFileAttributesA
+ * would interpret the path in the legacy ANSI code page and fail on national
+ * characters. Also returns FALSE on error rather than misreading
+ * INVALID_FILE_ATTRIBUTES as a reparse point. */
+static gboolean win32_is_reparse_point(const char *filename) {
+	wchar_t *wfilename = g_utf8_to_utf16(filename, -1, NULL, NULL, NULL);
+	if (!wfilename)
+		return FALSE;
+	DWORD attrs = GetFileAttributesW(wfilename);
+	g_free(wfilename);
+	return (attrs != INVALID_FILE_ATTRIBUTES) && (attrs & FILE_ATTRIBUTE_REPARSE_POINT);
+}
+#endif
+
 /**
 * Tests whether the given file is either regular or a symlink
 * @param filename input
@@ -337,7 +353,7 @@ int is_readable_file(const char *filename) {
 #ifndef _WIN32
 			|| S_ISLNK(sts.st_mode)
 #else
-		|| (GetFileAttributesA(filename) & FILE_ATTRIBUTE_REPARSE_POINT )
+		|| win32_is_reparse_point(filename)
 #endif
 	)
 		return 1;
@@ -356,7 +372,7 @@ int is_symlink_file(const char *filename) {
 #ifndef _WIN32
 	if (S_ISLNK(sts.st_mode))
 #else
-	if (GetFileAttributesA(filename) & FILE_ATTRIBUTE_REPARSE_POINT )
+	if (win32_is_reparse_point(filename))
 #endif
 		return 1;
 	return 0;
@@ -773,16 +789,15 @@ int siril_change_dir(const char *dir, gchar **err) {
 			* press the check seq button to display the list, and this is also done there. */
 			/* check_seq();
 			update_sequence_list();*/
-			// Don't follow symbolic links
-			if (g_path_is_absolute(dir)) {
-				new_dir = g_memdup(dir, strlen(dir) + 1);
-				g_free(com.wd);
-				com.wd = new_dir;
-			} else {
-				new_dir = siril_canonicalize_filename(dir, com.wd);
-				g_free(com.wd);
-				com.wd = new_dir;
-			}
+			// Always canonicalise so com.wd has a consistent form (native
+			// separators, no trailing slash, resolved '.'/'..'); this keeps later
+			// byte-wise comparisons of com.wd against other paths reliable. For a
+			// relative dir, com.wd is the base it is resolved against. Note
+			// g_canonicalize_filename does no I/O and does not resolve symbolic
+			// links, so the "don't follow symbolic links" intent is preserved.
+			new_dir = siril_canonicalize_filename(dir, com.wd);
+			g_free(com.wd);
+			com.wd = new_dir;
 
 		siril_log_message(_("Setting CWD (Current Working Directory) to '%s'\n"), com.wd);
 		retval = 0;
