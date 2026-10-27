@@ -387,7 +387,7 @@ int processNlBayes(
 	const unsigned nSP		= p_params.nSimilarPatches;
 	unsigned nInverseFailed	= 0;
 	const float threshold	= p_params.sigma * p_params.sigma * p_params.gamma *
-                                (p_params.isFirstStep ? chnls : 1.f);
+				(p_params.isFirstStep ? chnls : 1.f);
 
 	//! Allocate Sizes
 	if (p_params.isFirstStep) {
@@ -405,6 +405,10 @@ int processNlBayes(
 	mat.baricenter      .resize(p_params.isFirstStep ? sP2 : sPC);
 	mat.covMat          .resize(p_params.isFirstStep ? sP2 * sP2 : sPC * sPC);
 	mat.covMatTmp       .resize(p_params.isFirstStep ? sP2 * sP2 : sPC * sPC);
+
+	// Allocate scratchpad vectors ONCE per thread execution context
+	std::vector<pair<float, unsigned> > distance_buffer(sW * sW);
+	std::vector<float> ref_patch_buffer(sP2);
 
 	//! ponderation: weight sum per pixel
 	img_t<float> weight(width, height, chnls);
@@ -424,16 +428,18 @@ int processNlBayes(
 	for (unsigned ij = 0; ij < wh; ij += p_params.offSet) {
 		if (!processing_should_continue())
 			return 1;
+
 		//! Only non-seen patches are processed
 		if (mask[ij]) {
 			//! Search for similar patches around the reference one
 			unsigned nSimP = p_params.nSimilarPatches;
 			if (p_params.isFirstStep) {
-				estimateSimilarPatchesStep1(i_imNoisy, group3d, index, ij, p_params);
+				// Reusing pre-allocated vectors to avoid heap allocation thrashing
+				estimateSimilarPatchesStep1(i_imNoisy, group3d, index, ij, p_params, distance_buffer, ref_patch_buffer);
 			}
 			else {
 				nSimP = estimateSimilarPatchesStep2(i_imNoisy, io_imBasic, group3dNoisy,
-					group3dBasic, index, ij, p_params);
+					group3dBasic, index, ij, p_params, distance_buffer);
 				nSimP = (nSimP < 1 ? 1 : nSimP);
 			}
 
@@ -476,8 +482,7 @@ int processNlBayes(
 		if (thread == 0) {
 			if (ij - lastupdate > wh >> 4) {
 				lastupdate = ij;
-				float second;
-				second = (p_params.isFirstStep ? 0.f : 2.f);
+				float second = (p_params.isFirstStep ? 0.f : 2.f);
 				offset = (pass + second) / 4.f;
 				gui_iface.set_progress(offset + ((double)ij / (4.f * wh)), _("NL-Bayes denoising..."));
 			}
@@ -511,6 +516,8 @@ void estimateSimilarPatchesStep1(
 ,	std::vector<unsigned> &o_index
 ,	const unsigned p_ij
 ,	const nlbParams &p_params
+,	std::vector<pair<float, unsigned> > &distance
+,	std::vector<float> &ref_patch
 ){
 	//! Initialization
 	const unsigned sW		= p_params.sizeSearchWindow;
@@ -520,10 +527,8 @@ void estimateSimilarPatchesStep1(
 	const unsigned wh		= width * i_im.h;
 	const unsigned ind		= p_ij - (sW - 1) * (width + 1) / 2;
 	const unsigned nSimP	= p_params.nSimilarPatches;
-	vector<pair<float, unsigned> > distance(sW * sW);
 
-	//! Cache reference patch to avoid sW*sW redundant reloads from the large image array
-	vector<float> ref_patch(sP * sP);
+	// Populate reused ref_patch buffer
 	for (unsigned p = 0; p < sP; p++)
 		for (unsigned q = 0; q < sP; q++)
 			ref_patch[p * sP + q] = i_im[p_ij + p * width + q];
@@ -544,14 +549,13 @@ void estimateSimilarPatchesStep1(
 					diff += tmpValue * tmpValue;
 				}
 			}
-
-			//! Save all distances
 			distance[i * sW + j] = make_pair(diff, k);
 		}
 	}
 
 	//! Keep only the N2 best similar patches
-	partial_sort(distance.begin(), distance.begin() + nSimP, distance.end(), comparaisonFirst);
+	std::nth_element(distance.begin(), distance.begin() + nSimP, distance.end(), comparaisonFirst);
+	std::sort(distance.begin(), distance.begin() + nSimP, comparaisonFirst);
 
 	//! Register position of patches
 	for (unsigned n = 0; n < nSimP; n++) {
@@ -592,6 +596,7 @@ unsigned estimateSimilarPatchesStep2(
 ,	std::vector<unsigned> &o_index
 ,	const unsigned p_ij
 ,	const nlbParams &p_params
+,	std::vector<pair<float, unsigned> > &distance
 ){
 	//! Initialization
 	const unsigned width	= i_imNoisy.w;
@@ -600,7 +605,6 @@ unsigned estimateSimilarPatchesStep2(
 	const unsigned sP		= p_params.sizePatch;
 	const unsigned sW		= p_params.sizeSearchWindow;
 	const unsigned ind		= p_ij - (sW - 1) * (width + 1) / 2;
-	vector<pair<float, unsigned> > distance(sW * sW);
 
 	//! Compute distance between patches
 	for (unsigned i = 0; i < sW; i++) {
@@ -625,8 +629,8 @@ unsigned estimateSimilarPatchesStep2(
 	}
 
 	//! Keep only the nSimilarPatches best similar patches
-	partial_sort(distance.begin(), distance.begin() + p_params.nSimilarPatches, distance.end(),
-		comparaisonFirst);
+	std::nth_element(distance.begin(), distance.begin() + p_params.nSimilarPatches, distance.end(), comparaisonFirst);
+	std::sort(distance.begin(), distance.begin() + p_params.nSimilarPatches, comparaisonFirst);
 
 	//! Save index of similar patches
 	const float threshold = (p_params.tau > distance[p_params.nSimilarPatches - 1].first ?
@@ -634,7 +638,8 @@ unsigned estimateSimilarPatchesStep2(
 	unsigned nSimP = 0;
 
 	//! Register position of similar patches
-	for (unsigned n = 0; n < distance.size(); n++) {
+	// Only loop up to top-K cutoff
+	for (unsigned n = 0; n < p_params.nSimilarPatches; n++) {
 		if (distance[n].first < threshold) {
 			o_index[nSimP++] = distance[n].second;
 		}
