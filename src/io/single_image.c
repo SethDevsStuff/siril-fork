@@ -229,6 +229,7 @@ int create_uniq_from_gfit(char *filename, gboolean exists) {
 	if (com.uniq->is_lsf) {
 		/* the LSF keywords describe the file, not the image: without them an
 		 * image saved from the view is a plain image, as lsf_export makes */
+		lsf_read_view_uid(gfit, com.uniq->lsf_uid, sizeof com.uniq->lsf_uid);
 		lsf_strip_lsf_keys(gfit);
 		siril_log_warning(_("LSF: %s is a Living Stack file, opened as a view of its Stack. It cannot be saved "
 					"over: Save As writes a plain image, and the lsf_* commands maintain the file\n"), filename);

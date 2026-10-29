@@ -47,6 +47,8 @@
 #include "lsf/lsf_math.h"
 #include "lsf/lsf_settings.h"
 #include "lsf/lsf_stack.h"
+#include "lsf/lsf_wcs.h"
+#include "lsf/lsf_weights.h"
 #include "opencv/opencv.h"
 #include "registration/registration.h"
 
@@ -78,6 +80,8 @@ void lsf_cmd_args_free(struct lsf_cmd_args *a) {
 	g_free(a->export_out);
 	g_free(a->message);
 	g_free(a->image_indices);
+	g_free(a->wcs_file);
+	g_free(a->disto.filename);
 	lsf_settings_free(&a->settings);
 	free(a);
 }
@@ -118,25 +122,6 @@ static gchar *findstar_to_json(const star_finder_params *sf) {
 			g_ascii_formatd(buf[3], sizeof buf[3], "%.17g", sf->min_A),
 			g_ascii_formatd(buf[4], sizeof buf[4], "%.17g", sf->max_A),
 			g_ascii_formatd(buf[5], sizeof buf[5], "%.17g", sf->max_r));
-}
-
-/* applies the star detection parameters stored in align.findstar */
-static void findstar_from_json(const char *json, star_finder_params *sf) {
-	if (!json) return;
-	yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
-	if (!doc) return;
-	yyjson_val *root = yyjson_doc_get_root(doc), *v;
-	if ((v = yyjson_obj_get(root, "radius")) && yyjson_is_num(v)) sf->radius = (int) yyjson_get_num(v);
-	if ((v = yyjson_obj_get(root, "sigma")) && yyjson_is_num(v)) sf->sigma = yyjson_get_num(v);
-	if ((v = yyjson_obj_get(root, "roundness")) && yyjson_is_num(v)) sf->roundness = yyjson_get_num(v);
-	if ((v = yyjson_obj_get(root, "convergence")) && yyjson_is_num(v)) sf->convergence = (int) yyjson_get_num(v);
-	if ((v = yyjson_obj_get(root, "relax_checks")) && yyjson_is_bool(v)) sf->relax_checks = yyjson_get_bool(v);
-	if ((v = yyjson_obj_get(root, "profile")) && yyjson_is_num(v)) sf->profile = (starprofile) (int) yyjson_get_num(v);
-	if ((v = yyjson_obj_get(root, "min_beta")) && yyjson_is_num(v)) sf->min_beta = yyjson_get_num(v);
-	if ((v = yyjson_obj_get(root, "min_A")) && yyjson_is_num(v)) sf->min_A = yyjson_get_num(v);
-	if ((v = yyjson_obj_get(root, "max_A")) && yyjson_is_num(v)) sf->max_A = yyjson_get_num(v);
-	if ((v = yyjson_obj_get(root, "max_r")) && yyjson_is_num(v)) sf->max_r = yyjson_get_num(v);
-	yyjson_doc_free(doc);
 }
 
 static sequence *load_batch(const char *name) {
@@ -206,6 +191,7 @@ static const char *lsf_framing_name(framing_type f) {
 static int lsf_init_run(struct lsf_cmd_args *a) {
 	lsf_settings *s = &a->settings;
 	lsf_history h = { 0 };
+	lsf_wref wref = { 0 };
 	fits primary = { 0 };
 	GPtrArray *rows = g_ptr_array_new_with_free_func(lsf_ledger_row_free);
 	int retval = 1;
@@ -232,15 +218,42 @@ static int lsf_init_run(struct lsf_cmd_args *a) {
 	sequence *batch = seq;
 	int batch_ref = ref;
 	if (layer_has_usable_registration(seq, get_registration_layer(seq))) {
-		/* transforms computed with distortion correction are
-		 * applied here without it: a Living Stack has no undistorted grid yet */
+		/* Siril's apply undistorts the frames of a registration made with
+		 * distortion correction: the grid is then undistorted, for good, and
+		 * every append undistorts its frames with the same model (Section 10.4) */
 		int rl = get_registration_layer(seq);
-		if (seq->distoparam && rl >= 0 && seq->distoparam[rl].index != DISTO_UNDEF
-				&& seq->distoparam[rl].index != DISTO_FILE_COMET)
-			siril_log_warning(_("LSF: %s was registered with distortion correction, which a Living Stack does not "
-						"use: the transforms are applied without undistorting the frames, so they may not line up "
-						"toward the edges. Registering again without distortion correction is recommended\n"),
-					a->seqname);
+		disto_source ds = seq->distoparam && rl >= 0 ? seq->distoparam[rl].index : DISTO_UNDEF;
+		if (ds == DISTO_FILES) {
+			siril_log_error(_("LSF: %s was registered through plate solving (astrometric registration), which lsf_init "
+						"cannot apply. Register it with stars (register, with -disto for distortion correction), or "
+						"apply its registration first\n"), a->seqname);
+			goto end;
+		}
+		if (ds == DISTO_IMAGE || ds == DISTO_FILE || ds == DISTO_MASTER) {
+			if (!seq->distoparam[rl].filename && ds != DISTO_MASTER) {
+				siril_log_error(_("LSF: the distortion model of the registration of %s is not named in its .seq file, "
+							"register it again\n"), a->seqname);
+				goto end;
+			}
+			s->undistorted = TRUE;
+			lsf_disto_copy(&s->disto, &seq->distoparam[rl]);
+			if (s->disto.index == DISTO_IMAGE)
+				s->disto.index = DISTO_FILE;	// Siril saved the image's WCS to this file
+			if (s->disto.index == DISTO_MASTER && !s->disto.filename)
+				s->disto.filename = g_strdup(com.pref.prepro.disto_lib);
+			/* the .seq file names the model relative to the working directory;
+			 * the file keeps it whatever directory the appends run from */
+			if (s->disto.index == DISTO_FILE) {
+				gchar *abs = g_canonicalize_filename(s->disto.filename, NULL);
+				g_free(s->disto.filename);
+				s->disto.filename = abs;
+			}
+			gchar *model = lsf_disto_describe(&s->disto);
+			siril_log_message(_("LSF: %s was registered with distortion correction (%s): the frames are undistorted, "
+						"and so is the grid. Every append will undistort its frames with this model, or with "
+						"another one given to lsf_append with -disto=\n"), a->seqname, model);
+			g_free(model);
+		}
 		rseq = apply_init_registration(seq, a, &ref, origin, &base);
 		if (!rseq || !(src_index = map_to_sources(seq, rseq)))
 			goto end;
@@ -287,6 +300,7 @@ static int lsf_init_run(struct lsf_cmd_args *a) {
 	bargs.src_index = src_index;
 	bargs.xfrm_base = rseq ? &base : NULL;
 	bargs.framing = lsf_framing_name(a->framing);
+	bargs.disto = s->undistorted ? &s->disto : NULL;
 	bargs.settings = s;
 	bargs.hist = &h;
 	bargs.init = TRUE;
@@ -297,19 +311,20 @@ static int lsf_init_run(struct lsf_cmd_args *a) {
 	bargs.seq_name = seq->seqname;
 	bargs.rows = rows;
 	bargs.primary = &primary;
+	bargs.wref = &wref;
 	bargs.keep_seq_file = listed && batch == seq;
 	bargs.max_threads = a->max_threads;
 	if (lsf_process_batch(&bargs))
 		goto end;
 	if (rseq)
 		primary.history = g_slist_append(primary.history, g_strdup_printf(
-					"LSF gen 1: registration applied, %s framing, origin %d %d", bargs.framing,
-					origin[0], origin[1]));
+					"LSF gen 1: registration applied, %s framing, origin %d %d%s", bargs.framing,
+					origin[0], origin[1], s->undistorted ? ", undistorted" : ""));
 	if (lsf_build_primary(&primary, s, &h))
 		goto end;
 	uid = g_uuid_string_random();
 	gchar *replace_msg = NULL;
-	int written = lsf_write_file(a->path, NULL, s, &h, &primary, uid, 1, rows, 1, FALSE, a->compression, &replace_msg);
+	int written = lsf_write_file(a->path, NULL, s, &h, &wref, &primary, uid, 1, rows, 1, FALSE, a->compression, &replace_msg);
 	if (note_write(a, written, replace_msg))
 		goto end;
 	siril_log_info(_("LSF file %s created: %u frames, generation 1\n"),
@@ -319,6 +334,7 @@ end:
 	g_free(uid);
 	clearfits(&primary);
 	lsf_history_free(&h);
+	lsf_wref_free(&wref);
 	g_ptr_array_free(rows, TRUE);
 	if (rseq) {
 		remove_prefixed_sequence_files(seq, LSF_REG_PREFIX);
@@ -412,12 +428,12 @@ static int plan_expansion(const lsf_file *f, const struct lsf_cmd_args *a, const
  * file. The transforms stay in memory, in seq->regparam[*layer]: the .seq
  * file of the batch and its cached star lists are left as the user made
  * them. A registration made beforehand replaces this pass. */
-static int compute_against_stack(sequence *seq, const lsf_file *f, int *layer) {
+static int compute_against_stack(sequence *seq, const lsf_file *f, const disto_params *model, int *layer) {
 	const lsf_settings *s = &f->settings;
 	/* the star detection settings stored in the file, over a copy of the
 	 * preferences for what they do not hold; the preferences are not changed */
 	star_finder_params sf = com.pref.starfinder_conf;
-	findstar_from_json(s->findstar_json, &sf);
+	lsf_findstar_from_json(s->findstar_json, &sf);
 
 	struct registration_args *regargs = new_regargs(seq, s);
 	if (!regargs)
@@ -430,6 +446,16 @@ static int compute_against_stack(sequence *seq, const lsf_file *f, int *layer) {
 	regargs->max_stars_candidates = MAX_STARS_FITTED;
 	regargs->external_ref_path = g_strdup(f->path);
 	regargs->use_external_ref = TRUE;
+	/* an undistorted grid: the stars of the frames are undistorted with the
+	 * model before matching, the Stack's are not, since it is undistorted
+	 * already. Siril then records the model on the registration layer, and
+	 * its apply undistorts the frames with it. */
+	if (model) {
+		regargs->undistort = model->index;
+		regargs->distoparam.index = model->index;
+		regargs->distoparam.filename = g_strdup(model->filename);
+		regargs->ext_ref_undistorted = TRUE;
+	}
 
 	siril_log_message(_("LSF: registering %d frames against the Stack of %s\n"), seq->selnum, f->path);
 	int ret = register_star_alignment(regargs);
@@ -447,12 +473,23 @@ static int compute_against_stack(sequence *seq, const lsf_file *f, int *layer) {
  * onto the grid, expanded or not. Returns the registered sequence, written
  * with the lsf_r_ prefix. The transforms in seq stay relative to the grid
  * before the expansion. */
-static sequence *apply_onto_grid(sequence *seq, const lsf_file *f, const struct lsf_cmd_args *a, int layer, int pad[4]) {
+static sequence *apply_onto_grid(sequence *seq, const lsf_file *f, const struct lsf_cmd_args *a, int layer,
+		const disto_params *model, int pad[4]) {
 	const lsf_settings *s = &f->settings;
 	if (!seq->regparam || !seq->regparam[layer]) {
 		siril_log_error(_("LSF: the sequence has no registration on layer %d\n"), layer);
 		return NULL;
 	}
+	/* Siril's apply undistorts the frames with the model recorded on the
+	 * registration layer: the file's on an undistorted grid, none otherwise,
+	 * whatever an earlier registration of the sequence left there (in memory
+	 * only, the .seq file is not written) */
+	if (!seq->distoparam && !(seq->distoparam = calloc(seq->nb_layers, sizeof(disto_params)))) {
+		PRINT_ALLOC_ERR;
+		return NULL;
+	}
+	seq->distoparam[layer].index = model ? model->index : DISTO_UNDEF;
+	seq->distoparam[layer].filename = model ? g_strdup(model->filename) : NULL;
 
 	/* footprint of the registered frames on the grid */
 	double box[4];
@@ -483,6 +520,7 @@ static sequence *apply_onto_grid(sequence *seq, const lsf_file *f, const struct 
 	regargs->func = register_apply_reg;
 	regargs->layer = layer;
 	regargs->no_output = FALSE;
+	regargs->ext_ref_undistorted = model != NULL;
 	if (any_pad(pad))
 		regargs->canvas =(framing_roi) { -pad[LSF_PAD_LEFT], -pad[LSF_PAD_LAST],
 			f->rx + pad[LSF_PAD_LEFT] + pad[LSF_PAD_RIGHT], f->ry + pad[LSF_PAD_FIRST] + pad[LSF_PAD_LAST] };
@@ -503,11 +541,53 @@ static sequence *apply_onto_grid(sequence *seq, const lsf_file *f, const struct 
 }
 
 /* both passes */
-static sequence *register_against_stack(sequence *seq, const lsf_file *f, const struct lsf_cmd_args *a, int pad[4]) {
+static sequence *register_against_stack(sequence *seq, const lsf_file *f, const struct lsf_cmd_args *a,
+		const disto_params *model, int pad[4]) {
 	int layer;
-	if (compute_against_stack(seq, f, &layer))
+	if (compute_against_stack(seq, f, model, &layer))
 		return NULL;
-	return apply_onto_grid(seq, f, a, layer, pad);
+	return apply_onto_grid(seq, f, a, layer, model, pad);
+}
+
+/* first pass through the WCS (lsf_append -wcsreg, Section 10.4): each
+ * frame's transform from its WCS and the Stack's. On an undistorted grid the
+ * linear part of the frames' WCS is used, since the apply undistorts them. */
+static int compute_against_stack_wcs(sequence *seq, const lsf_file *f, const struct lsf_cmd_args *a, int *layer) {
+	const lsf_settings *s = &f->settings;
+	if (!has_wcs((fits *) &f->primary)) {
+		siril_log_error(_("LSF: the Stack of %s has no WCS, so frames cannot be registered through theirs. Plate-solve "
+					"the Stack (lsf_export, then platesolve) and import its WCS with lsf_util -wcs=, or register "
+					"with stars\n"), f->path);
+		return 1;
+	}
+	*layer = seq->nb_layers == 3 ? 1 : 0;
+	struct wcsprm *ref = wcs_copy_linear(f->primary.keywords.wcslib);
+	if (!ref)
+		return 1;
+	if (f->primary.keywords.wcslib->lin.dispre && !s->undistorted) {
+		/* the Stack keeps its own distortion: map through it */
+		wcsfree(ref);
+		free(ref);
+		ref = wcs_deepcopy(f->primary.keywords.wcslib, NULL);
+	}
+	siril_log_message(_("LSF: registering %d frames against the Stack of %s through their WCS\n"), seq->selnum, f->path);
+	/* the star measures are made on the grid, when the frames are merged
+	 * (Section 10.3) */
+	int ret = lsf_register_by_wcs(seq, *layer, ref, f->ry, s->transform, s->undistorted, a->max_threads);
+	wcsfree(ref);
+	free(ref);
+	if (ret) {
+		siril_log_error(_("LSF: no frame could be registered through its WCS: are the frames plate-solved?\n"));
+		return ret;
+	}
+	/* the transforms map onto the Stack, as an external reference: Siril's
+	 * apply takes them as they are, and gives the frames the Stack's WCS */
+	seq->ext_ref = TRUE;
+	g_free(seq->ext_ref_path);
+	seq->ext_ref_path = g_strdup(f->path);
+	seq->ext_ref_rx = f->rx;
+	seq->ext_ref_ry = f->ry;
+	return 0;
 }
 
 /***** registration made beforehand against an LSF file *****/
@@ -551,6 +631,7 @@ struct lsf_reg_data {
 	gchar *path, *uid;
 	int gen, rx, ry, origin_x, origin_y;
 	star_finder_params sf;	// the star detection stored in the file, regargs->sf_params
+	gchar *disto;		// the distortion model the frames were undistorted with (JSON), or NULL
 	gboolean registered;	// the registration succeeded
 };
 
@@ -560,6 +641,7 @@ static void free_reg_data(gpointer p) {
 		return;
 	g_free(d->path);
 	g_free(d->uid);
+	g_free(d->disto);
 	g_free(d);
 }
 
@@ -592,6 +674,8 @@ static void lsf_registration_end(struct registration_args *regargs) {
 		g_key_file_set_integer(kf, LSF_BINDING_GROUP, "origin_y", d->origin_y);
 		g_key_file_set_integer(kf, LSF_BINDING_GROUP, "layer", regargs->layer);
 		g_key_file_set_string(kf, LSF_BINDING_GROUP, "transforms", fp);
+		if (d->disto)
+			g_key_file_set_string(kf, LSF_BINDING_GROUP, "disto", d->disto);
 		g_key_file_set_string(kf, LSF_BINDING_GROUP, "date", date);
 		gchar *bpath = binding_path(regargs->seq);
 		GError *err = NULL;
@@ -634,10 +718,14 @@ int lsf_prepare_registration(struct registration_args *regargs, gboolean keep_ty
 	else if (regargs->func != register_star_alignment)
 		siril_log_error(_("LSF: only the global star alignment registers against a Living Stack, without the "
 					"two-pass option\n"));
-	else if (regargs->undistort != DISTO_UNDEF)
-		siril_log_error(_("LSF: distortion correction cannot be used with a Living Stack: the append applies the "
-					"transforms without undistorting the frames, which would then not line up with the stack "
-					"toward the edges\n"));
+	else if (regargs->undistort != DISTO_UNDEF && !s->undistorted)
+		siril_log_error(_("LSF: %s was created without distortion correction, and its frames cannot be undistorted: "
+					"they would not line up with the Stack toward the edges. Register without -disto\n"), path);
+	else if (s->undistorted && regargs->undistort == DISTO_IMAGE)
+		siril_log_error(_("LSF: the distortion model of the current image cannot be used against a Living Stack, "
+					"use -disto=file or -disto=master, or the model stored in the file\n"));
+	else if (s->undistorted && regargs->undistort == DISTO_UNDEF && s->disto.index == DISTO_UNDEF)
+		siril_log_error(_("LSF: %s is undistorted and stores no distortion model: give one with -disto=\n"), path);
 	else if (regargs->seq->nb_layers != info.file.nchan)
 		siril_log_error(_("LSF: the Living Stack has %d channel(s) and the sequence %d\n"),
 				info.file.nchan, regargs->seq->nb_layers);
@@ -663,8 +751,30 @@ int lsf_prepare_registration(struct registration_args *regargs, gboolean keep_ty
 		regargs->min_pairs = s->min_pairs;
 	if (!keep_findstar) {
 		d->sf = com.pref.starfinder_conf;
-		findstar_from_json(s->findstar_json, &d->sf);
+		lsf_findstar_from_json(s->findstar_json, &d->sf);
 		regargs->sf_params = &d->sf;
+	}
+	/* an undistorted grid: the frames are undistorted with the model given,
+	 * or the file's, and the Stack, undistorted already, is not */
+	if (s->undistorted) {
+		if (regargs->undistort == DISTO_UNDEF) {
+			regargs->undistort = s->disto.index;
+			g_free(regargs->distoparam.filename);
+			regargs->distoparam.index = s->disto.index;
+			regargs->distoparam.filename = g_strdup(s->disto.filename);
+		}
+		if (regargs->distoparam.index == DISTO_MASTER && !regargs->distoparam.filename)
+			regargs->distoparam.filename = g_strdup(com.pref.prepro.disto_lib);
+		if (regargs->distoparam.index == DISTO_FILE && regargs->distoparam.filename) {
+			gchar *abs = g_canonicalize_filename(regargs->distoparam.filename, NULL);	// as lsf_append stores it
+			g_free(regargs->distoparam.filename);
+			regargs->distoparam.filename = abs;
+		}
+		regargs->ext_ref_undistorted = TRUE;
+		d->disto = lsf_disto_to_json(&regargs->distoparam);
+		gchar *model = lsf_disto_describe(&regargs->distoparam);
+		siril_log_message(_("LSF: the Living Stack is undistorted: the frames are undistorted with %s\n"), model);
+		g_free(model);
 	}
 	regargs->hook_data = d;
 	regargs->hook_free = free_reg_data;
@@ -681,7 +791,8 @@ int lsf_prepare_registration(struct registration_args *regargs, gboolean keep_ty
  * them valid; a grid grown since does not. Returns TRUE with the layer and,
  * if wanted, the date of the registration; otherwise FALSE with why, or no
  * why when the sequence was never registered against an LSF file. */
-gboolean lsf_binding_check(const sequence *seq, const lsf_file *f, int *layer, gchar **date, gchar **why) {
+gboolean lsf_binding_check(const sequence *seq, const lsf_file *f, const disto_params *model, int *layer,
+		gchar **date, gchar **why) {
 	if (date)
 		*date = NULL;
 	if (why)
@@ -701,6 +812,8 @@ gboolean lsf_binding_check(const sequence *seq, const lsf_file *f, int *layer, g
 	int ox = g_key_file_get_integer(kf, LSF_BINDING_GROUP, "origin_x", NULL);
 	int oy = g_key_file_get_integer(kf, LSF_BINDING_GROUP, "origin_y", NULL);
 	int l = g_key_file_get_integer(kf, LSF_BINDING_GROUP, "layer", NULL);
+	gchar *bdisto = g_key_file_get_string(kf, LSF_BINDING_GROUP, "disto", NULL);
+	gchar *mdisto = model && model->index != DISTO_UNDEF ? lsf_disto_to_json(model) : NULL;
 	gchar *current = transforms_fingerprint(seq, l);
 	const char *reason = NULL;
 	if (!uid || strcmp(uid, f->uid))
@@ -709,6 +822,8 @@ gboolean lsf_binding_check(const sequence *seq, const lsf_file *f, int *layer, g
 		reason = _("the grid of the Living Stack has grown since the sequence was registered against it");
 	else if (!fp || !current || strcmp(fp, current))
 		reason = _("the sequence was registered again since it was registered against the Living Stack");
+	else if (g_strcmp0(bdisto, mdisto))
+		reason = _("the sequence was registered with another distortion model than the append uses");
 	gboolean ok = reason == NULL;
 	if (ok) {
 		*layer = l;
@@ -718,6 +833,8 @@ gboolean lsf_binding_check(const sequence *seq, const lsf_file *f, int *layer, g
 		*why = g_strdup(reason);
 	g_free(uid);
 	g_free(fp);
+	g_free(bdisto);
+	g_free(mdisto);
 	g_free(current);
 	g_key_file_free(kf);
 	return ok;
@@ -736,6 +853,12 @@ static int expand_grid(lsf_file *f, const int pad[4], int gen) {
 	f->settings.origin_y += pad[LSF_PAD_FIRST];
 	f->xfrm_shift[0] = pad[LSF_PAD_LEFT];
 	f->xfrm_shift[1] = pad[LSF_PAD_LAST];
+	/* the reference stars of the wFWHM stay on the same sky: in FITS pixels,
+	 * as CRPIX */
+	for (int i = 0; i < f->wref.n; i++) {
+		f->wref.x[i] += pad[LSF_PAD_LEFT];
+		f->wref.y[i] += pad[LSF_PAD_FIRST];
+	}
 	if (has_wcs(&f->primary)) {
 		/* CRPIX counts pixels in storage order */
 		Homography T;
@@ -945,6 +1068,68 @@ static int lsf_append_run(struct lsf_cmd_args *a) {
 		siril_log_message(_("LSF: %s already has rejection maps, counted since generation %d\n"),
 				a->path, f.hist.rej_gen);
 	f.settings.rejmaps |= a->rejmaps;	// lsf_process_batch() creates them
+	/* distortion correction is a property of the grid (Section 10.4): a grid
+	 * created with it undistorts every batch, with the model stored in the
+	 * file or the one given, which becomes the new default; a grid created
+	 * without it never does */
+	const disto_params *model = NULL;
+	if (a->disto.index != DISTO_UNDEF && !f.settings.undistorted) {
+		siril_log_error(_("LSF: %s was created without distortion correction and cannot switch: its Stack keeps the "
+					"distortion of its first batch, and undistorted frames would not line up with it toward the "
+					"edges. Append without -disto\n"), a->path);
+		goto end;
+	}
+	if (f.settings.undistorted && !a->noreg) {
+		if (a->disto.index != DISTO_UNDEF && !lsf_disto_same(&a->disto, &f.settings.disto)) {
+			gchar *was = lsf_disto_describe(&f.settings.disto), *now = lsf_disto_describe(&a->disto);
+			siril_log_message(_("LSF: distortion model changed from %s to %s. It applies from this append on and is "
+						"saved in the file for the following ones\n"), was, now);
+			f.primary.history = g_slist_append(f.primary.history, g_strdup_printf(
+						"LSF gen %d: distortion model %s, was %s", f.gen + 1, now, was));
+			g_free(was);
+			g_free(now);
+			lsf_disto_copy(&f.settings.disto, &a->disto);
+		}
+		if (f.settings.disto.index == DISTO_UNDEF) {
+			siril_log_error(_("LSF: %s is undistorted and stores no distortion model: give one with -disto=\n"), a->path);
+			goto end;
+		}
+		model = &f.settings.disto;
+	} else if (f.settings.undistorted)
+		siril_log_warning(_("LSF: %s is undistorted: -noreg merges the frames as they are, which must be undistorted "
+					"already, or they will not line up with the Stack toward the edges\n"), a->path);
+	/* the weight model switches from range to inverse from this append on
+	 * (Section 10.3): the merged frames keep their weights */
+	if (a->weight_inverse) {
+		lsf_settings *s = &f.settings;
+		if (s->weighting != WFWHM_WEIGHT && s->weighting != NBSTARS_WEIGHT) {
+			siril_log_error(_("LSF: -weight_model applies to wfwhm and nbstars weighting, which freeze a range; %s is "
+						"weighted by %s\n"), a->path, lsf_weight_name(s->weighting));
+			goto end;
+		}
+		if (s->weight_model == LSF_WMODEL_INVERSE)
+			siril_log_message(_("LSF: %s already uses the inverse weight model\n"), a->path);
+		else {
+			float *hist_wfwhm = NULL;
+			int *hist_nstars = NULL;
+			double *hist_weight = NULL;
+			long n = lsf_read_ledger_weights(&f, &hist_wfwhm, &hist_nstars, &hist_weight);
+			int failed = n <= 0 || lsf_switch_to_inverse(s, (int) n, hist_wfwhm, hist_nstars, hist_weight);
+			free(hist_wfwhm);
+			free(hist_nstars);
+			free(hist_weight);
+			if (failed) {
+				siril_log_error(_("LSF: the ledger of %s does not give the star measures of its frames, the weight "
+							"model cannot be switched\n"), a->path);
+				goto end;
+			}
+			siril_log_message(_("LSF: weight model switched from range to inverse, from this append on: frames beyond "
+						"the range of the first batch are no longer clamped. The %ld frames already merged keep "
+						"their weights, and the new ones are on the same scale on average\n"), n);
+			f.primary.history = g_slist_append(f.primary.history, g_strdup_printf(
+						"LSF gen %d: weight model inverse, was range", f.gen + 1));
+		}
+	}
 	seq = load_batch(a->seqname);
 	if (!seq)
 		goto end;
@@ -958,22 +1143,28 @@ static int lsf_append_run(struct lsf_cmd_args *a) {
 	int gen = f.gen + 1, batchnum = f.nb_batches + 1;
 	int pad[4] = { 0 };
 	if (!a->noreg) {
-		/* a registration made beforehand against this file
-		 * replaces the first pass, unless -reg asks for a new one */
 		int layer = 0;
-		gchar *date = NULL, *why = NULL;
-		gboolean reuse = !a->force_reg && lsf_binding_check(seq, &f, &layer, &date, &why);
-		if (reuse) {
-			siril_log_message(_("LSF: using the registration of %s against this file, made %s\n"),
-					a->seqname, date ? date : "");
-			rseq = apply_onto_grid(seq, &f, a, layer, pad);
+		if (a->wcsreg) {
+			/* through the WCS: a registration made beforehand is not used */
+			if (!compute_against_stack_wcs(seq, &f, a, &layer))
+				rseq = apply_onto_grid(seq, &f, a, layer, model, pad);
 		} else {
-			if (why && !a->force_reg)
-				siril_log_message(_("LSF: %s: registering the frames again\n"), why);
-			rseq = register_against_stack(seq, &f, a, pad);
+			/* a registration made beforehand against this file
+			 * replaces the first pass, unless -reg asks for a new one */
+			gchar *date = NULL, *why = NULL;
+			gboolean reuse = !a->force_reg && lsf_binding_check(seq, &f, model, &layer, &date, &why);
+			if (reuse) {
+				siril_log_message(_("LSF: using the registration of %s against this file, made %s\n"),
+						a->seqname, date ? date : "");
+				rseq = apply_onto_grid(seq, &f, a, layer, model, pad);
+			} else {
+				if (why && !a->force_reg)
+					siril_log_message(_("LSF: %s: registering the frames again\n"), why);
+				rseq = register_against_stack(seq, &f, a, model, pad);
+			}
+			g_free(date);
+			g_free(why);
 		}
-		g_free(date);
-		g_free(why);
 		if (!rseq)
 			goto end;
 		if (any_pad(pad)) {
@@ -1001,6 +1192,8 @@ static int lsf_append_run(struct lsf_cmd_args *a) {
 	bargs.src_seq = a->noreg ? NULL : seq;
 	bargs.src_index = src_index;
 	bargs.framing = a->noreg ? NULL : lsf_framing_name(a->framing);
+	bargs.reg_method = a->wcsreg ? "wcs" : "stars";
+	bargs.disto = model;
 	bargs.settings = &f.settings;
 	bargs.hist = &f.hist;
 	bargs.init = FALSE;
@@ -1010,6 +1203,7 @@ static int lsf_append_run(struct lsf_cmd_args *a) {
 	bargs.seq_name = seq->seqname;
 	bargs.rows = rows;
 	bargs.primary = &f.primary;
+	bargs.wref = &f.wref;
 	bargs.keep_seq_file = listed && batch == seq;
 	bargs.max_threads = a->max_threads;
 	if (lsf_process_batch(&bargs))
@@ -1027,7 +1221,7 @@ static int lsf_append_run(struct lsf_cmd_args *a) {
 		siril_log_message(_("LSF: compression of the extensions changed from %s to %s\n"),
 				lsf_compression_name(f.compression), lsf_compression_name(comp));
 	gchar *replace_msg = NULL;
-	int written = lsf_write_file(target, &f, &f.settings, &f.hist, &f.primary, f.uid, gen, rows, batchnum,
+	int written = lsf_write_file(target, &f, &f.settings, &f.hist, &f.wref, &f.primary, f.uid, gen, rows, batchnum,
 			a->backup && !a->out, comp, &replace_msg);
 	if (note_write(a, written, replace_msg))
 		goto end;
@@ -1060,6 +1254,16 @@ static void print_summary(const lsf_file *f) {
 	if (s->is_cfa)
 		siril_log_message(_("  grid %dx%d, %d channel(s), CFA sensor %s (debayered)\n"), f->rx, f->ry, f->nchan, s->bayer);
 	else siril_log_message(_("  grid %dx%d, %d channel(s), mono sensor\n"), f->rx, f->ry, f->nchan);
+	if (has_wcs((fits *) &f->primary)) {
+		gchar *desc = lsf_wcs_describe(f->primary.keywords.wcslib, f->rx, f->ry);
+		siril_log_message(_("  WCS: %s\n"), desc);
+		g_free(desc);
+	} else siril_log_message(_("  no WCS\n"));
+	if (s->undistorted) {
+		gchar *model = lsf_disto_describe(&s->disto);
+		siril_log_message(_("  undistorted grid, distortion model %s\n"), model);
+		g_free(model);
+	}
 	gchar *rej = rejection_text(s->rej, s->sig);
 	siril_log_message(_("  rejection %s, history test low %g high %g margin %g\n"),
 			rej, s->hist_low, s->hist_high, s->hist_margin);
@@ -1072,10 +1276,14 @@ static void print_summary(const lsf_file *f) {
 				f->nchan == 3 ? s->noise_norm[1] : 0.0, f->nchan == 3 ? s->noise_norm[2] : 0.0);
 		break;
 	case WFWHM_WEIGHT:
-		siril_log_message(_("  weighting wfwhm, frozen min %g max %g norm %g\n"), s->fwhm_min, s->fwhm_max, s->fwhm_norm);
+		siril_log_message(_("  weighting wfwhm (%s), frozen min %g max %g norm %g, floor %g, range x%g\n"),
+				lsf_weight_model_name(s->weight_model), s->fwhm_min, s->fwhm_max, s->fwhm_norm, s->weight_floor,
+				s->weight_range);
 		break;
 	case NBSTARS_WEIGHT:
-		siril_log_message(_("  weighting nbstars, frozen min %g max %g norm %g\n"), s->stars_min, s->stars_max, s->stars_norm);
+		siril_log_message(_("  weighting nbstars (%s), frozen min %g max %g norm %g, floor %g, range x%g\n"),
+				lsf_weight_model_name(s->weight_model), s->stars_min, s->stars_max, s->stars_norm, s->weight_floor,
+				s->weight_range);
 		break;
 	default:
 		siril_log_message(_("  weighting none\n"));
@@ -1257,6 +1465,8 @@ static int lsf_util_run(struct lsf_cmd_args *a) {
 	lsf_file f;
 	int retval = 1;
 	GPtrArray *none = NULL;
+	fits imported = { 0 };
+	struct wcsprm *new_wcs = NULL;
 	if (a->info)
 		return lsf_info_run(a);
 	gchar *problem = NULL;
@@ -1294,13 +1504,50 @@ static int lsf_util_run(struct lsf_cmd_args *a) {
 		add_message(a, _("The Stack (the image of the file) was modified outside Siril; the accumulator is intact. "
 					"Appending is refused until the Stack is repaired, which undoes the edit, or adopted, "
 					"which keeps it."));
-		retval = a->check && !a->repair && !a->adopt && !a->compression_set && !a->out ? 0 : 1;
+		retval = a->check && !a->repair && !a->adopt && !a->compression_set && !a->wcs_file && !a->out ? 0 : 1;
 		goto end;
+	}
+	/* WCS import (Section 8): the WCS of HDU 0, which the writer copies to
+	 * every extension, is replaced; the pixels and LSFHASH do not change */
+	if (a->wcs_file) {
+		gchar *why = NULL;
+		if (lsf_wcs_read_import(a->wcs_file, &f, &imported, &why)) {
+			siril_log_error(_("LSF: the WCS cannot be imported: %s\n"), why);
+			add_message(a, _("The WCS cannot be imported: %s."), why);
+			g_free(why);
+			goto end;
+		}
+		new_wcs = wcs_deepcopy(imported.keywords.wcslib, NULL);
+		/* an undistorted grid keeps a linear WCS: SIP terms solved on it only
+		 * fit residuals, and would make Siril distort the Stack's stars */
+		if (new_wcs && f.settings.undistorted && new_wcs->lin.dispre) {
+			double shift = lsf_wcs_sip_shift(new_wcs, f.rx, f.ry);
+			struct wcsprm *lin = wcs_copy_linear(new_wcs);
+			wcsfree(new_wcs);
+			free(new_wcs);
+			new_wcs = lin;
+			siril_log_message(_("LSF: the grid is undistorted, so the SIP terms of the imported WCS are dropped. They "
+						"corrected at most %.2f px at the edges of the grid\n"), shift);
+			if (shift > 0.5)
+				siril_log_warning(_("LSF: a correction of %.2f px on an undistorted grid suggests that the distortion "
+							"model does not fit these frames well\n"), shift);
+		}
+		if (!new_wcs) {
+			siril_log_error(_("LSF: the WCS of %s cannot be copied\n"), a->wcs_file);
+			goto end;
+		}
+		if (has_wcs(&f.primary) && lsf_wcs_same(new_wcs, f.primary.keywords.wcslib, f.rx, f.ry)) {
+			siril_log_message(_("LSF: %s already has this WCS\n"), a->path);
+			add_message(a, _("The file already has this WCS."));
+			wcsfree(new_wcs);
+			free(new_wcs);
+			new_wcs = NULL;
+		}
 	}
 	/* -out writes the result to a new file and leaves the source untouched,
 	 * even when no action changes anything */
 	const char *target = a->out ? a->out : a->path;
-	if (!fix_stack && !recompress && !a->out) {
+	if (!fix_stack && !recompress && !new_wcs && !a->out) {
 		retval = 0;
 		goto end;
 	}
@@ -1344,11 +1591,27 @@ static int lsf_util_run(struct lsf_cmd_args *a) {
 		else card = g_strdup_printf("LSF generation %d: extensions compressed with %s", gen, lsf_compression_name(comp));
 		f.primary.history = g_slist_append(f.primary.history, card);
 	}
+	gboolean wcs_imported = new_wcs != NULL;
+	if (new_wcs) {
+		gchar *desc = lsf_wcs_describe(new_wcs, f.rx, f.ry), *base = g_path_get_basename(a->wcs_file);
+		f.primary.history = g_slist_append(f.primary.history, g_strdup_printf(
+					"LSF generation %d: WCS imported from %s", gen, base));
+		siril_log_message(_("LSF: WCS imported from %s: %s\n"), a->wcs_file, desc);
+		g_free(desc);
+		g_free(base);
+		free_wcs(&f.primary);
+		f.primary.keywords.wcslib = new_wcs;
+		new_wcs = NULL;
+		/* the centre keywords Siril writes with a WCS */
+		f.primary.keywords.wcsdata = imported.keywords.wcsdata;
+		center2wcs2(f.primary.keywords.wcslib, f.rx, f.ry, &f.primary.keywords.wcsdata.ra,
+				&f.primary.keywords.wcsdata.dec);
+	}
 	if (lsf_build_primary(&f.primary, &f.settings, &f.hist))
 		goto end;
 	none = g_ptr_array_new();
 	gchar *replace_msg = NULL;
-	int written = lsf_write_file(target, &f, &f.settings, &f.hist, &f.primary, f.uid, gen, none, f.nb_batches,
+	int written = lsf_write_file(target, &f, &f.settings, &f.hist, &f.wref, &f.primary, f.uid, gen, none, f.nb_batches,
 			a->backup, comp, &replace_msg);
 	if (note_write(a, written, replace_msg))
 		goto end;
@@ -1373,6 +1636,10 @@ static int lsf_util_run(struct lsf_cmd_args *a) {
 				lsf_compression_name(comp), gen);
 		add_message(a, _("The extensions are compressed with %s."), lsf_compression_name(comp));
 	}
+	if (wcs_imported) {
+		siril_log_info(_("LSF: WCS of %s imported from %s, generation %d\n"), target, a->wcs_file, gen);
+		add_message(a, _("The WCS was written into the Living Stack."));
+	}
 	if (a->out) {
 		siril_log_info(_("LSF: %s written from %s, generation %d, %s left unchanged\n"), a->out, a->path,
 				gen, a->path);
@@ -1382,6 +1649,11 @@ static int lsf_util_run(struct lsf_cmd_args *a) {
 end:
 	if (none)
 		g_ptr_array_free(none, TRUE);
+	if (new_wcs) {
+		wcsfree(new_wcs);
+		free(new_wcs);
+	}
+	clearfits(&imported);
 	lsf_file_free(&f);
 	return retval;
 }
@@ -1631,6 +1903,10 @@ gchar *lsf_cmd_args_to_command(const struct lsf_cmd_args *a) {
 			g_string_append(cmd, " -rgb_equal");
 		if (s->weighting != NO_WEIGHT)
 			g_string_append_printf(cmd, " -weight=%s", lsf_weight_name(s->weighting));
+		if ((s->weighting == WFWHM_WEIGHT || s->weighting == NBSTARS_WEIGHT) && s->weight_floor != LSF_WEIGHT_FLOOR)
+			g_string_append_printf(cmd, " -weight_floor=%g", s->weight_floor);
+		if ((s->weighting == WFWHM_WEIGHT || s->weighting == NBSTARS_WEIGHT) && s->weight_range != 1.0)
+			g_string_append_printf(cmd, " -weight_range=%g", s->weight_range);
 		if (s->outnorm)
 			g_string_append(cmd, " -output_norm");
 		add_hist_and_common_args(cmd, a);
@@ -1648,8 +1924,18 @@ gchar *lsf_cmd_args_to_command(const struct lsf_cmd_args *a) {
 		}
 		if (a->noreg)
 			g_string_append(cmd, " -noreg");
+		else if (a->wcsreg)
+			g_string_append(cmd, " -wcsreg");
+		if (a->weight_inverse)
+			g_string_append(cmd, " -weight_model=inverse");
 		else if (a->force_reg)
 			g_string_append(cmd, " -reg");
+		if (a->disto.index == DISTO_MASTER)
+			g_string_append(cmd, " -disto=master");
+		else if (a->disto.index == DISTO_FILE) {
+			g_string_append(cmd, " -disto=file");
+			add_arg(cmd, a->disto.filename);
+		}
 		add_hist_and_common_args(cmd, a);
 		if (a->expand_step != LSF_EXPAND_STEP)
 			g_string_append_printf(cmd, " -expand_step=%d", a->expand_step);
@@ -1668,6 +1954,34 @@ gchar *lsf_cmd_args_to_command(const struct lsf_cmd_args *a) {
 		g_string_append(cmd, "lsf_export");
 		add_arg(cmd, a->path);
 		add_arg(cmd, a->out);
+		break;
+	case LSF_CMD_UTIL:
+		g_string_append(cmd, "lsf_util");
+		add_arg(cmd, a->path);
+		if (a->info)
+			g_string_append(cmd, " -info");
+		if (a->check)
+			g_string_append(cmd, " -check");
+		if (a->repair)
+			g_string_append(cmd, " -repair");
+		else if (a->adopt)
+			g_string_append(cmd, " -adopt");
+		if (a->compression_set)
+			g_string_append(cmd, a->compression == LSF_COMP_NONE ? " -decompress" :
+					a->compression == LSF_COMP_GZIP1 ? " -compress=gzip1" : " -compress");
+		if (a->wcs_file) {
+			gchar *opt = g_strdup_printf("-wcs=%s", a->wcs_file);
+			add_arg(cmd, opt);
+			g_free(opt);
+		}
+		if (a->out) {
+			gchar *opt = g_strdup_printf("-out=%s", a->out);
+			add_arg(cmd, opt);
+			g_free(opt);
+			if (a->overwrite)
+				g_string_append(cmd, " -overwrite");
+		} else if (a->backup)
+			g_string_append(cmd, " -backup");
 		break;
 	default:
 		g_string_free(cmd, TRUE);
@@ -1823,6 +2137,24 @@ int process_lsf_init(int nb) {
 		else if (!strcmp(w, "-rgb_equal")) s->rgb_equal = TRUE;
 		else if (!strcmp(w, "-output_norm")) s->outnorm = TRUE;
 		else if (!strcmp(w, "-overwrite")) a->overwrite = TRUE;
+		else if (g_str_has_prefix(w, "-weight_floor=")) {
+			gchar *end;
+			double v = g_ascii_strtod(w + 14, &end);
+			if (end == w + 14 || *end || !(v > 0.0 && v < 1.0)) {
+				siril_log_error(_("Wrong parameter values. %s is not valid (above 0 and below 1), aborting.\n"), w);
+				goto failure;
+			}
+			s->weight_floor = v;
+		}
+		else if (g_str_has_prefix(w, "-weight_range=")) {
+			gchar *end;
+			double v = g_ascii_strtod(w + 14, &end);
+			if (end == w + 14 || *end || !(v >= 1.0) || !isfinite(v)) {
+				siril_log_error(_("Wrong parameter values. %s is not valid (at least 1), aborting.\n"), w);
+				goto failure;
+			}
+			s->weight_range = v;
+		}
 		else if (g_str_has_prefix(w, "-weight=")) {
 			const char *v = w + 8;
 			if (!strcmp(v, "noise")) s->weighting = NOISE_WEIGHT;
@@ -1889,6 +2221,28 @@ int process_lsf_append(int nb) {
 		if (c > 0) continue;
 		if (!strcmp(w, "-noreg")) a->noreg = TRUE;
 		else if (!strcmp(w, "-reg")) a->force_reg = TRUE;
+		else if (!strcmp(w, "-wcsreg")) a->wcsreg = TRUE;
+		else if (!strcmp(w, "-weight_model=inverse")) a->weight_inverse = TRUE;
+		else if (!strcmp(w, "-disto=master")) {
+			/* as register -disto=master: the pattern of the preferences */
+			if (!com.pref.prepro.disto_lib || !com.pref.prepro.disto_lib[0]) {
+				siril_log_error(_("-disto=master needs a distortion master pattern in the preferences\n"));
+				goto failure;
+			}
+			g_free(a->disto.filename);
+			a->disto.index = DISTO_MASTER;
+			a->disto.filename = g_strdup(com.pref.prepro.disto_lib);
+		}
+		else if (!strcmp(w, "-disto=file")) {
+			/* as register -disto=file: the file is the next word */
+			if (i + 1 >= nb || !word[i + 1]) {
+				siril_log_error(_("Missing argument to %s, aborting.\n"), w);
+				goto failure;
+			}
+			g_free(a->disto.filename);
+			a->disto.index = DISTO_FILE;
+			a->disto.filename = g_canonicalize_filename(word[++i], NULL);	// stored in the file
+		}
 		else if (!strcmp(w, "-noexpand")) a->framing = FRAMING_CURRENT;	// same as -framing=current
 		else if (!strcmp(w, "-expand_force")) a->expand_force = TRUE;
 		else if (g_str_has_prefix(w, "-expand_step=")) {
@@ -1928,6 +2282,28 @@ int process_lsf_append(int nb) {
 		siril_log_error(_("-noreg and -reg cannot be used together\n"));
 		goto failure;
 	}
+	if (a->wcsreg && (a->noreg || a->force_reg)) {
+		siril_log_error(_("-wcsreg registers the frames through their WCS and cannot be used with -noreg or -reg\n"));
+		goto failure;
+	}
+	if (a->disto.index != DISTO_UNDEF && a->noreg) {
+		siril_log_error(_("-disto undistorts the frames when they are registered and cannot be used with -noreg\n"));
+		goto failure;
+	}
+	if (a->disto.index == DISTO_FILE) {
+		fits dfit = { 0 };
+		gchar *msg = NULL;
+		gboolean valid = !read_fits_metadata_from_path_first_HDU(a->disto.filename, &dfit)
+			&& validate_disto_params(&dfit, a->disto.filename, DISTO_FILE, &msg, NULL);
+		clearfits(&dfit);
+		if (!valid) {
+			siril_log_error(_("LSF: %s cannot be used as a distortion model%s%s\n"), a->disto.filename,
+					msg ? ": " : "", msg ? msg : "");
+			g_free(msg);
+			goto failure;
+		}
+		g_free(msg);
+	}
 	if (a->framing == FRAMING_MIN || a->framing == FRAMING_COG) {
 		siril_log_error(_("LSF: lsf_append supports -framing=max or -framing=current only. The grid of an LSF "
 					"file never shrinks or moves (Section 10.5), so min and cog framing apply to lsf_init\n"));
@@ -1953,7 +2329,8 @@ int process_lsf_export(int nb) {
 	return CMD_OK;
 }
 
-/* lsf_util file.lsf.fits [-check] [-repair | -adopt] [-compress[=gzip2|gzip1] | -decompress] [-out=file.lsf.fits [-overwrite]] [-backup] */
+/* lsf_util file.lsf.fits [-check] [-repair | -adopt] [-compress[=gzip2|gzip1] | -decompress] [-wcs=file]
+ *   [-out=file.lsf.fits [-overwrite]] [-backup] */
 int process_lsf_util(int nb) {
 	struct lsf_cmd_args *a = lsf_cmd_args_new(LSF_CMD_UTIL);
 	if (!a)
@@ -1977,6 +2354,10 @@ int process_lsf_util(int nb) {
 			g_free(a->out);
 			a->out = g_strdup(w + 5);
 		}
+		else if (g_str_has_prefix(w, "-wcs=") && w[5]) {
+			g_free(a->wcs_file);
+			a->wcs_file = g_strdup(w + 5);
+		}
 		else {
 			siril_log_error(_("Unknown parameter %s, aborting.\n"), w);
 			goto failure;
@@ -1986,11 +2367,12 @@ int process_lsf_util(int nb) {
 		g_free(a->out);	// the file itself: an update in place
 		a->out = NULL;
 	}
-	if (!a->check && !a->info && !a->repair && !a->adopt && !a->compression_set && !a->out) {
-		siril_log_error(_("lsf_util needs an action: -info, -check, -repair, -adopt, -compress, -decompress or -out=\n"));
+	if (!a->check && !a->info && !a->repair && !a->adopt && !a->compression_set && !a->wcs_file && !a->out) {
+		siril_log_error(_("lsf_util needs an action: -info, -check, -repair, -adopt, -compress, -decompress, -wcs= "
+					"or -out=\n"));
 		goto failure;
 	}
-	if (a->info && (a->check || a->repair || a->adopt || a->compression_set || a->out)) {
+	if (a->info && (a->check || a->repair || a->adopt || a->compression_set || a->wcs_file || a->out)) {
 		siril_log_error(_("-info only reads the file and cannot be used with other actions\n"));
 		goto failure;
 	}

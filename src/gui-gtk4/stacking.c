@@ -326,6 +326,8 @@ void on_comboweighing_changed(GObject *obj, GParamSpec *pspec, gpointer user_dat
 	GtkDropDown *box = GTK_DROP_DOWN(obj);
 	(void)pspec;
 	com.pref.stack.weighting_method = gtk_drop_down_get_selected(box);
+	if (stack_lsf_mode())
+		lsf_stacking_update_weight_widgets();	// the floor and range of wfwhm and nbstars
 }
 
 void on_stack_siglow_button_value_changed(GtkSpinButton *button, gpointer user_data) {

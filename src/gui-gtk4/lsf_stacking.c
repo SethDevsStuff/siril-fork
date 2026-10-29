@@ -24,6 +24,7 @@
 #include <math.h>
 #include <string.h>
 
+#include "algos/siril_wcs.h"
 #include "core/gui_iface.h"
 #include "core/processing.h"
 #include "core/proto.h"
@@ -44,6 +45,7 @@
 #include "lsf/lsf_commands.h"
 #include "lsf/lsf_fits.h"
 #include "lsf/lsf_settings.h"
+#include "lsf/lsf_weights.h"
 #include "registration/registration.h"
 #include "stacking/stacking.h"
 
@@ -211,6 +213,18 @@ void on_stack_lsf_hist_same_toggled(GtkCheckButton *button, gpointer user_data) 
 	lsf_stacking_update_hist_widgets();
 }
 
+/* the weight floor and range multiplier of a new file (Section 10.3): for
+ * the weightings that freeze a range, wfwhm and nbstars. An append uses the
+ * file's, which the summary shows. */
+void lsf_stacking_update_weight_widgets(void) {
+	static const char *ids[] = { "stack_lsf_weight_label", "stack_lsf_weight_floor", "stack_lsf_weight_range_label",
+		"stack_lsf_weight_range" };
+	weightingType w = gtk_drop_down_get_selected(GTK_DROP_DOWN(gtk_builder_get_object(gui.builder, "comboweighing")));
+	gboolean shown = stack_lsf_mode() && !stack_lsf_append_mode() && (w == WFWHM_WEIGHT || w == NBSTARS_WEIGHT);
+	for (int i = 0; i < (int) G_N_ELEMENTS(ids); i++)
+		gtk_widget_set_visible(GTK_WIDGET(gtk_builder_get_object(gui.builder, ids[i])), shown);
+}
+
 /* shows the new Stack, which lsf_load_result put in gfit, as stacking does */
 static void end_lsf_stacking(const lsf_job_result *res) {
 	set_cursor_waiting(FALSE);
@@ -316,6 +330,9 @@ static void load_append_info(gboolean fill) {
 			append_summary = lsf_gui_describe(info);
 			if (fill) {
 				fill_widgets_from_lsf(&info->file.settings);
+				/* a switch is chosen for one file */
+				siril_toggle_set_active(GTK_WIDGET(gtk_builder_get_object(gui.builder, "stack_lsf_weight_inverse")),
+						FALSE);
 				gchar *out = suggest_append_out(info);
 				gtk_editable_set_text(GTK_EDITABLE(gtk_builder_get_object(gui.builder, "stack_lsf_append_out")), out);
 				g_free(out);
@@ -406,6 +423,73 @@ void stack_set_lsf_append(const gchar *path) {
 		load_append_info(TRUE);	// the file's binding note changed
 }
 
+/* stack_lsf_append_regmethod: how lsf_append registers (Section 10.4) */
+enum { APPEND_REG_STARS, APPEND_REG_WCS, APPEND_REG_NONE };
+
+static guint append_regmethod() {
+	return gtk_drop_down_get_selected(GTK_DROP_DOWN(gtk_builder_get_object(gui.builder, "stack_lsf_append_regmethod")));
+}
+
+/* registration through the WCS needs the Stack's WCS, and plate-solved
+ * frames, which the reference frame shows. Returns a message or NULL. */
+static gchar *wcsreg_problems(gboolean *fatal) {
+	*fatal = FALSE;
+	if (!has_wcs(&append_info->file.primary)) {
+		*fatal = TRUE;
+		return g_strdup(_("This Living Stack has no WCS, so frames cannot be registered through theirs: open the file, "
+					"plate-solve its stack (Tools > Astrometry) and write the solution into the file, or register "
+					"with stars."));
+	}
+	fits meta = { 0 };
+	gchar *msg = NULL;
+	if (!seq_read_frame_metadata(&com.seq, sequence_find_refimage(&com.seq), &meta) && !has_wcs(&meta))
+		msg = g_strdup(_("The reference frame of the sequence is not plate-solved: frames registered through their WCS "
+					"must be. Frames that are not are not merged."));
+	clearfits(&meta);
+	return msg;
+}
+
+/* the frames to append beyond the weighting range frozen in the file
+ * (Section 10.3), from the registration data of the sequence: an estimate,
+ * since the append measures them again on the grid, against the file's
+ * reference stars, and the log gives its own count. Returns a message, or
+ * NULL when the file's weighting has no range or every frame is within it. */
+static gchar *weight_range_note(void) {
+	const lsf_settings *s = &append_info->file.settings;
+	if ((s->weighting != WFWHM_WEIGHT && s->weighting != NBSTARS_WEIGHT) || s->weight_model != LSF_WMODEL_RANGE)
+		return NULL;
+	const struct stacking_args *sa = stack_gui_args();
+	int layer = get_registration_layer(&com.seq);
+	if (layer < 0 || !com.seq.regparam || !com.seq.regparam[layer] || !sa->image_indices || sa->nb_images_to_stack < 1)
+		return g_strdup(_("The append measures the frames against the weighting range of the file; the log says "
+					"if some are beyond it."));
+	int n = sa->nb_images_to_stack;
+	float *wfwhm = malloc(n * sizeof(float));
+	int *nstars = malloc(n * sizeof(int));
+	if (!wfwhm || !nstars) {
+		free(wfwhm);
+		free(nstars);
+		return NULL;
+	}
+	for (int k = 0; k < n; k++) {
+		const regdata *r = &com.seq.regparam[layer][sa->image_indices[k]];
+		wfwhm[k] = r->weighted_fwhm;
+		nstars[k] = r->number_of_stars;
+	}
+	int better = 0, worse = 0, floored = 0;
+	lsf_weight_range_check(s, n, wfwhm, nstars, &better, &worse, &floored);
+	free(wfwhm);
+	free(nstars);
+	if (better + worse == 0)
+		return NULL;
+	return g_strdup_printf(_("From the registration data of the sequence, about %d of the %d frames are beyond the "
+				"weighting range of this Living Stack: %d better than the best of its first batch, which would "
+				"all get the top weight, and %d worse than its worst, %d of them at the weight floor. Their "
+				"weights would not follow their quality: switching to inverse weighting avoids it. The append "
+				"measures the frames again, so its own count may differ."), better + worse, n, better, worse,
+			floored);
+}
+
 /* the problems update_stack_interface shows and start_lsf_append checks:
  * the file, the batch and the pre-flight. Returns a message or NULL. */
 static gchar *append_problems(gboolean *fatal) {
@@ -414,15 +498,33 @@ static gchar *append_problems(gboolean *fatal) {
 		return NULL;
 	if (append_info->no_append)
 		return g_strdup_printf(_("This version cannot append to this file: %s."), append_info->no_append);
-	gboolean batch_fatal = FALSE, flight_fatal = FALSE;
+	gboolean batch_fatal = FALSE, flight_fatal = FALSE, wcs_fatal = FALSE;
 	gchar *batch = lsf_check_batch(append_info, &com.seq, &batch_fatal);
 	if (batch_fatal)
 		return batch;
-	GtkWidget *noreg = GTK_WIDGET(gtk_builder_get_object(gui.builder, "stack_lsf_noreg"));
+	gchar *wcs = append_regmethod() == APPEND_REG_WCS ? wcsreg_problems(&wcs_fatal) : NULL;
+	if (wcs_fatal) {
+		g_free(batch);
+		return wcs;
+	}
+	if (wcs) {
+		gchar *both = batch ? g_strdup_printf("%s %s", batch, wcs) : g_strdup(wcs);
+		g_free(batch);
+		g_free(wcs);
+		batch = both;
+	}
+	gchar *range = weight_range_note();
+	if (range) {
+		gchar *both = batch ? g_strdup_printf("%s %s", batch, range) : g_strdup(range);
+		g_free(batch);
+		g_free(range);
+		batch = both;
+	}
 	GtkWidget *rejmaps = GTK_WIDGET(gtk_builder_get_object(gui.builder, "stack_lsf_rejmaps"));
 	gchar *out = append_out_path();
-	gchar *flight = lsf_append_preflight(append_info, com.wd, out, stack_gui_args()->nb_images_to_stack, siril_toggle_get_active(noreg),
-			gtk_widget_get_visible(rejmaps) && siril_toggle_get_active(rejmaps), &flight_fatal);
+	gchar *flight = lsf_append_preflight(append_info, com.wd, out, stack_gui_args()->nb_images_to_stack,
+			append_regmethod() == APPEND_REG_NONE, gtk_widget_get_visible(rejmaps) && siril_toggle_get_active(rejmaps),
+			&flight_fatal);
 	g_free(out);
 	*fatal = flight_fatal;
 	if (flight_fatal) {
@@ -444,7 +546,8 @@ static gchar *append_registration_note(gboolean *reusable) {
 		return NULL;
 	int layer;
 	gchar *date = NULL, *why = NULL, *msg = NULL;
-	*reusable = lsf_binding_check(&com.seq, &append_info->file, &layer, &date, &why);
+	const lsf_settings *s = &append_info->file.settings;
+	*reusable = lsf_binding_check(&com.seq, &append_info->file, s->undistorted ? &s->disto : NULL, &layer, &date, &why);
 	if (*reusable)
 		msg = g_strdup_printf(_("The sequence was registered against this Living Stack (%s): the append uses "
 					"that registration."), date ? date : "");
@@ -513,8 +616,8 @@ static void start_lsf_append() {
 	GtkSpinButton *hist_high = GTK_SPIN_BUTTON(gtk_builder_get_object(gui.builder, "stack_lsf_hist_high"));
 	GtkSpinButton *hist_margin = GTK_SPIN_BUTTON(gtk_builder_get_object(gui.builder, "stack_lsf_hist_margin"));
 	GtkWidget *force = GTK_WIDGET(gtk_builder_get_object(gui.builder, "stack_lsf_expand_force"));
-	GtkWidget *noreg = GTK_WIDGET(gtk_builder_get_object(gui.builder, "stack_lsf_noreg"));
 	GtkWidget *rejmaps = GTK_WIDGET(gtk_builder_get_object(gui.builder, "stack_lsf_rejmaps"));
+	GtkDropDown *disto_combo = GTK_DROP_DOWN(gtk_builder_get_object(gui.builder, "stack_lsf_append_disto"));
 	GtkWidget *newfile = GTK_WIDGET(gtk_builder_get_object(gui.builder, "stack_lsf_append_newfile"));
 	GtkWidget *export_image = GTK_WIDGET(gtk_builder_get_object(gui.builder, "stack_lsf_append_export"));
 	GtkDropDown *rejec_combo = GTK_DROP_DOWN(gtk_builder_get_object(gui.builder, "comborejection"));
@@ -630,10 +733,25 @@ static void start_lsf_append() {
 		a->rej_set = TRUE;
 	}
 	a->seqname = g_strdup(com.seq.seqname);
-	a->noreg = siril_toggle_get_active(noreg);
+	a->noreg = append_regmethod() == APPEND_REG_NONE;
+	a->wcsreg = append_regmethod() == APPEND_REG_WCS;
 	/* shown when a registration against the file can be reused */
 	GtkWidget *force_reg = GTK_WIDGET(gtk_builder_get_object(gui.builder, "stack_lsf_force_reg"));
-	a->force_reg = !a->noreg && gtk_widget_get_visible(force_reg) && siril_toggle_get_active(force_reg);
+	GtkWidget *inverse = GTK_WIDGET(gtk_builder_get_object(gui.builder, "stack_lsf_weight_inverse"));
+	a->weight_inverse = gtk_widget_get_visible(inverse) && siril_toggle_get_active(inverse);
+	a->force_reg = append_regmethod() == APPEND_REG_STARS && gtk_widget_get_visible(force_reg)
+		&& siril_toggle_get_active(force_reg);
+	/* an undistorted file: its model, or the master of the preferences */
+	if (append_info->file.settings.undistorted && !a->noreg && gtk_drop_down_get_selected(disto_combo) == 1) {
+		if (!com.pref.prepro.disto_lib || !com.pref.prepro.disto_lib[0]) {
+			siril_message_dialog(GTK_MESSAGE_ERROR, _("No distortion master"), _("Set a distortion master in the "
+						"preferences (Preprocessing), or use the model of the file."));
+			lsf_cmd_args_free(a);
+			return;
+		}
+		a->disto.index = DISTO_MASTER;
+		a->disto.filename = g_strdup(com.pref.prepro.disto_lib);
+	}
 	a->framing = gtk_drop_down_get_selected(framing_combo) == 1 ? FRAMING_CURRENT : FRAMING_MAX;
 	a->framing_set = a->framing != FRAMING_MAX;
 	a->expand_step = gtk_spin_button_get_value_as_int(step);
@@ -779,6 +897,13 @@ static void start_lsf_stacking() {
 	s->lite_norm = norm != NO_NORM && siril_toggle_get_active(fast_norm);
 	s->rgb_equal = norm != NO_NORM && com.seq.nb_layers == 3 && siril_toggle_get_active(rgb_equal);
 	s->weighting = weighting;
+	/* the floor and range frozen with the first batch (Section 10.3) */
+	if (weighting == WFWHM_WEIGHT || weighting == NBSTARS_WEIGHT) {
+		s->weight_floor = gtk_spin_button_get_value(GTK_SPIN_BUTTON(gtk_builder_get_object(gui.builder,
+						"stack_lsf_weight_floor")));
+		s->weight_range = gtk_spin_button_get_value(GTK_SPIN_BUTTON(gtk_builder_get_object(gui.builder,
+						"stack_lsf_weight_range")));
+	}
 	s->outnorm = siril_toggle_get_active(output_norm);
 	guint fr = gtk_drop_down_get_selected(framing_combo);
 	a->framing = fr < G_N_ELEMENTS(lsf_framings) ? lsf_framings[fr] : FRAMING_MAX;
@@ -902,6 +1027,7 @@ gboolean lsf_stacking_update_widgets(int stack_method, gboolean can_reframe) {
 	/* with the registration already applied, the frames define the grid */
 	gtk_widget_set_sensitive(lsf_framing, can_reframe);
 	lsf_stacking_update_hist_widgets();
+	lsf_stacking_update_weight_widgets();
 	/* an append can only add rejection maps to a file that has none */
 	gtk_widget_set_visible(lsf_rejmaps, !append || (append_info && !append_info->file.settings.rejmaps));
 	gtk_check_button_set_label(GTK_CHECK_BUTTON(lsf_rejmaps), append ? _("Add rejection maps to the file, counted from this append") :
@@ -924,12 +1050,12 @@ void lsf_stacking_invalidate_checks(void) {
 	g_clear_pointer(&append_checks.key, g_free);
 }
 
-static void update_append_checks(gboolean noreg) {
+static void update_append_checks(guint method) {
 	GtkWidget *rejmaps = GTK_WIDGET(gtk_builder_get_object(gui.builder, "stack_lsf_rejmaps"));
 	gchar *out = append_out_path();
-	gchar *key = g_strdup_printf("%u|%s|%s|%d|%d|%d|%d|%d|%d|%s", append_serial, com.wd ? com.wd : "",
+	gchar *key = g_strdup_printf("%u|%s|%s|%d|%d|%d|%d|%u|%d|%s", append_serial, com.wd ? com.wd : "",
 			com.seq.seqname ? com.seq.seqname : "", com.seq.number, com.seq.selnum, com.seq.reference_image,
-			stack_gui_args()->nb_images_to_stack, noreg,
+			stack_gui_args()->nb_images_to_stack, method,
 			gtk_widget_get_visible(rejmaps) && siril_toggle_get_active(rejmaps), out ? out : "");
 	g_free(out);
 	if (!g_strcmp0(key, append_checks.key)) {
@@ -942,38 +1068,56 @@ static void update_append_checks(gboolean noreg) {
 	append_checks.key = key;
 	append_checks.problems = append_problems(&append_checks.fatal);
 	append_checks.reusable = FALSE;
-	append_checks.note = noreg ? NULL : append_registration_note(&append_checks.reusable);
+	/* a registration made beforehand is used by the star method only */
+	append_checks.note = method == APPEND_REG_STARS ? append_registration_note(&append_checks.reusable) : NULL;
 }
 
 /* The append box, the frame count and the Stacking button in append mode,
  * from update_stack_interface() once it counted the frames; listed when the
  * stacking filters leave frames to append */
 void lsf_stacking_update_append(gboolean listed) {
-	static GtkWidget *go_stack = NULL, *append_framing = NULL, *append_noreg = NULL, *expand_step = NULL,
-			*expand_force = NULL, *info_label = NULL, *force_reg = NULL;
+	static GtkWidget *go_stack = NULL, *append_framing = NULL, *expand_step = NULL, *expand_force = NULL,
+			*info_label = NULL, *force_reg = NULL, *disto_label = NULL, *disto = NULL, *weight_inverse = NULL;
 	static GtkLabel *result_label = NULL;
 	if (!go_stack) {
 		go_stack = GTK_WIDGET(gtk_builder_get_object(gui.builder, "gostack_button"));
 		result_label = GTK_LABEL(gtk_builder_get_object(gui.builder, "stackfilter_label"));
 		append_framing = GTK_WIDGET(gtk_builder_get_object(gui.builder, "stack_lsf_append_framing"));
-		append_noreg = GTK_WIDGET(gtk_builder_get_object(gui.builder, "stack_lsf_noreg"));
 		expand_step = GTK_WIDGET(gtk_builder_get_object(gui.builder, "stack_lsf_expand_step"));
 		expand_force = GTK_WIDGET(gtk_builder_get_object(gui.builder, "stack_lsf_expand_force"));
 		info_label = GTK_WIDGET(gtk_builder_get_object(gui.builder, "stack_lsf_info_label"));
 		force_reg = GTK_WIDGET(gtk_builder_get_object(gui.builder, "stack_lsf_force_reg"));
+		disto_label = GTK_WIDGET(gtk_builder_get_object(gui.builder, "stack_lsf_append_disto_label"));
+		disto = GTK_WIDGET(gtk_builder_get_object(gui.builder, "stack_lsf_append_disto"));
+		weight_inverse = GTK_WIDGET(gtk_builder_get_object(gui.builder, "stack_lsf_weight_inverse"));
 	}
 	gboolean grow = gtk_drop_down_get_selected(GTK_DROP_DOWN(append_framing)) == 0;
-	gboolean noreg = siril_toggle_get_active(append_noreg);
+	guint method = append_regmethod();
+	gboolean noreg = method == APPEND_REG_NONE;
 	gtk_widget_set_sensitive(append_framing, !noreg);
 	gtk_widget_set_sensitive(expand_step, grow && !noreg);
 	gtk_widget_set_sensitive(expand_force, grow && !noreg);
-	update_append_checks(noreg);
+	/* the distortion model, for an undistorted file only (Section 10.4) */
+	gboolean undistorted = append_info && append_info->file.settings.undistorted;
+	gtk_widget_set_visible(disto_label, undistorted);
+	gtk_widget_set_visible(disto, undistorted);
+	gtk_widget_set_sensitive(disto, !noreg);
+	update_append_checks(method);
 	gtk_widget_set_visible(force_reg, append_checks.reusable);
+	/* the switch to inverse weighting, for a file whose weighting still has
+	 * the range of its first batch (Section 10.3) */
+	const lsf_settings *ws = append_info ? &append_info->file.settings : NULL;
+	gboolean can_switch = ws && (ws->weighting == WFWHM_WEIGHT || ws->weighting == NBSTARS_WEIGHT)
+		&& ws->weight_model == LSF_WMODEL_RANGE;
+	gtk_widget_set_visible(weight_inverse, can_switch);
 	GString *text = g_string_new(append_summary ? append_summary : _("Choose a Living Stack file."));
 	if (append_checks.problems)
 		g_string_append_printf(text, "\n%s", append_checks.problems);
 	if (append_checks.note)
 		g_string_append_printf(text, "\n%s", append_checks.note);
+	if (can_switch && siril_toggle_get_active(weight_inverse))
+		g_string_append(text, _("\nThis append switches the file to inverse weighting, for good: the frames already "
+					"merged keep their weights."));
 	gtk_label_set_text(GTK_LABEL(info_label), text->str);
 	g_string_free(text, TRUE);
 	gchar *labelbuffer = g_strdup_printf(_("Appending %d images of the %d of the sequence"),

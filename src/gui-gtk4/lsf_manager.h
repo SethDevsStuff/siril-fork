@@ -16,4 +16,9 @@ gchar *lsf_gui_describe(const lsf_info *info);
 /* a dialog when an LSF job could not replace its file */
 void lsf_gui_report_write(const lsf_job_result *res);
 
+/* plate solving a view of a Living Stack: whether it is undistorted (solved
+ * at order 1), and the offer to write the solution into the file */
+gboolean lsf_gui_view_is_undistorted(void);
+void lsf_gui_offer_view_wcs(void);
+
 #endif

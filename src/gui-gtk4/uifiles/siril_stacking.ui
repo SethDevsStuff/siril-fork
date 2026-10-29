@@ -1325,16 +1325,61 @@ The &lt;b&gt;Generalized Extreme Studentized Deviate Test&lt;/b&gt; algorithm [3
                               </object>
                             </child>
                             <child>
-                              <object class="GtkCheckButton" id="stack_lsf_noreg">
-                                <property name="focusable">1</property>
-                                <property name="label" translatable="yes">The frames are already on the grid of the stack</property>
-                                <property name="tooltip-text" translatable="yes">Skips the registration against the stacked image. The frames must already be registered and resampled onto the exact grid of the Living Stack.</property>
-                                <signal name="toggled" handler="on_stack_lsf_append_option_changed"/>
+                              <object class="GtkLabel">
+                                <property name="halign">end</property>
+                                <property name="label" translatable="yes">Registration:</property>
                                 <layout>
                                   <property name="column">0</property>
                                   <property name="row">2</property>
-                                  <property name="column-span">3</property>
                                 </layout>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="GtkBox">
+                                <property name="spacing">5</property>
+                                <layout>
+                                  <property name="column">1</property>
+                                  <property name="row">2</property>
+                                  <property name="column-span">2</property>
+                                </layout>
+                                <child>
+                                  <object class="GtkDropDown" id="stack_lsf_append_regmethod">
+                                    <property name="model">
+                                      <object class="GtkStringList">
+                                        <items>
+                                          <item translatable="yes">With stars</item>
+                                          <item translatable="yes">Through the WCS</item>
+                                          <item translatable="yes">None, already on the grid</item>
+                                        </items>
+                                      </object>
+                                    </property>
+                                    <property name="selected">0</property>
+                                    <property name="tooltip-text" translatable="yes">How the frames are registered against the stacked image. With stars: Siril's global star alignment. Through the WCS: from the astrometric solution of each frame and of the stack, for frames that share too few stars with it; the frames must be plate-solved, and the Living Stack must have a WCS. None: the frames must already be registered and resampled onto the exact grid of the Living Stack.</property>
+                                    <signal name="notify::selected" handler="on_stack_lsf_append_option_changed"/>
+                                  </object>
+                                </child>
+                                <child>
+                                  <object class="GtkLabel" id="stack_lsf_append_disto_label">
+                                    <property name="label" translatable="yes">Distortion model:</property>
+                                    <property name="visible">0</property>
+                                  </object>
+                                </child>
+                                <child>
+                                  <object class="GtkDropDown" id="stack_lsf_append_disto">
+                                    <property name="model">
+                                      <object class="GtkStringList">
+                                        <items>
+                                          <item translatable="yes">The file's</item>
+                                          <item translatable="yes">Master of the preferences</item>
+                                        </items>
+                                      </object>
+                                    </property>
+                                    <property name="selected">0</property>
+                                    <property name="visible">0</property>
+                                    <property name="tooltip-text" translatable="yes">This Living Stack is undistorted: every append undistorts its frames before merging them. By default with the distortion model stored in the file; the master of the preferences replaces it, for this append and the ones that follow. Another model file can be given with lsf_append -disto=file.</property>
+                                    <signal name="notify::selected" handler="on_stack_lsf_append_option_changed"/>
+                                  </object>
+                                </child>
                               </object>
                             </child>
                             <child>
@@ -1430,6 +1475,20 @@ The &lt;b&gt;Generalized Extreme Studentized Deviate Test&lt;/b&gt; algorithm [3
                                 <layout>
                                   <property name="column">0</property>
                                   <property name="row">5</property>
+                                  <property name="column-span">3</property>
+                                </layout>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="GtkCheckButton" id="stack_lsf_weight_inverse">
+                                <property name="focusable">1</property>
+                                <property name="label" translatable="yes">Switch to inverse weighting from this append</property>
+                                <property name="tooltip-text" translatable="yes">The weights of this Living Stack are scaled between the best and the worst frame of its first batch. Frames beyond that range all get the top weight, or the weight of the worst or the floor, whatever their quality. Inverse weighting has no range: the weight follows the frame's wFWHM (or star count) however good or bad it is. It applies from this append on and cannot be undone. The frames already merged keep their weights, and the new ones are put on the same scale on average.</property>
+                                <property name="visible">0</property>
+                                <signal name="toggled" handler="on_stack_lsf_append_option_changed"/>
+                                <layout>
+                                  <property name="column">0</property>
+                                  <property name="row">7</property>
                                   <property name="column-span">3</property>
                                 </layout>
                               </object>
@@ -1711,6 +1770,70 @@ They can also be added later by an append, and then count from that append on.</
                               <property name="column">0</property>
                               <property name="row">5</property>
                               <property name="column-span">4</property>
+                            </layout>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkLabel" id="stack_lsf_weight_label">
+                            <property name="halign">end</property>
+                            <property name="label" translatable="yes">Weight floor:</property>
+                            <property name="visible">0</property>
+                            <layout>
+                              <property name="column">0</property>
+                              <property name="row">6</property>
+                            </layout>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkSpinButton" id="stack_lsf_weight_floor">
+                            <property name="focusable">1</property>
+                            <property name="digits">3</property>
+                            <property name="visible">0</property>
+                            <property name="tooltip-text" translatable="yes">The least weight a frame gets, where 1 is the best frame of this first batch. Siril gives the worst frame of a stack 0; a Living Stack keeps a little of every frame, because frames of later appends that are worse than this batch's worst would otherwise count for nothing. Stored in the file.</property>
+                            <property name="adjustment">
+                              <object class="GtkAdjustment">
+                                <property name="lower">0.001</property>
+                                <property name="upper">0.5</property>
+                                <property name="step-increment">0.005</property>
+                                <property name="page-increment">0.05</property>
+                                <property name="value">0.01</property>
+                              </object>
+                            </property>
+                            <layout>
+                              <property name="column">1</property>
+                              <property name="row">6</property>
+                            </layout>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkLabel" id="stack_lsf_weight_range_label">
+                            <property name="halign">end</property>
+                            <property name="label" translatable="yes">Range ×:</property>
+                            <property name="visible">0</property>
+                            <layout>
+                              <property name="column">2</property>
+                              <property name="row">6</property>
+                            </layout>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkSpinButton" id="stack_lsf_weight_range">
+                            <property name="focusable">1</property>
+                            <property name="digits">2</property>
+                            <property name="visible">0</property>
+                            <property name="tooltip-text" translatable="yes">The weights are scaled between the best and the worst frame of this first batch, as Siril does, and that range is kept for every later append. A value above 1 widens it toward worse frames, so that later frames a little worse than this batch's worst still get different weights. 1 is Siril's rule. Stored in the file.</property>
+                            <property name="adjustment">
+                              <object class="GtkAdjustment">
+                                <property name="lower">1</property>
+                                <property name="upper">10</property>
+                                <property name="step-increment">0.1</property>
+                                <property name="page-increment">1</property>
+                                <property name="value">1</property>
+                              </object>
+                            </property>
+                            <layout>
+                              <property name="column">3</property>
+                              <property name="row">6</property>
                             </layout>
                           </object>
                         </child>

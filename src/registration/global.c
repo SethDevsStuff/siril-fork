@@ -686,7 +686,7 @@ int register_star_alignment(struct registration_args *regargs) {
 		}
 		regargs->external_ref_rx = ext_fit.rx;
 		regargs->external_ref_ry = ext_fit.ry;
-		if (regargs->undistort) {
+		if (regargs->undistort && !regargs->ext_ref_undistorted) {
 			int status = 1;
 			regargs->disto_ext = init_disto_data_ext(&regargs->distoparam, &ext_fit, &status);
 			if (status) {
@@ -960,7 +960,7 @@ int register_multi_step_global(struct registration_args *regargs) {
 			goto free_all;
 		}
 		int status = 0;
-		if (regargs->undistort) {
+		if (regargs->undistort && !regargs->ext_ref_undistorted) {
 			regargs->disto_ext = init_disto_data_ext(&regargs->distoparam, &ext_fit, &status);
 			status |= disto_correct_stars(ref_stars, regargs->disto_ext);
 				if (status) {

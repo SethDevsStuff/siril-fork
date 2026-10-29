@@ -37,6 +37,7 @@
 #include "io/sequence.h"
 #include "lsf/lsf_commands.h"
 #include "lsf/lsf_fits.h"
+#include "lsf/lsf_settings.h"
 
 static lsf_info *reg_lsf = NULL;	// the file chosen, read by lsf_read_info, or NULL
 static gchar *reg_lsf_problem = NULL;	// why it cannot be used, or NULL
@@ -194,7 +195,8 @@ gboolean lsf_registration_update_widgets(void) {
 		gtk_editable_set_text(ref_entry, path);
 	gtk_widget_set_sensitive(w("reg_reference_checkbutton"), FALSE);
 	gtk_widget_set_sensitive(w("reg_referencefilechooser_box"), FALSE);
-	/* no distortion correction, and no output: the append applies */
+	/* distortion correction follows the file, which lsf_prepare_registration()
+	 * applies with the file's model, and no output: the append applies */
 	GtkDropDown *undistort = GTK_DROP_DOWN(w("comboreg_undistort"));
 	if (gtk_drop_down_get_selected(undistort) != DISTO_UNDEF)
 		gtk_drop_down_set_selected(undistort, DISTO_UNDEF);
@@ -211,6 +213,12 @@ gboolean lsf_registration_update_widgets(void) {
 		g_string_append_printf(text, "%s%s", text->len ? "\n" : "", reg_lsf_problem);
 	if (batch)
 		g_string_append_printf(text, "%s%s", text->len ? "\n" : "", batch);
+	if (reg_lsf && reg_lsf->file.settings.undistorted) {
+		gchar *model = lsf_disto_describe(&reg_lsf->file.settings.disto);
+		g_string_append_printf(text, _("%sThe frames are undistorted with the model of the file, %s, before their "
+					"stars are matched."), text->len ? "\n" : "", model);
+		g_free(model);
+	}
 	if (!fatal)
 		g_string_append_printf(text, "%s%s", text->len ? "\n" : "", _("Only the transforms are computed: the append "
 					"to this Living Stack applies them. Do not apply them before appending."));

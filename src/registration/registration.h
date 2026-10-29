@@ -172,6 +172,7 @@ struct registration_args {
 	unsigned int external_ref_rx, external_ref_ry; // dimensions of the external reference image (for global/apply reg only)
 	framing_roi canvas;	// apply reg with FRAMING_CURRENT: output canvas in the reference's pixels, opencv convention, origin may be negative (w = 0: the reference itself)
 	disto_data *disto_ext;			// undistortion information for an external reference
+	gboolean ext_ref_undistorted;	// the external reference is already undistorted: its stars are not corrected
 };
 
 struct registration_method *new_reg_method(const char *name, registration_function f,

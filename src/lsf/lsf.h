@@ -18,13 +18,24 @@
 #define LSF_EXT_REJ "LSF_REJ"
 #define LSF_EXT_SETTINGS "LSF_SETTINGS"
 #define LSF_EXT_LEDGER "LSF_LEDGER"
+#define LSF_EXT_WREF "LSF_WREF"
 #define LSF_COUNT_MAX 65535
 #define LSF_LOW_STACK_WARN 25
 #define LSF_NEFF_MIN (1.0 + 1e-4)
 #define LSF_EXPAND_STEP 64	// default step of a grid expansion, px per side (Section 10.5)
-/* least wfwhm or nbstars weight before normalization (Section 10.3), 1 being
- * the best frame of the first batch: a frame at or beyond its worst still counts */
+#define LSF_FOCAL_TOLERANCE 0.05	// relative FOCALLEN difference still taken as the same optics (Section 7)
+/* default least wfwhm or nbstars weight before normalization (weight.floor,
+ * Section 10.3), 1 being the best frame of the first batch: a frame at or
+ * beyond its worst still counts */
 #define LSF_WEIGHT_FLOOR 0.01
+
+/* how the frozen wfwhm and nbstars constants scale the frames (weight.model,
+ * Section 10.3): RANGE, Siril's formula between the first batch's best and
+ * worst (its span multiplied by weight.range), a frame beyond them clamped;
+ * INVERSE, unclamped: (best wFWHM / wFWHM)^2, Siril's formula with an
+ * infinite worst, or (stars / most stars)^2. Files start with RANGE, and an
+ * append may switch them to INVERSE. */
+enum { LSF_WMODEL_RANGE, LSF_WMODEL_INVERSE };
 
 /* tile compression of the extension images (Section 5.3): LSF_ACC with
  * GZIP_1 or GZIP_2 and no quantization, the count planes with RICE_1 */
@@ -60,11 +71,13 @@ typedef struct {
 	/* grid */
 	int origin_x, origin_y;		// grid.origin_*, total padding before the data (Section 10.5)
 	int oversample;			// grid.oversample, the drizzle scale: this writer merges onto 1 only
+	gboolean undistorted;		// grid.undistorted: every frame is undistorted before it is merged
 	/* registration */
 	transformation_type transform;	// align.transform
 	opencv_interpolation interpolation;	// align.interpolation
 	int min_pairs;			// align.min_pairs
 	gchar *findstar_json;		// align.findstar
+	disto_params disto;		// align.disto, the distortion model of the appends (undistorted grid only)
 	/* rejection */
 	rejection rej;			// reject.method
 	double sig[2];			// reject.params
@@ -73,6 +86,9 @@ typedef struct {
 	weightingType weighting;	// weight.scheme
 	double noise_norm[3];		// per channel
 	double fwhm_min, fwhm_max, fwhm_norm;
+	int weight_model;		// weight.model, LSF_WMODEL_* (wfwhm and nbstars)
+	double weight_floor;		// weight.floor, the least weight before the norm
+	double weight_range;		// weight.range, multiplier of the first batch's span (1: Siril's)
 	double stars_min, stars_max, stars_norm;
 	/* normalization against a frozen baseline frame */
 	normalization norm;		// norm.method
@@ -88,6 +104,15 @@ typedef struct {
 	GPtrArray *unknown;		// of lsf_setting_row*
 } lsf_settings;
 
+/* LSF_WREF (Section 10.3): the stars of the reference frame of the first
+ * batch, on the grid, frozen. Every frame's wFWHM is measured against them,
+ * so that it does not depend on the batch, the registration or the depth of
+ * the Stack. FITS pixel coordinates of the current grid. */
+typedef struct {
+	int n;
+	double *x, *y;
+} lsf_wref;
+
 /* values from the existing file needed to rewrite it */
 typedef struct {
 	gchar *path;
@@ -96,6 +121,7 @@ typedef struct {
 	int nchan, rx, ry;
 	lsf_settings settings;
 	lsf_history hist;
+	lsf_wref wref;			// LSF_WREF, n = 0 when the file has none
 	fits primary;			// metadata only (no pixels), for the header
 	int ledger_hdu;			// 1-based HDU number of LSF_LEDGER
 	GArray *unknown_hdus;		// of int, 1-based HDU numbers to preserve (C7)
@@ -125,6 +151,7 @@ typedef struct {
 	gchar reg_type[9];
 	double xfrm[9];
 	gchar *align_json;
+	gchar *reg_dist;	// REG_DIST: the SIP cards the frame was undistorted with, or NULL
 	double norm_sc[3], norm_off[3];
 	gchar norm_mth[3][13];
 	double weight[3];

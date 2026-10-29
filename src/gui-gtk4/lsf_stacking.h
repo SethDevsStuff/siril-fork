@@ -10,6 +10,7 @@ void stack_set_image_output_name(const gchar *name);
 void stack_set_lsf_append(const gchar *path);
 void lsf_stacking_start(void);
 void lsf_stacking_update_hist_widgets(void);
+void lsf_stacking_update_weight_widgets(void);
 gboolean lsf_stacking_update_widgets(int stack_method, gboolean can_reframe);
 void lsf_stacking_update_append(gboolean listed);
 void lsf_stacking_invalidate_checks(void);

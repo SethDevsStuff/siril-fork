@@ -57,6 +57,10 @@ struct lsf_cmd_args {
 	gboolean load_result;	// init and append: the new Stack becomes the result image (GUI)
 	gboolean rej_set;	// append: settings.rej and sig override the rejection stored in the file
 	gboolean force_reg;	// append: -reg, register again even with a registration made against the file
+	gboolean wcsreg;	// append: -wcsreg, register through the WCS of the frames and of the Stack (Section 10.4)
+	gboolean weight_inverse;	// append: -weight_model=inverse, from this append on (Section 10.3)
+	disto_params disto;	// append: -disto=, the distortion model of an undistorted grid; DISTO_UNDEF: the file's
+	gchar *wcs_file;	// util: -wcs=, the plate-solved image or .wcs file whose WCS is imported (Section 8)
 	int *image_indices;	// init and append: frames chosen by the GUI's stacking filters, or NULL
 	int nb_images;
 	int max_threads;	// thread budget of the job, com.max_thread by default
@@ -75,7 +79,8 @@ gchar *lsf_check_batch(const lsf_info *info, sequence *seq, gboolean *fatal);
 int lsf_prepare_registration(struct registration_args *regargs, gboolean keep_type, gboolean keep_pairs,
 		gboolean keep_findstar);
 const gchar *lsf_registration_result(const struct registration_args *regargs);
-gboolean lsf_binding_check(const sequence *seq, const lsf_file *f, int *layer, gchar **date, gchar **why);
+gboolean lsf_binding_check(const sequence *seq, const lsf_file *f, const disto_params *model, int *layer,
+		gchar **date, gchar **why);
 gchar *lsf_append_preflight(const lsf_info *info, const char *wd, const char *out, int nb_frames, gboolean noreg,
 		gboolean add_rejmaps, gboolean *fatal);
 gboolean lsf_same_file(const char *p1, const char *p2);

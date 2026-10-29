@@ -14,6 +14,8 @@ struct lsf_batch_args {
 	int *src_index;			// seq index -> src_seq index, or NULL
 	const Homography *xfrm_base;	// init: maps the registration of src_seq onto the grid, or NULL
 	const char *framing;		// framing of the registration ("max", "current"), or NULL
+	const char *reg_method;		// append: "stars" or "wcs" (Section 10.4), NULL for stars
+	const disto_params *disto;	// distortion model the frames were undistorted with, or NULL
 	lsf_settings *settings;
 	lsf_history *hist;		// in: history (may be empty), out: merged
 	gboolean init;			// first batch: freeze the constants
@@ -24,6 +26,7 @@ struct lsf_batch_args {
 	const char *seq_name;
 	GPtrArray *rows;		// out: lsf_ledger_row* of the merged frames
 	fits *primary;			// in/out: header metadata for HDU 0 (built from the reference frame on init)
+	lsf_wref *wref;			// LSF_WREF (Section 10.3), on the current grid: filled on init
 	gboolean keep_seq_file;		// the selection of seq was changed in memory: do not write its .seq file
 	int max_threads;		// thread budget of the merge, at least 1
 	guint64 rejected[3][2], hist_rejected[3][2];

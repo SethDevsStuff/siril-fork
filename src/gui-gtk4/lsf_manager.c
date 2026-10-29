@@ -23,7 +23,9 @@
  * that changes the file goes through the same jobs as the commands. */
 
 #include <string.h>
+#include <glib/gstdio.h>
 
+#include "algos/siril_wcs.h"
 #include "core/processing.h"
 #include "core/proto.h"
 #include "core/siril.h"
@@ -38,6 +40,8 @@
 #include "lsf/lsf.h"
 #include "lsf/lsf_commands.h"
 #include "lsf/lsf_fits.h"
+#include "lsf/lsf_settings.h"
+#include "lsf/lsf_wcs.h"
 
 static lsf_info *info = NULL;		// the file shown, or NULL
 static gboolean stack_edited = FALSE;	// the last check of this file found check 8 failed
@@ -180,7 +184,32 @@ gchar *lsf_gui_describe(const lsf_info *in) {
 	g_free(added);
 	g_free(size);
 	g_free(grid);
-	return msg;
+	/* the WCS, which registration through the WCS needs, and the distortion
+	 * correction of the grid (Section 10.4) */
+	gchar *wcs = has_wcs((fits *) &f->primary) ? lsf_wcs_describe(f->primary.keywords.wcslib, f->rx, f->ry)
+		: g_strdup(_("none"));
+	gchar *more;
+	if (s->undistorted) {
+		gchar *model = lsf_disto_describe(&s->disto);
+		more = g_strdup_printf(_("%s\nWCS: %s. Undistorted grid: every append undistorts its frames, with %s by "
+					"default."), msg, wcs, model);
+		g_free(model);
+	} else more = g_strdup_printf(_("%s\nWCS: %s. Frames are not undistorted."), msg, wcs);
+	g_free(wcs);
+	g_free(msg);
+	/* the weighting, and for wfwhm and nbstars how it scales the frames
+	 * (Section 10.3) */
+	gchar *weights;
+	if (s->weighting == WFWHM_WEIGHT || s->weighting == NBSTARS_WEIGHT) {
+		gchar *scale = s->weight_model == LSF_WMODEL_INVERSE ? g_strdup(_("inverse, no range"))
+			: s->weighting == WFWHM_WEIGHT ? g_strdup_printf(_("range of wFWHM %.2f to %.2f"), s->fwhm_min, s->fwhm_max)
+			: g_strdup_printf(_("range of %.0f to %.0f stars"), s->stars_min, s->stars_max);
+		weights = g_strdup_printf(_("%s\nWeighting %s: %s, floor %g."), more, lsf_weight_name(s->weighting), scale,
+				s->weight_floor);
+		g_free(scale);
+	} else weights = g_strdup_printf(_("%s\nWeighting %s."), more, lsf_weight_name(s->weighting));
+	g_free(more);
+	return weights;
 }
 
 static GtkWidget *w(const char *id) {
@@ -191,9 +220,9 @@ static GtkWidget *w(const char *id) {
  * normalization (Section 10.3), or -1 when the scheme has no floor */
 static double floor_weight(const lsf_settings *s) {
 	if (s->weighting == WFWHM_WEIGHT && s->fwhm_norm > 0.0)
-		return LSF_WEIGHT_FLOOR / s->fwhm_norm;
+		return s->weight_floor / s->fwhm_norm;
 	if (s->weighting == NBSTARS_WEIGHT && s->stars_norm > 0.0)
-		return LSF_WEIGHT_FLOOR / s->stars_norm;
+		return s->weight_floor / s->stars_norm;
 	return -1.0;
 }
 
@@ -303,7 +332,7 @@ static void load_file() {
 
 	gboolean ok = info != NULL;
 	const char *actions[] = { "lsfm_check", "lsfm_compress", "lsfm_compression", "lsfm_copy", "lsfm_export",
-		"lsfm_maps_save" };
+		"lsfm_import_wcs", "lsfm_maps_save" };
 	for (int i = 0; i < (int) G_N_ELEMENTS(actions); i++)
 		gtk_widget_set_sensitive(w(actions[i]), ok);
 	gtk_widget_set_sensitive(w("lsfm_repair"), ok && stack_edited);
@@ -612,6 +641,131 @@ void on_lsfm_export_clicked(GtkButton *button, gpointer user_data) {
 	g_free(pending_out);
 	pending_out = set_right_extension(out);
 	gtk_label_set_text(GTK_LABEL(w("lsfm_result")), _("Working…"));
+	start_job(a);
+}
+
+/* lsf_util -wcs= with a plate-solved image of the stack or a .wcs file */
+void on_lsfm_import_wcs_clicked(GtkButton *button, gpointer user_data) {
+	if (!info || processing_is_job_active())
+		return;
+	SirilFileChooser *fc = siril_fc_open(GTK_WINDOW(w("lsf_manager_dialog")), GTK_FILE_CHOOSER_ACTION_OPEN);
+	siril_fc_set_current_folder_path(fc, com.wd);
+	siril_fc_set_select_multiple(fc, FALSE);
+	siril_fc_add_filter_pattern(fc, _("Plate-solved images and WCS files"),
+			"*.fit;*.fits;*.fts;*.fit.fz;*.fits.fz;*.wcs;*.FIT;*.FITS;*.FTS;*.WCS", TRUE);
+	gchar *file = siril_fc_run(fc) == GTK_RESPONSE_ACCEPT ? siril_fc_get_filename(fc) : NULL;
+	siril_fc_destroy(fc);
+	if (!file)
+		return;
+	struct lsf_cmd_args *a = new_rewrite_args();
+	if (!a) {
+		g_free(file);
+		return;
+	}
+	a->wcs_file = file;
+	start_job(a);
+}
+
+/* ── a WCS solved on a view of the file ────────────────────────────────── */
+
+static gchar *view_wcs_file = NULL;	// the .wcs file written for lsf_util -wcs=
+
+/* Siril removes the solutions it reads back (solve-field's .wcs) unless the
+ * preferences keep them: this .wcs file is such an intermediate, since the
+ * WCS is now in the Living Stack. It is kept when the import failed. */
+static void end_view_wcs(const lsf_job_result *res) {
+	set_cursor_waiting(FALSE);
+	lsf_gui_report_write(res);
+	if (!res->retval && view_wcs_file && !com.pref.astrometry.keep_wcs_files)
+		g_unlink(view_wcs_file);
+	g_clear_pointer(&view_wcs_file, g_free);
+	if (res->retval) {
+		siril_message_dialog(GTK_MESSAGE_ERROR, _("The WCS was not written into the Living Stack"),
+				res->message ? res->message : _("See the log."));
+		return;
+	}
+	/* the view shows the file as it is now, with the WCS it stores */
+	open_single_image(res->path);
+	siril_message_dialog(GTK_MESSAGE_INFO, _("WCS written into the Living Stack"),
+			res->message ? res->message : _("Done."));
+}
+
+static gboolean read_view_info(lsf_info *in) {
+	if (!single_image_is_loaded() || !com.uniq || !com.uniq->is_lsf || !com.uniq->filename)
+		return FALSE;
+	if (lsf_read_info(com.uniq->filename, in)) {
+		lsf_info_free(in);
+		return FALSE;
+	}
+	return TRUE;
+}
+
+/* the image shown is a view of an undistorted Living Stack, whose WCS must
+ * stay linear: the astrometry dialog then solves at order 1 */
+gboolean lsf_gui_view_is_undistorted(void) {
+	lsf_info in;
+	if (!read_view_info(&in))
+		return FALSE;
+	gboolean undistorted = in.file.settings.undistorted;
+	lsf_info_free(&in);
+	return undistorted;
+}
+
+/* After plate solving a view of a Living Stack (the astrometry dialog):
+ * offers to write the solution into the file, through lsf_util -wcs= and a
+ * .wcs file in the working directory. The solution is valid for the file
+ * only if the view kept its geometry: the same LSFUID, size and row order. */
+void lsf_gui_offer_view_wcs(void) {
+	lsf_info in;
+	if (!single_image_is_loaded() || !com.uniq || !com.uniq->is_lsf || !has_wcs(gfit))
+		return;
+	if (!read_view_info(&in)) {
+		siril_message_dialog(GTK_MESSAGE_WARNING, _("The WCS cannot be written into the Living Stack"),
+				_("The file of this view cannot be read as a Living Stack any more."));
+		return;
+	}
+	const char *why = NULL;
+	if (strcmp(in.file.uid, com.uniq->lsf_uid))
+		why = _("The file was replaced by another Living Stack since this view was opened.");
+	else if ((int) gfit->rx != in.file.rx || (int) gfit->ry != in.file.ry)
+		why = _("The view and the Living Stack no longer have the same size: the view was cropped or resized, "
+				"or frames grew the grid since it was opened. Open the file again and solve it.");
+	else if (strcmp(gfit->keywords.row_order, in.file.primary.keywords.row_order))
+		why = _("The view was flipped since it was opened. Open the file again and solve it.");
+	if (why) {
+		siril_message_dialog(GTK_MESSAGE_WARNING, _("The WCS cannot be written into the Living Stack"), (char *) why);
+		lsf_info_free(&in);
+		return;
+	}
+	gchar *base = g_path_get_basename(in.file.path);
+	gchar *msg = g_strdup_printf(_("Write this solution into %s? The stacked image does not change; the file gets a new "
+				"generation, and the view is opened again from it. The solution must be of the view as it was "
+				"opened: not rotated, mirrored or otherwise transformed.%s"), base,
+			in.file.settings.undistorted ? _(" The grid is undistorted: distortion terms are not kept.") : "");
+	gboolean write = siril_confirm_dialog(_("Write the WCS into the Living Stack"), msg, _("Write"));
+	g_free(msg);
+	g_free(base);
+	if (!write || processing_is_job_active()) {
+		lsf_info_free(&in);
+		return;
+	}
+	gchar *stem = lsf_stem(in.file.path), *name = g_strdup_printf("%s.lsf.wcs", stem);
+	g_free(view_wcs_file);
+	view_wcs_file = g_build_filename(com.wd, name, NULL);
+	g_free(stem);
+	g_free(name);
+	struct lsf_cmd_args *a = NULL;
+	if (save_wcs_fits(gfit, view_wcs_file) || !(a = lsf_cmd_args_new(LSF_CMD_UTIL))) {
+		siril_message_dialog(GTK_MESSAGE_ERROR, _("The WCS was not written into the Living Stack"),
+				_("The solution could not be saved to a .wcs file in the working directory."));
+		g_clear_pointer(&view_wcs_file, g_free);
+		lsf_info_free(&in);
+		return;
+	}
+	a->path = g_strdup(in.file.path);
+	a->wcs_file = g_strdup(view_wcs_file);
+	a->end_func = end_view_wcs;
+	lsf_info_free(&in);
 	start_job(a);
 }
 

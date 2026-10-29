@@ -217,6 +217,7 @@ src_files = [
   'lsf/lsf_math.c',
   'lsf/lsf_settings.c',
   'lsf/lsf_stack.c',
+  'lsf/lsf_wcs.c',
   'lsf/lsf_weights.c',
 
   'opencv/opencv.cpp',

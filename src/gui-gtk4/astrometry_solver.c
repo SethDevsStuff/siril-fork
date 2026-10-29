@@ -30,6 +30,7 @@
 #include "gui-gtk4/dialogs.h"
 #include "gui-gtk4/image_display.h"
 #include "gui-gtk4/image_interactions.h"
+#include "gui-gtk4/lsf_manager.h"
 #include "gui-gtk4/message_dialog.h"
 #include "gui-gtk4/progress_and_log.h"
 #include "gui-gtk4/utils.h"
@@ -549,6 +550,10 @@ gboolean end_plate_solver(gpointer p) {
 		} else {
 			redraw(REDRAW_OVERLAY);
 		}
+		/* a view of a Living Stack is never saved: its solution can be
+		 * written into the file instead */
+		if (!args->for_sequence)
+			lsf_gui_offer_view_wcs();
 	}
 	if (args->image_flipped)
 		clear_stars_list(TRUE);
@@ -868,6 +873,8 @@ void on_distomaster_save_button_clicked(GtkButton *button, gpointer user_data) {
 void open_astrometry_dialog() {
 	if (single_image_is_loaded() || sequence_is_loaded()) {
 		initialize_ips_dialog();
+		/* a view of a Living Stack is not flipped after solving */
+		gtk_widget_set_sensitive(GTK_WIDGET(flipbutton), !(single_image_is_loaded() && com.uniq && com.uniq->is_lsf));
 		siril_open_dialog("astrometry_dialog");
 	}
 }
@@ -898,6 +905,19 @@ int fill_plate_solver_structure_from_GUI(struct astrometry_data *args) {
 	}
 	args->downsample = is_downsample_activated();
 	args->trans_order = get_order();
+	/* a view of a Living Stack: its solution is written back into the file
+	 * only if the view keeps the file's pixels, so it is not flipped, and an
+	 * undistorted grid keeps a linear WCS */
+	if (!args->for_sequence && single_image_is_loaded() && com.uniq && com.uniq->is_lsf) {
+		if (args->flip_image)
+			siril_log_message(_("LSF: the view of a Living Stack is not flipped after solving, so that its solution "
+						"can be written into the file\n"));
+		args->flip_image = FALSE;
+		if (args->trans_order > 1 && lsf_gui_view_is_undistorted()) {
+			siril_log_message(_("LSF: the Living Stack is undistorted, it is solved without distortion terms\n"));
+			args->trans_order = 1;
+		}
+	}
 	args->pixel_size = get_pixel();
 	args->focal_length = get_focal();
 	if (is_save_disto_activated())

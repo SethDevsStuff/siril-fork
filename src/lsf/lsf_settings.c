@@ -51,6 +51,66 @@ gboolean lsf_norm_from_name(const char *name, normalization *n) {
 		if (!g_ascii_strcasecmp(norm_names[i], name)) { *n = (normalization) i; return TRUE; }
 	return FALSE;
 }
+/* align.disto: the distortion model of the appends, a file of Siril's
+ * register -disto=file, or the master pattern of -disto=master (JSON:
+ * source and file) */
+gchar *lsf_disto_to_json(const disto_params *d) {
+	yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+	yyjson_mut_val *root = yyjson_mut_obj(doc);
+	yyjson_mut_doc_set_root(doc, root);
+	yyjson_mut_obj_add_str(doc, root, "source", d->index == DISTO_MASTER ? "master" : "file");
+	yyjson_mut_obj_add_str(doc, root, "file", d->filename ? d->filename : "");
+	char *json = yyjson_mut_write(doc, 0, NULL);
+	gchar *out = g_strdup(json ? json : "{}");
+	free(json);
+	yyjson_mut_doc_free(doc);
+	return out;
+}
+
+int lsf_disto_from_json(const char *json, disto_params *d) {
+	yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+	if (!doc) return 1;
+	yyjson_val *root = yyjson_doc_get_root(doc);
+	const char *src = yyjson_get_str(yyjson_obj_get(root, "source"));
+	const char *file = yyjson_get_str(yyjson_obj_get(root, "file"));
+	int ret = !src || !file || (strcmp(src, "master") && strcmp(src, "file"));
+	if (!ret) {
+		g_free(d->filename);
+		d->index = strcmp(src, "master") ? DISTO_FILE : DISTO_MASTER;
+		d->filename = g_strdup(file);
+	}
+	yyjson_doc_free(doc);
+	return ret;
+}
+
+void lsf_disto_copy(disto_params *dst, const disto_params *src) {
+	g_free(dst->filename);
+	dst->index = src->index;
+	dst->filename = g_strdup(src->filename);
+	dst->velocity = src->velocity;
+}
+
+/* how a model is shown, and given back to lsf_append (-disto=) */
+gchar *lsf_disto_describe(const disto_params *d) {
+	if (d->index == DISTO_MASTER)
+		return g_strdup_printf("master (%s)", d->filename ? d->filename : "");
+	if (d->index == DISTO_FILE)
+		return g_strdup_printf("file %s", d->filename ? d->filename : "");
+	return g_strdup("none");
+}
+
+gboolean lsf_disto_same(const disto_params *a, const disto_params *b) {
+	return a->index == b->index && !g_strcmp0(a->filename, b->filename);
+}
+
+static const char *weight_model_names[] = { "range", "inverse" };
+const char *lsf_weight_model_name(int m) { return weight_model_names[m]; }
+gboolean lsf_weight_model_from_name(const char *name, int *m) {
+	for (int i = 0; i < (int) G_N_ELEMENTS(weight_model_names); i++)
+		if (!g_ascii_strcasecmp(weight_model_names[i], name)) { *m = i; return TRUE; }
+	return FALSE;
+}
+
 const char *lsf_weight_name(weightingType w) { return weight_names[w]; }
 gboolean lsf_weight_from_name(const char *name, weightingType *w) {
 	for (int i = 0; i < (int) G_N_ELEMENTS(weight_names); i++)
@@ -86,6 +146,9 @@ void lsf_settings_init(lsf_settings *s) {
 	s->hist_margin = 1.0;
 	s->weighting = NO_WEIGHT;
 	s->fwhm_norm = s->stars_norm = 1.0;
+	s->weight_model = LSF_WMODEL_RANGE;
+	s->weight_floor = LSF_WEIGHT_FLOOR;
+	s->weight_range = 1.0;
 	s->norm = ADDITIVE_SCALING;
 	s->unknown = g_ptr_array_new_with_free_func(lsf_setting_row_free);
 }
@@ -94,9 +157,10 @@ void lsf_settings_free(lsf_settings *s) {
 	g_free(s->findstar_json);
 	g_free(s->filter);
 	g_free(s->created_utc);
+	g_free(s->disto.filename);
 	if (s->unknown)
 		g_ptr_array_free(s->unknown, TRUE);
-	s->findstar_json = s->filter = s->created_utc = NULL;
+	s->findstar_json = s->filter = s->created_utc = s->disto.filename = NULL;
 	s->unknown = NULL;
 }
 
@@ -141,10 +205,13 @@ GPtrArray *lsf_settings_to_rows(const lsf_settings *s, int nchan) {
 	add_int(rows, "grid.oversample", s->oversample);
 	add_int(rows, "grid.origin_x", s->origin_x);
 	add_int(rows, "grid.origin_y", s->origin_y);
+	add_bool(rows, "grid.undistorted", s->undistorted);
 	add_str(rows, "align.transform", transf_names[s->transform < 0 ? HOMOGRAPHY_TRANSFORMATION : s->transform]);
 	add_str(rows, "align.interpolation", interp_names[s->interpolation]);
 	add_int(rows, "align.min_pairs", s->min_pairs);
 	add_row(rows, "align.findstar", "JSON", g_strdup(s->findstar_json ? s->findstar_json : "{}"));
+	if (s->undistorted && s->disto.index != DISTO_UNDEF)
+		add_row(rows, "align.disto", "JSON", lsf_disto_to_json(&s->disto));
 	add_str(rows, "reject.method", lsf_rejection_name(s->rej));
 	gchar *lo = fmt_double(s->sig[0]), *hi = fmt_double(s->sig[1]);
 	add_row(rows, "reject.params", "JSON", g_strdup_printf("{\"low\":%s,\"high\":%s}", lo, hi));
@@ -169,6 +236,12 @@ GPtrArray *lsf_settings_to_rows(const lsf_settings *s, int nchan) {
 		break;
 	default:
 		break;
+	}
+	/* the model, floor and span multiplier of the schemes that freeze a range */
+	if (s->weighting == WFWHM_WEIGHT || s->weighting == NBSTARS_WEIGHT) {
+		add_str(rows, "weight.model", lsf_weight_model_name(s->weight_model));
+		add_flt(rows, "weight.floor", s->weight_floor);
+		add_flt(rows, "weight.range", s->weight_range);
 	}
 	add_str(rows, "norm.method", lsf_norm_name(s->norm));
 	add_str(rows, "norm.estimator", s->lite_norm ? "lite" : "ikss");
@@ -283,6 +356,8 @@ int lsf_settings_from_rows(lsf_settings *s, GPtrArray *rows, int nchan) {
 		}
 		else if (!strcmp(k, "align.min_pairs")) s->min_pairs = atoi(v);
 		else if (!strcmp(k, "align.findstar")) { g_free(s->findstar_json); s->findstar_json = g_strdup(v); }
+		else if (!strcmp(k, "grid.undistorted")) s->undistorted = parse_bool(v);
+		else if (!strcmp(k, "align.disto")) err |= lsf_disto_from_json(v, &s->disto);
 		else if (!strcmp(k, "reject.method")) err |= !lsf_rejection_from_name(v, &s->rej);
 		else if (!strcmp(k, "reject.params")) err |= parse_reject_params(v, s);
 		else if (!strcmp(k, "reject.hist_low")) s->hist_low = g_ascii_strtod(v, NULL);
@@ -293,6 +368,9 @@ int lsf_settings_from_rows(lsf_settings *s, GPtrArray *rows, int nchan) {
 		else if (!strcmp(k, "weight.fwhm_min")) s->fwhm_min = g_ascii_strtod(v, NULL);
 		else if (!strcmp(k, "weight.fwhm_max")) s->fwhm_max = g_ascii_strtod(v, NULL);
 		else if (!strcmp(k, "weight.fwhm_norm")) s->fwhm_norm = g_ascii_strtod(v, NULL);
+		else if (!strcmp(k, "weight.model")) err |= !lsf_weight_model_from_name(v, &s->weight_model);
+		else if (!strcmp(k, "weight.floor")) s->weight_floor = g_ascii_strtod(v, NULL);
+		else if (!strcmp(k, "weight.range")) s->weight_range = g_ascii_strtod(v, NULL);
 		else if (!strcmp(k, "weight.stars_min")) s->stars_min = g_ascii_strtod(v, NULL);
 		else if (!strcmp(k, "weight.stars_max")) s->stars_max = g_ascii_strtod(v, NULL);
 		else if (!strcmp(k, "weight.stars_norm")) s->stars_norm = g_ascii_strtod(v, NULL);
@@ -328,5 +406,29 @@ int lsf_settings_from_rows(lsf_settings *s, GPtrArray *rows, int nchan) {
 					"must be above 0, reject.hist_margin at least 1)\n"));
 		err = 1;
 	}
+	if (!(s->weight_floor > 0.0 && s->weight_floor < 1.0) || !(s->weight_range >= 1.0)) {
+		siril_log_error(_("LSF: the weight settings are not valid (weight.floor must be between 0 and 1, "
+					"weight.range at least 1)\n"));
+		err = 1;
+	}
 	return err;
+}
+
+/* applies the star detection parameters stored in align.findstar to sf */
+void lsf_findstar_from_json(const char *json, star_finder_params *sf) {
+	if (!json) return;
+	yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+	if (!doc) return;
+	yyjson_val *root = yyjson_doc_get_root(doc), *v;
+	if ((v = yyjson_obj_get(root, "radius")) && yyjson_is_num(v)) sf->radius = (int) yyjson_get_num(v);
+	if ((v = yyjson_obj_get(root, "sigma")) && yyjson_is_num(v)) sf->sigma = yyjson_get_num(v);
+	if ((v = yyjson_obj_get(root, "roundness")) && yyjson_is_num(v)) sf->roundness = yyjson_get_num(v);
+	if ((v = yyjson_obj_get(root, "convergence")) && yyjson_is_num(v)) sf->convergence = (int) yyjson_get_num(v);
+	if ((v = yyjson_obj_get(root, "relax_checks")) && yyjson_is_bool(v)) sf->relax_checks = yyjson_get_bool(v);
+	if ((v = yyjson_obj_get(root, "profile")) && yyjson_is_num(v)) sf->profile = (starprofile) (int) yyjson_get_num(v);
+	if ((v = yyjson_obj_get(root, "min_beta")) && yyjson_is_num(v)) sf->min_beta = yyjson_get_num(v);
+	if ((v = yyjson_obj_get(root, "min_A")) && yyjson_is_num(v)) sf->min_A = yyjson_get_num(v);
+	if ((v = yyjson_obj_get(root, "max_A")) && yyjson_is_num(v)) sf->max_A = yyjson_get_num(v);
+	if ((v = yyjson_obj_get(root, "max_r")) && yyjson_is_num(v)) sf->max_r = yyjson_get_num(v);
+	yyjson_doc_free(doc);
 }

@@ -37,6 +37,7 @@
 #include <omp.h>
 #endif
 
+#include "algos/star_finder.h"
 #include "algos/statistics.h"
 #include "core/gui_iface.h"
 #include "core/OS_utils.h"
@@ -52,6 +53,7 @@
 #include "lsf/lsf_math.h"
 #include "lsf/lsf_settings.h"
 #include "lsf/lsf_stack.h"
+#include "lsf/lsf_wcs.h"
 #include "lsf/lsf_weights.h"
 #include "opencv/opencv.h"
 #include "registration/registration.h"
@@ -65,6 +67,7 @@ void lsf_ledger_row_free(gpointer p) {
 	g_free(r->filter);
 	g_free(r->orighdr);
 	g_free(r->align_json);
+	g_free(r->reg_dist);
 	g_free(r);
 }
 
@@ -75,9 +78,16 @@ typedef struct {
 	double *pscale[3], *poffset[3], *pmul[3];
 	double *weight[3];
 	double *sframe[3];	// frame noise in accumulator units (sigma_frame)
+	/* star measures on the grid against LSF_WREF (Section 10.3) */
+	float *fwhm, *wfwhm, *round;
+	int *nstars;
 } batch_frames;
 
 static void free_batch_frames(batch_frames *b) {
+	free(b->fwhm);
+	free(b->wfwhm);
+	free(b->round);
+	free(b->nstars);
 	free(b->idx);
 	for (int c = 0; c < 3; c++) {
 		free(b->pscale[c]); free(b->poffset[c]); free(b->pmul[c]);
@@ -121,7 +131,11 @@ const char *lsf_frame_mismatch(const fits *primary, const fits *frame) {
 		return "XBINNING/YBINNING";
 	if (differ_dbl(p->pixel_size_x, f->pixel_size_x) || differ_dbl(p->pixel_size_y, f->pixel_size_y))
 		return "XPIXSZ/YPIXSZ";
-	if (differ_dbl(p->focal_length, f->focal_length))
+	/* plate solving replaces FOCALLEN with the focal length it measures, a
+	 * few percent from the nominal one; a reducer or another telescope
+	 * differs by much more */
+	if (dbl_known(p->focal_length) && dbl_known(f->focal_length)
+			&& fabs(p->focal_length - f->focal_length) > LSF_FOCAL_TOLERANCE * MAX(p->focal_length, f->focal_length))
 		return "FOCALLEN";
 	if (differ_str(p->instrume, f->instrume))
 		return "INSTRUME";
@@ -214,22 +228,33 @@ static void fill_ledger_row(lsf_ledger_row *r, struct lsf_batch_args *args, cons
 		if (t < SHIFT_TRANSFORMATION) t = SHIFT_TRANSFORMATION;
 	}
 	g_strlcpy(r->reg_type, args->src_seq ? transf[t < 0 ? 3 : t] : "NONE", sizeof r->reg_type);
+	/* the distortion model, as ALIGN names it and as REG_DIST records the
+	 * SIP terms applied (Section 9) */
+	gchar *disto = g_strdup("");
+	if (args->src_seq && args->disto && args->disto->index != DISTO_UNDEF) {
+		g_free(disto);
+		disto = g_strdup_printf(",\"disto\":\"%s\"", args->disto->index == DISTO_MASTER ? "master" : "file");
+		r->reg_dist = lsf_disto_cards(args->disto, (fits *) meta);
+	}
 	if (!args->src_seq)
 		r->align_json = g_strdup("{\"reference\":\"none\"}");
 	else if (args->xfrm_base)
-		r->align_json = g_strdup_printf("{\"reference\":\"sequence\",\"framing\":\"%s\",\"transform\":\"%s\",\"interpolation\":%d}",
-				args->framing ? args->framing : "current", transf[t], args->settings->interpolation);
-	else r->align_json = g_strdup_printf("{\"reference\":\"stack\",\"framing\":\"%s\",\"transform\":\"%s\",\"interpolation\":%d,\"min_pairs\":%d}",
+		r->align_json = g_strdup_printf("{\"reference\":\"sequence\",\"framing\":\"%s\",\"transform\":\"%s\",\"interpolation\":%d%s}",
+				args->framing ? args->framing : "current", transf[t], args->settings->interpolation, disto);
+	else r->align_json = g_strdup_printf("{\"reference\":\"stack\",\"method\":\"%s\",\"framing\":\"%s\",\"transform\":\"%s\","
+				"\"interpolation\":%d,\"min_pairs\":%d%s}", args->reg_method ? args->reg_method : "stars",
 				args->framing ? args->framing : "current", transf[t < 0 ? 3 : t], args->settings->interpolation,
-				args->settings->min_pairs);
+				args->settings->min_pairs, disto);
+	g_free(disto);
 
 	regdata *q = reg ? reg : src_reg;
-	r->fwhm = q ? q->fwhm : NAN;
-	r->wfwhm = q ? q->weighted_fwhm : NAN;
-	r->round = q ? q->roundness : NAN;
 	r->regq = q ? (float) q->quality : NAN;
 	r->regbg = q ? q->background_lvl : NAN;
-	r->nstars = q ? q->number_of_stars : INT_MIN;
+	/* the measures the weights used, on the grid (Section 10.3) */
+	r->fwhm = b->fwhm[k];
+	r->wfwhm = b->wfwhm[k];
+	r->round = b->round[k];
+	r->nstars = b->nstars[k];
 
 	for (int c = 0; c < nchan; c++) {
 		r->norm_sc[c] = b->pscale[c][k] * b->pmul[c][k];
@@ -314,12 +339,187 @@ static double normalize_sample(normalization norm, float v, double pscale, doubl
 	}
 }
 
+/***** star measures against LSF_WREF (Section 10.3) *****/
+
+/* the radius of a star pair: the RANSAC threshold of Siril's star alignment
+ * (defaultRANSACReprojThreshold in opencv.cpp), within which it keeps a pair */
+#define LSF_PAIR_RADIUS 3.0
+
+/* the reference stars where the frame, on the grid, has data: the others
+ * cannot pair, and a frame framed differently would be counted as worse */
+static int count_covered(const fits *fit, int layer, const lsf_wref *ref) {
+	int covered = 0;
+	size_t plane = (size_t) fit->rx * fit->ry * (fit->naxes[2] > 1 ? layer : 0);
+	for (int j = 0; j < ref->n; j++) {
+		/* FITS pixels to the pixel holding them, in FITS order */
+		long px = lround(ref->x[j] - 1.0), py = lround(ref->y[j] - 1.0);
+		if (px < 0 || py < 0 || px >= fit->rx || py >= fit->ry)
+			continue;
+		size_t at = plane + (size_t) py * fit->rx + px;
+		double v = fit->type == DATA_FLOAT ? fit->fdata[at] : fit->data[at];
+		if (v != 0.0 && isfinite(v))
+			covered++;
+	}
+	return covered;
+}
+
+/* the stars of frame i of seq, detected with sf on layer, in Siril
+ * coordinates (FITS order, 0-based), and its FWHM, roundness, and the number
+ * of reference stars where it has data. Returns the number of stars, 0 when
+ * none, -1 on error. */
+static int detect_frame_stars(sequence *seq, int i, struct starfinder_data *sf, int threads, const lsf_wref *ref,
+		double **x, double **y, float *fwhm, float *round, int *covered) {
+	fits fit = { 0 };
+	*x = *y = NULL;
+	if (seq_read_frame(seq, i, &fit, FALSE, -1)) {
+		siril_log_error(_("LSF: could not read frame %d\n"), seq->imgparam[i].filenum);
+		return -1;
+	}
+	*covered = ref ? count_covered(&fit, sf->layer, ref) : 0;
+	psf_star **stars = NULL;
+	int nb = 0;
+	struct starfinder_data *found = findstar_image_worker(sf, -1, i, &fit, NULL, threads);
+	if (found) {
+		stars = *found->stars;
+		nb = *found->nb_stars;
+		free(found);
+	}
+	*fwhm = *round = NAN;
+	if (stars && nb > 0) {
+		float FWHMx, FWHMy, B;
+		char *units;
+		FWHM_stats(stars, nb, seq->bitpix, &FWHMx, &FWHMy, &units, &B, NULL, 0.);
+		*fwhm = FWHMx;
+		*round = FWHMy / FWHMx;
+		*x = malloc(nb * sizeof(double));
+		*y = malloc(nb * sizeof(double));
+		if (!*x || !*y) {
+			PRINT_ALLOC_ERR;
+			nb = -1;
+		}
+		for (int k = 0; k < nb; k++)
+			display_to_siril(stars[k]->xpos, stars[k]->ypos, *x + k, *y + k, fit.ry);
+	} else nb = 0;
+	if (stars)
+		free_fitted_stars(stars);
+	clearfits(&fit);
+	if (nb < 0) {
+		free(*x);
+		free(*y);
+		*x = *y = NULL;
+	}
+	return nb;
+}
+
+/* pairs between a frame's stars and the reference stars, both on the grid,
+ * each reference star used once, within LSF_PAIR_RADIUS */
+static int count_pairs(const double *x, const double *y, int nb, const lsf_wref *ref) {
+	gboolean *used = calloc(ref->n, sizeof(gboolean));
+	if (!used) {
+		PRINT_ALLOC_ERR;
+		return 0;
+	}
+	int pairs = 0;
+	const double r2 = LSF_PAIR_RADIUS * LSF_PAIR_RADIUS;
+	for (int i = 0; i < nb; i++) {
+		int best = -1;
+		double bd = r2;
+		for (int j = 0; j < ref->n; j++) {
+			if (used[j])
+				continue;
+			/* LSF_WREF holds FITS pixels: Siril's coordinates + 0.5 */
+			double dx = ref->x[j] - 0.5 - x[i], dy = ref->y[j] - 0.5 - y[i], dd = dx * dx + dy * dy;
+			if (dd < bd) {
+				bd = dd;
+				best = j;
+			}
+		}
+		if (best >= 0) {
+			used[best] = TRUE;
+			pairs++;
+		}
+	}
+	free(used);
+	return pairs;
+}
+
+/* The star measures of the frames to merge, on the grid, as the weights use
+ * them (Section 10.3). On initialization the stars of the reference frame
+ * become LSF_WREF, frozen. Each frame's wFWHM is Siril's star alignment
+ * formula with the reference stars as reference: 2 FWHM (fitted - pairs) /
+ * fitted + FWHM, fitted being the reference stars where the frame has data,
+ * capped as star alignment caps them. Measured on every frame the same way,
+ * whatever registered it, however deep the Stack is and however it is
+ * framed, so that weights stay comparable across appends. Returns 0, or 1
+ * on error. */
+static int measure_frames(struct lsf_batch_args *args, const int *cand, int nb, batch_frames *b, int threads) {
+	sequence *seq = args->seq;
+	lsf_wref *ref = args->wref;
+	star_finder_params sf = com.pref.starfinder_conf;
+	lsf_findstar_from_json(args->settings->findstar_json, &sf);
+	struct starfinder_data sfd = { 0 };
+	sfd.im.from_seq = seq;
+	sfd.params = &sf;
+	sfd.layer = batch_reg_layer(seq);
+	sfd.keep_stars = TRUE;
+	sfd.max_stars_fitted = MAX_STARS_FITTED;
+	b->fwhm = malloc(nb * sizeof(float));
+	b->wfwhm = malloc(nb * sizeof(float));
+	b->round = malloc(nb * sizeof(float));
+	b->nstars = malloc(nb * sizeof(int));
+	if (!b->fwhm || !b->wfwhm || !b->round || !b->nstars) {
+		PRINT_ALLOC_ERR;
+		return 1;
+	}
+	if (args->init && ref->n == 0) {
+		double *x, *y;
+		float fwhm, round;
+		int covered;
+		int n = detect_frame_stars(seq, args->ref_image, &sfd, threads, NULL, &x, &y, &fwhm, &round, &covered);
+		if (n <= 0) {
+			siril_log_error(_("LSF: no star found in the reference frame %d, the star measures of the frames cannot "
+						"be referred to it\n"), seq->imgparam[args->ref_image].filenum);
+			free(x);
+			free(y);
+			return 1;
+		}
+		for (int k = 0; k < n; k++) {
+			x[k] += 0.5;	// FITS pixels
+			y[k] += 0.5;
+		}
+		ref->n = n;
+		ref->x = x;
+		ref->y = y;
+		siril_log_message(_("LSF: %d stars of the reference frame %d are the reference of the wFWHM of every frame\n"),
+				n, seq->imgparam[args->ref_image].filenum);
+	}
+	gui_iface.set_progress(PROGRESS_RESET, _("LSF: measuring the stars of the frames"));
+	for (int k = 0; k < nb; k++) {
+		double *x, *y;
+		int covered;
+		int n = detect_frame_stars(seq, cand[k], &sfd, threads, ref, &x, &y, &b->fwhm[k], &b->round[k], &covered);
+		if (n < 0)
+			return 1;
+		int pairs = n > 0 ? count_pairs(x, y, n, ref) : 0;
+		free(x);
+		free(y);
+		int fitted = MIN(covered, MAX_STARS_FITTED);
+		b->nstars[k] = n;
+		b->wfwhm[k] = n > 0 && fitted > 0 ? (float) (2.0 * b->fwhm[k] * MAX(fitted - pairs, 0) / fitted + b->fwhm[k]) : 0.f;
+		siril_log_debug("LSF: frame %d, %d stars, %d pairs with the %d reference stars it covers, FWHM %.3f, wFWHM %.3f\n",
+				seq->imgparam[cand[k]].filenum, n, pairs, fitted, b->fwhm[k], b->wfwhm[k]);
+		gui_iface.set_progress((double) (k + 1) / nb, NULL);
+		if (!processing_should_continue())
+			return 1;
+	}
+	return 0;
+}
+
 int lsf_process_batch(struct lsf_batch_args *args) {
 	sequence *seq = args->seq;
 	lsf_settings *s = args->settings;
 	lsf_history *h = args->hist;
 	int nchan = seq->nb_layers;
-	int reglayer = batch_reg_layer(seq);
 	/* norm.rgb_equal equalizes to green: the baseline is frozen per channel,
 	 * so the reference channel cannot follow the registration layer */
 	int rgb_ref = 1;
@@ -467,7 +667,6 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 		free(noise_raw); free(wfwhm); free(nstars); free(cand);
 		goto end;
 	}
-	gboolean has_reg = layer_has_registration(seq, reglayer);
 	for (int k = 0; k < nb; k++) {
 		int i = cand[k];
 		for (int c = 0; c < nchan; c++) {
@@ -496,20 +695,34 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 			b.sframe[c][k] = stats[i][c]->bgnoise * fabs(pscale * pmul);
 			noise_raw[c * nb + k] = lsf_noise_raw_weight(pscale, stats[i][c]->bgnoise);
 		}
-		wfwhm[k] = has_reg ? seq->regparam[reglayer][i].weighted_fwhm : 0.f;
-		nstars[k] = has_reg ? seq->regparam[reglayer][i].number_of_stars : 0;
+	}
+	/* the star measures of the weights, against the frozen reference stars,
+	 * whatever the weighting, so that the ledger's are comparable */
+	if (measure_frames(args, cand, nb, &b, max_threads)) {
+		free(noise_raw); free(wfwhm); free(nstars); free(cand);
+		goto end;
+	}
+	for (int k = 0; k < nb; k++) {
+		wfwhm[k] = b.wfwhm[k];
+		nstars[k] = b.nstars[k];
 	}
 
 	/* 4. weights, with constants frozen from the first batch */
-	if ((s->weighting == WFWHM_WEIGHT || s->weighting == NBSTARS_WEIGHT) && !has_reg) {
-		siril_log_error(_("Sequence does not have registration info, cannot use weighing by %s, aborting\n"),
-				lsf_weight_name(s->weighting));
-		free(noise_raw); free(wfwhm); free(nstars); free(cand);
-		goto end;
-	}
 	if (args->init && lsf_freeze_weights(s, nb, nchan, noise_raw, wfwhm, nstars)) {
 		free(noise_raw); free(wfwhm); free(nstars); free(cand);
 		goto end;
+	}
+	/* a range frozen from the first batch clamps the frames of a batch that
+	 * reach beyond it: they lose their differences, or fall to the floor */
+	int better, worse, floored;
+	if (!args->init && lsf_weight_range_check(s, nb, wfwhm, nstars, &better, &worse, &floored)
+			&& (better > 0 || worse > 0)) {
+		siril_log_warning(_("LSF: %d of the %d frames of this batch are beyond the weighting range frozen from the first "
+					"batch: %d better than its best, which all get the top weight, and %d worse than its worst, "
+					"which all get its weight. %d frames of the batch are at the weight floor. These weights no "
+					"longer follow the frames' quality. Switching the file to the inverse weight model (lsf_append "
+					"-weight_model=inverse) stops this for the next appends\n"), better + worse, nb, better, worse,
+				floored);
 	}
 	int kept = 0;
 	for (int k = 0; k < nb; k++) {
@@ -532,6 +745,10 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 			b.pmul[c][kept] = b.pmul[c][k];
 			b.sframe[c][kept] = b.sframe[c][k];
 		}
+		b.fwhm[kept] = b.fwhm[k];
+		b.wfwhm[kept] = b.wfwhm[k];
+		b.round[kept] = b.round[k];
+		b.nstars[kept] = b.nstars[k];
 		kept++;
 	}
 	free(noise_raw); free(wfwhm); free(nstars); free(cand);

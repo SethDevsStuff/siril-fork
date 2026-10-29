@@ -145,6 +145,59 @@ void lsf_file_free(lsf_file *f) {
 	if (f->unknown_hdus)
 		g_array_free(f->unknown_hdus, TRUE);
 	f->unknown_hdus = NULL;
+	lsf_wref_free(&f->wref);
+}
+
+/* WFWHM, NSTARS and the WEIGHT of the first channel of every ledger row
+ * (Section 9), for a change of the weight model on append. Unknown values
+ * are 0. Returns the number of rows, or -1 on error. */
+long lsf_read_ledger_weights(const lsf_file *f, float **wfwhm, int **nstars, double **weight) {
+	fitsfile *fptr = NULL;
+	int status = 0, cf = 0, cn = 0, cw = 0;
+	long n = f->ledger_rows;
+	*wfwhm = NULL;
+	*nstars = NULL;
+	*weight = NULL;
+	if (n <= 0 || fits_open_diskfile(&fptr, f->path, READONLY, &status))
+		return -1;
+	fits_movabs_hdu(fptr, f->ledger_hdu, NULL, &status);
+	fits_get_colnum(fptr, CASEINSEN, "WFWHM", &cf, &status);
+	fits_get_colnum(fptr, CASEINSEN, "NSTARS", &cn, &status);
+	fits_get_colnum(fptr, CASEINSEN, "WEIGHT", &cw, &status);
+	*wfwhm = calloc(n, sizeof(float));
+	*nstars = calloc(n, sizeof(int));
+	*weight = calloc(n, sizeof(double));
+	if (!status && *wfwhm && *nstars && *weight) {
+		float fnull = 0.f;
+		int inull = 0;
+		double dnull = 0.0;
+		fits_read_col(fptr, TFLOAT, cf, 1, 1, n, &fnull, *wfwhm, NULL, &status);
+		fits_read_col(fptr, TINT, cn, 1, 1, n, &inull, *nstars, NULL, &status);
+		for (long r = 1; r <= n && !status; r++)
+			fits_read_col(fptr, TDOUBLE, cw, r, 1, 1, &dnull, *weight + r - 1, NULL, &status);
+	}
+	int st = 0;
+	fits_close_file(fptr, &st);
+	if (status || !*wfwhm || !*nstars || !*weight) {
+		free(*wfwhm);
+		free(*nstars);
+		free(*weight);
+		*wfwhm = NULL;
+		*nstars = NULL;
+		*weight = NULL;
+		return -1;
+	}
+	for (long r = 0; r < n; r++)
+		if (!isfinite((*wfwhm)[r]))
+			(*wfwhm)[r] = 0.f;
+	return n;
+}
+
+void lsf_wref_free(lsf_wref *w) {
+	free(w->x);
+	free(w->y);
+	w->x = w->y = NULL;
+	w->n = 0;
 }
 
 /* SHA-256 of float32 data as stored in FITS: big-endian, file order, no padding */
@@ -348,7 +401,7 @@ static int open_and_validate(const char *path, lsf_file *f, gboolean tolerate_ed
 	/* check 3: required HDUs, found by name, with consistent dimensions */
 	status = 0;
 	fits_get_num_hdus(fptr, &hdunum, &status);
-	int hdu_acc = 0, hdu_count = 0, hdu_settings = 0, hdu_ledger = 0, hdu_rej = 0;
+	int hdu_acc = 0, hdu_count = 0, hdu_settings = 0, hdu_ledger = 0, hdu_rej = 0, hdu_wref = 0;
 	for (int i = 2; i <= hdunum; i++) {
 		char extname[FLEN_VALUE] = { 0 };
 		status = 0;
@@ -360,6 +413,7 @@ static int open_and_validate(const char *path, lsf_file *f, gboolean tolerate_ed
 		else if (!strcmp(extname, LSF_EXT_SETTINGS)) hdu_settings = i;
 		else if (!strcmp(extname, LSF_EXT_LEDGER)) hdu_ledger = i;
 		else if (!strcmp(extname, LSF_EXT_REJ)) hdu_rej = i;
+		else if (!strcmp(extname, LSF_EXT_WREF)) hdu_wref = i;
 		else if (!strcmp(extname, "LSF_STARS")) {
 			/* the star cache would be stale after this append (Section 10.4) */
 			if (!light)
@@ -369,6 +423,11 @@ static int open_and_validate(const char *path, lsf_file *f, gboolean tolerate_ed
 	}
 	if (!hdu_acc || !hdu_count || !hdu_settings || !hdu_ledger) {
 		ret = validation_failure(3, path, light, problem, _("a required LSF HDU is missing"));
+		goto end;
+	}
+	if (!hdu_wref) {
+		ret = validation_failure(3, path, light, problem, _("the file has no LSF_WREF reference stars, it was written "
+					"before they were required: create it again with lsf_init"));
 		goto end;
 	}
 	f->ledger_hdu = hdu_ledger;
@@ -468,8 +527,10 @@ static int open_and_validate(const char *path, lsf_file *f, gboolean tolerate_ed
 		!strcmp(f->acc_codec, "GZIP_2") ? LSF_COMP_GZIP2 : LSF_COMP_NONE;
 
 	/* check 4: LSFUID and LSFGEN identical across all LSF HDUs */
-	int hdus[] = { 1, hdu_acc, hdu_count, hdu_settings, hdu_ledger, hdu_rej };
-	int nb_hdus = G_N_ELEMENTS(hdus) - (hdu_rej ? 0 : 1);
+	int hdus[7] = { 1, hdu_acc, hdu_count, hdu_settings, hdu_ledger, hdu_wref };
+	int nb_hdus = 6;
+	if (hdu_rej)
+		hdus[nb_hdus++] = hdu_rej;
 	char uid0[FLEN_VALUE] = { 0 };
 	int gen0 = -1;
 	for (int i = 0; i < nb_hdus; i++) {
@@ -491,6 +552,30 @@ static int open_and_validate(const char *path, lsf_file *f, gboolean tolerate_ed
 	}
 	g_strlcpy(f->uid, uid0, sizeof f->uid);
 	f->gen = gen0;
+
+	/* LSF_WREF, the frozen reference stars of the star measures (Section 10.3) */
+	{
+		long n = 0;
+		int cx = 0, cy = 0;
+		status = 0;
+		fits_movabs_hdu(fptr, hdu_wref, NULL, &status);
+		fits_get_num_rows(fptr, &n, &status);
+		fits_get_colnum(fptr, CASEINSEN, "X", &cx, &status);
+		fits_get_colnum(fptr, CASEINSEN, "Y", &cy, &status);
+		if (!status && n > 0) {
+			f->wref.x = malloc(n * sizeof(double));
+			f->wref.y = malloc(n * sizeof(double));
+			if (f->wref.x && f->wref.y) {
+				fits_read_col(fptr, TDOUBLE, cx, 1, 1, n, NULL, f->wref.x, NULL, &status);
+				fits_read_col(fptr, TDOUBLE, cy, 1, 1, n, NULL, f->wref.y, NULL, &status);
+			}
+		}
+		if (status || n <= 0 || !f->wref.x || !f->wref.y) {
+			ret = validation_failure(3, path, light, problem, _("the LSF_WREF table cannot be read or is empty"));
+			goto end;
+		}
+		f->wref.n = (int) n;
+	}
 
 	/* check 5: DATASUM and CHECKSUM on every extension where present */
 	for (int i = 2; i <= hdunum && !light; i++) {
@@ -971,13 +1056,23 @@ static int write_settings_hdu(fitsfile *fptr, const lsf_settings *s, int nchan,
 	return *status;
 }
 
+/* LSF_WREF: the frozen reference stars, X and Y in FITS pixels of the grid */
+static int write_wref_hdu(fitsfile *fptr, const lsf_wref *w, const char *uid, int gen, int *status) {
+	char *ttype[] = { "X", "Y" }, *tform[] = { "1D", "1D" }, *tunit[] = { "pix", "pix" };
+	fits_create_tbl(fptr, BINARY_TBL, 0, 2, ttype, tform, tunit, LSF_EXT_WREF, status);
+	fits_write_col(fptr, TDOUBLE, 1, 1, 1, w->n, w->x, status);
+	fits_write_col(fptr, TDOUBLE, 2, 1, 1, w->n, w->y, status);
+	write_identity(fptr, NULL, uid, gen, status);
+	return *status;
+}
+
 /* ledger columns, Section 9. A '%d' in the form is the plane count P. */
 static const struct { const char *name, *form; } ledger_cols[] = {
 	{ "FRAME_ID", "32A" }, { "BATCH", "J" }, { "GEN", "J" }, { "ADDED_UTC", "24A" },
 	{ "FILENAME", "1PA" }, { "DATE_OBS", "24A" }, { "EXPTIME", "D" }, { "GAIN", "J" },
 	{ "OFFSET", "J" }, { "XBINNING", "J" }, { "YBINNING", "J" }, { "CCD_TEMP", "E" },
 	{ "FILTER", "16A" }, { "ORIGHDR", "1PA" }, { "REG_TYPE", "8A" }, { "REG_XFRM", "9D" },
-	{ "ALIGN", "1PA" }, { "NORM_SC", "%dD" }, { "NORM_OFF", "%dD" }, { "NORM_MTH", "%dA" },
+	{ "ALIGN", "1PA" }, { "REG_DIST", "1PA" }, { "NORM_SC", "%dD" }, { "NORM_OFF", "%dD" }, { "NORM_MTH", "%dA" },
 	{ "WEIGHT", "%dD" }, { "FWHM", "E" }, { "WFWHM", "E" }, { "ROUND", "E" }, { "REGQ", "E" },
 	{ "REGBG", "E" }, { "NSTARS", "J" }, { "BKG_MED", "%dE" }, { "NOISE", "%dE" },
 	{ "NOISE_N", "%dE" }, { "STAT_MEAN", "%dE" }, { "STAT_SIG", "%dE" }, { "STAT_MAD", "%dE" },
@@ -1060,6 +1155,7 @@ static void write_ledger_rows(fitsfile *fptr, GPtrArray *rows, long first_row, i
 		put_str(fptr, "REG_TYPE", row, r->reg_type, status);
 		put(fptr, TDOUBLE, "REG_XFRM", row, 9, r->xfrm, status);
 		put_str(fptr, "ALIGN", row, r->align_json, status);
+		put_str(fptr, "REG_DIST", row, r->reg_dist, status);
 		put(fptr, TDOUBLE, "NORM_SC", row, nchan, r->norm_sc, status);
 		put(fptr, TDOUBLE, "NORM_OFF", row, nchan, r->norm_off, status);
 		{
@@ -1197,7 +1293,7 @@ const char *lsf_compression_name(lsf_compression comp) {
  * file, or NULL on initialization. Returns LSF_WRITE_OK, LSF_WRITE_FAILED,
  * or when the replace fails LSF_WRITE_KEPT_TMP or LSF_WRITE_LEFT_AS_BAK,
  * with what the user should do in replace_msg when it is not NULL. */
-int lsf_write_file(const char *path, lsf_file *old, const lsf_settings *s, lsf_history *h,
+int lsf_write_file(const char *path, lsf_file *old, const lsf_settings *s, lsf_history *h, const lsf_wref *wref,
 		fits *primary, const char *uid, int gen, GPtrArray *new_rows, int batch, gboolean backup,
 		lsf_compression comp, gchar **replace_msg) {
 	int status = 0;
@@ -1348,6 +1444,8 @@ int lsf_write_file(const char *path, lsf_file *old, const lsf_settings *s, lsf_h
 	lsf_settings mirrored = *s;
 	mirrored.rejmaps = has_rej;
 	write_settings_hdu(fptr, &mirrored, nchan, uid, gen, &status);
+	if (wref && wref->n > 0)
+		write_wref_hdu(fptr, wref, uid, gen, &status);
 	if (status) {
 		report_fits_error(status);
 		goto end;
@@ -1471,6 +1569,31 @@ end:
 
 /* removes the LSF keywords that Siril kept as unknown keywords of a header
  * copied from an LSF primary, so a derived image does not claim to be LSF */
+/* the LSFUID of an image read from an LSF file, before lsf_strip_lsf_keys()
+ * removes it; empty when there is none */
+void lsf_read_view_uid(const fits *fit, char *uid, size_t n) {
+	uid[0] = '\0';
+	if (!fit->unknown_keys)
+		return;
+	gchar **cards = g_strsplit(fit->unknown_keys, "\n", -1);
+	for (int i = 0; cards[i] && !uid[0]; i++) {
+		char key[FLEN_KEYWORD], value[FLEN_VALUE], comment[FLEN_COMMENT];
+		int len = 0, status = 0;
+		fits_get_keyname(cards[i], key, &len, &status);
+		if (status || strcmp(key, "LSFUID"))
+			continue;
+		fits_parse_value(cards[i], value, comment, &status);
+		if (!status) {
+			char *v = value[0] == '\'' ? value + 1 : value;
+			char *q = strchr(v, '\'');
+			if (q)
+				*q = '\0';
+			g_strlcpy(uid, g_strstrip(v), n);
+		}
+	}
+	g_strfreev(cards);
+}
+
 void lsf_strip_lsf_keys(fits *fit) {
 	if (!fit->unknown_keys)
 		return;

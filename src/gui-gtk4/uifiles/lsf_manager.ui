@@ -239,14 +239,21 @@
                                 <signal name="clicked" handler="on_lsfm_export_clicked"/>
                               </object>
                             </child>
+                            <child>
+                              <object class="GtkButton" id="lsfm_import_wcs">
+                                <property name="label" translatable="yes">Import a WCS…</property>
+                                <property name="tooltip-text" translatable="yes">Writes into the Living Stack the astrometric solution (WCS) of a plate-solved image of its stack, such as the exported image once plate-solved, or of a .wcs file. It must have the size of the stack. The image itself does not change. Registering frames through their WCS needs it. On an undistorted Living Stack, the distortion terms of the solution are dropped.</property>
+                                <signal name="clicked" handler="on_lsfm_import_wcs_clicked"/>
+                              </object>
+                            </child>
                           </object>
                         </child>
                       </object>
                     </child>
                     <child>
                       <object class="GtkCheckButton" id="lsfm_newfile">
-                        <property name="label" translatable="yes">Save Repair, Adopt and Compression to a new file</property>
-                        <property name="tooltip-text" translatable="yes">Repair, Adopt and Compression rewrite the file. With this, they ask for the name of a new file to write, and the file is left as it was; the dialog then shows the new file. Without it, the file is overwritten. The new file continues the same stack: append to one of the two files only.</property>
+                        <property name="label" translatable="yes">Save Repair, Adopt, Compression and WCS import to a new file</property>
+                        <property name="tooltip-text" translatable="yes">Repair, Adopt, Compression and the WCS import rewrite the file. With this, they ask for the name of a new file to write, and the file is left as it was; the dialog then shows the new file. Without it, the file is overwritten. The new file continues the same stack: append to one of the two files only.</property>
                       </object>
                     </child>
                     <child>

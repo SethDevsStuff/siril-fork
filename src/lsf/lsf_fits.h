@@ -43,6 +43,8 @@ int lsf_history_alloc_rej(lsf_history *h, int first_gen);
 int lsf_history_grow(lsf_history *h, const int pad[4]);
 void lsf_history_free(lsf_history *h);
 void lsf_file_free(lsf_file *f);
+void lsf_wref_free(lsf_wref *w);
+long lsf_read_ledger_weights(const lsf_file *f, float **wfwhm, int **nstars, double **weight);
 int lsf_open_and_validate(const char *path, lsf_file *f, gboolean tolerate_edited_stack);
 int lsf_open_and_validate_msg(const char *path, lsf_file *f, gboolean tolerate_edited_stack, gchar **problem);
 int lsf_read_info(const char *path, lsf_info *info);
@@ -52,11 +54,12 @@ void lsf_ledger_view_free(gpointer p);
 GPtrArray *lsf_read_history(const char *path);
 gchar *lsf_hash_float_data(const float *data, size_t n);
 gchar *lsf_now_utc_iso(void);
-int lsf_write_file(const char *path, lsf_file *old, const lsf_settings *s, lsf_history *h,
+int lsf_write_file(const char *path, lsf_file *old, const lsf_settings *s, lsf_history *h, const lsf_wref *wref,
 		fits *primary, const char *uid, int gen, GPtrArray *new_rows, int batch, gboolean backup,
 		lsf_compression comp, gchar **replace_msg);
 const char *lsf_compression_name(lsf_compression comp);
 int lsf_export_master(const char *lsf_path, const char *out_path);
 void lsf_strip_lsf_keys(fits *fit);
+void lsf_read_view_uid(const fits *fit, char *uid, size_t n);
 
 #endif /* SRC_LSF_LSF_FITS_H_ */

@@ -1291,7 +1291,7 @@ int register_apply_reg(struct registration_args *regargs) {
 		int status = 1, status2 = 0;
 		index = regargs->distoparam.index; // to keep track if DISTO_FILES as if no distorsion is effectively present, it will be set to UNDEF
 		regargs->disto = init_disto_data(&regargs->distoparam, regargs->seq, regargs->WCSDATA, regargs->driz != NULL, &status);
-		if (regargs->use_external_ref) { // we fetch its model to undistort its stars
+		if (regargs->use_external_ref && !regargs->ext_ref_undistorted) { // we fetch its model to undistort its stars
 			fits ext_fit = { 0 };
 			// status intentionally ignored: the external ref was already loaded successfully before
 			(void) read_fits_metadata_from_path_first_HDU(regargs->seq->ext_ref_path, &ext_fit);
