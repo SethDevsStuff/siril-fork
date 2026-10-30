@@ -120,6 +120,14 @@ double lsf_sigma_pred2(weightingType scheme, double W, double M2, double W2, int
 	return s2 * (1.0 + W2 / (W * W));
 }
 
+/* whether the history test applies at a pixel (Section 10.6): its history
+ * holds at least LSF_HIST_MIN_NEFF effective samples. A thinner history
+ * cannot tell an outlier from a bad MEAN, and a bad MEAN that rejects every
+ * later sample would never heal. */
+gboolean lsf_history_testable(double W, double W2) {
+	return W > 0.0 && W2 > 0.0 && W * W / W2 >= LSF_HIST_MIN_NEFF;
+}
+
 /* sigma_hist = margin * max(c * sigma_pred, sigma_frame), sigma_frame alone
  * when sigma_pred is undefined (Section 10.6) */
 double lsf_sigma_hist(double sigma_pred2, double c, double sigma_frame, double margin) {
@@ -222,9 +230,11 @@ void lsf_footprint_init(double box[4]) {
 	box[1] = box[3] = -DBL_MAX;
 }
 
-/* adds the corners of an fx x fy frame transformed by h (row-major 3x3) */
-void lsf_footprint_add(const double h[9], int fx, int fy, double box[4]) {
-	const double cx[4] = { 0.0, fx - 1.0, fx - 1.0, 0.0 }, cy[4] = { 0.0, 0.0, fy - 1.0, fy - 1.0 };
+/* adds the corners of an fx x fy frame transformed by h (row-major 3x3),
+ * inset pixels inside its outer pixel centers */
+void lsf_footprint_add(const double h[9], int fx, int fy, double inset, double box[4]) {
+	const double x0 = inset, x1 = fx - 1.0 - inset, y0 = inset, y1 = fy - 1.0 - inset;
+	const double cx[4] = { x0, x1, x1, x0 }, cy[4] = { y0, y0, y1, y1 };
 	for (int j = 0; j < 4; j++) {
 		double w = h[6] * cx[j] + h[7] * cy[j] + h[8];
 		double x = (h[0] * cx[j] + h[1] * cy[j] + h[2]) / w;
@@ -252,6 +262,58 @@ gboolean lsf_grid_overhang(const double box[4], int rx, int ry, int need[4]) {
 		any |= need[s] > 0;
 	}
 	return any;
+}
+
+/* Frame edges (Section 10.5). The outermost warped pixels of a frame mix its
+ * data with the zero fill around it: the interpolation reaches outside the
+ * frame. They are not data. The margin is the number of samples dropped
+ * inward from each edge, the outermost one included, measured on frames
+ * warped by Siril with the interpolation clamp LSF uses: nearest none,
+ * bilinear, area and Lanczos4 the outermost pixel, bicubic also the next
+ * one, where it overshoots by several percent. */
+int lsf_edge_margin(opencv_interpolation interp) {
+	switch (interp) {
+	case OPENCV_NEAREST:
+	case OPENCV_NONE:
+		return 0;
+	case OPENCV_CUBIC:
+		return 2;
+	default:
+		return 1;
+	}
+}
+
+/* The samples of a frame on an rx x ry grid that count as data: has marks
+ * the non-zero pixels, storage order. On each row y, x from row_lo[y] to
+ * row_hi[y], and on each column x, y from col_lo[x] to col_hi[x]: the data
+ * of the line minus margin samples at each end, empty when lo > hi. An end
+ * at the border of the grid stays: the frame may continue beyond it. A
+ * warped frame meets each row and column once, so interior zeros do not
+ * matter. */
+void lsf_edge_limits(const guint8 *has, int rx, int ry, int margin,
+		int *row_lo, int *row_hi, int *col_lo, int *col_hi) {
+	for (int x = 0; x < rx; x++) {
+		col_lo[x] = ry;
+		col_hi[x] = -1;
+	}
+	for (int y = 0; y < ry; y++) {
+		const guint8 *line = has + (size_t) y * rx;
+		int lo = rx, hi = -1;
+		for (int x = 0; x < rx; x++) {
+			if (!line[x])
+				continue;
+			if (lo == rx) lo = x;
+			hi = x;
+			if (col_lo[x] == ry) col_lo[x] = y;
+			col_hi[x] = y;
+		}
+		row_lo[y] = lo > 0 && lo < rx ? lo + margin : lo;
+		row_hi[y] = hi >= 0 && hi < rx - 1 ? hi - margin : hi;
+	}
+	for (int x = 0; x < rx; x++) {
+		if (col_lo[x] > 0 && col_lo[x] < ry) col_lo[x] += margin;
+		if (col_hi[x] >= 0 && col_hi[x] < ry - 1) col_hi[x] -= margin;
+	}
 }
 
 /* each side grows in multiples of step pixels */

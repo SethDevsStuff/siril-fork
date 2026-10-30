@@ -491,9 +491,12 @@ static sequence *apply_onto_grid(sequence *seq, const lsf_file *f, const struct 
 	seq->distoparam[layer].index = model ? model->index : DISTO_UNDEF;
 	seq->distoparam[layer].filename = model ? g_strdup(model->filename) : NULL;
 
-	/* footprint of the registered frames on the grid */
+	/* footprint of the registered frames on the grid, without the edge
+	 * samples the merge drops: the outermost one lies outside the frame's
+	 * outer pixel centers already, each further one moves the edge in a pixel */
 	double box[4];
 	int first = -1;
+	const double inset = MAX(lsf_edge_margin(s->interpolation) - 1, 0);
 	lsf_footprint_init(box);
 	for (int i = 0; i < seq->number; i++) {
 		const Homography *H = &seq->regparam[layer][i].H;
@@ -501,7 +504,7 @@ static sequence *apply_onto_grid(sequence *seq, const lsf_file *f, const struct 
 			continue;
 		double h[9] = { H->h00, H->h01, H->h02, H->h10, H->h11, H->h12, H->h20, H->h21, H->h22 };
 		lsf_footprint_add(h, seq->is_variable ? seq->imgparam[i].rx : seq->rx,
-				seq->is_variable ? seq->imgparam[i].ry : seq->ry, box);
+				seq->is_variable ? seq->imgparam[i].ry : seq->ry, inset, box);
 		if (first < 0)
 			first = i;
 	}
@@ -961,7 +964,7 @@ static sequence *apply_init_registration(sequence *seq, const struct lsf_cmd_arg
 			cvTransfH(&Hi, &Href, &Hr);	// Href^-1 * Hi
 			double h[9] = { Hr.h00, Hr.h01, Hr.h02, Hr.h10, Hr.h11, Hr.h12, Hr.h20, Hr.h21, Hr.h22 };
 			lsf_footprint_add(h, seq->is_variable ? seq->imgparam[i].rx : seq->rx,
-					seq->is_variable ? seq->imgparam[i].ry : seq->ry, box);
+					seq->is_variable ? seq->imgparam[i].ry : seq->ry, 0.0, box);
 		}
 		lsf_grid_overhang(box, rx, ry, pad);
 	}

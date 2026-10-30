@@ -418,6 +418,8 @@ A pixel outside the grid counts as covered when a transformed frame reaches its 
 - The X and Y of LSF\_WREF get the same shifts as CRPIX1 and CRPIX2, so the reference stars stay on the same sky (Section 10.3).
 - A HISTORY card records the old and new grid size and the padding of each side.
 
+**Frame edges are not data.** The outermost warped pixels of a frame mix its data with the zero fill around it, because the interpolation reaches outside the frame, so their values are attenuated but not 0. The writer does not merge them. On each row and each column of a frame on the grid, it drops a margin of samples inward from the first and the last non-zero pixel: none for nearest-neighbour interpolation, 1 for bilinear, area and Lanczos4, 2 for bicubic, which also overshoots on the next pixel. The margin follows align.interpolation and is not stored. An edge at the border of the grid is kept, since the frame may continue beyond it. The footprint that decides the expansion leaves the same samples out, so a grid never grows for pixels whose data is then dropped. Without this rule, an edge value that a grid expansion moves inside the image would be kept for good by the history test (Section 10.6).
+
 The writer refuses an append that would more than double the grid on either axis in one expansion, since that usually means a wrong registration, unless the user forces it. It also refuses one when a band of the expanded grid, together with the batch's frame buffers, would not fit in the memory it may use (Section 10.10). In both cases the user can crop the batch to the grid instead.
 
 Expansion never shrinks the grid. Cropping is a separate operation, out of scope here.
@@ -427,7 +429,7 @@ Expansion never shrinks the grid. Cropping is a separate operation, out of scope
 Rejection runs in two stages, in this order:
 
 1. **Batch-local rejection.** Siril's existing rejection is run on the batch, unchanged, with reject.method and reject.params. Siril stops rejecting once 4 or fewer samples remain at a pixel, so a batch of 4 frames or fewer gets no batch-local rejection, and only the history test applies.
-2. **History test.** This is the only rejection step that LSF adds. Each surviving sample x of a new frame is compared with the accumulated history. Let σ\_pred be the predicted spread of a new sample about MEAN (Section 10.7). The sample is tested with
+2. **History test.** This is the only rejection step that LSF adds. Each surviving sample x of a new frame is compared with the accumulated history, where it holds enough samples (see "A thin history is not tested" below). Let σ\_pred be the predicted spread of a new sample about MEAN (Section 10.7). The sample is tested with
 
    z = (x − MEAN) / σ\_hist, where σ\_hist = reject.hist\_margin · max(c · σ\_pred, σ\_frame).
 
@@ -448,6 +450,8 @@ A sample is rejected if it fails either stage. The history thresholds are separa
 All three are applied when the test runs. Stored M2 stays the exact sum, so the policy can change later without rewriting any file. They need no stored plane: σ\_frame and the frame's weight are already in the ledger (NOISE, WEIGHT), and c comes from the settings.
 
 Where σ\_pred is undefined (fewer than two effective samples), σ\_hist uses σ\_frame alone.
+
+**A thin history is not tested.** The history test runs only where the history holds at least 5 effective samples, n\_eff = W^2 / W2 (Section 10.7), counted before the batch is merged. This is Siril's own limit: its rejection stops once 4 or fewer samples remain. Elsewhere the samples that survive the batch-local rejection are merged as they are. A few samples cannot tell an outlier from a bad MEAN. When they agree on a wrong value, M2 stays small and every later good sample would be rejected, so the pixel would never heal: edge values that a grid expansion moved inside the image, an outlier in a short first batch, hot pixels. With weights, one heavy sample among light ones counts as about one, however many there are. The limit is a constant of the profile and is not stored. A first batch of fewer than 5 frames therefore leaves its next append untested as well, where nothing else covers its pixels.
 
 ### 10.7 Derived statistics
 

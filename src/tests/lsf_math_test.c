@@ -121,6 +121,19 @@ Test(lsf_math, sigma_hist_floor) {
 	cr_assert_float_eq(lsf_sigma_hist(-1.0, 1.014, 0.03, 1.0), 0.03, 1e-12);
 }
 
+/* Section 10.6, E1 of the edge cases: no history test on fewer than 5
+ * effective samples. Equal weights: n_eff = COUNT. One full weight among
+ * floored ones is about a single sample, however many there are. */
+Test(lsf_math, history_testable) {
+	cr_assert(!lsf_history_testable(0.0, 0.0));
+	cr_assert(!lsf_history_testable(2.0, 2.0));
+	cr_assert(!lsf_history_testable(4.0, 4.0));
+	cr_assert(lsf_history_testable(5.0, 5.0));
+	cr_assert(lsf_history_testable(8.0, 8.0));
+	double W = 1.0 + 10 * 0.01, W2 = 1.0 + 10 * 0.0001;	// n_eff = 1.2
+	cr_assert(!lsf_history_testable(W, W2));
+}
+
 Test(lsf_math, outnorm_range) {
 	float m0[] = { 0.f, 0.2f, 0.5f, 0.9f }, w0[] = { 0.f, 1.f, 1.f, 0.f };
 	float *mean[3] = { m0, NULL, NULL }, *W[3] = { w0, NULL, NULL };
@@ -227,7 +240,7 @@ Test(lsf_math, expansion_shifted_frame) {
 	double h[9] = { 1, 0, 150, 0, 1, -70, 0, 0, 1 }, box[4];
 	int need[4], pad[4];
 	lsf_footprint_init(box);
-	lsf_footprint_add(h, 1600, 1200, box);
+	lsf_footprint_add(h, 1600, 1200, 0.0, box);
 	cr_assert(lsf_grid_overhang(box, 1600, 1200, need));
 	cr_assert_eq(need[LSF_PAD_LEFT], 0);
 	cr_assert_eq(need[LSF_PAD_RIGHT], 150);
@@ -240,7 +253,7 @@ Test(lsf_math, expansion_shifted_frame) {
 
 	lsf_xfrm_shift(h, pad[LSF_PAD_LEFT], pad[LSF_PAD_LAST]);
 	lsf_footprint_init(box);
-	lsf_footprint_add(h, 1600, 1200, box);
+	lsf_footprint_add(h, 1600, 1200, 0.0, box);
 	cr_assert(!lsf_grid_overhang(box, 1600 + 192, 1200 + 128, need));
 }
 
@@ -249,7 +262,7 @@ Test(lsf_math, expansion_other_side) {
 	double h[9] = { 1, 0, -10, 0, 1, 65, 0, 0, 1 }, box[4];
 	int need[4], pad[4];
 	lsf_footprint_init(box);
-	lsf_footprint_add(h, 100, 100, box);
+	lsf_footprint_add(h, 100, 100, 0.0, box);
 	cr_assert(lsf_grid_overhang(box, 100, 100, need));
 	cr_assert_eq(need[LSF_PAD_LEFT], 10);
 	cr_assert_eq(need[LSF_PAD_FIRST], 65);
@@ -264,13 +277,68 @@ Test(lsf_math, expansion_subpixel) {
 	double h[9] = { 1, 0, -0.4, 0, 1, 0.9, 0, 0, 1 }, box[4];
 	int need[4];
 	lsf_footprint_init(box);
-	lsf_footprint_add(h, 100, 100, box);
+	lsf_footprint_add(h, 100, 100, 0.0, box);
 	cr_assert(!lsf_grid_overhang(box, 100, 100, need));
 	h[2] = -1.0;
 	lsf_footprint_init(box);
-	lsf_footprint_add(h, 100, 100, box);
+	lsf_footprint_add(h, 100, 100, 0.0, box);
 	cr_assert(lsf_grid_overhang(box, 100, 100, need));
 	cr_assert_eq(need[LSF_PAD_LEFT], 1);
+}
+
+/* the footprint without the edge samples the merge drops: a frame 1.5 px
+ * beyond the left side reaches the center of one outside pixel, but with
+ * the 1 px inset of bicubic only that of none */
+Test(lsf_math, expansion_inset) {
+	double h[9] = { 1, 0, -1.5, 0, 1, 0, 0, 0, 1 }, box[4];
+	int need[4];
+	lsf_footprint_init(box);
+	lsf_footprint_add(h, 100, 100, 0.0, box);
+	cr_assert(lsf_grid_overhang(box, 100, 100, need));
+	cr_assert_eq(need[LSF_PAD_LEFT], 1);
+	lsf_footprint_init(box);
+	lsf_footprint_add(h, 100, 100, lsf_edge_margin(OPENCV_CUBIC) - 1.0, box);
+	cr_assert(!lsf_grid_overhang(box, 100, 100, need));
+}
+
+Test(lsf_math, edge_margin) {
+	cr_assert_eq(lsf_edge_margin(OPENCV_NEAREST), 0);
+	cr_assert_eq(lsf_edge_margin(OPENCV_NONE), 0);
+	cr_assert_eq(lsf_edge_margin(OPENCV_LINEAR), 1);
+	cr_assert_eq(lsf_edge_margin(OPENCV_AREA), 1);
+	cr_assert_eq(lsf_edge_margin(OPENCV_LANCZOS4), 1);
+	cr_assert_eq(lsf_edge_margin(OPENCV_CUBIC), 2);
+}
+
+/* Section 10.5, E1 of the edge cases: a frame on a 10 x 8 grid with data in
+ * columns 3 to 9 and storage rows 0 to 5 loses 2 samples at its left edge
+ * and its last rows, none at the right side and row 0, which are the border
+ * of the grid. An interior zero changes nothing. */
+Test(lsf_math, edge_limits) {
+	const int rx = 10, ry = 8;
+	guint8 has[80] = { 0 };
+	for (int y = 0; y <= 5; y++)
+		for (int x = 3; x < rx; x++)
+			has[y * rx + x] = 1;
+	has[2 * rx + 6] = 0;
+	int row_lo[8], row_hi[8], col_lo[10], col_hi[10];
+	lsf_edge_limits(has, rx, ry, 2, row_lo, row_hi, col_lo, col_hi);
+	for (int y = 0; y <= 5; y++) {
+		cr_assert_eq(row_lo[y], 5, "row %d", y);
+		cr_assert_eq(row_hi[y], 9, "row %d", y);
+	}
+	for (int y = 6; y < ry; y++)
+		cr_assert(row_lo[y] > row_hi[y], "row %d", y);
+	for (int x = 0; x < 3; x++)
+		cr_assert(col_lo[x] > col_hi[x], "column %d", x);
+	for (int x = 3; x < rx; x++) {
+		cr_assert_eq(col_lo[x], 0, "column %d", x);
+		cr_assert_eq(col_hi[x], 3, "column %d", x);
+	}
+	/* margin 0 keeps every non-zero sample */
+	lsf_edge_limits(has, rx, ry, 0, row_lo, row_hi, col_lo, col_hi);
+	cr_assert_eq(row_lo[0], 3);
+	cr_assert_eq(col_hi[3], 5);
 }
 
 /* the shifted transform maps every point to the old image plus the shift */

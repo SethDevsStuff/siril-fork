@@ -22,6 +22,9 @@
 #define LSF_COUNT_MAX 65535
 #define LSF_LOW_STACK_WARN 25
 #define LSF_NEFF_MIN (1.0 + 1e-4)
+/* the history test runs only where the history holds this many effective
+ * samples (Section 10.6): as Siril's rejection, which stops at 4 */
+#define LSF_HIST_MIN_NEFF 5.0
 #define LSF_EXPAND_STEP 64	// default step of a grid expansion, px per side (Section 10.5)
 #define LSF_FOCAL_TOLERANCE 0.05	// relative FOCALLEN difference still taken as the same optics (Section 7)
 /* default least wfwhm or nbstars weight before normalization (weight.floor,

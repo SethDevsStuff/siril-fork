@@ -17,6 +17,7 @@ void lsf_merge(float *mean_a, float *w_a, float *m2_a, float *w2_a, WORD *c_a,
 void lsf_count_add(WORD *c, int n, gboolean *saturated);
 double lsf_clip_correction(double kl, double kh);
 double lsf_sigma_pred2(weightingType scheme, double W, double M2, double W2, int N, double w_new);
+gboolean lsf_history_testable(double W, double W2);
 double lsf_sigma_hist(double sigma_pred2, double c, double sigma_frame, double margin);
 gboolean lsf_outnorm_range(float *const mean[3], float *const W[3], size_t n, int nchan,
 		double *mini, double *maxi);
@@ -26,8 +27,11 @@ float lsf_stack_value(float mean, float w, gboolean norm, double mini, double ra
 size_t lsf_adopt_plane(float *mean, const float *w, const float *disp, size_t n,
 		gboolean norm, double mini, double maxi, size_t *nonfinite);
 void lsf_footprint_init(double box[4]);
-void lsf_footprint_add(const double h[9], int fx, int fy, double box[4]);
+void lsf_footprint_add(const double h[9], int fx, int fy, double inset, double box[4]);
 gboolean lsf_grid_overhang(const double box[4], int rx, int ry, int need[4]);
+int lsf_edge_margin(opencv_interpolation interp);
+void lsf_edge_limits(const guint8 *has, int rx, int ry, int margin,
+		int *row_lo, int *row_hi, int *col_lo, int *col_hi);
 void lsf_expand_pads(const int need[4], int step, int pad[4]);
 void lsf_xfrm_shift(double h[9], double dx, double dy);
 void lsf_pad_plane(const void *src, void *dst, size_t elsize, int rx, int ry, const int pad[4]);

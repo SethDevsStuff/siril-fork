@@ -81,9 +81,13 @@ typedef struct {
 	/* star measures on the grid against LSF_WREF (Section 10.3) */
 	float *fwhm, *wfwhm, *round;
 	int *nstars;
+	/* the samples that count as data, lsf_edge_limits() of each frame:
+	 * [frame * ry + y] and [frame * rx + x] (Section 10.5) */
+	int *row_lo, *row_hi, *col_lo, *col_hi;
 } batch_frames;
 
 static void free_batch_frames(batch_frames *b) {
+	free(b->row_lo); free(b->row_hi); free(b->col_lo); free(b->col_hi);
 	free(b->fwhm);
 	free(b->wfwhm);
 	free(b->round);
@@ -363,16 +367,40 @@ static int count_covered(const fits *fit, int layer, const lsf_wref *ref) {
 	return covered;
 }
 
+/* lsf_edge_limits() of a frame on the grid, a pixel being data when it is
+ * not 0 in some channel. Returns 0, or 1 on error. */
+static int frame_edge_limits(const fits *fit, int margin, int *row_lo, int *row_hi, int *col_lo, int *col_hi) {
+	size_t n = (size_t) fit->rx * fit->ry;
+	guint8 *has = calloc(n, 1);
+	if (!has) {
+		PRINT_ALLOC_ERR;
+		return 1;
+	}
+	for (int c = 0; c < (int) fit->naxes[2]; c++) {
+		for (size_t p = 0; p < n; p++)
+			has[p] |= fit->type == DATA_FLOAT ? fit->fdata[c * n + p] != 0.f : fit->data[c * n + p] != 0;
+	}
+	lsf_edge_limits(has, fit->rx, fit->ry, margin, row_lo, row_hi, col_lo, col_hi);
+	free(has);
+	return 0;
+}
+
 /* the stars of frame i of seq, detected with sf on layer, in Siril
  * coordinates (FITS order, 0-based), and its FWHM, roundness, and the number
- * of reference stars where it has data. Returns the number of stars, 0 when
- * none, -1 on error. */
+ * of reference stars where it has data. With edges, the edge limits of the
+ * frame for its batch slot k too. Returns the number of stars, 0 when none,
+ * -1 on error. */
 static int detect_frame_stars(sequence *seq, int i, struct starfinder_data *sf, int threads, const lsf_wref *ref,
-		double **x, double **y, float *fwhm, float *round, int *covered) {
+		batch_frames *edges, int k, int margin, double **x, double **y, float *fwhm, float *round, int *covered) {
 	fits fit = { 0 };
 	*x = *y = NULL;
 	if (seq_read_frame(seq, i, &fit, FALSE, -1)) {
 		siril_log_error(_("LSF: could not read frame %d\n"), seq->imgparam[i].filenum);
+		return -1;
+	}
+	if (edges && frame_edge_limits(&fit, margin, edges->row_lo + (size_t) k * fit.ry, edges->row_hi + (size_t) k * fit.ry,
+				edges->col_lo + (size_t) k * fit.rx, edges->col_hi + (size_t) k * fit.rx)) {
+		clearfits(&fit);
 		return -1;
 	}
 	*covered = ref ? count_covered(&fit, sf->layer, ref) : 0;
@@ -451,7 +479,7 @@ static int count_pairs(const double *x, const double *y, int nb, const lsf_wref 
  * capped as star alignment caps them. Measured on every frame the same way,
  * whatever registered it, however deep the Stack is and however it is
  * framed, so that weights stay comparable across appends. Returns 0, or 1
- * on error. */
+ * on error. The edge limits of the frames are found on the way. */
 static int measure_frames(struct lsf_batch_args *args, const int *cand, int nb, batch_frames *b, int threads) {
 	sequence *seq = args->seq;
 	lsf_wref *ref = args->wref;
@@ -467,15 +495,22 @@ static int measure_frames(struct lsf_batch_args *args, const int *cand, int nb, 
 	b->wfwhm = malloc(nb * sizeof(float));
 	b->round = malloc(nb * sizeof(float));
 	b->nstars = malloc(nb * sizeof(int));
-	if (!b->fwhm || !b->wfwhm || !b->round || !b->nstars) {
+	b->row_lo = malloc((size_t) nb * seq->ry * sizeof(int));
+	b->row_hi = malloc((size_t) nb * seq->ry * sizeof(int));
+	b->col_lo = malloc((size_t) nb * seq->rx * sizeof(int));
+	b->col_hi = malloc((size_t) nb * seq->rx * sizeof(int));
+	if (!b->fwhm || !b->wfwhm || !b->round || !b->nstars || !b->row_lo || !b->row_hi || !b->col_lo || !b->col_hi) {
 		PRINT_ALLOC_ERR;
 		return 1;
 	}
+	/* the frames are read here anyway: their edges are found on the way */
+	const int margin = lsf_edge_margin(args->settings->interpolation);
 	if (args->init && ref->n == 0) {
 		double *x, *y;
 		float fwhm, round;
 		int covered;
-		int n = detect_frame_stars(seq, args->ref_image, &sfd, threads, NULL, &x, &y, &fwhm, &round, &covered);
+		int n = detect_frame_stars(seq, args->ref_image, &sfd, threads, NULL, NULL, 0, 0, &x, &y, &fwhm, &round,
+				&covered);
 		if (n <= 0) {
 			siril_log_error(_("LSF: no star found in the reference frame %d, the star measures of the frames cannot "
 						"be referred to it\n"), seq->imgparam[args->ref_image].filenum);
@@ -497,7 +532,8 @@ static int measure_frames(struct lsf_batch_args *args, const int *cand, int nb, 
 	for (int k = 0; k < nb; k++) {
 		double *x, *y;
 		int covered;
-		int n = detect_frame_stars(seq, cand[k], &sfd, threads, ref, &x, &y, &b->fwhm[k], &b->round[k], &covered);
+		int n = detect_frame_stars(seq, cand[k], &sfd, threads, ref, b, k, margin, &x, &y, &b->fwhm[k], &b->round[k],
+				&covered);
 		if (n < 0)
 			return 1;
 		int pairs = n > 0 ? count_pairs(x, y, n, ref) : 0;
@@ -749,6 +785,12 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 		b.wfwhm[kept] = b.wfwhm[k];
 		b.round[kept] = b.round[k];
 		b.nstars[kept] = b.nstars[k];
+		if (kept != k) {
+			memcpy(b.row_lo + (size_t) kept * seq->ry, b.row_lo + (size_t) k * seq->ry, seq->ry * sizeof(int));
+			memcpy(b.row_hi + (size_t) kept * seq->ry, b.row_hi + (size_t) k * seq->ry, seq->ry * sizeof(int));
+			memcpy(b.col_lo + (size_t) kept * seq->rx, b.col_lo + (size_t) k * seq->rx, seq->rx * sizeof(int));
+			memcpy(b.col_hi + (size_t) kept * seq->rx, b.col_hi + (size_t) k * seq->rx, seq->rx * sizeof(int));
+		}
 		kept++;
 	}
 	free(noise_raw); free(wfwhm); free(nstars); free(cand);
@@ -858,7 +900,7 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 	}
 
 	gui_iface.set_progress(PROGRESS_RESET, _("LSF: merging the batch"));
-	guint64 irej[3][2] = { { 0 } }, hrej[3][2] = { { 0 } };
+	guint64 irej[3][2] = { { 0 } }, hrej[3][2] = { { 0 } }, edge_drop[3] = { 0 }, thin[3] = { 0 };
 	int err = 0, done_blocks = 0;
 	gboolean saturated = FALSE, rej_saturated = FALSE;
 	const long rx = naxes[0], ry = naxes[1];
@@ -879,7 +921,7 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 		struct _image_block *blk = blocks + bi;
 		int layer = (int) blk->channel;
 		td->db.layer = layer;
-		guint64 brej[2] = { 0, 0 }, bhrej[2] = { 0, 0 };
+		guint64 brej[2] = { 0, 0 }, bhrej[2] = { 0, 0 }, bedge = 0, bthin = 0;
 		gboolean bsat = FALSE, brsat = FALSE;
 
 		/* read the block from all frames */
@@ -913,11 +955,18 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 		for (long y = 0; y < blk->height; y++) {
 			/* line y of the block is stored at ry - y - 1, as in
 			 * stack_mean_with_rejection(), so the Stack matches Siril's */
-			size_t pdata_idx = (size_t) (ry - (blk->start_row + y) - 1) * rx;
+			const long srow = ry - (blk->start_row + y) - 1;
+			size_t pdata_idx = (size_t) srow * rx;
 			size_t line_idx = (size_t) y * rx;
 			for (long x = 0; x < rx; x++, pdata_idx++) {
 				for (int f = 0; f < nb; f++) {
 					float v = td->pix[f][line_idx + x];
+					/* frame-edge samples are not data (Section 10.5) */
+					size_t r = (size_t) f * ry + srow, c = (size_t) f * rx + x;
+					if (v != 0.f && (x < b.row_lo[r] || x > b.row_hi[r] || srow < b.col_lo[c] || srow > b.col_hi[c])) {
+						v = 0.f;
+						bedge++;
+					}
 					stack[f] = (float) normalize_sample(s->norm, v, b.pscale[layer][f],
 							b.poffset[layer][f], b.pmul[layer][f]);
 				}
@@ -961,13 +1010,14 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 							}
 				}
 				double Wh = w_h[pdata_idx];
+				gboolean testable = lsf_history_testable(Wh, w2_h[pdata_idx]);
 				int n = 0, hlo = 0, hhi = 0;
 				for (int f = 0; f < nb; f++) {
 					float val = o_stack[f];
 					if (!sel[f])
 						continue;
 					double wf = b.weight[layer][f];
-					if (Wh > 0.0) {	// history test, Section 10.6
+					if (testable) {	// history test, Section 10.6
 						double sp2 = lsf_sigma_pred2(s->weighting, Wh, m2_h[pdata_idx],
 								w2_h[pdata_idx], count_h[pdata_idx], wf);
 						double sh = lsf_sigma_hist(sp2, clip_c, b.sframe[layer][f], margin);
@@ -981,6 +1031,8 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 					td->wbufd[n] = wf;
 					n++;
 				}
+				if (!testable && Wh > 0.0)
+					bthin += n;
 				bhrej[0] += hlo;
 				bhrej[1] += hhi;
 				/* both tests count in the rejection maps (Section 5.4) */
@@ -1004,6 +1056,8 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 			irej[layer][1] += brej[1];
 			hrej[layer][0] += bhrej[0];
 			hrej[layer][1] += bhrej[1];
+			edge_drop[layer] += bedge;
+			thin[layer] += bthin;
 			saturated |= bsat;
 			rej_saturated |= brsat;
 			done_blocks++;
@@ -1018,6 +1072,11 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 	h->rej_saturated |= rej_saturated;
 
 	double nb_tot = (double) rx * ry * nb;
+	siril_log_message(_("LSF: %" G_GUINT64_FORMAT " frame-edge samples of channel #0 not merged (%d px at each edge "
+				"of a frame inside the grid)\n"), edge_drop[0], lsf_edge_margin(s->interpolation));
+	if (!args->init)
+		siril_log_message(_("LSF: %" G_GUINT64_FORMAT " samples of channel #0 merged without the history test, "
+					"where the history holds fewer than %g effective samples\n"), thin[0], LSF_HIST_MIN_NEFF);
 	for (int c = 0; c < nchan; c++) {
 		siril_log_message(_("LSF pixel rejection in channel #%d: batch %.3lf%% - %.3lf%%, history %.3lf%% - %.3lf%%\n"),
 				c, irej[c][0] / nb_tot * 100.0, irej[c][1] / nb_tot * 100.0,
