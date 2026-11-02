@@ -22,6 +22,7 @@
  * history, and the lsf_util, lsf_export and lsf_maps jobs on it. Everything
  * that changes the file goes through the same jobs as the commands. */
 
+#include <math.h>
 #include <string.h>
 #include <glib/gstdio.h>
 
@@ -174,11 +175,14 @@ gchar *lsf_gui_describe(const lsf_info *in) {
 	      *added = short_date(in->last_added), *size = g_format_size(in->file_bytes);
 	gchar *grid = s->oversample > 1 ? g_strdup_printf(_("%dx%d grid, drizzled x%d"), f->rx, f->ry, s->oversample) :
 		g_strdup_printf(_("%dx%d grid"), f->rx, f->ry);
-	gchar *msg = g_strdup_printf(_("%ld frames in %d batches, %.1f h of exposure, frames from %s to %s, last appended %s.\n"
-				"%s, %s, filter %s. Compression %s, rejection maps %s, %s."),
-			f->ledger_rows, f->nb_batches, in->exposure / 3600.0, first, last, added, grid,
+	gchar *expmap = f->has_exp ? g_strdup(_("exposure map kept")) : isfinite(f->ledger_exptime) ?
+		g_strdup_printf(_("every frame %g s"), f->ledger_exptime) : g_strdup(_("exposure per pixel unknown"));
+	gchar *msg = g_strdup_printf(_("%ld frames in %d batches, %.1f h of exposure (%s), frames from %s to %s, last "
+				"appended %s.\n%s, %s, filter %s. Compression %s, rejection maps %s, %s."),
+			f->ledger_rows, f->nb_batches, in->exposure / 3600.0, expmap, first, last, added, grid,
 			f->nchan == 3 ? _("colour") : _("mono"), s->filter && s->filter[0] ? s->filter : _("none"),
 			lsf_compression_name(f->compression), s->rejmaps ? _("kept") : _("not kept"), size);
+	g_free(expmap);
 	g_free(first);
 	g_free(last);
 	g_free(added);
@@ -340,6 +344,8 @@ static void load_file() {
 	gboolean rej = ok && info->file.settings.rejmaps;
 	gtk_widget_set_sensitive(w("lsfm_map_rejlo"), rej);
 	gtk_widget_set_sensitive(w("lsfm_map_rejhi"), rej);
+	/* exposure per pixel: the map, or COUNT times the one exposure (Section 10.8) */
+	gtk_widget_set_sensitive(w("lsfm_map_exp"), ok && (info->file.has_exp || isfinite(info->file.ledger_exptime)));
 	if (ok) {
 		gtk_drop_down_set_selected(GTK_DROP_DOWN(w("lsfm_compression")), info->file.compression == LSF_COMP_GZIP2 ? 1 :
 				info->file.compression == LSF_COMP_GZIP1 ? 2 : 0);
@@ -424,7 +430,8 @@ static void end_export(const lsf_job_result *res) {
 static const struct { const char *id, *suffix; guint flag; } map_kinds[] = {
 	{ "lsfm_map_neff", "neff", LSF_MAP_NEFF }, { "lsfm_map_noise", "noise", LSF_MAP_NOISE },
 	{ "lsfm_map_sigma", "sigma", LSF_MAP_SIGMA }, { "lsfm_map_snr", "snr", LSF_MAP_SNR },
-	{ "lsfm_map_rejlo", "rejlo", LSF_MAP_REJLO }, { "lsfm_map_rejhi", "rejhi", LSF_MAP_REJHI }
+	{ "lsfm_map_rejlo", "rejlo", LSF_MAP_REJLO }, { "lsfm_map_rejhi", "rejhi", LSF_MAP_REJHI },
+	{ "lsfm_map_exp", "exp", LSF_MAP_EXP }
 };
 
 static void end_maps(const lsf_job_result *res) {

@@ -32,22 +32,28 @@
 #include <math.h>
 #include <string.h>
 
+#include <glib/gstdio.h>
 #include <gsl/gsl_cdf.h>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
 
+#include "algos/sorting.h"
 #include "algos/star_finder.h"
 #include "algos/statistics.h"
+#include "algos/statistics_float.h"
 #include "core/gui_iface.h"
 #include "core/OS_utils.h"
 #include "core/processing.h"
 #include "core/proto.h"
+#include "core/sequence_filtering.h"
 #include "core/siril.h"
 #include "core/siril_alloc.h"
 #include "core/siril_log.h"
 #include "io/image_format_fits.h"
 #include "io/sequence.h"
+#include "stacking/blending.h"
+#include "stacking/stacking.h"
 #include "lsf/lsf.h"
 #include "lsf/lsf_fits.h"
 #include "lsf/lsf_math.h"
@@ -78,20 +84,42 @@ typedef struct {
 	double *pscale[3], *poffset[3], *pmul[3];
 	double *weight[3];
 	double *sframe[3];	// frame noise in accumulator units (sigma_frame)
+	double *exptime;	// exposure added to the exposure map per sample, 0 when unknown
 	/* star measures on the grid against LSF_WREF (Section 10.3) */
 	float *fwhm, *wfwhm, *round;
 	int *nstars;
+	int *covered;		// reference stars where the frame has data
+	/* data pixels of the frame inside its edge limits, and those where the
+	 * Stack has data too (W > 0), counted for -overlap_norm */
+	long *ndata, *overlap;
+	gboolean overlap_norm;	// normalized on the overlap, with the Stack or between the frames
 	/* the samples that count as data, lsf_edge_limits() of each frame:
 	 * [frame * ry + y] and [frame * rx + x] (Section 10.5) */
 	int *row_lo, *row_hi, *col_lo, *col_hi;
+	/* -overlap_norm on initialization: the mean of each frame in bins of
+	 * bin x bin pixels of the grid, NAN where a bin is not all data, over
+	 * the box of bins holding its data, bbox[4 * frame]: first bin column
+	 * and row, width and height. bins[frame][(c * h + j) * w + i] */
+	int bin, nbinned;
+	float **bins;
+	int *bbox;
 } batch_frames;
 
 static void free_batch_frames(batch_frames *b) {
 	free(b->row_lo); free(b->row_hi); free(b->col_lo); free(b->col_hi);
+	if (b->bins)
+		for (int k = 0; k < b->nbinned; k++)
+			free(b->bins[k]);
+	free(b->bins);
+	free(b->bbox);
 	free(b->fwhm);
 	free(b->wfwhm);
 	free(b->round);
 	free(b->nstars);
+	free(b->covered);
+	free(b->ndata);
+	free(b->overlap);
+	free(b->exptime);
 	free(b->idx);
 	for (int c = 0; c < 3; c++) {
 		free(b->pscale[c]); free(b->poffset[c]); free(b->pmul[c]);
@@ -237,8 +265,16 @@ static void fill_ledger_row(lsf_ledger_row *r, struct lsf_batch_args *args, cons
 	gchar *disto = g_strdup("");
 	if (args->src_seq && args->disto && args->disto->index != DISTO_UNDEF) {
 		g_free(disto);
-		disto = g_strdup_printf(",\"disto\":\"%s\"", args->disto->index == DISTO_MASTER ? "master" : "file");
-		r->reg_dist = lsf_disto_cards(args->disto, (fits *) meta);
+		disto = g_strdup_printf(",\"disto\":\"%s\"", args->disto->index == DISTO_MASTER ? "master" :
+				args->disto->index == DISTO_FILES ? "frames" : "file");
+		if (args->disto->index == DISTO_FILES) {
+			/* the registered frame has the grid's WCS: the source frame
+			 * holds the SIP terms it was undistorted with */
+			fits src_meta = { 0 };
+			if (!seq_read_frame_metadata(src, src_idx, &src_meta))
+				r->reg_dist = lsf_disto_cards(args->disto, &src_meta);
+			clearfits(&src_meta);
+		} else r->reg_dist = lsf_disto_cards(args->disto, (fits *) meta);
 	}
 	if (!args->src_seq)
 		r->align_json = g_strdup("{\"reference\":\"none\"}");
@@ -259,11 +295,14 @@ static void fill_ledger_row(lsf_ledger_row *r, struct lsf_batch_args *args, cons
 	r->wfwhm = b->wfwhm[k];
 	r->round = b->round[k];
 	r->nstars = b->nstars[k];
+	r->feather = args->feather;
 
 	for (int c = 0; c < nchan; c++) {
 		r->norm_sc[c] = b->pscale[c][k] * b->pmul[c][k];
 		r->norm_off[c] = b->poffset[c][k];
-		g_strlcpy(r->norm_mth[c], lsf_norm_name(args->settings->norm), sizeof r->norm_mth[c]);
+		/* "+ovl": against the Stack on the overlap (-overlap_norm) */
+		g_snprintf(r->norm_mth[c], sizeof r->norm_mth[c], "%s%s", lsf_norm_name(args->settings->norm),
+				b->overlap_norm ? "+ovl" : "");
 		r->weight[c] = b->weight[c][k];
 		imstats *st = stats[c];
 		r->bkg_med[c] = st ? (float) st->median : NAN;
@@ -287,10 +326,21 @@ typedef struct {
 	double *wbufd;		// their weights
 	gboolean *sel;		// frame survived the batch-local rejection
 	void *mem;
+	float **mask;		// [frame] feathering weights of the block, NULL without feathering
+	void *mask_mem;
 } lsf_thread_data;
 
-static int alloc_thread_data(lsf_thread_data *t, int nb, size_t block_pix, gboolean ushort_input, rejection rej) {
+static int alloc_thread_data(lsf_thread_data *t, int nb, size_t block_pix, gboolean ushort_input, rejection rej,
+		gboolean masks) {
 	memset(t, 0, sizeof(lsf_thread_data));
+	if (masks) {
+		t->mask = malloc(nb * sizeof(float *));
+		t->mask_mem = siril_malloc((size_t) nb * block_pix * sizeof(float));
+		if (!t->mask || !t->mask_mem)
+			return 1;
+		for (int f = 0; f < nb; f++)
+			t->mask[f] = (float *) t->mask_mem + (size_t) f * block_pix;
+	}
 	t->pix = malloc(nb * sizeof(float *));
 	t->mem = siril_malloc((size_t) nb * block_pix * sizeof(float));
 	t->db.stack = malloc(nb * sizeof(float));
@@ -326,8 +376,113 @@ static int alloc_thread_data(lsf_thread_data *t, int nb, size_t block_pix, gbool
 
 static void free_thread_data(lsf_thread_data *t) {
 	free(t->pix); siril_free(t->mem); free(t->wbuf); free(t->xbuf); free(t->wbufd); free(t->sel);
+	free(t->mask); siril_free(t->mask_mem);
 	free(t->db.stack); free(t->db.o_stack); free(t->db.w_stack); free(t->db.rejected);
 	free(t->db.xf);
+}
+
+/* source coordinate of output pixel i of n in a resize from ns pixels, as
+ * OpenCV's INTER_LINEAR computes it, clamped to the source: the lower pixel
+ * and the weight of the upper one */
+static void resize_coord(int i, int n, int ns, int *lo, int *hi, float *w) {
+	double s = (i + 0.5) * ns / (double) n - 0.5;
+	if (s <= 0.0) {
+		*lo = *hi = 0;
+		*w = 0.f;
+		return;
+	}
+	*lo = (int) s;
+	if (*lo >= ns - 1) {
+		*lo = *hi = ns - 1;
+		*w = 0.f;
+		return;
+	}
+	*hi = *lo + 1;
+	*w = (float) (s - *lo);
+}
+
+/* where each column of a frame falls on its scaled mask, the same for all the
+ * frames and blocks of a batch */
+typedef struct {
+	int *xlo, *xhi;
+	float *xw;
+} feather_columns;
+
+static int feather_columns_init(feather_columns *fc, const sequence *seq) {
+	int srx = 0, sry = 0;
+	compute_downscaled_mask_size(seq->rx, seq->ry, &srx, &sry, NULL, NULL);
+	fc->xlo = malloc(seq->rx * sizeof(int));
+	fc->xhi = malloc(seq->rx * sizeof(int));
+	fc->xw = malloc(seq->rx * sizeof(float));
+	if (!fc->xlo || !fc->xhi || !fc->xw) {
+		PRINT_ALLOC_ERR;
+		return 1;
+	}
+	for (int x = 0; x < seq->rx; x++)
+		resize_coord(x, seq->rx, srx, &fc->xlo[x], &fc->xhi[x], &fc->xw[x]);
+	return 0;
+}
+
+/* the feathering weights of one block of frame idx, from its mask as Siril's
+ * stacking uses it (median_and_mean.c): the distance to the frame's edge,
+ * downscaled, upscaled linearly, ramped over feather. Siril upscales the
+ * rows of each block separately, from truncated bounds, so its weights
+ * depend on how the image is cut in blocks; here each row is interpolated as
+ * the upscale of the whole mask gives it, which is what Siril gives when a
+ * channel is one block, and does not depend on the blocks. Returns 0, or 1
+ * on error. */
+static int read_feather_block(sequence *seq, int idx, const rectangle *area, int feather, const feather_columns *fc,
+		float *out) {
+	int srx = 0, sry = 0;
+	compute_downscaled_mask_size(seq->rx, seq->ry, &srx, &sry, NULL, NULL);
+	const int rx = seq->rx, ry = seq->ry;
+	/* line y of the block is FITS row ry - 1 - (area->y + y); the scaled rows
+	 * those need, in FITS order */
+	int lo, hi, s0, s1;
+	float w;
+	resize_coord(ry - area->y - area->h, ry, sry, &s0, &hi, &w);
+	resize_coord(ry - 1 - area->y, ry, sry, &lo, &s1, &w);
+	rectangle msa = { 0, sry - (s1 + 1), srx, s1 - s0 + 1 };	// top-down, as read_mask_fits_area takes it
+	float *scaled = siril_malloc((size_t) srx * msa.h * sizeof(float));
+	if (!scaled) {
+		PRINT_ALLOC_ERR;
+		return 1;
+	}
+	const int *xlo = fc->xlo, *xhi = fc->xhi;
+	const float *xw = fc->xw;
+	gchar *maskfile = get_sequence_cache_filename(seq, idx, "cache", "msk", NULL);
+	int err = read_mask_fits_area(maskfile, &msa, sry, scaled);	// FITS row s0 first
+	g_free(maskfile);
+	if (err) {
+		siril_log_error(_("Error reading one of the masks areas (%d: %d %d %d %d)\n"), idx + 1, msa.x, msa.y, msa.w, msa.h);
+		siril_free(scaled);
+		return 1;
+	}
+	float invd = 1.f / (float) feather;
+	for (int y = 0; y < area->h; y++) {
+		float wy;
+		resize_coord(ry - 1 - (area->y + y), ry, sry, &lo, &hi, &wy);
+		const float *r0 = scaled + (size_t) (lo - s0) * srx, *r1 = scaled + (size_t) (hi - s0) * srx;
+		float *o = out + (size_t) y * rx;
+		for (int x = 0; x < rx; x++) {
+			float a = r0[xlo[x]] + (r0[xhi[x]] - r0[xlo[x]]) * xw[x];
+			float b = r1[xlo[x]] + (r1[xhi[x]] - r1[xlo[x]]) * xw[x];
+			float v = a + (b - a) * wy;
+			o[x] = v <= 0.f ? 0.f : v > (float) feather ? 1.f : get_ramped_value(v * invd);
+		}
+	}
+	siril_free(scaled);
+	return 0;
+}
+
+/* the feathering masks of a temporary registered batch go with it */
+static void remove_feather_masks(sequence *seq) {
+	for (int i = 0; i < seq->number; i++) {
+		gchar *maskfile = get_sequence_cache_filename(seq, i, "cache", "msk", NULL);
+		if (maskfile)
+			g_unlink(maskfile);
+		g_free(maskfile);
+	}
 }
 
 static double normalize_sample(normalization norm, float v, double pscale, double poffset, double pmul) {
@@ -385,13 +540,100 @@ static int frame_edge_limits(const fits *fit, int margin, int *row_lo, int *row_
 	return 0;
 }
 
+/* a pixel of a frame on the grid that is data: inside its edge limits
+ * (Section 10.5) and not 0 in channel c */
+static gboolean is_data(const fits *fit, int c, size_t x, size_t y, const int *row_lo, const int *row_hi,
+		const int *col_lo, const int *col_hi) {
+	if ((int) x < row_lo[y] || (int) x > row_hi[y] || (int) y < col_lo[x] || (int) y > col_hi[x])
+		return FALSE;
+	size_t at = (size_t) c * fit->rx * fit->ry + y * fit->rx + x;
+	return fit->type == DATA_FLOAT ? fit->fdata[at] != 0.f : fit->data[at] != 0;
+}
+
+/* the data pixels of a frame on the grid, in its first channel, and those
+ * where the Stack has data too (-overlap_norm) */
+static void count_overlap(const fits *fit, const lsf_history *h, const int *row_lo, const int *row_hi,
+		const int *col_lo, const int *col_hi, long *ndata, long *overlap) {
+	long nd = 0, no = 0;
+	const float *W = h->plane[LSF_PL_W][0];
+	for (size_t y = 0; y < fit->ry; y++)
+		for (size_t x = 0; x < fit->rx; x++)
+			if (is_data(fit, 0, x, y, row_lo, row_hi, col_lo, col_hi)) {
+				nd++;
+				no += W[y * fit->rx + x] > 0.f;
+			}
+	*ndata = nd;
+	*overlap = no;
+}
+
+/* the size of the bins of -overlap_norm on initialization: LSF_OVERLAP_BIN
+ * pixels, or larger when the binned frames would take more than a quarter
+ * of the memory Siril may use */
+static int overlap_bin_size(int nb, int nchan, int rx, int ry) {
+	guint64 limit = (guint64) get_max_memory_in_MB() * BYTES_IN_A_MB / 4;
+	int bin = LSF_OVERLAP_BIN;
+	while (bin < 1024 && (guint64) nb * nchan * ((rx + bin - 1) / bin) * ((ry + bin - 1) / bin) * sizeof(float) > limit)
+		bin *= 2;
+	return bin;
+}
+
+/* the bins of frame k on the grid (batch_frames.bins), from its edge limits.
+ * Returns 0, or 1 on error. */
+static int bin_frame(const fits *fit, batch_frames *b, int k) {
+	const int *rlo = b->row_lo + (size_t) k * fit->ry, *rhi = b->row_hi + (size_t) k * fit->ry;
+	const int *clo = b->col_lo + (size_t) k * fit->rx, *chi = b->col_hi + (size_t) k * fit->rx;
+	int x0 = INT_MAX, x1 = -1, y0 = INT_MAX, y1 = -1;
+	for (int y = 0; y < (int) fit->ry; y++)
+		if (rlo[y] <= rhi[y]) {
+			y0 = MIN(y0, y);
+			y1 = y;
+			x0 = MIN(x0, rlo[y]);
+			x1 = MAX(x1, rhi[y]);
+		}
+	int *box = b->bbox + 4 * (size_t) k;
+	if (y1 < 0)
+		return 0;	// no data: no bins
+	const int B = b->bin, nchan = (int) fit->naxes[2];
+	box[0] = x0 / B;
+	box[1] = y0 / B;
+	box[2] = x1 / B - box[0] + 1;
+	box[3] = y1 / B - box[1] + 1;
+	size_t nbins = (size_t) box[2] * box[3];
+	float *out = malloc(nchan * nbins * sizeof(float));
+	if (!out) {
+		PRINT_ALLOC_ERR;
+		return 1;
+	}
+	const size_t plane = (size_t) fit->rx * fit->ry;
+	for (int c = 0; c < nchan; c++)
+		for (int j = 0; j < box[3]; j++)
+			for (int i = 0; i < box[2]; i++) {
+				int px = (box[0] + i) * B, py = (box[1] + j) * B;
+				gboolean full = px + B <= (int) fit->rx && py + B <= (int) fit->ry;
+				double sum = 0.0;
+				for (int y = py; full && y < py + B; y++)
+					for (int x = px; x < px + B; x++) {
+						if (!is_data(fit, c, x, y, rlo, rhi, clo, chi)) {
+							full = FALSE;
+							break;
+						}
+						size_t at = c * plane + (size_t) y * fit->rx + x;
+						sum += fit->type == DATA_FLOAT ? fit->fdata[at] : fit->data[at] * INV_USHRT_MAX_DOUBLE;
+					}
+				out[((size_t) c * box[3] + j) * box[2] + i] = full ? (float) (sum / (B * B)) : NAN;
+			}
+	b->bins[k] = out;
+	return 0;
+}
+
 /* the stars of frame i of seq, detected with sf on layer, in Siril
  * coordinates (FITS order, 0-based), and its FWHM, roundness, and the number
  * of reference stars where it has data. With edges, the edge limits of the
- * frame for its batch slot k too. Returns the number of stars, 0 when none,
- * -1 on error. */
+ * frame for its batch slot k too, and with hist its overlap with the Stack.
+ * Returns the number of stars, 0 when none, -1 on error. */
 static int detect_frame_stars(sequence *seq, int i, struct starfinder_data *sf, int threads, const lsf_wref *ref,
-		batch_frames *edges, int k, int margin, double **x, double **y, float *fwhm, float *round, int *covered) {
+		batch_frames *edges, int k, int margin, const lsf_history *hist, double **x, double **y, float *fwhm,
+		float *round, int *covered) {
 	fits fit = { 0 };
 	*x = *y = NULL;
 	if (seq_read_frame(seq, i, &fit, FALSE, -1)) {
@@ -400,6 +642,14 @@ static int detect_frame_stars(sequence *seq, int i, struct starfinder_data *sf, 
 	}
 	if (edges && frame_edge_limits(&fit, margin, edges->row_lo + (size_t) k * fit.ry, edges->row_hi + (size_t) k * fit.ry,
 				edges->col_lo + (size_t) k * fit.rx, edges->col_hi + (size_t) k * fit.rx)) {
+		clearfits(&fit);
+		return -1;
+	}
+	if (edges && hist)
+		count_overlap(&fit, hist, edges->row_lo + (size_t) k * fit.ry, edges->row_hi + (size_t) k * fit.ry,
+				edges->col_lo + (size_t) k * fit.rx, edges->col_hi + (size_t) k * fit.rx,
+				&edges->ndata[k], &edges->overlap[k]);
+	if (edges && edges->bins && bin_frame(&fit, edges, k)) {
 		clearfits(&fit);
 		return -1;
 	}
@@ -499,9 +749,23 @@ static int measure_frames(struct lsf_batch_args *args, const int *cand, int nb, 
 	b->row_hi = malloc((size_t) nb * seq->ry * sizeof(int));
 	b->col_lo = malloc((size_t) nb * seq->rx * sizeof(int));
 	b->col_hi = malloc((size_t) nb * seq->rx * sizeof(int));
-	if (!b->fwhm || !b->wfwhm || !b->round || !b->nstars || !b->row_lo || !b->row_hi || !b->col_lo || !b->col_hi) {
+	b->covered = malloc(nb * sizeof(int));
+	b->ndata = calloc(nb, sizeof(long));
+	b->overlap = calloc(nb, sizeof(long));
+	if (!b->fwhm || !b->wfwhm || !b->round || !b->nstars || !b->row_lo || !b->row_hi || !b->col_lo || !b->col_hi
+			|| !b->covered || !b->ndata || !b->overlap) {
 		PRINT_ALLOC_ERR;
 		return 1;
+	}
+	if (args->init && args->overlap_norm && args->settings->norm != NO_NORM && nb > 1) {
+		b->bin = overlap_bin_size(nb, seq->nb_layers, seq->rx, seq->ry);
+		b->bins = calloc(nb, sizeof(float *));
+		b->bbox = calloc(4 * (size_t) nb, sizeof(int));
+		if (!b->bins || !b->bbox) {
+			PRINT_ALLOC_ERR;
+			return 1;
+		}
+		b->nbinned = nb;
 	}
 	/* the frames are read here anyway: their edges are found on the way */
 	const int margin = lsf_edge_margin(args->settings->interpolation);
@@ -509,7 +773,7 @@ static int measure_frames(struct lsf_batch_args *args, const int *cand, int nb, 
 		double *x, *y;
 		float fwhm, round;
 		int covered;
-		int n = detect_frame_stars(seq, args->ref_image, &sfd, threads, NULL, NULL, 0, 0, &x, &y, &fwhm, &round,
+		int n = detect_frame_stars(seq, args->ref_image, &sfd, threads, NULL, NULL, 0, 0, NULL, &x, &y, &fwhm, &round,
 				&covered);
 		if (n <= 0) {
 			siril_log_error(_("LSF: no star found in the reference frame %d, the star measures of the frames cannot "
@@ -532,14 +796,15 @@ static int measure_frames(struct lsf_batch_args *args, const int *cand, int nb, 
 	for (int k = 0; k < nb; k++) {
 		double *x, *y;
 		int covered;
-		int n = detect_frame_stars(seq, cand[k], &sfd, threads, ref, b, k, margin, &x, &y, &b->fwhm[k], &b->round[k],
-				&covered);
+		int n = detect_frame_stars(seq, cand[k], &sfd, threads, ref, b, k, margin,
+				args->overlap_norm && !args->init ? args->hist : NULL, &x, &y, &b->fwhm[k], &b->round[k], &covered);
 		if (n < 0)
 			return 1;
 		int pairs = n > 0 ? count_pairs(x, y, n, ref) : 0;
 		free(x);
 		free(y);
 		int fitted = MIN(covered, MAX_STARS_FITTED);
+		b->covered[k] = covered;
 		b->nstars[k] = n;
 		b->wfwhm[k] = n > 0 && fitted > 0 ? (float) (2.0 * b->fwhm[k] * MAX(fitted - pairs, 0) / fitted + b->fwhm[k]) : 0.f;
 		siril_log_debug("LSF: frame %d, %d stars, %d pairs with the %d reference stars it covers, FWHM %.3f, wFWHM %.3f\n",
@@ -549,6 +814,397 @@ static int measure_frames(struct lsf_batch_args *args, const int *cand, int nb, 
 			return 1;
 	}
 	return 0;
+}
+
+/* The exposure map (Section 3) is created by the first commit that merges an
+ * exposure different from the others. Until then it is COUNT times the
+ * exposure every frame had, which the existing pixels get (*backfill, -1 when
+ * the map is not created now). A history holding frames of unknown exposure,
+ * or that mixed exposures before exposure maps existed, cannot get one.
+ * *unknown counts the frames that add 0 s to an existing map because their
+ * exposure is not known. Returns 0, or 1 on error. */
+static int prepare_exposure_map(struct lsf_batch_args *args, const batch_frames *b, const fits *metas,
+		double *backfill, int *unknown) {
+	lsf_history *h = args->hist;
+	sequence *seq = args->seq;
+	*backfill = -1.0;
+	*unknown = 0;
+	if (!h->exp[0]) {
+		/* the exposure the merged frames had: the ledger's, or the first
+		 * known one of the batch */
+		double ref = NAN;
+		if (!args->init)
+			ref = isfinite(args->prev_exptime) ? args->prev_exptime : args->primary->keywords.exposure;
+		gboolean differ = FALSE;
+		for (int k = 0; k < b->nb && !differ; k++) {
+			double e = metas[b->idx[k]].keywords.exposure;
+			if (!dbl_known(e))
+				continue;
+			if (!dbl_known(ref))
+				ref = e;
+			else differ = differ_dbl(e, ref);
+		}
+		if (!differ)
+			return 0;
+		if (!args->init && !isfinite(args->prev_exptime)) {
+			siril_log_warning(_("LSF: the frames of this batch do not all have the exposure of the frames already merged, "
+						"but some of those have no known exposure, or their exposures differed before exposure maps "
+						"existed: the file cannot have an exposure map, and its per-pixel integration time is not "
+						"known\n"));
+			return 0;
+		}
+		if (lsf_history_alloc_exp(h))
+			return 1;
+		if (!args->init) {
+			for (int c = 0; c < h->nchan; c++)
+				lsf_exp_backfill(h->exp[c], h->count[c], (size_t) h->rx * h->ry, args->prev_exptime);
+			*backfill = args->prev_exptime;
+			siril_log_message(_("LSF: the exposures of the frames differ from now on, exposure map created: COUNT x %g s "
+						"for the frames already merged\n"), args->prev_exptime);
+			if (h->count_saturated)
+				siril_log_warning(_("LSF: some counts are saturated, the exposure map is a lower bound there\n"));
+		} else {
+			*backfill = 0.0;
+			siril_log_message(_("LSF: the exposures of the frames differ, exposure map created\n"));
+		}
+	}
+	/* their samples count in the map as 0 s */
+	GString *list = g_string_new(NULL);
+	for (int k = 0; k < b->nb; k++)
+		if (!dbl_known(metas[b->idx[k]].keywords.exposure)) {
+			g_string_append_printf(list, "%s%d", (*unknown)++ ? ", " : "", seq->imgparam[b->idx[k]].filenum);
+		}
+	if (*unknown)
+		siril_log_warning(_("LSF: %d frame(s) of this batch have no known exposure (%s): they are merged, and add "
+					"0 s to the exposure map, which is a lower bound where they contribute\n"), *unknown, list->str);
+	g_string_free(list, TRUE);
+	return 0;
+}
+
+/* median of n values; reorders data */
+static double median_of(float *data, size_t n, int threads) {
+	return histogram_median_float(data, n, threads > 1 ? (threading_type) threads : SINGLE_THREADED);
+}
+
+/* -overlap_norm, for mosaics: the frames of the batch are normalized as
+ * usual, by their global statistics, but against a baseline of the batch
+ * instead of the frozen one. That baseline is the global statistics of the
+ * frame with the largest overlap with the Stack, as its normalization onto
+ * the Stack on that overlap maps them: its data pixels where W > 0 against
+ * MEAN on the same pixels. The frame itself is then normalized onto the
+ * Stack, and the others onto it, which suits a batch showing one panel.
+ *
+ * Only the level comes from the overlap: the offset, the median of MEAN -
+ * the scaled frame, or for mul the factor, the ratio of their medians. The
+ * scale stays the frozen one. Siril's scale is a dispersion, mostly noise,
+ * which compares two frames but not a frame with the Stack, whose noise is
+ * averaged away, and a fit of the frame against MEAN is biased by their
+ * different star profiles. Returns 1 with the baseline in loc and scale, 0
+ * when the overlap is too small, -1 on error. */
+static int overlap_baseline(struct lsf_batch_args *args, const batch_frames *b, const int *cand, int nb,
+		imstats ***stats, int threads, double loc[3], double scale[3]) {
+	lsf_settings *s = args->settings;
+	lsf_history *h = args->hist;
+	sequence *seq = args->seq;
+	int best = 0;
+	for (int k = 1; k < nb; k++)
+		if (b->overlap[k] > b->overlap[best])
+			best = k;
+	int i = cand[best];
+	long ov = b->overlap[best];
+	if (ov < LSF_OVERLAP_MIN_PIX || ov < LSF_OVERLAP_MIN_FRAC * b->ndata[best]) {
+		siril_log_warning(_("LSF: -overlap_norm: the batch overlaps the Stack on %ld pixels at most (frame %d), too few "
+					"to normalize it on the overlap: it is normalized against the frozen baseline\n"), ov,
+				seq->imgparam[i].filenum);
+		return 0;
+	}
+	fits fit = { 0 };
+	if (seq_read_frame(seq, i, &fit, FALSE, -1)) {
+		siril_log_error(_("LSF: could not read frame %d\n"), seq->imgparam[i].filenum);
+		return -1;
+	}
+	size_t npix = (size_t) fit.rx * fit.ry;
+	float *fv = malloc(npix * sizeof(float)), *sv = malloc(npix * sizeof(float)), *tmp = malloc(npix * sizeof(float));
+	int ret = 1;
+	if (!fv || !sv || !tmp) {
+		PRINT_ALLOC_ERR;
+		ret = -1;
+	}
+	const int *rlo = b->row_lo + (size_t) best * fit.ry, *rhi = b->row_hi + (size_t) best * fit.ry;
+	const int *clo = b->col_lo + (size_t) best * fit.rx, *chi = b->col_hi + (size_t) best * fit.rx;
+	for (int c = 0; c < h->nchan && ret == 1; c++) {
+		const float *W = h->plane[LSF_PL_W][c], *M = h->plane[LSF_PL_MEAN][c];
+		size_t n = 0;
+		for (size_t y = 0; y < fit.ry; y++)
+			for (size_t x = 0; x < fit.rx; x++) {
+				size_t p = y * fit.rx + x;
+				if (W[p] > 0.f && is_data(&fit, c, x, y, rlo, rhi, clo, chi)) {
+					size_t at = (size_t) c * npix + p;
+					fv[n] = fit.type == DATA_FLOAT ? fit.fdata[at] : (float) (fit.data[at] * INV_USHRT_MAX_DOUBLE);
+					sv[n] = M[p];
+					n++;
+				}
+			}
+		if (n <= 3) {
+			ret = 0;
+			break;
+		}
+		/* the frame's own estimators, as the normalization uses them, and
+		 * the frozen scale its normalization has */
+		double gl = est_loc(stats[i][c], s->lite_norm), gs = est_scale(stats[i][c], s->lite_norm);
+		int reflayer = s->rgb_equal && h->nchan == 3 ? 1 : c;
+		double a_frozen = gs > 0.0 ? s->base_scale[reflayer] / gs : 1.0;
+		double a = 1.0, off = 0.0;	// normalized = a v + off, on the overlap
+		switch (s->norm) {
+		case ADDITIVE_SCALING:
+			a = a_frozen;
+			/* no break */
+		case ADDITIVE:
+			for (size_t k = 0; k < n; k++)
+				tmp[k] = sv[k] - (float) (a * fv[k]);
+			off = median_of(tmp, n, threads);
+			siril_log_message(_("LSF: overlap normalization, channel %d: frame %d against the Stack on %zu pixels, "
+						"scale %g (frozen), offset %g\n"), c, seq->imgparam[i].filenum, n, a, off);
+			break;
+		case MULTIPLICATIVE:
+		case MULTIPLICATIVE_SCALING: {
+			double mf = median_of(fv, n, threads), ms = median_of(sv, n, threads);
+			if (!(mf > 0.0) || !(ms > 0.0)) {
+				ret = 0;
+				break;
+			}
+			a = ms / mf;
+			siril_log_message(_("LSF: overlap normalization, channel %d: frame %d against the Stack on %zu pixels, "
+						"factor %g\n"), c, seq->imgparam[i].filenum, n, a);
+			break;
+		}
+		default:
+			break;
+		}
+		if (ret != 1)
+			break;
+		/* the baseline that gives the frame this normalization: for
+		 * addscale pscale = scale / gs = a, poffset = a gl - loc = -off; for
+		 * mul pmul = loc / gl = a; for mulscale the frozen scale, and the
+		 * level the rest of the factor */
+		if (s->norm == MULTIPLICATIVE_SCALING) {
+			scale[c] = s->base_scale[reflayer];
+			loc[c] = gl * a / a_frozen;
+		} else {
+			scale[c] = a * gs;
+			loc[c] = s->norm == MULTIPLICATIVE ? gl * a : a * gl + off;
+		}
+	}
+	if (ret == 0)
+		siril_log_warning(_("LSF: -overlap_norm: the overlap of frame %d with the Stack has no usable statistics: the "
+					"batch is normalized against the frozen baseline\n"), seq->imgparam[i].filenum);
+	free(fv);
+	free(sv);
+	free(tmp);
+	clearfits(&fit);
+	return ret;
+}
+
+/* the area two boxes of bins share */
+static long box_intersection(const int *a, const int *b) {
+	long w = MIN(a[0] + a[2], b[0] + b[2]) - MAX(a[0], b[0]);
+	long h = MIN(a[1] + a[3], b[1] + b[3]) - MAX(a[1], b[1]);
+	return w > 0 && h > 0 ? w * h : 0;
+}
+
+/* The levels of n frames from their overlaps: Nij the size of the overlap of
+ * frames i and j, 0 when too small to use, and Mij the level of frame i on it.
+ * Solved all together by Siril's overlap solver, on the frames the overlaps
+ * connect to frame ref, which keeps its level. coeffs gets what to add to each
+ * frame, or with additive FALSE what to multiply it by, nothing changing for
+ * the others; reached says which frames were connected. Returns the number of
+ * frames matched, ref not counted, or -1 on error. */
+int lsf_solve_levels(int n, int ref, size_t **Nij, double **Mij, gboolean additive, double *coeffs, gboolean *reached) {
+	int *frames = malloc(n * sizeof(int)), *index = malloc(n * sizeof(int));
+	size_t **subN = malloc(n * sizeof(size_t *)), *Nmem = malloc((size_t) n * n * sizeof(size_t));
+	double **subM = malloc(n * sizeof(double *)), *Mmem = malloc((size_t) n * n * sizeof(double));
+	double *x = malloc(n * sizeof(double));
+	int m = 0;
+	if (!frames || !index || !subN || !Nmem || !subM || !Mmem || !x) {
+		PRINT_ALLOC_ERR;
+		m = -1;
+		goto end;
+	}
+	for (int i = 0; i < n; i++) {
+		coeffs[i] = additive ? 0.0 : 1.0;
+		reached[i] = FALSE;
+	}
+	frames[m++] = ref;
+	reached[ref] = TRUE;
+	for (int q = 0; q < m; q++)
+		for (int j = 0; j < n; j++)
+			if (!reached[j] && Nij[frames[q]][j] > 0) {
+				reached[j] = TRUE;
+				frames[m++] = j;
+			}
+	if (m > 1) {
+		for (int i = 0; i < m; i++) {
+			subN[i] = Nmem + (size_t) i * m;
+			subM[i] = Mmem + (size_t) i * m;
+			for (int j = 0; j < m; j++) {
+				subN[i][j] = Nij[frames[i]][frames[j]];
+				subM[i][j] = Mij[frames[i]][frames[j]];
+			}
+			if (i > 0)
+				index[i - 1] = i;
+		}
+		solve_overlap_coeffs(m, index, 0, subN, subM, additive, x);
+		for (int i = 1; i < m; i++)
+			if (isfinite(x[i - 1]) && (additive || x[i - 1] > 0.0))
+				coeffs[frames[i]] = x[i - 1];
+	}
+	m--;
+end:
+	free(frames); free(index); free(subN); free(Nmem); free(subM); free(Mmem); free(x);
+	return m;
+}
+
+/* -overlap_norm on initialization, for a first batch of several panels.
+ * The frames are normalized by their global statistics against the
+ * reference frame, as usual, which leaves panels of different content at
+ * different levels; their levels are then matched where they overlap, as an
+ * append matches a batch to the Stack. Each pair of frames gives the median of
+ * each on the bins of batch_frames they share, all channels being data, and
+ * Siril's overlap solver takes them all together. The scale stays the frame's
+ * own, for the reasons given at overlap_baseline(). The coefficients of the
+ * frames are changed in place. Returns the number of frames matched, -1 on
+ * error. */
+static int match_batch_levels(struct lsf_batch_args *args, batch_frames *b, int nb, int threads) {
+	const lsf_settings *s = args->settings;
+	sequence *seq = args->seq;
+	const int nchan = seq->nb_layers, B = b->bin;
+	gboolean additive = s->norm == ADDITIVE || s->norm == ADDITIVE_SCALING;
+	size_t *Nmem = calloc((size_t) nb * nb, sizeof(size_t));
+	size_t **Nij = malloc(nb * sizeof(size_t *));
+	double *Mmem = calloc((size_t) nchan * nb * nb, sizeof(double));
+	double **Mrows = malloc((size_t) nchan * nb * sizeof(double *));
+	long *ndata = calloc(nb, sizeof(long));
+	double *coeffs = malloc(nb * sizeof(double));
+	gboolean *reached = malloc(nb * sizeof(gboolean));
+	int matched = -1;
+	if (!Nmem || !Nij || !Mmem || !Mrows || !ndata || !coeffs || !reached) {
+		PRINT_ALLOC_ERR;
+		goto end;
+	}
+	for (int i = 0; i < nb; i++)
+		Nij[i] = Nmem + (size_t) i * nb;
+	for (size_t i = 0; i < (size_t) nchan * nb; i++)
+		Mrows[i] = Mmem + i * nb;
+	size_t maxbins = 1;
+	int ref = 0;
+	for (int k = 0; k < nb; k++) {
+		const size_t fbins = (size_t) b->bbox[4 * k + 2] * b->bbox[4 * k + 3];
+		maxbins = MAX(maxbins, fbins);
+		if (b->idx[k] == args->ref_image)
+			ref = k;
+		for (size_t p = 0; b->bins[k] && p < fbins; p++) {
+			gboolean full = TRUE;
+			for (int c = 0; c < nchan; c++)
+				full = full && isfinite(b->bins[k][c * fbins + p]);
+			ndata[k] += full;
+		}
+	}
+	const long min_bins = MAX(LSF_OVERLAP_MIN_PIX / (B * B), 4);
+	gboolean failed = FALSE;
+#ifdef _OPENMP
+#pragma omp parallel num_threads(threads) if (threads > 1)
+#endif
+	{
+		size_t *pi = malloc(maxbins * sizeof(size_t)), *pj = malloc(maxbins * sizeof(size_t));
+		float *vi = malloc(maxbins * sizeof(float)), *vj = malloc(maxbins * sizeof(float));
+		if (!pi || !pj || !vi || !vj) {
+			PRINT_ALLOC_ERR;
+#ifdef _OPENMP
+#pragma omp atomic write
+#endif
+			failed = TRUE;
+		}
+#ifdef _OPENMP
+#pragma omp for schedule(dynamic)
+#endif
+		for (int i = 0; i < nb; i++) {
+			if (!pi || !pj || !vi || !vj || !b->bins[i])
+				continue;
+			const int *bi = b->bbox + 4 * (size_t) i;
+			const size_t fi = (size_t) bi[2] * bi[3];
+			for (int j = i + 1; j < nb; j++) {
+				const int *bj = b->bbox + 4 * (size_t) j;
+				if (!b->bins[j] || !box_intersection(bi, bj))
+					continue;
+				const size_t fj = (size_t) bj[2] * bj[3];
+				/* the bins they share */
+				size_t n = 0;
+				for (int y = MAX(bi[1], bj[1]); y < MIN(bi[1] + bi[3], bj[1] + bj[3]); y++)
+					for (int x = MAX(bi[0], bj[0]); x < MIN(bi[0] + bi[2], bj[0] + bj[2]); x++) {
+						size_t ai = (size_t) (y - bi[1]) * bi[2] + (x - bi[0]);
+						size_t aj = (size_t) (y - bj[1]) * bj[2] + (x - bj[0]);
+						gboolean full = TRUE;
+						for (int c = 0; c < nchan && full; c++)
+							full = isfinite(b->bins[i][c * fi + ai]) && isfinite(b->bins[j][c * fj + aj]);
+						if (full) {
+							pi[n] = ai;
+							pj[n] = aj;
+							n++;
+						}
+					}
+				if ((long) n < min_bins || n < LSF_OVERLAP_MIN_FRAC * MAX(ndata[i], ndata[j]))
+					continue;
+				Nij[i][j] = Nij[j][i] = n;
+				for (int c = 0; c < nchan; c++) {
+					const double psi = b->pscale[c][i], poi = b->poffset[c][i], pmi = b->pmul[c][i];
+					const double psj = b->pscale[c][j], poj = b->poffset[c][j], pmj = b->pmul[c][j];
+					for (size_t k = 0; k < n; k++) {
+						double v = b->bins[i][c * fi + pi[k]], w = b->bins[j][c * fj + pj[k]];
+						vi[k] = (float) (additive ? v * psi - poi : v * psi * pmi);
+						vj[k] = (float) (additive ? w * psj - poj : w * psj * pmj);
+					}
+					Mrows[(size_t) c * nb + i][j] = median_of(vi, n, 1);
+					Mrows[(size_t) c * nb + j][i] = median_of(vj, n, 1);
+				}
+			}
+		}
+		free(pi); free(pj); free(vi); free(vj);
+	}
+	if (failed)
+		goto end;
+	for (int c = 0; c < nchan; c++) {
+		matched = lsf_solve_levels(nb, ref, Nij, Mrows + (size_t) c * nb, additive, coeffs, reached);
+		if (matched < 0)
+			goto end;
+		double lo = DBL_MAX, hi = -DBL_MAX;
+		for (int k = 0; k < nb; k++) {
+			if (!reached[k] || k == ref)
+				continue;
+			if (additive)
+				b->poffset[c][k] -= coeffs[k];
+			else b->pmul[c][k] *= coeffs[k];
+			lo = MIN(lo, coeffs[k]);
+			hi = MAX(hi, coeffs[k]);
+		}
+		if (matched > 0)
+			siril_log_message(additive ? _("LSF: overlap normalization of the batch, channel %d: %d frames matched to "
+						"the others where they overlap, offsets %g to %g\n") : _("LSF: overlap normalization of "
+						"the batch, channel %d: %d frames matched to the others where they overlap, factors %g "
+						"to %g\n"), c, matched, lo, hi);
+	}
+	if (matched < nb - 1) {
+		GString *few = g_string_new(NULL);
+		for (int k = 0; k < nb; k++)
+			if (!reached[k])
+				g_string_append_printf(few, "%s%d", few->len ? ", " : "", seq->imgparam[b->idx[k]].filenum);
+		siril_log_warning(_("LSF: -overlap_norm: %d frame(s) (%s) do not overlap the reference frame or the frames "
+					"connected to it enough to be matched there, and keep their normalization by their global "
+					"statistics\n"), nb - 1 - matched, few->str);
+		g_string_free(few, TRUE);
+	}
+end:
+	free(Nmem); free(Nij); free(Mmem); free(Mrows); free(ndata); free(coeffs); free(reached);
+	return matched;
 }
 
 int lsf_process_batch(struct lsf_batch_args *args) {
@@ -570,7 +1226,8 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 	struct _image_block *blocks = NULL;
 	int nb_threads = 1;
 	const int max_threads = MAX(args->max_threads, 1);	// the budget of the job, not com.max_thread
-	gboolean opened = FALSE;
+	gboolean opened = FALSE, masks_made = FALSE;
+	feather_columns fcols = { 0 };
 	fits refmeta = { 0 };
 	struct stacking_args rargs = { 0 };	// rejection arguments for apply_rejection_float()
 
@@ -692,10 +1349,11 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 		b.weight[c] = malloc(nb * sizeof(double));
 		b.sframe[c] = malloc(nb * sizeof(double));
 	}
+	b.exptime = malloc(nb * sizeof(double));
 	double *noise_raw = malloc(nchan * nb * sizeof(double));
 	float *wfwhm = malloc(nb * sizeof(float));
 	int *nstars = malloc(nb * sizeof(int));
-	gboolean alloc_ok = b.idx && noise_raw && wfwhm && nstars;
+	gboolean alloc_ok = b.idx && b.exptime && noise_raw && wfwhm && nstars;
 	for (int c = 0; c < nchan; c++)
 		alloc_ok = alloc_ok && b.pscale[c] && b.poffset[c] && b.pmul[c] && b.weight[c] && b.sframe[c];
 	if (!alloc_ok) {
@@ -703,24 +1361,76 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 		free(noise_raw); free(wfwhm); free(nstars); free(cand);
 		goto end;
 	}
+	/* the star measures of the weights, against the frozen reference stars,
+	 * whatever the weighting, so that the ledger's are comparable */
+	if (measure_frames(args, cand, nb, &b, max_threads)) {
+		free(noise_raw); free(wfwhm); free(nstars); free(cand);
+		goto end;
+	}
+	/* with max framing no frame is cropped: one that keeps much less than its
+	 * area on the grid was not placed where the grid was framed for it */
+	if (args->src_seq && args->framing && !strcmp(args->framing, "max")) {
+		int cropped = 0, first = 0;
+		for (int k = 0; k < nb; k++) {
+			const int *rl = b.row_lo + (size_t) k * seq->ry, *rh = b.row_hi + (size_t) k * seq->ry;
+			double area = 0.0;
+			for (int y = 0; y < seq->ry; y++)
+				area += MAX(rh[y] - rl[y] + 1, 0);
+			const sequence *src = args->src_seq;
+			int si = args->src_index ? args->src_index[cand[k]] : cand[k];
+			double full = (double) (src->is_variable ? src->imgparam[si].rx : src->rx)
+				* (src->is_variable ? src->imgparam[si].ry : src->ry);
+			if (area < LSF_MIN_LANDED * full) {
+				if (!cropped++)
+					first = seq->imgparam[cand[k]].filenum;
+			}
+		}
+		if (cropped)
+			siril_log_warning(_("LSF: %d frame(s), the first being frame %d, keep less than %.0f%% of their area on the "
+						"grid although its framing should hold them all: check the registration, and the result\n"),
+					cropped, first, 100.0 * LSF_MIN_LANDED);
+	}
+	/* the baseline of this batch: the frozen one, or with -overlap_norm the
+	 * Stack on its overlap. The Stack is equalized already, so each channel
+	 * is matched to its own. */
+	const double *bloc = s->base_loc, *bscale = s->base_scale;
+	double oloc[3], oscale[3];
+	if (args->overlap_norm && args->init && s->norm == NO_NORM)
+		siril_log_warning(_("LSF: -overlap_norm is ignored without normalization\n"));
+	if (args->overlap_norm && !args->init) {
+		if (s->norm == NO_NORM)
+			siril_log_warning(_("LSF: -overlap_norm is ignored, the file is not normalized\n"));
+		else {
+			int r = overlap_baseline(args, &b, cand, nb, stats, max_threads, oloc, oscale);
+			if (r < 0) {
+				free(noise_raw); free(wfwhm); free(nstars); free(cand);
+				goto end;
+			}
+			if (r > 0) {
+				b.overlap_norm = TRUE;
+				bloc = oloc;
+				bscale = oscale;
+			}
+		}
+	}
 	for (int k = 0; k < nb; k++) {
 		int i = cand[k];
 		for (int c = 0; c < nchan; c++) {
-			int reflayer = s->rgb_equal && nchan == 3 ? rgb_ref : c;
+			int reflayer = s->rgb_equal && nchan == 3 && !b.overlap_norm ? rgb_ref : c;
 			double loc = est_loc(stats[i][c], s->lite_norm), sca = est_scale(stats[i][c], s->lite_norm);
 			double pscale = 1.0, poffset = 0.0, pmul = 1.0;
 			switch (s->norm) {
 			case ADDITIVE_SCALING:
-				pscale = sca == 0.0 ? 1.0 : s->base_scale[reflayer] / sca;
+				pscale = sca == 0.0 ? 1.0 : bscale[reflayer] / sca;
 				/* no break */
 			case ADDITIVE:
-				poffset = pscale * loc - s->base_loc[reflayer];
+				poffset = pscale * loc - bloc[reflayer];
 				break;
 			case MULTIPLICATIVE_SCALING:
-				pscale = sca == 0.0 ? 1.0 : s->base_scale[reflayer] / sca;
+				pscale = sca == 0.0 ? 1.0 : bscale[reflayer] / sca;
 				/* no break */
 			case MULTIPLICATIVE:
-				pmul = loc == 0.0 ? 1.0 : s->base_loc[reflayer] / loc;
+				pmul = loc == 0.0 ? 1.0 : bloc[reflayer] / loc;
 				break;
 			default:
 				break;
@@ -731,12 +1441,6 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 			b.sframe[c][k] = stats[i][c]->bgnoise * fabs(pscale * pmul);
 			noise_raw[c * nb + k] = lsf_noise_raw_weight(pscale, stats[i][c]->bgnoise);
 		}
-	}
-	/* the star measures of the weights, against the frozen reference stars,
-	 * whatever the weighting, so that the ledger's are comparable */
-	if (measure_frames(args, cand, nb, &b, max_threads)) {
-		free(noise_raw); free(wfwhm); free(nstars); free(cand);
-		goto end;
 	}
 	for (int k = 0; k < nb; k++) {
 		wfwhm[k] = b.wfwhm[k];
@@ -760,6 +1464,25 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 					"-weight_model=inverse) stops this for the next appends\n"), better + worse, nb, better, worse,
 				floored);
 	}
+	/* the star measures need the reference stars of the first batch, which
+	 * mosaic panels away from it do not cover */
+	int few = 0;
+	double cover_sum = 0.0;
+	GString *few_list = g_string_new(NULL);
+	for (int k = 0; k < nb; k++) {
+		cover_sum += args->wref->n > 0 ? (double) MIN(b.covered[k], args->wref->n) / args->wref->n : 0.0;
+		if (s->weighting == WFWHM_WEIGHT && b.covered[k] > 0 && b.covered[k] < LSF_WREF_MIN_COVER)
+			g_string_append_printf(few_list, "%s%d", few++ ? ", " : "", seq->imgparam[cand[k]].filenum);
+	}
+	if (few)
+		siril_log_warning(_("LSF: %d frame(s) of this batch (%s) cover fewer than %d of the reference stars of the first "
+					"batch (LSF_WREF): their wFWHM, and so their weights, are unreliable. Mosaic panels away from "
+					"the first batch need noise weighting\n"), few, few_list->str, LSF_WREF_MIN_COVER);
+	g_string_free(few_list, TRUE);
+	if (s->weighting == NBSTARS_WEIGHT && !args->init && cover_sum / nb < 0.5)
+		siril_log_warning(_("LSF: the frames of this batch cover %.0f%% of the reference frame of the first batch on "
+					"average: their star counts follow the field more than their quality. Mosaics need noise "
+					"weighting\n"), 100.0 * cover_sum / nb);
 	int kept = 0;
 	for (int k = 0; k < nb; k++) {
 		gboolean zero = FALSE;
@@ -769,11 +1492,21 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 			zero |= !(w[c] > 0.0);
 		}
 		if (zero) {
-			siril_log_warning(_("LSF: frame %d has a weight of 0 and is not merged\n"),
+			if (s->weighting == WFWHM_WEIGHT && nstars[k] > 0 && b.covered[k] == 0)
+				siril_log_warning(_("LSF: frame %d covers none of the reference stars of the first batch (LSF_WREF), so "
+							"its wFWHM cannot be measured: it is not merged. Mosaic panels away from the first "
+							"batch need noise weighting\n"), seq->imgparam[cand[k]].filenum);
+			else siril_log_warning(_("LSF: frame %d has a weight of 0 and is not merged\n"),
 					seq->imgparam[cand[k]].filenum);
+			if (b.bins) {
+				free(b.bins[k]);
+				b.bins[k] = NULL;
+			}
 			continue;
 		}
 		b.idx[kept] = cand[k];
+		double e = metas[cand[k]].keywords.exposure;
+		b.exptime[kept] = dbl_known(e) ? e : 0.0;
 		for (int c = 0; c < nchan; c++) {
 			b.weight[c][kept] = w[c];
 			b.pscale[c][kept] = b.pscale[c][k];
@@ -785,6 +1518,11 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 		b.wfwhm[kept] = b.wfwhm[k];
 		b.round[kept] = b.round[k];
 		b.nstars[kept] = b.nstars[k];
+		if (kept != k && b.bins) {
+			b.bins[kept] = b.bins[k];
+			b.bins[k] = NULL;
+			memcpy(b.bbox + 4 * (size_t) kept, b.bbox + 4 * (size_t) k, 4 * sizeof(int));
+		}
 		if (kept != k) {
 			memcpy(b.row_lo + (size_t) kept * seq->ry, b.row_lo + (size_t) k * seq->ry, seq->ry * sizeof(int));
 			memcpy(b.row_hi + (size_t) kept * seq->ry, b.row_hi + (size_t) k * seq->ry, seq->ry * sizeof(int));
@@ -799,6 +1537,25 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 		siril_log_error(_("LSF: no frame to merge in this batch\n"));
 		goto end;
 	}
+	/* a first batch of several panels: the levels of the frames kept, matched
+	 * on their overlaps. The bins are not needed afterwards. */
+	if (b.bins) {
+		int r = match_batch_levels(args, &b, nb, max_threads);
+		if (r < 0)
+			goto end;
+		b.overlap_norm = r > 0;
+		for (int k = 0; k < nb; k++)
+			for (int c = 0; c < nchan; c++)
+				b.sframe[c][k] = stats[b.idx[k]][c]->bgnoise * fabs(b.pscale[c][k] * b.pmul[c][k]);
+		for (int k = 0; k < b.nbinned; k++)
+			free(b.bins[k]);
+		g_clear_pointer(&b.bins, free);
+		b.nbinned = 0;
+	}
+	double backfill = -1.0;
+	int exp_unknown = 0;
+	if (prepare_exposure_map(args, &b, metas, &backfill, &exp_unknown))
+		goto end;
 	if (s->rej == GESDT && nb < 3)
 		siril_log_warning(_("LSF: the Generalized Extreme Studentized Deviate Test needs at least three frames, "
 					"only the history test applies to this batch\n"));
@@ -830,6 +1587,26 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 	}
 	naxes[2] = nchan;
 	gboolean ushort_input = get_data_type(bitpix) == DATA_USHORT;
+
+	/* feathering masks, Siril's: a distance to each frame's edge, cached
+	 * beside the sequence. Made for all the frames of the sequence, as the
+	 * kept ones are not a selection compute_masks knows. */
+	const gboolean feather = args->feather > 0;
+	if (feather) {
+		struct stacking_args margs = sargs;
+		margs.feather_dist = args->feather;
+		margs.filtering_criterion = seq_filter_all;
+		margs.filtering_parameter = 0.0;
+		margs.nb_images_to_stack = seq->number;
+		init_ramp();
+		masks_made = TRUE;
+		if (compute_masks(&margs)) {
+			siril_log_error(_("LSF: could not compute the feathering masks of the batch\n"));
+			goto end;
+		}
+		if (feather_columns_init(&fcols, seq))
+			goto end;
+	}
 
 	rargs.type_of_rejection = (s->rej == GESDT && nb < 3) ? NO_REJEC : s->rej;
 	rargs.sig[0] = (float) s->sig[0];
@@ -868,11 +1645,11 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 	 * Siril's memory limit. With a limit set as a ratio of the available
 	 * memory, the part already read may be counted twice, which only makes
 	 * the blocks smaller. */
-	guint64 hist_bytes = (guint64) h->rx * h->ry * h->nchan * (LSF_NB_PL * sizeof(float)
-			+ (h->rej[0][0] ? 3 : 1) * sizeof(WORD));
+	guint64 hist_bytes = lsf_history_bytes((guint64) h->rx * h->ry * h->nchan, h->rej[0][0] != NULL, h->exp[0] != NULL);
 	guint64 mem = (guint64) get_max_memory_in_MB() * BYTES_IN_A_MB;
 	mem = mem > hist_bytes ? mem - hist_bytes : 0;
-	guint64 row_bytes = (guint64) nb * naxes[0] * (sizeof(float) + (ushort_input ? sizeof(WORD) : 0));
+	guint64 row_bytes = (guint64) nb * naxes[0] * (sizeof(float) + (ushort_input ? sizeof(WORD) : 0)
+			+ (feather ? sizeof(float) : 0));
 	long max_rows = (long) (mem / (MAX(row_bytes, 1) * nb_threads));
 	if (max_rows < 1) {
 		siril_log_error(_("LSF: not enough memory to process the batch: the accumulator uses %.0f MB of the "
@@ -893,7 +1670,7 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 		goto end;
 	}
 	for (int t = 0; t < nb_threads; t++) {
-		if (alloc_thread_data(&tdata[t], nb, block_pix, ushort_input, rargs.type_of_rejection)) {
+		if (alloc_thread_data(&tdata[t], nb, block_pix, ushort_input, rargs.type_of_rejection, feather)) {
 			PRINT_ALLOC_ERR;
 			goto end;
 		}
@@ -939,6 +1716,8 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 			if (ushort_input)
 				for (size_t p = 0; p < npix; p++)
 					td->pix[f][p] = (float) (td->wbuf[p] * INV_USHRT_MAX_DOUBLE);
+			if (feather && read_feather_block(seq, b.idx[f], &area, args->feather, &fcols, td->mask[f]))
+				block_err = TRUE;
 		}
 		if (block_err) {
 			g_atomic_int_set(&err, 1);
@@ -951,6 +1730,7 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 		float *m2_h = h->plane[LSF_PL_M2][layer], *w2_h = h->plane[LSF_PL_W2][layer];
 		WORD *count_h = h->count[layer];
 		WORD *rlo_h = h->rej[0][layer], *rhi_h = h->rej[1][layer];	// NULL without LSF_REJ
+		float *exp_h = h->exp[layer];	// NULL without the exposure map
 
 		for (long y = 0; y < blk->height; y++) {
 			/* line y of the block is stored at ry - y - 1, as in
@@ -987,7 +1767,8 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 				 * differ only when the stop rule of the rejection (N - r <= 4) left
 				 * a gap in the kept range, then the kept samples are matched back
 				 * to their frames. Sigmedian keeps the range test: its kept samples
-				 * include the medians that replaced the outliers. */
+				 * include the medians that replaced the outliers. Feathering takes
+				 * the weighted branch, as masking does in Siril. */
 				float pmin = FLT_MAX, pmax = -FLT_MAX;
 				for (int f = 0; f < kept_pixels; f++) {
 					if (pmin > stack[f]) pmin = stack[f];
@@ -1000,7 +1781,7 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 					sel[f] = val >= pmin && val <= pmax && val != 0.f;
 					nsel += sel[f];
 				}
-				if (nsel != kept_pixels && s->weighting == NO_WEIGHT && s->rej != SIGMEDIAN) {
+				if (nsel != kept_pixels && s->weighting == NO_WEIGHT && !feather && s->rej != SIGMEDIAN) {
 					memset(sel, 0, nb * sizeof(gboolean));
 					for (int k = 0; k < kept_pixels; k++)
 						for (int f = 0; f < nb; f++)
@@ -1012,9 +1793,16 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 				double Wh = w_h[pdata_idx];
 				gboolean testable = lsf_history_testable(Wh, w2_h[pdata_idx]);
 				int n = 0, hlo = 0, hhi = 0;
+				double texp = 0.0;
 				for (int f = 0; f < nb; f++) {
 					float val = o_stack[f];
 					if (!sel[f])
+						continue;
+					/* a feathered sample weighs wf times its ramp, 0 being no
+					 * sample; the history test keeps the frame's own weight,
+					 * the ramp telling nothing of its noise */
+					float m = feather ? td->mask[f][line_idx + x] : 1.f;
+					if (!(m > 0.f))
 						continue;
 					double wf = b.weight[layer][f];
 					if (testable) {	// history test, Section 10.6
@@ -1028,7 +1816,8 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 						}
 					}
 					td->xbuf[n] = val;
-					td->wbufd[n] = wf;
+					td->wbufd[n] = wf * m;
+					texp += b.exptime[f];
 					n++;
 				}
 				if (!testable && Wh > 0.0)
@@ -1046,6 +1835,8 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 				lsf_batch_stats(td->xbuf, td->wbufd, n, &mb, &wb, &m2b, &w2b);
 				lsf_merge(&mean_h[pdata_idx], &w_h[pdata_idx], &m2_h[pdata_idx], &w2_h[pdata_idx],
 						&count_h[pdata_idx], mb, wb, m2b, w2b, n, &bsat);
+				if (exp_h)
+					exp_h[pdata_idx] = (float) ((double) exp_h[pdata_idx] + texp);
 			}
 		}
 #ifdef _OPENMP
@@ -1143,12 +1934,34 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 		p->history = g_slist_append(p->history, g_strdup_printf("LSF gen %d ch %d rejected %%: %.4f %.4f hist %.4f %.4f",
 					args->gen, c, irej[c][0] / nb_tot * 100.0, irej[c][1] / nb_tot * 100.0,
 					hrej[c][0] / nb_tot * 100.0, hrej[c][1] / nb_tot * 100.0));
+	if (backfill > 0.0)
+		p->history = g_slist_append(p->history, g_strdup_printf("LSF gen %d: exposure map created, COUNT x %g s "
+					"before", args->gen, backfill));
+	else if (backfill == 0.0)
+		p->history = g_slist_append(p->history, g_strdup_printf("LSF gen %d: exposure map created", args->gen));
+	if (exp_unknown)
+		p->history = g_slist_append(p->history, g_strdup_printf("LSF gen %d: %d frames of unknown exposure added "
+					"0 s to the exposure map", args->gen, exp_unknown));
+	if (b.overlap_norm)
+		p->history = g_slist_append(p->history, g_strdup_printf(args->init ? "LSF gen %d: frames normalized on "
+					"their overlaps" : "LSF gen %d: normalized on the overlap with the Stack", args->gen));
+	/* Siril's distance is measured on its masks, at MASK_SCALE */
+	if (args->feather > 0)
+		p->history = g_slist_append(p->history, g_strdup_printf("LSF gen %d: frame edges feathered, -feather=%d "
+					"(about %d px)", args->gen, args->feather, args->feather * 10));
 	retval = 0;
 
 end:
 	if (opened)
 		for (int k = 0; k < b.nb; k++)
 			seq_close_image(seq, b.idx[k]);
+	/* a batch registered by the LSF command is removed after it, and its
+	 * masks with it; the user's own sequence keeps them, as stack does */
+	if (masks_made && args->src_seq)
+		remove_feather_masks(seq);
+	free(fcols.xlo);
+	free(fcols.xhi);
+	free(fcols.xw);
 	if (tdata) {
 		for (int t = 0; t < nb_threads; t++)
 			free_thread_data(&tdata[t]);

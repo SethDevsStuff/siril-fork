@@ -249,11 +249,33 @@ static void add_matrix(GString *out, const char *name, double m[MAX_SIP_SIZE][MA
 		}
 }
 
+/* the SIP terms of wcs and the reference pixel they apply to, as cards */
+static gchar *sip_cards(const struct wcsprm *wcs) {
+	double A[MAX_SIP_SIZE][MAX_SIP_SIZE] = { 0 }, B[MAX_SIP_SIZE][MAX_SIP_SIZE] = { 0 };
+	double AP[MAX_SIP_SIZE][MAX_SIP_SIZE] = { 0 }, BP[MAX_SIP_SIZE][MAX_SIP_SIZE] = { 0 };
+	int order = extract_SIP_order_and_matrices(wcs->lin.dispre, A, B, AP, BP);
+	GString *s = g_string_new(NULL);
+	char value[FLEN_VALUE];
+	g_snprintf(value, sizeof value, "%.15E", wcs->crpix[0]);
+	add_card(s, "CRPIX1", value);
+	g_snprintf(value, sizeof value, "%.15E", wcs->crpix[1]);
+	add_card(s, "CRPIX2", value);
+	add_matrix(s, "A", A, order);
+	add_matrix(s, "B", B, order);
+	add_matrix(s, "AP", AP, order);
+	add_matrix(s, "BP", BP, order);
+	return g_string_free(s, FALSE);
+}
+
 /* REG_DIST of a frame (Section 9): the SIP terms of the model it was
  * undistorted with, and the reference pixel they apply to, as 80-character
  * cards. The master pattern is resolved with the frame's header, as Siril's
- * apply does. NULL when the model cannot be read. */
+ * apply does; with the frames' own models (astrometric registration), frame
+ * is the source frame, whose WCS holds them. NULL when the model cannot be
+ * read, or when the frame has no SIP terms. */
 gchar *lsf_disto_cards(const disto_params *d, fits *frame) {
+	if (d && d->index == DISTO_FILES)
+		return has_wcs(frame) && frame->keywords.wcslib->lin.dispre ? sip_cards(frame->keywords.wcslib) : NULL;
 	if (!d || !d->filename || (d->index != DISTO_FILE && d->index != DISTO_MASTER))
 		return NULL;
 	int status = 0;
@@ -265,22 +287,8 @@ gchar *lsf_disto_cards(const disto_params *d, fits *frame) {
 	}
 	fits m = { 0 };
 	gchar *out = NULL;
-	if (!read_fits_metadata_from_path_first_HDU(path, &m) && has_wcs(&m) && m.keywords.wcslib->lin.dispre) {
-		double A[MAX_SIP_SIZE][MAX_SIP_SIZE] = { 0 }, B[MAX_SIP_SIZE][MAX_SIP_SIZE] = { 0 };
-		double AP[MAX_SIP_SIZE][MAX_SIP_SIZE] = { 0 }, BP[MAX_SIP_SIZE][MAX_SIP_SIZE] = { 0 };
-		int order = extract_SIP_order_and_matrices(m.keywords.wcslib->lin.dispre, A, B, AP, BP);
-		GString *s = g_string_new(NULL);
-		char value[FLEN_VALUE];
-		g_snprintf(value, sizeof value, "%.15E", m.keywords.wcslib->crpix[0]);
-		add_card(s, "CRPIX1", value);
-		g_snprintf(value, sizeof value, "%.15E", m.keywords.wcslib->crpix[1]);
-		add_card(s, "CRPIX2", value);
-		add_matrix(s, "A", A, order);
-		add_matrix(s, "B", B, order);
-		add_matrix(s, "AP", AP, order);
-		add_matrix(s, "BP", BP, order);
-		out = g_string_free(s, FALSE);
-	}
+	if (!read_fits_metadata_from_path_first_HDU(path, &m) && has_wcs(&m) && m.keywords.wcslib->lin.dispre)
+		out = sip_cards(m.keywords.wcslib);
 	clearfits(&m);
 	g_free(path);
 	return out;

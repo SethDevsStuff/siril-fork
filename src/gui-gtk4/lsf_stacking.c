@@ -430,6 +430,24 @@ static guint append_regmethod() {
 	return gtk_drop_down_get_selected(GTK_DROP_DOWN(gtk_builder_get_object(gui.builder, "stack_lsf_append_regmethod")));
 }
 
+/* the feathering distance of the Living Stack options, in the units of
+ * stacking's Borders feathering, and their normalization on the overlaps */
+static int blend_feather() {
+	return gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(gtk_builder_get_object(gui.builder, "stack_lsf_feather")));
+}
+
+static gboolean blend_overlap_norm() {
+	return siril_toggle_get_active(GTK_WIDGET(gtk_builder_get_object(gui.builder, "stack_lsf_overlap_norm")));
+}
+
+/* the masks of Siril's feathering are at a tenth of the image size
+ * (MASK_SCALE): the distance in pixels the value gives */
+static void on_lsf_feather_changed(GtkSpinButton *spin, gpointer label) {
+	gchar *txt = g_strdup_printf(_("≈ %d px"), 10 * gtk_spin_button_get_value_as_int(spin));
+	gtk_label_set_text(GTK_LABEL(label), txt);
+	g_free(txt);
+}
+
 /* registration through the WCS needs the Stack's WCS, and plate-solved
  * frames, which the reference frame shows. Returns a message or NULL. */
 static gchar *wcsreg_problems(gboolean *fatal) {
@@ -502,6 +520,16 @@ static gchar *append_problems(gboolean *fatal) {
 	gchar *batch = lsf_check_batch(append_info, &com.seq, &batch_fatal);
 	if (batch_fatal)
 		return batch;
+	/* a file made from an astrometric registration: star alignment cannot
+	 * undistort with the frames' own SIP terms, only with the master */
+	const lsf_settings *s = &append_info->file.settings;
+	GtkDropDown *disto_combo = GTK_DROP_DOWN(gtk_builder_get_object(gui.builder, "stack_lsf_append_disto"));
+	if (s->undistorted && s->disto.index == DISTO_FILES && append_regmethod() == APPEND_REG_STARS
+			&& gtk_drop_down_get_selected(disto_combo) != 1) {
+		g_free(batch);
+		return g_strdup(_("This Living Stack undistorts each frame with the SIP terms of its own WCS: plate-solve "
+					"the frames and register them through the WCS, or undistort them with the distortion master."));
+	}
 	gchar *wcs = append_regmethod() == APPEND_REG_WCS ? wcsreg_problems(&wcs_fatal) : NULL;
 	if (wcs_fatal) {
 		g_free(batch);
@@ -763,6 +791,9 @@ static void start_lsf_append() {
 	a->hist_margin = margin;
 	a->hist_margin_set = margin_set;
 	a->rejmaps = gtk_widget_get_visible(rejmaps) && siril_toggle_get_active(rejmaps);
+	/* feathering, and normalization on the overlap with the Stack */
+	a->feather = blend_feather();
+	a->overlap_norm = blend_overlap_norm();
 	/* stack_lsf_append_compression: keep, none, gzip2, gzip1 */
 	guint comp = gtk_drop_down_get_selected(comp_combo);
 	if (comp >= 1 && comp <= 3) {
@@ -918,6 +949,9 @@ static void start_lsf_stacking() {
 		a->hist_margin_set = TRUE;
 	}
 	a->rejmaps = siril_toggle_get_active(rejmaps);
+	/* feathering, and the levels of the frames matched on their overlaps */
+	a->feather = blend_feather();
+	a->overlap_norm = blend_overlap_norm();
 	guint comp = gtk_drop_down_get_selected(comp_combo);
 	if (comp == 1 || comp == 2) {
 		a->compression = comp == 1 ? LSF_COMP_GZIP2 : LSF_COMP_GZIP1;
@@ -952,9 +986,16 @@ gboolean lsf_stacking_update_widgets(int stack_method, gboolean can_reframe) {
 			*blend_frame = NULL, *lsf_grid = NULL, *lsf_framing = NULL, *force32b = NULL, *rejmaps = NULL,
 			*merge_rejmaps = NULL, *append_box = NULL, *output_box = NULL, *lsf_framing_label = NULL,
 			*lsf_comp_label = NULL, *lsf_comp = NULL, *lsf_hist_same = NULL, *lsf_rejmaps = NULL,
-			*weighing_combo = NULL, *siglow = NULL, *sighigh = NULL, *rejec_combo = NULL;
+			*weighing_combo = NULL, *siglow = NULL, *sighigh = NULL, *rejec_combo = NULL, *overlap_norm = NULL,
+			*lsf_overlap_norm = NULL;
 	static GtkDropDown *method_combo = NULL;
 	if (!go_stack) {
+		overlap_norm = GTK_WIDGET(gtk_builder_get_object(gui.builder, "check_norm_overlap"));
+		lsf_overlap_norm = GTK_WIDGET(gtk_builder_get_object(gui.builder, "stack_lsf_overlap_norm"));
+		GtkWidget *feather = GTK_WIDGET(gtk_builder_get_object(gui.builder, "stack_lsf_feather"));
+		GtkWidget *feather_px = GTK_WIDGET(gtk_builder_get_object(gui.builder, "stack_lsf_feather_px"));
+		g_signal_connect(feather, "value-changed", G_CALLBACK(on_lsf_feather_changed), feather_px);
+		on_lsf_feather_changed(GTK_SPIN_BUTTON(feather), feather_px);
 		go_stack = GTK_WIDGET(gtk_builder_get_object(gui.builder, "gostack_button"));
 		method_combo = GTK_DROP_DOWN(gtk_builder_get_object(gui.builder, "comboboxstack_methods"));
 		widgetnormalize = GTK_WIDGET(gtk_builder_get_object(gui.builder, "combonormalize"));
@@ -1013,6 +1054,7 @@ gboolean lsf_stacking_update_widgets(int stack_method, gboolean can_reframe) {
 		gboolean has_rej = gtk_drop_down_get_selected(GTK_DROP_DOWN(rejec_combo)) != NO_REJEC;
 		gtk_widget_set_visible(rejmaps, has_rej);
 		gtk_widget_set_visible(merge_rejmaps, has_rej);
+		gtk_widget_set_visible(overlap_norm, TRUE);
 		return FALSE;
 	}
 	if (stack_method != STACK_MEAN) {
@@ -1021,7 +1063,17 @@ gboolean lsf_stacking_update_widgets(int stack_method, gboolean can_reframe) {
 	}
 	gtk_widget_set_visible(max_framing, FALSE);
 	gtk_widget_set_visible(upscale_at_stacking, FALSE);
+	/* blending is in the Living Stack options, whatever the framing:
+	 * feathering, and the normalization on the overlaps, with the Stack for
+	 * an append, between the frames for a first batch of several panels */
 	gtk_widget_set_visible(blend_frame, FALSE);
+	gtk_widget_set_tooltip_text(lsf_overlap_norm, append ?
+			_("For a mosaic panel: the frame of the batch that overlaps the Living Stack most is matched to it where "
+				"they overlap, and the other frames to that one, instead of the normalization frozen by the first "
+				"batch. The batch should show one panel. Only the level is matched, the scale stays the frozen one.") :
+			_("For a first batch of several mosaic panels, plate-solved together: after their normalization by "
+				"their global statistics, the levels of the frames are matched where they overlap, one frame after "
+				"the other from the reference frame. Only the level is matched, the scale stays the frame's own."));
 	gtk_widget_set_visible(rejmaps, FALSE);
 	gtk_widget_set_visible(merge_rejmaps, FALSE);
 	/* with the registration already applied, the frames define the grid */
@@ -1053,9 +1105,10 @@ void lsf_stacking_invalidate_checks(void) {
 static void update_append_checks(guint method) {
 	GtkWidget *rejmaps = GTK_WIDGET(gtk_builder_get_object(gui.builder, "stack_lsf_rejmaps"));
 	gchar *out = append_out_path();
-	gchar *key = g_strdup_printf("%u|%s|%s|%d|%d|%d|%d|%u|%d|%s", append_serial, com.wd ? com.wd : "",
+	GtkDropDown *disto = GTK_DROP_DOWN(gtk_builder_get_object(gui.builder, "stack_lsf_append_disto"));
+	gchar *key = g_strdup_printf("%u|%s|%s|%d|%d|%d|%d|%u|%u|%d|%s", append_serial, com.wd ? com.wd : "",
 			com.seq.seqname ? com.seq.seqname : "", com.seq.number, com.seq.selnum, com.seq.reference_image,
-			stack_gui_args()->nb_images_to_stack, method,
+			stack_gui_args()->nb_images_to_stack, method, gtk_drop_down_get_selected(disto),
 			gtk_widget_get_visible(rejmaps) && siril_toggle_get_active(rejmaps), out ? out : "");
 	g_free(out);
 	if (!g_strcmp0(key, append_checks.key)) {

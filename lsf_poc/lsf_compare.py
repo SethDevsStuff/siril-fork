@@ -33,7 +33,8 @@ Stage iter   <p>_lsf_1.lsf.fits     = set 1 (copy of lsf_set_1)
                                     with the next set selected (lsf_append writes in place)
 Stage check  <p>_check.csv          pure-Python v0.4 structure checks of every .lsf.fits product:
                                     EXTNAMEs (LSF_ACC, LSF_COUNT, LSF_SETTINGS, LSF_LEDGER last),
-                                    LSF_ACC NAXIS3 == 4*P, LSFUID/LSFGEN identical across LSF HDUs,
+                                    LSF_ACC NAXIS3 == 4*P (5*P with the EXP planes of an exposure
+                                    map), LSFUID/LSFGEN identical across LSF HDUs,
                                     LSFGEN +1 along lsf_1..lsf_4, STACKCNT == ledger rows,
                                     LSFHASH == sha256(primary data), plus `fitsverify` if on PATH.
                                     Raises if any check fails.
@@ -679,9 +680,13 @@ def check_lsf_file(path: str) -> tuple:
     p = int(prim.get("NAXIS3", 1)) if int(prim.get("NAXIS", 2)) >= 3 else 1
     acc = by.get("LSF_ACC", {})
     n3 = int(acc.get("NAXIS3", 0)) if acc else 0
-    chk("acc_naxis3_4P", n3 == 4 * p, f"NAXIS3={n3} P={p}")
+    # 5*P when the file has an exposure map (EXP planes after W2)
+    chk("acc_naxis3_4P", n3 in (4 * p, 5 * p), f"NAXIS3={n3} P={p}")
     planes = [acc.get(f"LSFPL{i}") for i in range(1, n3 + 1)]
     chk("acc_planes_named", all(planes), ",".join(str(x) for x in planes))
+    if n3 == 5 * p:
+        want = ["EXP"] if p == 1 else ["EXP_R", "EXP_G", "EXP_B"]
+        chk("acc_exp_planes", all(w in [str(x).strip() for x in planes] for w in want), ",".join(str(x) for x in planes))
     uid, gen = prim.get("LSFUID"), prim.get("LSFGEN")
     chk("primary_uid_gen", uid is not None and gen is not None, f"LSFUID={uid} LSFGEN={gen}")
     for e in LSF_EXTS:

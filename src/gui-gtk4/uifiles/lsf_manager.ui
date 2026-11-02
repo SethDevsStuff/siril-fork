@@ -328,6 +328,12 @@
                       </object>
                     </child>
                     <child>
+                      <object class="GtkCheckButton" id="lsfm_map_exp">
+                        <property name="label" translatable="yes">Exposure (exp)</property>
+                        <property name="tooltip-text" translatable="yes">Integration time at each pixel, in seconds: the exposure map of the file, or the count of frames times their exposure when they all have the same one. Not available when the exposures of the frames differ or are not all known and the file has no exposure map.</property>
+                      </object>
+                    </child>
+                    <child>
                       <object class="GtkBox">
                         <property name="spacing">5</property>
                         <child>

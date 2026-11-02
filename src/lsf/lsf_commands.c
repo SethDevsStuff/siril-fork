@@ -36,6 +36,7 @@
 #include "core/processing.h"
 #include "core/processing_thread.h"
 #include "core/proto.h"
+#include "core/sequence_filtering.h"
 #include "core/siril.h"
 #include "core/siril_log.h"
 #include "io/image_format_fits.h"
@@ -172,7 +173,7 @@ static void apply_hist_overrides(struct lsf_cmd_args *a, lsf_settings *s) {
 
 #define LSF_REG_PREFIX "lsf_r_"
 static sequence *apply_init_registration(sequence *seq, const struct lsf_cmd_args *a, int *ref,
-		int origin[2], Homography *base);
+		int origin[2], Homography *base, gboolean *undistorted);
 static int *map_to_sources(sequence *seq, sequence *rseq);
 
 static gboolean any_pad(const int pad[4]) {
@@ -223,12 +224,6 @@ static int lsf_init_run(struct lsf_cmd_args *a) {
 		 * every append undistorts its frames with the same model (Section 10.4) */
 		int rl = get_registration_layer(seq);
 		disto_source ds = seq->distoparam && rl >= 0 ? seq->distoparam[rl].index : DISTO_UNDEF;
-		if (ds == DISTO_FILES) {
-			siril_log_error(_("LSF: %s was registered through plate solving (astrometric registration), which lsf_init "
-						"cannot apply. Register it with stars (register, with -disto for distortion correction), or "
-						"apply its registration first\n"), a->seqname);
-			goto end;
-		}
 		if (ds == DISTO_IMAGE || ds == DISTO_FILE || ds == DISTO_MASTER) {
 			if (!seq->distoparam[rl].filename && ds != DISTO_MASTER) {
 				siril_log_error(_("LSF: the distortion model of the registration of %s is not named in its .seq file, "
@@ -254,9 +249,25 @@ static int lsf_init_run(struct lsf_cmd_args *a) {
 						"another one given to lsf_append with -disto=\n"), a->seqname, model);
 			g_free(model);
 		}
-		rseq = apply_init_registration(seq, a, &ref, origin, &base);
+		gboolean undistorted = FALSE;
+		rseq = apply_init_registration(seq, a, &ref, origin, &base, &undistorted);
 		if (!rseq || !(src_index = map_to_sources(seq, rseq)))
 			goto end;
+		/* an astrometric registration (seqplatesolve): Siril's apply
+		 * undistorts each frame with the SIP terms of its own WCS, when it
+		 * has some, and the appends do the same through their WCS */
+		if (ds == DISTO_FILES) {
+			if (undistorted) {
+				s->undistorted = TRUE;
+				g_free(s->disto.filename);
+				s->disto = (disto_params) { .index = DISTO_FILES };
+				siril_log_message(_("LSF: %s was registered through plate solving: each frame is undistorted with the "
+							"SIP terms of its own WCS, and the grid is undistorted. Every append must be plate-solved "
+							"and registered through the WCS (lsf_append -wcsreg), or given one model with -disto=\n"),
+						a->seqname);
+			} else siril_log_message(_("LSF: %s was registered through plate solving, without distortion terms: the "
+						"frames are not undistorted\n"), a->seqname);
+		}
 		batch = rseq;
 		batch_ref = 0;
 		for (int i = 0; i < rseq->number; i++)
@@ -314,12 +325,19 @@ static int lsf_init_run(struct lsf_cmd_args *a) {
 	bargs.wref = &wref;
 	bargs.keep_seq_file = listed && batch == seq;
 	bargs.max_threads = a->max_threads;
+	bargs.feather = a->feather;
+	bargs.overlap_norm = a->overlap_norm;
 	if (lsf_process_batch(&bargs))
 		goto end;
+	/* a HISTORY card holds 72 characters: the undistortion has its own */
 	if (rseq)
 		primary.history = g_slist_append(primary.history, g_strdup_printf(
-					"LSF gen 1: registration applied, %s framing, origin %d %d%s", bargs.framing,
-					origin[0], origin[1], s->undistorted ? ", undistorted" : ""));
+					"LSF gen 1: registration applied, %s framing, origin %d %d", bargs.framing,
+					origin[0], origin[1]));
+	if (rseq && s->undistorted)
+		primary.history = g_slist_append(primary.history, g_strdup(s->disto.index == DISTO_FILES ?
+					"LSF gen 1: grid undistorted, each frame with its own SIP terms" :
+					"LSF gen 1: grid undistorted"));
 	if (lsf_build_primary(&primary, s, &h))
 		goto end;
 	uid = g_uuid_string_random();
@@ -403,12 +421,12 @@ static int plan_expansion(const lsf_file *f, const struct lsf_cmd_args *a, const
 	if (!a->expand_force && (nrx > 2 * f->rx || nry > 2 * f->ry)) {
 		siril_log_error(_("LSF: this batch would grow the grid from %dx%d to %dx%d, more than twice on one axis, "
 					"which usually means a wrong registration. Check the registration, or use -expand_force "
-					"to grow the grid anyway, or -framing=current to crop the batch to the grid\n"),
+					"to grow the grid anyway, as a mosaic panel appended beside the Stack may need, or "
+					"-framing=current to crop the batch to the grid\n"),
 				f->rx, f->ry, nrx, nry);
 		return 1;
 	}
-	guint64 bytes = (guint64) nrx * nry * f->nchan * (LSF_NB_PL * sizeof(float)
-			+ (f->settings.rejmaps ? 3 : 1) * sizeof(WORD));
+	guint64 bytes = lsf_history_bytes((guint64) nrx * nry * f->nchan, f->settings.rejmaps, f->has_exp);
 	int max_mb = get_max_memory_in_MB();
 	if (bytes > (guint64) max_mb * BYTES_IN_A_MB) {
 		siril_log_error(_("LSF: the accumulator of the expanded %dx%d grid needs %.0f MB, more than the %d MB "
@@ -524,6 +542,7 @@ static sequence *apply_onto_grid(sequence *seq, const lsf_file *f, const struct 
 	regargs->layer = layer;
 	regargs->no_output = FALSE;
 	regargs->ext_ref_undistorted = model != NULL;
+	regargs->keep_transforms = model && model->index == DISTO_FILES;	// -wcsreg, onto the Stack
 	if (any_pad(pad))
 		regargs->canvas =(framing_roi) { -pad[LSF_PAD_LEFT], -pad[LSF_PAD_LAST],
 			f->rx + pad[LSF_PAD_LEFT] + pad[LSF_PAD_RIGHT], f->ry + pad[LSF_PAD_FIRST] + pad[LSF_PAD_LAST] };
@@ -729,6 +748,10 @@ int lsf_prepare_registration(struct registration_args *regargs, gboolean keep_ty
 					"use -disto=file or -disto=master, or the model stored in the file\n"));
 	else if (s->undistorted && regargs->undistort == DISTO_UNDEF && s->disto.index == DISTO_UNDEF)
 		siril_log_error(_("LSF: %s is undistorted and stores no distortion model: give one with -disto=\n"), path);
+	else if (s->undistorted && regargs->undistort == DISTO_UNDEF && s->disto.index == DISTO_FILES)
+		siril_log_error(_("LSF: %s undistorts each frame with the SIP terms of its own WCS, which star alignment "
+					"cannot use: plate-solve the frames and append them with lsf_append -wcsreg, or register "
+					"with -disto=file or -disto=master\n"), path);
 	else if (regargs->seq->nb_layers != info.file.nchan)
 		siril_log_error(_("LSF: the Living Stack has %d channel(s) and the sequence %d\n"),
 				info.file.nchan, regargs->seq->nb_layers);
@@ -926,8 +949,51 @@ static int *map_to_sources(sequence *seq, sequence *rseq) {
  * (negative when the grid starts inside it) and base the transform from the
  * registration of the sequence onto the grid. Returns the registered
  * sequence, written with the lsf_r_ prefix. */
+/* An astrometric registration (seqplatesolve): the transforms of the frames
+ * from their WCS, by Siril's functions, for the framing asked. Max framing is
+ * Siril's: a projection at the centre of the frames, at the angle that frames
+ * them best, whichever way the reference frame is turned. The apply keeps
+ * these transforms (keep_transforms) and gives the frames wcsref. Returns 0,
+ * or 1 with the reason logged. */
+static int astrometric_transforms(sequence *seq, const struct lsf_cmd_args *a, int layer, int ref,
+		struct wcsprm **wcsref) {
+	struct registration_args *regargs = new_regargs(seq, &a->settings);
+	int *included = calloc(seq->number, sizeof(int));
+	int ret = 1;
+	if (!regargs || !included
+			|| !(regargs->WCSDATA = calloc(seq->number, sizeof(struct wcsprm)))) {
+		PRINT_ALLOC_ERR;
+		goto end;
+	}
+	regargs->layer = layer;
+	if (convert_parsed_filter_to_filter(&regargs->filters, seq, &regargs->filtering_criterion,
+				&regargs->filtering_parameter) || collect_sequence_astrometry(regargs, included))
+		goto end;
+	if (!included[ref]) {
+		siril_log_error(_("LSF: the reference frame of %s is not plate-solved\n"), seq->seqname);
+		goto end;
+	}
+	int seq_ref = seq->reference_image;
+	ret = compute_Hs_from_astrometry(seq, included, ref, regargs->WCSDATA, a->framing, layer, NULL, wcsref)
+		|| !*wcsref;
+	seq->reference_image = seq_ref;
+end:
+	if (ret)
+		siril_log_error(_("LSF: the transforms of %s could not be computed from the WCS of its frames\n"), seq->seqname);
+	if (regargs && regargs->WCSDATA && included) {
+		for (int i = 0; i < seq->number; i++)
+			if (included[i])
+				wcsfree(regargs->WCSDATA + i);
+		free(regargs->WCSDATA);
+	}
+	free(included);
+	if (regargs)
+		free_regargs(regargs);
+	return ret;
+}
+
 static sequence *apply_init_registration(sequence *seq, const struct lsf_cmd_args *a, int *ref,
-		int origin[2], Homography *base) {
+		int origin[2], Homography *base, gboolean *undistorted) {
 	int layer = get_registration_layer(seq);
 	int pad[4] = { 0 };
 	if (seq->ext_ref) {
@@ -949,7 +1015,16 @@ static sequence *apply_init_registration(sequence *seq, const struct lsf_cmd_arg
 		siril_log_error(_("LSF: no selected frame of %s has registration data\n"), seq->seqname);
 		return NULL;
 	}
+	gboolean astrometric = layer_has_distortion(seq, layer) && seq->distoparam[layer].index == DISTO_FILES;
+	struct wcsprm *wcsref = NULL;
+	if (astrometric && astrometric_transforms(seq, a, layer, *ref, &wcsref))
+		return NULL;
 	Homography Href = seq->regparam[layer][*ref].H;
+	/* what the apply maps the frames by: Href^-1 * H, and H as it is for an
+	 * astrometric registration, whose transforms are onto the grid's WCS */
+	Homography Hframe = Href;
+	if (astrometric)
+		cvGetEye(&Hframe);
 	int rx = seq->is_variable ? seq->imgparam[*ref].rx : seq->rx;
 	int ry = seq->is_variable ? seq->imgparam[*ref].ry : seq->ry;
 
@@ -961,7 +1036,7 @@ static sequence *apply_init_registration(sequence *seq, const struct lsf_cmd_arg
 			Homography Hi = seq->regparam[layer][i].H, Hr;
 			if (!seq->imgparam[i].incl || guess_transform_from_H(Hi) == NULL_TRANSFORMATION)
 				continue;
-			cvTransfH(&Hi, &Href, &Hr);	// Href^-1 * Hi
+			cvTransfH(&Hi, &Hframe, &Hr);	// Hframe^-1 * Hi
 			double h[9] = { Hr.h00, Hr.h01, Hr.h02, Hr.h10, Hr.h11, Hr.h12, Hr.h20, Hr.h21, Hr.h22 };
 			lsf_footprint_add(h, seq->is_variable ? seq->imgparam[i].rx : seq->rx,
 					seq->is_variable ? seq->imgparam[i].ry : seq->ry, 0.0, box);
@@ -975,6 +1050,8 @@ static sequence *apply_init_registration(sequence *seq, const struct lsf_cmd_arg
 	regargs->layer = layer;
 	regargs->no_output = FALSE;
 	regargs->framing = a->framing == FRAMING_MAX ? FRAMING_CURRENT : a->framing;
+	regargs->keep_transforms = astrometric;
+	regargs->wcsref = wcsref;
 	if (any_pad(pad))
 		regargs->canvas = (framing_roi) { -pad[LSF_PAD_LEFT], -pad[LSF_PAD_LAST],
 			rx + pad[LSF_PAD_LEFT] + pad[LSF_PAD_RIGHT], ry + pad[LSF_PAD_FIRST] + pad[LSF_PAD_LAST] };
@@ -992,12 +1069,13 @@ static sequence *apply_init_registration(sequence *seq, const struct lsf_cmd_arg
 	 * every framing; the reference frame's first stored pixel gives origin */
 	Homography R, Ht = regargs->framingd.Htransf;
 	int nrx = regargs->framingd.roi_out.w, nry = regargs->framingd.roi_out.h;
+	*undistorted = regargs->undistort != DISTO_UNDEF;
 	free_regargs(regargs);
 	*base = Ht;
 	cvInvertH(base);
 	cvMultH(*base, Href, &R);
-	origin[0] = (int) lround(R.h01 * (ry - 1) + R.h02);
-	origin[1] = nry - 1 - (int) lround(R.h11 * (ry - 1) + R.h12);
+	const double hr[9] = { R.h00, R.h01, R.h02, R.h10, R.h11, R.h12, R.h20, R.h21, R.h22 };
+	lsf_frame_origin(hr, rx, ry, nry, origin);
 	siril_log_message(_("LSF: registration of %s applied with %s framing: grid %dx%d, origin %d %d "
 				"from the reference frame\n"), seq->seqname, lsf_framing_name(a->framing), nrx, nry,
 			origin[0], origin[1]);
@@ -1095,6 +1173,14 @@ static int lsf_append_run(struct lsf_cmd_args *a) {
 		}
 		if (f.settings.disto.index == DISTO_UNDEF) {
 			siril_log_error(_("LSF: %s is undistorted and stores no distortion model: give one with -disto=\n"), a->path);
+			goto end;
+		}
+		/* the frames' own SIP terms: Siril's star alignment undistorts the
+		 * stars with one model, so only the WCS registers such frames */
+		if (f.settings.disto.index == DISTO_FILES && !a->wcsreg) {
+			siril_log_error(_("LSF: %s undistorts each frame with the SIP terms of its own WCS (it was created from an "
+						"astrometric registration): plate-solve the frames and append with -wcsreg, or give one "
+						"model for all of them with -disto=file or -disto=master\n"), a->path);
 			goto end;
 		}
 		model = &f.settings.disto;
@@ -1203,12 +1289,15 @@ static int lsf_append_run(struct lsf_cmd_args *a) {
 	bargs.batch = batchnum;
 	bargs.gen = gen;
 	bargs.prev_frames = f.ledger_rows;
+	bargs.prev_exptime = f.ledger_exptime;
 	bargs.seq_name = seq->seqname;
 	bargs.rows = rows;
 	bargs.primary = &f.primary;
 	bargs.wref = &f.wref;
 	bargs.keep_seq_file = listed && batch == seq;
 	bargs.max_threads = a->max_threads;
+	bargs.overlap_norm = a->overlap_norm;
+	bargs.feather = a->feather;
 	if (lsf_process_batch(&bargs))
 		goto end;
 	/* the transforms of the new rows were computed onto the grid before its expansion */
@@ -1293,8 +1382,22 @@ static void print_summary(const lsf_file *f) {
 	}
 	double raw = (double) f->rx * f->ry * f->nchan;
 	siril_log_message(_("  LSF_ACC %s, %.0f MB stored (%.0f%% of raw), LSF_COUNT %s, %.0f MB stored (%.0f%% of raw)\n"),
-			f->acc_codec, (double) f->acc_bytes / BYTES_IN_A_MB, 100.0 * f->acc_bytes / (raw * LSF_NB_PL * sizeof(float)),
+			f->acc_codec, (double) f->acc_bytes / BYTES_IN_A_MB,
+			100.0 * f->acc_bytes / (raw * (LSF_NB_PL + (f->has_exp ? 1 : 0)) * sizeof(float)),
 			f->count_codec, (double) f->count_bytes / BYTES_IN_A_MB, 100.0 * f->count_bytes / (raw * sizeof(WORD)));
+	if (f->has_exp && f->hist.exp[0]) {
+		float emax = 0.f;
+		for (int c = 0; c < f->nchan; c++)
+			for (size_t i = 0; i < (size_t) f->rx * f->ry; i++)
+				emax = MAX(emax, f->hist.exp[c][i]);
+		siril_log_message(_("  exposure map (EXP planes of LSF_ACC), up to %.1f s per pixel\n"), emax);
+	} else if (f->has_exp)
+		siril_log_message(_("  exposure map (EXP planes of LSF_ACC)\n"));
+	else if (isfinite(f->ledger_exptime))
+		siril_log_message(_("  no exposure map: every frame has %g s, so COUNT x %g s is the exposure per pixel\n"),
+				f->ledger_exptime, f->ledger_exptime);
+	else siril_log_message(_("  no exposure map, and the exposures of the frames are not all the same or not all known: "
+				"the exposure per pixel is not known\n"));
 	if (s->rejmaps)	// LSF_REJ is present, check 7
 		siril_log_message(_("  LSF_REJ %s, %.0f MB stored (%.0f%% of raw), rejections counted since generation %d%s\n"),
 				f->rej_codec, (double) f->rej_bytes / BYTES_IN_A_MB, 100.0 * f->rej_bytes / (raw * 2 * sizeof(WORD)),
@@ -1377,7 +1480,8 @@ gchar *lsf_append_preflight(const lsf_info *info, const char *wd, const char *ou
 	*fatal = FALSE;
 	gboolean rej = f->settings.rejmaps || add_rejmaps;
 	guint64 npix = (guint64) f->rx * f->ry * f->nchan;
-	guint64 hist = npix * (LSF_NB_PL * sizeof(float) + (rej ? 3 : 1) * sizeof(WORD));
+	/* an exposure map the append creates is not counted: the batch is not read yet */
+	guint64 hist = lsf_history_bytes(npix, rej, f->has_exp);
 	guint64 max_mem = (guint64) get_max_memory_in_MB() * BYTES_IN_A_MB;
 	if (hist >= max_mem) {
 		*fatal = TRUE;
@@ -1427,7 +1531,7 @@ gchar *lsf_init_preflight(sequence *seq, const char *wd, const char *path, int n
 	*fatal = FALSE;
 	int nchan = seq->nb_layers;
 	guint64 npix = (guint64) seq->rx * seq->ry * nchan;
-	guint64 hist = npix * (LSF_NB_PL * sizeof(float) + (rejmaps ? 3 : 1) * sizeof(WORD));
+	guint64 hist = lsf_history_bytes(npix, rejmaps, FALSE);
 	guint64 max_mem = (guint64) get_max_memory_in_MB() * BYTES_IN_A_MB;
 	if (hist >= max_mem) {
 		*fatal = TRUE;
@@ -1662,7 +1766,8 @@ end:
 }
 
 /* lsf_maps: images derived from the accumulator (Sections 10.7, 10.8). The
- * noise and sigma maps are in the units of the Stack. */
+ * noise and sigma maps are in the units of the Stack, the exposure map in
+ * seconds. */
 static int lsf_maps_run(struct lsf_cmd_args *a) {
 	static const struct { guint flag; int rej; const char *suffix, *what; } kinds[] = {
 		{ LSF_MAP_NEFF, -1, "neff", N_("effective number of frames") },
@@ -1671,6 +1776,7 @@ static int lsf_maps_run(struct lsf_cmd_args *a) {
 		{ LSF_MAP_SNR, -1, "snr", N_("mean over its standard deviation") },
 		{ LSF_MAP_REJLO, 0, "rejlo", N_("samples rejected low") },
 		{ LSF_MAP_REJHI, 1, "rejhi", N_("samples rejected high") },
+		{ LSF_MAP_EXP, -1, "exp", N_("exposure of the merged samples, seconds") },
 	};
 	lsf_file f;
 	int retval = 0;
@@ -1683,6 +1789,15 @@ static int lsf_maps_run(struct lsf_cmd_args *a) {
 	if ((a->maps & (LSF_MAP_REJLO | LSF_MAP_REJHI)) && !f.hist.rej[0][0]) {
 		siril_log_error(_("LSF: %s has no rejection maps. They are created by lsf_init or lsf_append "
 					"with -rejmaps, and count from then on\n"), a->path);
+		lsf_file_free(&f);
+		return 1;
+	}
+	/* without the exposure map, all the frames had one exposure, or the
+	 * exposure per pixel is not known (Section 10.8) */
+	gboolean exp_derived = !f.hist.exp[0];
+	if ((a->maps & LSF_MAP_EXP) && exp_derived && !isfinite(f.ledger_exptime)) {
+		siril_log_error(_("LSF: %s has no exposure map, and the exposures of its frames are not all the same or not all "
+					"known: the exposure per pixel cannot be derived\n"), a->path);
 		lsf_file_free(&f);
 		return 1;
 	}
@@ -1705,7 +1820,13 @@ static int lsf_maps_run(struct lsf_cmd_args *a) {
 		/* rejection maps: the counts themselves, as LSF_REJ stores them */
 		for (int c = 0; rej >= 0 && c < f.nchan; c++)
 			memcpy(fit->pdata[c], f.hist.rej[rej][c], n * sizeof(WORD));
-		for (int c = 0; rej < 0 && c < f.nchan; c++) {
+		gboolean exp = kinds[m].flag == LSF_MAP_EXP;
+		for (int c = 0; exp && c < f.nchan; c++) {
+			if (!exp_derived)
+				memcpy(fit->fpdata[c], f.hist.exp[c], n * sizeof(float));
+			else lsf_exp_backfill(fit->fpdata[c], f.hist.count[c], n, f.ledger_exptime);
+		}
+		for (int c = 0; rej < 0 && !exp && c < f.nchan; c++) {
 			const float *mean = f.hist.plane[LSF_PL_MEAN][c], *W = f.hist.plane[LSF_PL_W][c];
 			const float *M2 = f.hist.plane[LSF_PL_M2][c], *W2 = f.hist.plane[LSF_PL_W2][c];
 			const WORD *N = f.hist.count[c];
@@ -1725,6 +1846,9 @@ static int lsf_maps_run(struct lsf_cmd_args *a) {
 		if (rej >= 0)
 			fit->history = g_slist_append(fit->history, g_strdup_printf("LSF %s map (%s since generation %d)",
 						kinds[m].suffix, kinds[m].what, f.hist.rej_gen));
+		else if (exp && exp_derived)
+			fit->history = g_slist_append(fit->history, g_strdup_printf("LSF %s map (%s, COUNT x %g s)",
+						kinds[m].suffix, kinds[m].what, f.ledger_exptime));
 		else fit->history = g_slist_append(fit->history, g_strdup_printf("LSF %s map (%s)",
 					kinds[m].suffix, kinds[m].what));
 		fit->history = g_slist_append(fit->history, g_strdup_printf("from LSF file %s, generation %d",
@@ -1881,6 +2005,8 @@ static void add_hist_and_common_args(GString *cmd, const struct lsf_cmd_args *a)
 		g_string_append_printf(cmd, " -framing=%s", lsf_framing_name(a->framing));
 	if (a->rejmaps)
 		g_string_append(cmd, " -rejmaps");
+	if (a->feather > 0)
+		g_string_append_printf(cmd, " -feather=%d", a->feather);
 	if (a->compression_set)
 		g_string_append(cmd, a->compression == LSF_COMP_NONE ? " -nocompress" :
 				a->compression == LSF_COMP_GZIP1 ? " -compress=gzip1" : " -compress");
@@ -1912,6 +2038,8 @@ gchar *lsf_cmd_args_to_command(const struct lsf_cmd_args *a) {
 			g_string_append_printf(cmd, " -weight_range=%g", s->weight_range);
 		if (s->outnorm)
 			g_string_append(cmd, " -output_norm");
+		if (a->overlap_norm)
+			g_string_append(cmd, " -overlap_norm");
 		add_hist_and_common_args(cmd, a);
 		if (a->overwrite)
 			g_string_append(cmd, " -overwrite");
@@ -1933,8 +2061,12 @@ gchar *lsf_cmd_args_to_command(const struct lsf_cmd_args *a) {
 			g_string_append(cmd, " -weight_model=inverse");
 		else if (a->force_reg)
 			g_string_append(cmd, " -reg");
+		if (a->overlap_norm)
+			g_string_append(cmd, " -overlap_norm");
 		if (a->disto.index == DISTO_MASTER)
 			g_string_append(cmd, " -disto=master");
+		else if (a->disto.index == DISTO_FILES)
+			g_string_append(cmd, " -disto=frames");
 		else if (a->disto.index == DISTO_FILE) {
 			g_string_append(cmd, " -disto=file");
 			add_arg(cmd, a->disto.filename);
@@ -2070,6 +2202,16 @@ static int parse_common_option(struct lsf_cmd_args *a, const char *w) {
 		a->rejmaps = TRUE;
 		return 1;
 	}
+	if (g_str_has_prefix(w, "-feather=")) {
+		gchar *end;
+		gint64 v = g_ascii_strtoll(w + 9, &end, 10);
+		if (end == w + 9 || *end || v < 0 || v > LSF_FEATHER_MAX) {
+			siril_log_error(_("Wrong parameter values. %s is not valid (0 to %d), aborting.\n"), w, LSF_FEATHER_MAX);
+			return -1;
+		}
+		a->feather = (int) v;
+		return 1;
+	}
 	if (!strcmp(w, "-nocompress"))
 		return set_compression_opt(a, LSF_COMP_NONE);
 	return parse_compress_option(a, w);
@@ -2112,7 +2254,7 @@ static int parse_rejection(struct lsf_cmd_args *a, int *pi) {
 
 /* lsf_init sequencename file.lsf.fits [rej [type] sigma_low sigma_high] [-nonorm, -norm=] [-fastnorm]
  *   [-rgb_equal] [-weight=] [-output_norm] [-framing=max|current|min|cog] [-hist_low=] [-hist_high=] [-hist_margin=]
- *   [-rejmaps] [-compress[=gzip2|gzip1]] [-overwrite] */
+ *   [-rejmaps] [-overlap_norm] [-feather=] [-compress[=gzip2|gzip1]] [-overwrite] */
 int process_lsf_init(int nb) {
 	struct lsf_cmd_args *a = lsf_cmd_args_new(LSF_CMD_INIT);
 	if (!a)
@@ -2139,6 +2281,7 @@ int process_lsf_init(int nb) {
 		else if (!strcmp(w, "-fastnorm")) s->lite_norm = TRUE;
 		else if (!strcmp(w, "-rgb_equal")) s->rgb_equal = TRUE;
 		else if (!strcmp(w, "-output_norm")) s->outnorm = TRUE;
+		else if (!strcmp(w, "-overlap_norm")) a->overlap_norm = TRUE;
 		else if (!strcmp(w, "-overwrite")) a->overwrite = TRUE;
 		else if (g_str_has_prefix(w, "-weight_floor=")) {
 			gchar *end;
@@ -2205,7 +2348,7 @@ gboolean lsf_same_file(const char *p1, const char *p2) {
 
 /* lsf_append file.lsf.fits sequencename [rej [type] sigma_low sigma_high] [-noreg] [-framing=max|current]
  *   [-noexpand] [-expand_step=] [-expand_force] [-out=file.lsf.fits [-overwrite] | -backup] [-hist_low=]
- *   [-hist_high=] [-hist_margin=] [-rejmaps] [-compress[=gzip2|gzip1] | -nocompress] */
+ *   [-hist_high=] [-hist_margin=] [-rejmaps] [-overlap_norm] [-feather=] [-compress[=gzip2|gzip1] | -nocompress] */
 int process_lsf_append(int nb) {
 	struct lsf_cmd_args *a = lsf_cmd_args_new(LSF_CMD_APPEND);
 	if (!a)
@@ -2226,6 +2369,7 @@ int process_lsf_append(int nb) {
 		else if (!strcmp(w, "-reg")) a->force_reg = TRUE;
 		else if (!strcmp(w, "-wcsreg")) a->wcsreg = TRUE;
 		else if (!strcmp(w, "-weight_model=inverse")) a->weight_inverse = TRUE;
+		else if (!strcmp(w, "-overlap_norm")) a->overlap_norm = TRUE;
 		else if (!strcmp(w, "-disto=master")) {
 			/* as register -disto=master: the pattern of the preferences */
 			if (!com.pref.prepro.disto_lib || !com.pref.prepro.disto_lib[0]) {
@@ -2235,6 +2379,12 @@ int process_lsf_append(int nb) {
 			g_free(a->disto.filename);
 			a->disto.index = DISTO_MASTER;
 			a->disto.filename = g_strdup(com.pref.prepro.disto_lib);
+		}
+		else if (!strcmp(w, "-disto=frames")) {
+			/* the SIP terms of each frame's own WCS, as an astrometric
+			 * registration undistorts them (-wcsreg) */
+			g_free(a->disto.filename);
+			a->disto = (disto_params) { .index = DISTO_FILES };
 		}
 		else if (!strcmp(w, "-disto=file")) {
 			/* as register -disto=file: the file is the next word */
@@ -2291,6 +2441,10 @@ int process_lsf_append(int nb) {
 	}
 	if (a->disto.index != DISTO_UNDEF && a->noreg) {
 		siril_log_error(_("-disto undistorts the frames when they are registered and cannot be used with -noreg\n"));
+		goto failure;
+	}
+	if (a->disto.index == DISTO_FILES && !a->wcsreg) {
+		siril_log_error(_("-disto=frames undistorts each frame with the SIP terms of its own WCS, which needs -wcsreg\n"));
 		goto failure;
 	}
 	if (a->disto.index == DISTO_FILE) {
@@ -2391,7 +2545,7 @@ failure:
 	return CMD_ARG_ERROR;
 }
 
-/* lsf_maps file.lsf.fits prefix [-neff] [-noise] [-sigma] [-snr] [-rejlo] [-rejhi] */
+/* lsf_maps file.lsf.fits prefix [-neff] [-noise] [-sigma] [-snr] [-rejlo] [-rejhi] [-exp] */
 int process_lsf_maps(int nb) {
 	struct lsf_cmd_args *a = lsf_cmd_args_new(LSF_CMD_MAPS);
 	if (!a)
@@ -2406,6 +2560,7 @@ int process_lsf_maps(int nb) {
 		else if (!strcmp(w, "-snr")) a->maps |= LSF_MAP_SNR;
 		else if (!strcmp(w, "-rejlo")) a->maps |= LSF_MAP_REJLO;
 		else if (!strcmp(w, "-rejhi")) a->maps |= LSF_MAP_REJHI;
+		else if (!strcmp(w, "-exp")) a->maps |= LSF_MAP_EXP;
 		else {
 			siril_log_error(_("Unknown parameter %s, aborting.\n"), w);
 			lsf_cmd_args_free(a);

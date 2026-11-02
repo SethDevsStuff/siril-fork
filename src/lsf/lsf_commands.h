@@ -15,7 +15,7 @@ typedef enum { LSF_CMD_INIT, LSF_CMD_APPEND, LSF_CMD_EXPORT, LSF_CMD_UTIL, LSF_C
 
 /* maps of lsf_maps (Section 10.8) */
 enum { LSF_MAP_NEFF = 1 << 0, LSF_MAP_NOISE = 1 << 1, LSF_MAP_SIGMA = 1 << 2, LSF_MAP_SNR = 1 << 3,
-	LSF_MAP_REJLO = 1 << 4, LSF_MAP_REJHI = 1 << 5 };
+	LSF_MAP_REJLO = 1 << 4, LSF_MAP_REJHI = 1 << 5, LSF_MAP_EXP = 1 << 6 };
 
 typedef struct lsf_job_result lsf_job_result;
 /* called on the main thread when the job is over, after the processing
@@ -59,6 +59,8 @@ struct lsf_cmd_args {
 	gboolean force_reg;	// append: -reg, register again even with a registration made against the file
 	gboolean wcsreg;	// append: -wcsreg, register through the WCS of the frames and of the Stack (Section 10.4)
 	gboolean weight_inverse;	// append: -weight_model=inverse, from this append on (Section 10.3)
+	gboolean overlap_norm;		// append: -overlap_norm, normalization against the Stack on the overlap
+	int feather;			// init and append: -feather=, px, 0 for none
 	disto_params disto;	// append: -disto=, the distortion model of an undistorted grid; DISTO_UNDEF: the file's
 	gchar *wcs_file;	// util: -wcs=, the plate-solved image or .wcs file whose WCS is imported (Section 8)
 	int *image_indices;	// init and append: frames chosen by the GUI's stacking filters, or NULL

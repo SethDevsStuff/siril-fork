@@ -173,6 +173,7 @@ struct registration_args {
 	framing_roi canvas;	// apply reg with FRAMING_CURRENT: output canvas in the reference's pixels, opencv convention, origin may be negative (w = 0: the reference itself)
 	disto_data *disto_ext;			// undistortion information for an external reference
 	gboolean ext_ref_undistorted;	// the external reference is already undistorted: its stars are not corrected
+	gboolean keep_transforms;	// astrometric registration (DISTO_FILES): the transforms were computed by the caller, the images' astrometry only gives their distortion
 };
 
 struct registration_method *new_reg_method(const char *name, registration_function f,

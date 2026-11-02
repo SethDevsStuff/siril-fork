@@ -52,13 +52,14 @@ gboolean lsf_norm_from_name(const char *name, normalization *n) {
 	return FALSE;
 }
 /* align.disto: the distortion model of the appends, a file of Siril's
- * register -disto=file, or the master pattern of -disto=master (JSON:
- * source and file) */
+ * register -disto=file, the master pattern of -disto=master, or the frames'
+ * own SIP terms of an astrometric registration (JSON: source and file, empty
+ * for the frames) */
 gchar *lsf_disto_to_json(const disto_params *d) {
 	yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
 	yyjson_mut_val *root = yyjson_mut_obj(doc);
 	yyjson_mut_doc_set_root(doc, root);
-	yyjson_mut_obj_add_str(doc, root, "source", d->index == DISTO_MASTER ? "master" : "file");
+	yyjson_mut_obj_add_str(doc, root, "source", d->index == DISTO_MASTER ? "master" : d->index == DISTO_FILES ? "frames" : "file");
 	yyjson_mut_obj_add_str(doc, root, "file", d->filename ? d->filename : "");
 	char *json = yyjson_mut_write(doc, 0, NULL);
 	gchar *out = g_strdup(json ? json : "{}");
@@ -73,11 +74,11 @@ int lsf_disto_from_json(const char *json, disto_params *d) {
 	yyjson_val *root = yyjson_doc_get_root(doc);
 	const char *src = yyjson_get_str(yyjson_obj_get(root, "source"));
 	const char *file = yyjson_get_str(yyjson_obj_get(root, "file"));
-	int ret = !src || !file || (strcmp(src, "master") && strcmp(src, "file"));
+	int ret = !src || !file || (strcmp(src, "master") && strcmp(src, "file") && strcmp(src, "frames"));
 	if (!ret) {
 		g_free(d->filename);
-		d->index = strcmp(src, "master") ? DISTO_FILE : DISTO_MASTER;
-		d->filename = g_strdup(file);
+		d->index = !strcmp(src, "master") ? DISTO_MASTER : !strcmp(src, "frames") ? DISTO_FILES : DISTO_FILE;
+		d->filename = d->index == DISTO_FILES ? NULL : g_strdup(file);
 	}
 	yyjson_doc_free(doc);
 	return ret;
@@ -96,6 +97,8 @@ gchar *lsf_disto_describe(const disto_params *d) {
 		return g_strdup_printf("master (%s)", d->filename ? d->filename : "");
 	if (d->index == DISTO_FILE)
 		return g_strdup_printf("file %s", d->filename ? d->filename : "");
+	if (d->index == DISTO_FILES)
+		return g_strdup(_("the SIP terms of each frame's own WCS"));
 	return g_strdup("none");
 }
 

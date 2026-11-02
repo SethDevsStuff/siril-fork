@@ -208,6 +208,7 @@ void compute_max_framing(struct stacking_args *args, int output_size[2], int off
 /* normalization functions, normalization.c */
 
 int do_normalization(struct stacking_args *args);
+void solve_overlap_coeffs(int nb_frames, int *index, int index_ref, size_t **Nij, double **Mij, gboolean additive, double *coeffs);
 int *compute_thread_distribution(int nb_workers, int max);
 void free_ostats(overlap_stats_t **ostats, int nb_layers);
 overlap_stats_t **alloc_ostats(int nb_layers, int nb_frames);

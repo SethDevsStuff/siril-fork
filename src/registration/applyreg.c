@@ -1211,6 +1211,8 @@ int register_apply_reg(struct registration_args *regargs) {
 			siril_log_warning(_("Warning: the number of images after collecting astrometry is different from the number of images before filtering.\n"));
 			siril_log_warning(_("The registration will be applied to the filtered images only.\n"));
 		}
+	}
+	if (regargs->undistort == DISTO_FILES && !regargs->keep_transforms) {
 		Homography Href = { 0 };
 		if (compute_Hs_from_astrometry(regargs->seq, included, regargs->reference_image, regargs->WCSDATA, regargs->framing, regargs->layer, &Href, &regargs->wcsref)) {
 			retval = -1;
@@ -1241,6 +1243,8 @@ int register_apply_reg(struct registration_args *regargs) {
 				regargs->framingd.Htransf = regargs->seq->regparam[regargs->layer][regargs->reference_image].H;
 			}
 		}
+	} else if (regargs->keep_transforms) {
+		cvGetEye(&regargs->framingd.Htransf); // as compute_Hs_from_astrometry gives
 	} else {
 		regargs->framingd.Htransf = regargs->seq->regparam[regargs->layer][regargs->reference_image].H;
 	}
@@ -1317,7 +1321,7 @@ int register_apply_reg(struct registration_args *regargs) {
 			remove_dis_from_wcs(regargs->wcsref); // we remove distortions as the output is undistorted, so its astrometry should be as well
 		if (!regargs->undistort && regargs->wcsref->lin.dispre)
 			siril_log_warning(_("Distortion was found in reference image astrometry but you did not include distortion correction when registering the images\n"));
-		if (index == DISTO_FILES && image_is_flipped_from_wcs(regargs->wcsref)) { // we are in astrometric reg, we will need to flip the solution if required
+		if (index == DISTO_FILES && !regargs->use_external_ref && image_is_flipped_from_wcs(regargs->wcsref)) { // we are in astrometric reg, we will need to flip the solution if required
 			Homography H = { 0 };
 			cvGetEye(&H);
 			H.h11 = -1.;

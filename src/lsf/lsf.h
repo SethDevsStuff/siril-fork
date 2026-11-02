@@ -31,6 +31,19 @@
  * Section 10.3), 1 being the best frame of the first batch: a frame at or
  * beyond its worst still counts */
 #define LSF_WEIGHT_FLOOR 0.01
+/* a frame covering fewer reference stars (LSF_WREF) has an unreliable wFWHM,
+ * which happens to mosaic panels away from the first batch */
+#define LSF_WREF_MIN_COVER 10
+/* least overlap with the Stack for -overlap_norm: pixels, and share of the
+ * frame's data */
+#define LSF_OVERLAP_MIN_PIX 10000
+#define LSF_OVERLAP_MIN_FRAC 0.01
+/* bins of -overlap_norm on initialization, px: the frames of the batch are
+ * matched on the bins they share */
+#define LSF_OVERLAP_BIN 16
+/* a frame under max framing keeps at least this share of its area on the grid */
+#define LSF_MIN_LANDED 0.9
+#define LSF_FEATHER_MAX 2000	// as the stack command's -feather=, in pixels of its masks (1/10 scale)
 
 /* how the frozen wfwhm and nbstars constants scale the frames (weight.model,
  * Section 10.3): RANGE, Siril's formula between the first batch's best and
@@ -59,6 +72,9 @@ typedef struct {
 	WORD *rej[2][3];
 	gboolean rej_saturated;
 	int rej_gen;			// LSFRGEN, the first generation counted
+	/* exposure map (Section 3), the EXP planes of LSF_ACC, NULL when the file
+	 * has none: sum of EXPTIME over the accepted samples, seconds */
+	float *exp[3];
 } lsf_history;
 
 /* one row of LSF_SETTINGS that this writer does not know, kept (C7) */
@@ -135,6 +151,10 @@ typedef struct {
 	gboolean stack_modified;	// check 8 failed (only when tolerated)
 	float *stack_data;		// HDU 0 pixels when stack_modified, file order
 	double xfrm_shift[2];		// grid expansion of this commit: shift of the REG_XFRM already in the ledger
+	gboolean has_exp;		// LSF_ACC holds the EXP planes of the exposure map
+	/* EXPTIME of every ledger row when they all have the same, known one, so
+	 * that the exposure map is COUNT times it; NAN otherwise */
+	double ledger_exptime;
 	lsf_compression compression;	// of LSF_ACC, as found in the file
 	gchar acc_codec[FLEN_VALUE], count_codec[FLEN_VALUE], rej_codec[FLEN_VALUE];	// ZCMPTYPE, "none" when not compressed
 	long long acc_bytes, count_bytes, rej_bytes;	// size of the data units as stored
@@ -157,6 +177,7 @@ typedef struct {
 	gchar *reg_dist;	// REG_DIST: the SIP cards the frame was undistorted with, or NULL
 	double norm_sc[3], norm_off[3];
 	gchar norm_mth[3][13];
+	int feather;		// FEATHER: the feathering distance the frame was merged with, px, 0 for none
 	double weight[3];
 	float fwhm, wfwhm, round, regq, regbg;
 	int nstars;

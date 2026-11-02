@@ -29,6 +29,7 @@
 #include "lsf/lsf_fits.h"
 #include "lsf/lsf_math.h"
 #include "lsf/lsf_settings.h"
+#include "lsf/lsf_stack.h"
 #include "lsf/lsf_weights.h"
 
 cominfo com;	// the core data struct
@@ -90,6 +91,20 @@ Test(lsf_math, count_add) {
 	lsf_count_add(&c, 3, &sat);
 	cr_assert_eq(c, 65535);
 	cr_assert(sat);
+}
+
+/* the exposure map of a history of one exposure is COUNT times it, exactly
+ * for integer exposures; a saturated count stays at 65535 times it */
+Test(lsf_math, exp_backfill) {
+	const WORD count[] = { 0, 1, 7, 65535 };
+	float exp[4] = { -1.f, -1.f, -1.f, -1.f };
+	lsf_exp_backfill(exp, count, 4, 120.0);
+	cr_assert_eq(exp[0], 0.f);
+	cr_assert_eq(exp[1], 120.f);
+	cr_assert_eq(exp[2], 840.f);
+	cr_assert_eq(exp[3], 7864200.f);
+	lsf_exp_backfill(exp, count, 4, 0.5);
+	cr_assert_eq(exp[2], 3.5f);
 }
 
 /* Section 10.6: c is about 1.014 at +-3 sigma and 1.048 at +-2.5 sigma */
@@ -350,6 +365,98 @@ Test(lsf_math, xfrm_shift) {
 	double w = h[6] * x + h[7] * y + h[8], ws = s[6] * x + s[7] * y + s[8];
 	cr_assert_float_eq((s[0] * x + s[1] * y + s[2]) / ws, (h[0] * x + h[1] * y + h[2]) / w + 64.0, 1e-9);
 	cr_assert_float_eq((s[3] * x + s[4] * y + s[5]) / ws, (h[3] * x + h[4] * y + h[5]) / w + 128.0, 1e-9);
+}
+
+/* the margins before a frame: its first stored row is at the top of the grid
+ * in Siril's coordinates, whichever way the transform turns the frame */
+Test(lsf_math, frame_origin) {
+	int origin[2];
+	const double shift[9] = { 1, 0, 2726, 0, 1, 2776, 0, 0, 1 };
+	lsf_frame_origin(shift, 3008, 3008, 5902, origin);
+	cr_assert_eq(origin[0], 2726);
+	cr_assert_eq(origin[1], 5902 - 1 - (3007 + 2776));
+	/* the same place on the grid, turned upside down */
+	const double flip[9] = { 1, 0, 2726, 0, -1, 2776 + 3007, 0, 0, 1 };
+	lsf_frame_origin(flip, 3008, 3008, 5902, origin);
+	cr_assert_eq(origin[0], 2726);
+	cr_assert_eq(origin[1], 5902 - 1 - (3007 + 2776));
+}
+
+/* the frames' own SIP terms survive the settings */
+Test(lsf_math, disto_frames_json) {
+	disto_params d = { .index = DISTO_FILES }, r = { .index = DISTO_UNDEF };
+	gchar *json = lsf_disto_to_json(&d);
+	cr_assert_eq(lsf_disto_from_json(json, &r), 0);
+	cr_assert_eq(r.index, DISTO_FILES);
+	cr_assert(r.filename == NULL);
+	cr_assert(lsf_disto_same(&d, &r));
+	g_free(json);
+}
+
+/* three frames in a chain: 0 - 1 - 2, frame 3 connected to none */
+static void levels_setup(size_t **N, double **M, size_t *Nm, double *Mm) {
+	memset(Nm, 0, 16 * sizeof(size_t));
+	memset(Mm, 0, 16 * sizeof(double));
+	for (int i = 0; i < 4; i++) {
+		N[i] = Nm + 4 * i;
+		M[i] = Mm + 4 * i;
+	}
+	N[0][1] = N[1][0] = 1000;
+	N[1][2] = N[2][1] = 500;
+}
+
+/* a frame reached only through another gets the sum of the two offsets, and
+ * one not reached is left alone */
+Test(lsf_math, solve_levels_additive) {
+	size_t Nm[16], *N[4];
+	double Mm[16], *M[4], c[4];
+	gboolean reached[4];
+	levels_setup(N, M, Nm, Mm);
+	M[0][1] = 0.10; M[1][0] = 0.13;	// frame 1 is 0.03 too high
+	M[1][2] = 0.20; M[2][1] = 0.15;	// frame 2 is 0.05 below frame 1
+	cr_assert_eq(lsf_solve_levels(4, 0, N, M, TRUE, c, reached), 2);
+	cr_assert_float_eq(c[0], 0.0, 1e-12);
+	cr_assert_float_eq(c[1], -0.03, 1e-9);
+	cr_assert_float_eq(c[2], 0.02, 1e-9);
+	cr_assert_float_eq(c[3], 0.0, 1e-12);
+	cr_assert(reached[2]);
+	cr_assert(!reached[3]);
+}
+
+Test(lsf_math, solve_levels_multiplicative) {
+	size_t Nm[16], *N[4];
+	double Mm[16], *M[4], c[4];
+	gboolean reached[4];
+	levels_setup(N, M, Nm, Mm);
+	M[0][1] = 0.10; M[1][0] = 0.20;	// frame 1 is twice as bright
+	M[1][2] = 0.30; M[2][1] = 0.60;	// frame 2 twice frame 1
+	cr_assert_eq(lsf_solve_levels(4, 0, N, M, FALSE, c, reached), 2);
+	cr_assert_float_eq(c[1], 0.5, 1e-9);
+	cr_assert_float_eq(c[2], 0.25, 1e-9);
+	cr_assert_float_eq(c[3], 1.0, 1e-12);
+}
+
+/* a loop of panels that disagree: no frame takes all the error, unlike
+ * matching one frame after another */
+Test(lsf_math, solve_levels_loop) {
+	size_t Nm[9], *N[3];
+	double Mm[9], *M[3], c[3];
+	gboolean reached[3];
+	memset(Nm, 0, sizeof Nm);
+	memset(Mm, 0, sizeof Mm);
+	for (int i = 0; i < 3; i++) {
+		N[i] = Nm + 3 * i;
+		M[i] = Mm + 3 * i;
+		for (int j = 0; j < 3; j++)
+			N[i][j] = i == j ? 0 : 1000;
+	}
+	/* differences 1 - 0: 0.03, 2 - 1: 0.03, and 2 - 0: 0.03 instead of 0.06 */
+	M[0][1] = 0.10; M[1][0] = 0.13;
+	M[1][2] = 0.10; M[2][1] = 0.13;
+	M[0][2] = 0.10; M[2][0] = 0.13;
+	cr_assert_eq(lsf_solve_levels(3, 0, N, M, TRUE, c, reached), 2);
+	cr_assert_float_eq(c[1], -0.02, 1e-9);
+	cr_assert_float_eq(c[2], -0.04, 1e-9);
 }
 
 /* padding keeps every existing pixel and adds zeros (W = 0, no data) */

@@ -80,6 +80,14 @@ void lsf_count_add(WORD *c, int n, gboolean *saturated) {
 	*c = (WORD) v;
 }
 
+/* exposure map of a history whose every frame had the same exposure
+ * (Section 10.2): COUNT times it. Exact unless a count saturated, which
+ * makes those pixels a lower bound. */
+void lsf_exp_backfill(float *exp, const WORD *count, size_t n, double exptime) {
+	for (size_t i = 0; i < n; i++)
+		exp[i] = (float) ((double) count[i] * exptime);
+}
+
 static double phi(double x) {
 	return exp(-0.5 * x * x) / sqrt(2.0 * M_PI);
 }
@@ -314,6 +322,21 @@ void lsf_edge_limits(const guint8 *has, int rx, int ry, int margin,
 		if (col_lo[x] > 0 && col_lo[x] < ry) col_lo[x] += margin;
 		if (col_hi[x] >= 0 && col_hi[x] < ry - 1) col_hi[x] -= margin;
 	}
+}
+
+/* grid.origin_x and grid.origin_y (Section 10.1): the margins of an nry rows
+ * grid before an rx x ry frame mapped onto it by h, in columns from the left
+ * and in rows from the top, whichever way h turns the frame */
+void lsf_frame_origin(const double h[9], int rx, int ry, int nry, int origin[2]) {
+	double xmin = DBL_MAX, ymax = -DBL_MAX;
+	for (int j = 0; j < 2; j++)
+		for (int i = 0; i < 2; i++) {
+			double x = i * (rx - 1.0), y = j * (ry - 1.0);
+			xmin = MIN(xmin, h[0] * x + h[1] * y + h[2]);
+			ymax = MAX(ymax, h[3] * x + h[4] * y + h[5]);
+		}
+	origin[0] = (int) lround(xmin);
+	origin[1] = nry - 1 - (int) lround(ymax);
 }
 
 /* each side grows in multiples of step pixels */

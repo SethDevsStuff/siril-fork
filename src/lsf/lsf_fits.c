@@ -90,6 +90,25 @@ int lsf_history_alloc_rej(lsf_history *h, int first_gen) {
 	return 0;
 }
 
+/* exposure map (Section 3), zero */
+int lsf_history_alloc_exp(lsf_history *h) {
+	size_t n = (size_t) h->rx * h->ry;
+	for (int c = 0; c < h->nchan; c++) {
+		h->exp[c] = siril_calloc(n, sizeof(float));
+		if (!h->exp[c]) {
+			PRINT_ALLOC_ERR;
+			return 1;
+		}
+	}
+	return 0;
+}
+
+/* memory of an accumulator of npix pixels times channels, with its optional
+ * planes */
+guint64 lsf_history_bytes(guint64 npix, gboolean rej, gboolean exp) {
+	return npix * ((LSF_NB_PL + (exp ? 1 : 0)) * sizeof(float) + (rej ? 3 : 1) * sizeof(WORD));
+}
+
 /* grid expansion (Section 10.5): pads every plane with zeros, one plane at a
  * time so that only one extra plane is in memory. W = 0 in the padding, so
  * no existing pixel changes. */
@@ -97,11 +116,12 @@ int lsf_history_grow(lsf_history *h, const int pad[4]) {
 	int nrx = h->rx + pad[LSF_PAD_LEFT] + pad[LSF_PAD_RIGHT];
 	int nry = h->ry + pad[LSF_PAD_FIRST] + pad[LSF_PAD_LAST];
 	size_t n = (size_t) nrx * nry;
-	gboolean has_rej = h->rej[0][0] != NULL;
+	gboolean has_rej = h->rej[0][0] != NULL, has_exp = h->exp[0] != NULL;
 	for (int c = 0; c < h->nchan; c++) {
-		/* the accumulator planes, the count, then the rejection maps */
-		for (int k = 0; k < LSF_NB_PL + (has_rej ? 3 : 1); k++) {
-			void **plane = k < LSF_NB_PL ? (void **) &h->plane[k][c] :
+		/* the accumulator planes, the exposure map, the count, then the
+		 * rejection maps */
+		for (int k = -(has_exp ? 1 : 0); k < LSF_NB_PL + (has_rej ? 3 : 1); k++) {
+			void **plane = k < 0 ? (void **) &h->exp[c] : k < LSF_NB_PL ? (void **) &h->plane[k][c] :
 				k == LSF_NB_PL ? (void **) &h->count[c] : (void **) &h->rej[k - LSF_NB_PL - 1][c];
 			size_t elsize = k < LSF_NB_PL ? sizeof(float) : sizeof(WORD);
 			void *grown = siril_calloc(n, elsize);
@@ -127,6 +147,8 @@ void lsf_history_free(lsf_history *h) {
 		}
 		siril_free(h->count[c]);
 		h->count[c] = NULL;
+		siril_free(h->exp[c]);
+		h->exp[c] = NULL;
 		for (int d = 0; d < 2; d++) {
 			siril_free(h->rej[d][c]);
 			h->rej[d][c] = NULL;
@@ -224,6 +246,13 @@ static gchar *plane_name(int kind, int chan, int nchan) {
 	if (nchan == 1)
 		return g_strdup(plane_kind[kind]);
 	return g_strdup_printf("%s%s", plane_kind[kind], chan_suffix[chan]);
+}
+
+/* the exposure map planes of LSF_ACC (Section 3), after W2 */
+static gchar *exp_plane_name(int chan, int nchan) {
+	if (nchan == 1)
+		return g_strdup("EXP");
+	return g_strdup_printf("EXP%s", chan_suffix[chan]);
 }
 
 /* planes of LSF_REJ (Section 5.4): REJLO then REJHI, P channels each */
@@ -450,11 +479,13 @@ static int open_and_validate(const char *path, lsf_file *f, gboolean tolerate_ed
 	status = 0;
 	fits_movabs_hdu(fptr, hdu_acc, NULL, &status);
 	fits_get_img_param(fptr, 3, &abitpix, &anaxis, anaxes, &status);
+	/* the EXP planes of the exposure map are optional (Section 3) */
 	if (status || abitpix != FLOAT_IMG || anaxis != 3 || anaxes[0] != f->rx || anaxes[1] != f->ry
-			|| anaxes[2] != LSF_NB_PL * f->nchan) {
+			|| (anaxes[2] != LSF_NB_PL * f->nchan && anaxes[2] != (LSF_NB_PL + 1) * f->nchan)) {
 		ret = validation_failure(3, path, light, problem, _("LSF_ACC does not have the expected dimensions"));
 		goto end;
 	}
+	f->has_exp = anaxes[2] == (LSF_NB_PL + 1) * f->nchan;
 	/* map the planes by name (C6) */
 	int plane_index[LSF_NB_PL][3];
 	for (int k = 0; k < LSF_NB_PL; k++)
@@ -469,6 +500,16 @@ static int open_and_validate(const char *path, lsf_file *f, gboolean tolerate_ed
 				goto end;
 			}
 		}
+	int exp_index[3] = { -1, -1, -1 };
+	for (int c = 0; f->has_exp && c < f->nchan; c++) {
+		gchar *expected = exp_plane_name(c, f->nchan);
+		exp_index[c] = find_plane(fptr, anaxes[2], expected);
+		g_free(expected);
+		if (exp_index[c] < 0) {
+			ret = validation_failure(3, path, light, problem, _("LSF_ACC does not hold the expected named planes"));
+			goto end;
+		}
+	}
 
 	long cnaxes[3] = { 0, 0, 1 };
 	int cnaxis = 0, cbitpix = 0, ctype = 0;
@@ -603,6 +644,11 @@ static int open_and_validate(const char *path, lsf_file *f, gboolean tolerate_ed
 	f->nb_batches = 0;
 	int has_batch = !fits_get_colnum(fptr, CASEINSEN, "BATCH", &cbatch, &status);
 	status = 0;
+	/* and the exposure all the frames share, if they do */
+	int cexp = 0;
+	gboolean has_exptime = !fits_get_colnum(fptr, CASEINSEN, "EXPTIME", &cexp, &status);
+	status = 0;
+	f->ledger_exptime = has_exptime && f->ledger_rows > 0 ? 0.0 : NAN;
 	for (long r = 1; r <= f->ledger_rows; r++) {
 		int g = 0, b = 0;
 		fits_read_col(fptr, TINT, cgen, r, 1, 1, NULL, &g, NULL, &status);
@@ -611,6 +657,16 @@ static int open_and_validate(const char *path, lsf_file *f, gboolean tolerate_ed
 		if (status) break;
 		if (g > f->max_ledger_gen) f->max_ledger_gen = g;
 		if (b > f->nb_batches) f->nb_batches = b;
+		if (isfinite(f->ledger_exptime)) {
+			double e = NAN;
+			int st = 0;
+			fits_read_col(fptr, TDOUBLE, cexp, r, 1, 1, NULL, &e, NULL, &st);
+			if (st || !isfinite(e) || e < 0.0
+					|| (r > 1 && fabs(e - f->ledger_exptime) > 1e-6 * MAX(e, f->ledger_exptime)))
+				f->ledger_exptime = NAN;
+			else if (r == 1)
+				f->ledger_exptime = e;
+		}
 	}
 	/* a generation without ledger rows changed no frame (Repair, Adopt) */
 	if (status || f->max_ledger_gen > f->gen) {
@@ -723,6 +779,16 @@ static int open_and_validate(const char *path, lsf_file *f, gboolean tolerate_ed
 			long fpixel[3] = { 1, 1, plane_index[k][c] + 1 };
 			fits_read_pix(fptr, TFLOAT, fpixel, npix, NULL, f->hist.plane[k][c], NULL, &status);
 		}
+	if (f->has_exp && !status) {
+		if (lsf_history_alloc_exp(&f->hist)) {
+			ret = -1;
+			goto end;
+		}
+		for (int c = 0; c < f->nchan && !status; c++) {
+			long fpixel[3] = { 1, 1, exp_index[c] + 1 };
+			fits_read_pix(fptr, TFLOAT, fpixel, npix, NULL, f->hist.exp[c], NULL, &status);
+		}
+	}
 	fits_movabs_hdu(fptr, hdu_count, NULL, &status);
 	for (int c = 0; c < f->nchan && !status; c++) {
 		/* a single count plane is shared by all channels (Section 3) */
@@ -1114,16 +1180,32 @@ static int create_ledger_hdu(fitsfile *fptr, int nchan, int *status) {
 	return *status;
 }
 
+/* the column, or 0 when the ledger has none: a column absent from an older
+ * ledger is not an error, and leaves no message on CFITSIO's error stack */
 static int colnum(fitsfile *fptr, const char *name) {
 	int status = 0, c = 0;
+	fits_write_errmark();
 	fits_get_colnum(fptr, CASEINSEN, (char *) name, &c, &status);
+	fits_clear_errmark();
 	return status ? 0 : c;
 }
 
+/* A variable-length string (1PA) is written as its bytes: CFITSIO writes
+ * and reads a string of 28800 characters or more as text with an error
+ * ("ASCII string column is too wide"), and ORIGHDR reaches that with a few
+ * hundred header cards. The bytes stored are the same; an empty string is
+ * left to CFITSIO, which stores it as one byte. */
 static void put_str(fitsfile *fptr, const char *name, long row, const char *v, int *status) {
 	int c = colnum(fptr, name);
 	if (!c) return;
 	char *s = (char *) (v ? v : "");
+	int typecode = 0;
+	long repeat = 0, width = 0;
+	fits_get_coltype(fptr, c, &typecode, &repeat, &width, status);
+	if (typecode < 0 && *s) {
+		fits_write_col(fptr, TBYTE, c, row, 1, (LONGLONG) strlen(s), s, status);
+		return;
+	}
 	fits_write_col_str(fptr, c, row, 1, 1, &s, status);
 }
 
@@ -1131,6 +1213,52 @@ static void put(fitsfile *fptr, int type, const char *name, long row, long n, vo
 	int c = colnum(fptr, name);
 	if (!c) return;	// column absent in an older ledger
 	fits_write_col(fptr, type, c, row, 1, n, v, status);
+}
+
+/* FEATHER (Section 9) is added to the ledger by the first commit that
+ * feathers its frames; the rows already there get 0, no feathering */
+static void add_feather_column(fitsfile *fptr, GPtrArray *rows, int *status) {
+	gboolean feathered = FALSE;
+	for (guint i = 0; i < rows->len; i++)
+		feathered |= ((lsf_ledger_row *) g_ptr_array_index(rows, i))->feather > 0;
+	if (!feathered || *status || colnum(fptr, "FEATHER"))
+		return;
+	int ncols = 0;
+	long nrows = 0;
+	fits_get_num_cols(fptr, &ncols, status);
+	fits_get_num_rows(fptr, &nrows, status);
+	fits_insert_col(fptr, ncols + 1, "FEATHER", "J", status);
+	long tnull = INT_MIN;
+	char key[FLEN_KEYWORD];
+	g_snprintf(key, sizeof key, "TNULL%d", ncols + 1);
+	fits_update_key(fptr, TLONG, key, &tnull, NULL, status);
+	int zero = 0;
+	for (long r = 1; r <= nrows && !*status; r++)
+		fits_write_col(fptr, TINT, ncols + 1, r, 1, 1, &zero, status);
+}
+
+/* NORM_MTH, 12 characters per channel (Section 9). CFITSIO reads its TDIM
+ * (12,P) as P strings of 12 in a table it opened, but as one string of 12 P
+ * in the table it has just created, or in one without TDIM: written as one
+ * string into P of them, only the first channel's would be kept. */
+static void put_norm_mth(fitsfile *fptr, long row, int nchan, gchar mth[3][13], int *status) {
+	int c = colnum(fptr, "NORM_MTH"), type = 0;
+	long repeat = 0, width = 0;
+	if (!c || *status || nchan < 1 || nchan > 3)
+		return;
+	fits_get_coltype(fptr, c, &type, &repeat, &width, status);
+	char joined[3 * 12 + 1], cells[3][13];
+	char *v[3];
+	for (int k = 0; k < nchan; k++) {
+		g_snprintf(cells[k], sizeof cells[k], "%-12s", mth[k]);
+		memcpy(joined + 12 * k, cells[k], 12);
+		v[k] = cells[k];
+	}
+	joined[12 * nchan] = '\0';
+	if (width >= 12 * nchan) {
+		v[0] = joined;
+		fits_write_col(fptr, TSTRING, c, row, 1, 1, v, status);
+	} else fits_write_col(fptr, TSTRING, c, row, 1, nchan, v, status);
 }
 
 static void write_ledger_rows(fitsfile *fptr, GPtrArray *rows, long first_row, int nchan,
@@ -1158,12 +1286,7 @@ static void write_ledger_rows(fitsfile *fptr, GPtrArray *rows, long first_row, i
 		put_str(fptr, "REG_DIST", row, r->reg_dist, status);
 		put(fptr, TDOUBLE, "NORM_SC", row, nchan, r->norm_sc, status);
 		put(fptr, TDOUBLE, "NORM_OFF", row, nchan, r->norm_off, status);
-		{
-			char mth[3 * 12 + 1];
-			for (int c = 0; c < nchan; c++)
-				g_snprintf(mth + 12 * c, 13, "%-12s", r->norm_mth[c]);
-			put_str(fptr, "NORM_MTH", row, mth, status);
-		}
+		put_norm_mth(fptr, row, nchan, r->norm_mth, status);
 		put(fptr, TDOUBLE, "WEIGHT", row, nchan, r->weight, status);
 		put(fptr, TFLOAT, "FWHM", row, 1, &r->fwhm, status);
 		put(fptr, TFLOAT, "WFWHM", row, 1, &r->wfwhm, status);
@@ -1171,6 +1294,7 @@ static void write_ledger_rows(fitsfile *fptr, GPtrArray *rows, long first_row, i
 		put(fptr, TFLOAT, "REGQ", row, 1, &r->regq, status);
 		put(fptr, TFLOAT, "REGBG", row, 1, &r->regbg, status);
 		put(fptr, TINT, "NSTARS", row, 1, &r->nstars, status);
+		put(fptr, TINT, "FEATHER", row, 1, &r->feather, status);	// once a commit has feathered
 		put(fptr, TFLOAT, "BKG_MED", row, nchan, r->bkg_med, status);
 		put(fptr, TFLOAT, "NOISE", row, nchan, r->noise, status);
 		put(fptr, TFLOAT, "NOISE_N", row, nchan, r->noise_n, status);
@@ -1371,23 +1495,25 @@ int lsf_write_file(const char *path, lsf_file *old, const lsf_settings *s, lsf_h
 				comp == LSF_COMP_GZIP1 ? GZIP1_COMP : GZIP2_COMP, 0.0, 0.0))
 		goto end;
 
-	/* LSF_ACC */
-	long anaxes[3] = { h->rx, h->ry, LSF_NB_PL * nchan };
+	/* LSF_ACC, with the planes of the exposure map after W2 when there is one */
+	gboolean has_exp = h->exp[0] != NULL;
+	int nkinds = LSF_NB_PL + (has_exp ? 1 : 0);
+	long anaxes[3] = { h->rx, h->ry, nkinds * nchan };
 	fits_create_img(fptr, FLOAT_IMG, 3, anaxes, &status);
 	write_identity(fptr, LSF_EXT_ACC, uid, gen, &status);
-	for (int k = 0, p = 1; k < LSF_NB_PL; k++)
+	for (int k = 0, p = 1; k < nkinds; k++)
 		for (int c = 0; c < nchan; c++, p++) {
 			char key[FLEN_KEYWORD];
-			gchar *name = plane_name(k, c, nchan);
+			gchar *name = k < LSF_NB_PL ? plane_name(k, c, nchan) : exp_plane_name(c, nchan);
 			g_snprintf(key, sizeof key, "LSFPL%d", p);
 			fits_update_key(fptr, TSTRING, key, name, NULL, &status);
 			g_free(name);
 		}
 	write_cards(fptr, wcs, &status);
-	for (int k = 0, p = 1; k < LSF_NB_PL && !status; k++)
+	for (int k = 0, p = 1; k < nkinds && !status; k++)
 		for (int c = 0; c < nchan && !status; c++, p++) {
 			long fpixel[3] = { 1, 1, p };
-			fits_write_pix(fptr, TFLOAT, fpixel, npix, h->plane[k][c], &status);
+			fits_write_pix(fptr, TFLOAT, fpixel, npix, k < LSF_NB_PL ? h->plane[k][c] : h->exp[c], &status);
 		}
 
 	/* LSF_COUNT */
@@ -1474,6 +1600,7 @@ int lsf_write_file(const char *path, lsf_file *old, const lsf_settings *s, lsf_h
 	} else {
 		create_ledger_hdu(fptr, nchan, &status);
 	}
+	add_feather_column(fptr, new_rows, &status);
 	write_identity(fptr, NULL, uid, gen, &status);
 	write_ledger_rows(fptr, new_rows, first_row, nchan, batch, gen, added, &status);
 	if (status) {
