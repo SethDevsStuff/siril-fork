@@ -15,6 +15,11 @@
  *    img.rows()    -> img.h        img.columns() -> img.w
  *    img.channels()-> img.d        img.pixels()  -> img.w*img.h
  *    img.val(col,row,chan) -> img(col,row,chan)
+
+ *  Optimized in 2026
+ *  - Fixed cache thrashing by flipping planar loops (chan on the outside).
+ *  - Unrolled and vectorized channels in BilateralWeight.
+ *  - Streamlined data locality in main aggregation blocks.
  */
 
 #include <cmath>
@@ -52,11 +57,14 @@ namespace da3d {
 namespace {
 
 void ExtractPatch(const img_t<float> &src, int pr, int pc, img_t<float> *dst) {
-  // src is padded, so (pr, pc) becomes the upper left pixel (row pr, col pc).
-  for (int chan = 0; chan < dst->d; ++chan)
-    for (int row = 0; row < dst->h; ++row)
-      for (int col = 0; col < dst->w; ++col)
+  // Planar-optimized extraction
+  for (int chan = 0; chan < dst->d; ++chan) {
+    for (int row = 0; row < dst->h; ++row) {
+      for (int col = 0; col < dst->w; ++col) {
         (*dst)(col, row, chan) = src(pc + col, pr + row, chan);
+      }
+    }
+  }
 }
 
 void BilateralWeight(const img_t<float> &g, img_t<float> *k, int r, float gamma_r_sigma2,
@@ -64,23 +72,55 @@ void BilateralWeight(const img_t<float> &g, img_t<float> *k, int r, float gamma_
   const float inv_gamma_r_sigma2 = 1.f / gamma_r_sigma2;
   const float inv_2sigma_s2      = 0.5f / sigma_s2;
   const int channels = g.d;
-  // Cache center-pixel values to avoid repeated accesses in the inner loop
-  float center[4];  // channels is at most 4
-  for (int chan = 0; chan < channels; ++chan)
+  
+  float center[4] = {0.f};
+  for (int chan = 0; chan < channels && chan < 4; ++chan) {
     center[chan] = g(r, r, chan);
-  for (int row = 0; row < g.h; ++row) {
-    const float dr = static_cast<float>(row - r);
-    const float row_dist2 = dr * dr * inv_2sigma_s2;
-    for (int col = 0; col < g.w; ++col) {
-      float x = 0.f;
-      for (int chan = 0; chan < channels; ++chan) {
-        float y = g(col, row, chan) - center[chan];
-        x += y * y;
+  }
+
+  // Fast paths for fixed astronomical/RGB channels to trigger SIMD vectorization
+  if (channels == 3) {
+    for (int row = 0; row < g.h; ++row) {
+      const float dr = static_cast<float>(row - r);
+      const float row_dist2 = dr * dr * inv_2sigma_s2;
+      for (int col = 0; col < g.w; ++col) {
+        float y0 = g(col, row, 0) - center[0];
+        float y1 = g(col, row, 1) - center[1];
+        float y2 = g(col, row, 2) - center[2];
+        float x = (y0 * y0 + y1 * y1 + y2 * y2) * inv_gamma_r_sigma2;
+        const float dc = static_cast<float>(col - r);
+        x += row_dist2 + dc * dc * inv_2sigma_s2;
+        (*k)(col, row) = utils::fastexp(-x);
       }
-      x *= inv_gamma_r_sigma2;
-      const float dc = static_cast<float>(col - r);
-      x += row_dist2 + dc * dc * inv_2sigma_s2;
-      (*k)(col, row) = utils::fastexp(-x);
+    }
+  } else if (channels == 1) {
+    for (int row = 0; row < g.h; ++row) {
+      const float dr = static_cast<float>(row - r);
+      const float row_dist2 = dr * dr * inv_2sigma_s2;
+      for (int col = 0; col < g.w; ++col) {
+        float y0 = g(col, row, 0) - center[0];
+        float x = (y0 * y0) * inv_gamma_r_sigma2;
+        const float dc = static_cast<float>(col - r);
+        x += row_dist2 + dc * dc * inv_2sigma_s2;
+        (*k)(col, row) = utils::fastexp(-x);
+      }
+    }
+  } else {
+    // Fallback for fallback/4-channel
+    for (int row = 0; row < g.h; ++row) {
+      const float dr = static_cast<float>(row - r);
+      const float row_dist2 = dr * dr * inv_2sigma_s2;
+      for (int col = 0; col < g.w; ++col) {
+        float x = 0.f;
+        for (int chan = 0; chan < channels; ++chan) {
+          float y = g(col, row, chan) - center[chan];
+          x += y * y;
+        }
+        x *= inv_gamma_r_sigma2;
+        const float dc = static_cast<float>(col - r);
+        x += row_dist2 + dc * dc * inv_2sigma_s2;
+        (*k)(col, row) = utils::fastexp(-x);
+      }
     }
   }
 }
@@ -89,11 +129,16 @@ void ComputeRegressionPlane(const img_t<float> &y, const img_t<float> &g, const 
                             int r, vector<pair<float, float>> *reg_plane) {
   constexpr float epsilon = 0.0001f;
   float a = 0.f, b = 0.f, c = 0.f;
+  
+  // k is 1-channel spatial, cache layout is friendly here
   for (int row = 0; row < y.h; ++row) {
     for (int col = 0; col < y.w; ++col) {
-      a += (row - r) * (row - r) * k(col, row);
-      b += (row - r) * (col - r) * k(col, row);
-      c += (col - r) * (col - r) * k(col, row);
+      float k_val = k(col, row);
+      float dr = row - r;
+      float dc = col - r;
+      a += dr * dr * k_val;
+      b += dr * dc * k_val;
+      c += dc * dc * k_val;
     }
   }
   float det = a * c - b * b;
@@ -102,30 +147,36 @@ void ComputeRegressionPlane(const img_t<float> &y, const img_t<float> &g, const 
       (*reg_plane)[chan] = {0.f, 0.f};
     }
   } else {
+    const float inv_det = 1.f / det;
     for (int chan = 0; chan < y.d; ++chan) {
       float d = 0.f, e = 0.f;
       float central = g(r, r, chan);
       for (int row = 0; row < y.h; ++row) {
         for (int col = 0; col < y.w; ++col) {
-          d += (row - r) * (y(col, row, chan) - central) * k(col, row);
-          e += (col - r) * (y(col, row, chan) - central) * k(col, row);
+          float k_val = k(col, row);
+          float diff = y(col, row, chan) - central;
+          d += (row - r) * diff * k_val;
+          e += (col - r) * diff * k_val;
         }
       }
       // Solves the system
       // |a   b| |x1|   |d|
       // |     | |  | = | |
       // |b   c| |x2|   |e|
-      (*reg_plane)[chan] = {(c * d - b * e) / det, (a * e - b * d) / det};
+      (*reg_plane)[chan] = {(c * d - b * e) * inv_det, (a * e - b * d) * inv_det};
     }
   }
 }
 
 void SubtractPlane(int r, const vector<pair<float, float>> &reg_plane, img_t<float> *y) {
-  for (int row = 0; row < y->h; ++row) {
-    for (int col = 0; col < y->w; ++col) {
-      for (int chan = 0; chan < y->d; ++chan) {
-        (*y)(col, row, chan) -= reg_plane[chan].first * (row - r) +
-                                reg_plane[chan].second * (col - r);
+  // Planar flipped
+  for (int chan = 0; chan < y->d; ++chan) {
+    float p_first = reg_plane[chan].first;
+    float p_second = reg_plane[chan].second;
+    for (int row = 0; row < y->h; ++row) {
+      float dr = row - r;
+      for (int col = 0; col < y->w; ++col) {
+        (*y)(col, row, chan) -= p_first * dr + p_second * (col - r);
       }
     }
   }
@@ -133,10 +184,10 @@ void SubtractPlane(int r, const vector<pair<float, float>> &reg_plane, img_t<flo
 
 void ModifyPatch(const img_t<float> &patch, const img_t<float> &k, imgops::dft_patch *modified,
                  float *average = nullptr) {
-  // compute the total weight of the mask
   float weight = accumulate(k.data.begin(), k.data.end(), 0.f);
   if (!weight)
     return;
+  const float inv_weight = 1.f / weight;
 
   for (int chan = 0; chan < patch.d; ++chan) {
     float avg = 0.f;
@@ -145,12 +196,13 @@ void ModifyPatch(const img_t<float> &patch, const img_t<float> &k, imgops::dft_p
         avg += k(col, row) * patch(col, row, chan);
       }
     }
-    avg /= weight;
+    avg *= inv_weight;
     for (int row = 0; row < patch.h; ++row) {
       for (int col = 0; col < patch.w; ++col) {
+        float kv = k(col, row);
         modified->space(col, row, chan) =
-            k(col, row) * patch(col, row, chan) +
-            (1.f - k(col, row)) * avg;
+            kv * patch(col, row, chan) +
+            (1.f - kv) * avg;
       }
     }
     if (average) average[chan] = avg;
@@ -183,11 +235,11 @@ pair<img_t<float>, img_t<float>> DA3D_block(int &retval, const img_t<float> &noi
   img_t<float> k(s, s);
   imgops::dft_patch y_m(s, s, guide.d);
   imgops::dft_patch g_m(s, s, guide.d);
-  int pr, pc;  // coordinates of the central pixel
-  vector<pair<float, float>> reg_plane(guide.d);  // parameters of the regression plane
+  int pr, pc;
+  vector<pair<float, float>> reg_plane(guide.d);
   vector<float> ytv(guide.d);
-  float* yt = ytv.data();  // weighted average of the patch
-  WeightMap agg_weights(guide.h - s + 1, guide.w - s + 1);  // line 1
+  float* yt = ytv.data();
+  WeightMap agg_weights(guide.h - s + 1, guide.w - s + 1);
 
   img_t<float> output(guide.w, guide.h, guide.d);
   img_t<float> weights(guide.w, guide.h);
@@ -195,7 +247,7 @@ pair<img_t<float>, img_t<float>> DA3D_block(int &retval, const img_t<float> &noi
   weights.set_value(0.f);
 
   // main loop
-  while (agg_weights.Minimum() < threshold) {  // line 4
+  while (agg_weights.Minimum() < threshold) {  
     if (!processing_should_continue()) {
       retval++;
       break;
@@ -211,70 +263,88 @@ pair<img_t<float>, img_t<float>> DA3D_block(int &retval, const img_t<float> &noi
       }
     }
 
-    tie(pr, pc) = agg_weights.FindMinimum();  // line 5
-    ExtractPatch(noisy, pr, pc, &y);  // line 6
-    ExtractPatch(guide, pr, pc, &g);  // line 7
-    BilateralWeight(g, &k_reg, r, gamma_rr_sigma2, sigma_sr2);  // line 8
-    ComputeRegressionPlane(y, g, k_reg, r, &reg_plane);  // line 9
-    SubtractPlane(r, reg_plane, &y);  // line 10
-    SubtractPlane(r, reg_plane, &g);  // line 11
-    BilateralWeight(g, &k, r, gamma_r_sigma2, sigma_s2);  // line 12
-    if (accumulate(k.data.begin(), k.data.end(), 0.f) < 10.f) {  // line 13
-      for (float& v : k.data) v *= v;  // Square the weights   // line 14
-      for (int row = 0; row < s; ++row) {                 // line 15-16
-        for (int col = 0; col < s; ++col) {
-          for (int chan = 0; chan < output.d; ++chan) {
+    tie(pr, pc) = agg_weights.FindMinimum();
+    ExtractPatch(noisy, pr, pc, &y);
+    ExtractPatch(guide, pr, pc, &g);
+    BilateralWeight(g, &k_reg, r, gamma_rr_sigma2, sigma_sr2);
+    ComputeRegressionPlane(y, g, k_reg, r, &reg_plane);
+    SubtractPlane(r, reg_plane, &y);
+    SubtractPlane(r, reg_plane, &g);
+    BilateralWeight(g, &k, r, gamma_r_sigma2, sigma_s2);
+    
+    if (accumulate(k.data.begin(), k.data.end(), 0.f) < 10.f) {  
+      for (float& v : k.data) v *= v;
+      // Flipped to Planar-First
+      for (int chan = 0; chan < output.d; ++chan) {
+        float p_first = reg_plane[chan].first;
+        float p_second = reg_plane[chan].second;
+        for (int row = 0; row < s; ++row) {
+          float dr = row - r;
+          for (int col = 0; col < s; ++col) {
             output(col + pc, row + pr, chan) +=
-                (g(col, row, chan) + reg_plane[chan].first * (row - r) +
-                reg_plane[chan].second * (col - r)) * k(col, row);
+                (g(col, row, chan) + p_first * dr + p_second * (col - r)) * k(col, row);
           }
+        }
+      }
+      // Seperated weights accumulation loop since weights is a 1-channel spatial layout
+      for (int row = 0; row < s; ++row) {
+        for (int col = 0; col < s; ++col) {
           weights(col + pc, row + pr) += k(col, row);
         }
       }
     } else {
-      ModifyPatch(y, k, &y_m, yt);  // line 18
-      ModifyPatch(g, k, &g_m);  // line 19
-      y_m.to_freq();  // line 20
-      g_m.to_freq();  // line 21
+      ModifyPatch(y, k, &y_m, yt);
+      ModifyPatch(g, k, &g_m);
+      y_m.to_freq();
+      g_m.to_freq();
+      
       float sigma_f2 = 0.f;
       for (int row = 0; row < s; ++row) {
         for (int col = 0; col < s; ++col) {
           sigma_f2 += k(col, row) * k(col, row);
         }
       }
-      sigma_f2 *= sigma2;  // line 22
-      for (int row = 0; row < y_m.h(); ++row) {
-        for (int col = 0; col < y_m.fw(); ++col) {
-          for (int chan = 0; chan < y_m.d(); ++chan) {
+      sigma_f2 *= sigma2;
+      const float inv_sigma_f2 = 1.f / sigma_f2;
+
+      // Flipped to Planar-First frequency processing loop
+      for (int chan = 0; chan < y_m.d(); ++chan) {
+        for (int row = 0; row < y_m.h(); ++row) {
+          for (int col = 0; col < y_m.fw(); ++col) {
             if (row || col) {
-              float x = norm(g_m.freq(col, row, chan)) / sigma_f2;
-              float K;
-              K = utils::fastexp(-.8f / x);  // line 23
+              float x = norm(g_m.freq(col, row, chan)) * inv_sigma_f2;
+              float K = utils::fastexp(-.8f / x);
               y_m.freq(col, row, chan) *= K;
             }
           }
         }
       }
-      y_m.to_space();  // line 24
+      y_m.to_space();
 
-      // lines 25,26,30
-      // col and row are the "internal" indexes (with respect to the patch).
-      for (int row = 0; row < s; ++row) {
-        for (int col = 0; col < s; ++col) {
-          for (int chan = 0; chan < output.d; ++chan) {
-            float pij = (row - r) * reg_plane[chan].first +
-                        (col - r) * reg_plane[chan].second;
+      // Flipped to Planar-First pixel aggregation loop
+      for (int chan = 0; chan < output.d; ++chan) {
+        float p_first = reg_plane[chan].first;
+        float p_second = reg_plane[chan].second;
+        float yt_c = yt[chan];
+        for (int row = 0; row < s; ++row) {
+          float dr = row - r;
+          for (int col = 0; col < s; ++col) {
+            float pij = dr * p_first + (col - r) * p_second;
             float kij = k(col, row);
             output(col + pc, row + pr, chan) +=
-                (y_m.space(col, row, chan) - (1.f - kij) * yt[chan] +
-                pij * kij) * kij;
+                (y_m.space(col, row, chan) - (1.f - kij) * yt_c + pij * kij) * kij;
           }
-          k(col, row) *= k(col, row);  // line 27
+        }
+      }
+      // Separate spatial accumulation of weight maps to maximize straight memory writes
+      for (int row = 0; row < s; ++row) {
+        for (int col = 0; col < s; ++col) {
+          k(col, row) *= k(col, row);
           weights(col + pc, row + pr) += k(col, row);
         }
       }
     }
-    agg_weights.IncreaseWeights(k, pr - r, pc - r);  // line 29
+    agg_weights.IncreaseWeights(k, pr - r, pc - r);
   }
   return {std::move(output), std::move(weights)};
 }
@@ -312,7 +382,7 @@ img_t<float> DA3D(int &retval, const img_t<float> &noisy, const img_t<float> &gu
     thread = omp_get_thread_num();
 #else
     thread = 0;
-#endif
+#endif  // _OPENMP
 
     result_tiles[i] = DA3D_block(retval, noisy_tiles[i], guide_tiles[i], sigma,
                                  r, sigma_s, gamma_r, threshold, nthreads, thread);
