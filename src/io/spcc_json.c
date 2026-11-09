@@ -62,7 +62,7 @@ static int load_spcc_object_from_file(const gchar *jsonFilePath, spcc_object *da
 	fclose(fp);
 	if (!doc) {
 		siril_log_error(_("Error loading SPCC JSON file %s: %s (at position %zu)\n"), jsonFilePath, err.msg, err.pos);
-		return FALSE;
+		return 0;
 	}
 
 	// Get root array
