@@ -29,6 +29,7 @@
 #include <glib/gstdio.h>
 
 #include "algos/astrometry_solver.h"
+#include "algos/demosaicing.h"
 #include "algos/siril_wcs.h"
 #include "core/command.h"
 #include "core/command_line_processor.h"
@@ -39,6 +40,7 @@
 #include "core/sequence_filtering.h"
 #include "core/siril.h"
 #include "core/siril_log.h"
+#include "drizzle/cdrizzleutil.h"
 #include "io/image_format_fits.h"
 #include "io/sequence.h"
 #include "io/single_image.h"
@@ -64,6 +66,7 @@ struct lsf_cmd_args *lsf_cmd_args_new(lsf_cmd_mode mode) {
 	}
 	a->mode = mode;
 	a->framing = FRAMING_MAX;
+	a->kernel = -1;
 	a->expand_step = LSF_EXPAND_STEP;
 	a->max_threads = com.max_thread;
 	lsf_settings_init(&a->settings);
@@ -136,6 +139,135 @@ static sequence *load_batch(const char *name) {
 	return seq;
 }
 
+static gboolean bayer_is_known(const char *pat) {
+	return !strcmp(pat, "RGGB") || !strcmp(pat, "GRBG") || !strcmp(pat, "GBRG") || !strcmp(pat, "BGGR");
+}
+
+static gboolean bayer_is_known(const char *pat);
+
+/* a sequence Siril's registration drizzled (Section 13): merged as it is when
+ * its .lsfreg sidecar says how, refused otherwise, since its scale, pixfrac,
+ * kernel and the scale of its weights are not recorded anywhere else. bayer
+ * is the file's pattern, "" for mono, NULL before a file exists. */
+static gchar *refused_drizzled(sequence *seq, gboolean drizzle, const char *bayer) {
+	lsf_drizzle_sidecar d;
+	gchar *why = NULL, *msg = NULL;
+	if (!lsf_read_drizzle_sidecar(seq, &d, &why)) {
+		msg = g_strdup_printf(_("%s was drizzled by Siril without a Living Stack sidecar%s%s, so how it was drizzled is "
+					"not known. Drizzle it again with the Registration tab's \"Write a Living Stack sidecar\" or "
+					"the -lsfreg option, or give the sequence it was made from: lsf_init -drizzle drizzles frames "
+					"itself"), seq->seqname, why ? ": " : "", why ? why : "");
+		g_free(why);
+		return msg;
+	}
+	if (bayer && !drizzle)
+		msg = g_strdup_printf(_("%s is drizzled, and the Living Stack is not: a file takes drizzled frames only if it was "
+					"created with -drizzle"), seq->seqname);
+	else if (d.variable || seq->is_variable)
+		msg = g_strdup_printf(_("the frames of %s differ in size (max framing), and a Living Stack takes drizzled frames "
+					"only on one grid: drizzle with the current, min or cog framing"), seq->seqname);
+	else if (d.undistorted)
+		msg = g_strdup_printf(_("%s was drizzled with distortion correction, which drizzle in a Living Stack does not "
+					"support yet"), seq->seqname);
+	else if (bayer && !bayer[0] && d.bayer[0])
+		msg = g_strdup_printf(_("the file was drizzled from mono frames, and %s from CFA frames"), seq->seqname);
+	else if (bayer && bayer[0] && !d.bayer[0])
+		msg = g_strdup_printf(_("the file was drizzled from CFA frames, and %s from mono frames"), seq->seqname);
+	else if (bayer && bayer[0] && strcmp(bayer, d.bayer))
+		msg = g_strdup_printf(_("%s was drizzled from frames with the Bayer pattern %s, and the file %s"), seq->seqname,
+				d.bayer, bayer);
+	else if (d.bayer[0] && !bayer_is_known(d.bayer))
+		msg = g_strdup_printf(_("CFA drizzle needs a Bayer pattern, and %s was drizzled from frames with %s"),
+				seq->seqname, d.bayer);
+	lsf_drizzle_sidecar_clear(&d);
+	return msg;
+}
+
+/* why a batch cannot be merged at all, or NULL (Sections 1.1, 10.1). A sequence
+ * Siril has drizzled is merged only with its sidecar (refused_drizzled). For a file that is not
+ * drizzled, so is a sequence of CFA frames that are not debayered, which would
+ * be merged as a mono image of the raw mosaic. For a drizzled one (drizzle),
+ * the sequence must be just that, or mono. bayer is the file's Bayer pattern,
+ * empty for a mono file and NULL when no file exists yet. */
+static gchar *refused_sequence(sequence *seq, gboolean drizzle, const char *bayer) {
+	if (seq->is_drizzle)
+		return refused_drizzled(seq, drizzle, bayer);
+	fits meta = { 0 };
+	gchar *msg = NULL;
+	if (!seq_read_frame_metadata(seq, sequence_find_refimage(seq), &meta)) {
+		const char *pat = meta.keywords.bayer_pattern;
+		const gboolean cfa = fit_is_cfa(&meta);
+		if (!drizzle && cfa)
+			msg = g_strdup_printf(_("the frames of %s are CFA and not debayered. Debayer them at calibration "
+						"(calibrate -debayer), or create a CFA drizzle file with lsf_init -drizzle"), seq->seqname);
+		else if (drizzle && !cfa && seq->nb_layers != 1)
+			msg = g_strdup_printf(_("drizzle needs CFA frames that are not debayered, or mono frames, and those of %s are "
+						"neither"), seq->seqname);
+		else if (drizzle && !cfa && bayer && bayer[0])
+			msg = g_strdup_printf(_("the file was drizzled from CFA frames, and those of %s are mono"), seq->seqname);
+		else if (drizzle && cfa && bayer && !bayer[0])
+			msg = g_strdup_printf(_("the file was drizzled from mono frames, and those of %s are CFA"), seq->seqname);
+		else if (drizzle && cfa && !bayer_is_known(pat))
+			msg = g_strdup_printf(_("CFA drizzle needs a Bayer pattern, and the frames of %s have %s"), seq->seqname, pat);
+		else if (drizzle && cfa && bayer && strcmp(pat, bayer))
+			msg = g_strdup_printf(_("the frames of %s have the Bayer pattern %s, and the file %s"), seq->seqname, pat, bayer);
+	}
+	clearfits(&meta);
+	return msg;
+}
+
+static gint64 free_space_of(const char *path, gchar **fs_id);
+
+/* an accumulator kept in temporary files that would not fit on their disk:
+ * why, or NULL. Some of its planes may not be written at all. */
+static gchar *accumulator_space_problem(guint64 npix, gboolean rej, gboolean exp) {
+	if (!lsf_accumulator_spills(npix))
+		return NULL;
+	guint64 bytes = lsf_history_bytes(npix, rej, exp);
+	gint64 space = free_space_of(com.pref.swap_dir, NULL);
+	if (space < 0 || (guint64) space >= bytes)
+		return NULL;
+	gchar *need = g_format_size(bytes), *have = g_format_size(space);
+	gchar *msg = g_strdup_printf(_("the accumulator does not fit in the %d MB Siril may use, and its temporary files need "
+				"%s in %s, which has %s free"), get_max_memory_in_MB(), need, com.pref.swap_dir, have);
+	g_free(need);
+	g_free(have);
+	return msg;
+}
+
+/* the file's Bayer pattern as refused_sequence() takes it */
+static const char *file_pattern(const lsf_settings *s) {
+	return s->is_cfa ? s->bayer : "";
+}
+
+/* whether the frames of seq are CFA and not debayered */
+gboolean lsf_sequence_is_cfa(sequence *seq) {
+	fits meta = { 0 };
+	gboolean cfa = !seq_read_frame_metadata(seq, sequence_find_refimage(seq), &meta) && fit_is_cfa(&meta);
+	clearfits(&meta);
+	return cfa;
+}
+
+/* why lsf_init cannot drizzle seq with its registration, or NULL */
+static gchar *drizzle_registration_problem(sequence *seq) {
+	int rl = get_registration_layer(seq);
+	if (!layer_has_usable_registration(seq, rl))
+		return g_strdup_printf(_("-drizzle needs a registration that is not applied yet: register %s first, "
+					"with register -2pass"), seq->seqname);
+	if (seq->distoparam && rl >= 0 && seq->distoparam[rl].index != DISTO_UNDEF)
+		return g_strdup(_("-drizzle does not support yet a registration with distortion correction or "
+					"through plate solving"));
+	return NULL;
+}
+
+/* the kernel called name (Section 9), or -1 */
+int lsf_kernel_from_name(const char *name) {
+	for (int k = 0; k < kernel_LAST; k++)
+		if (!g_ascii_strcasecmp(name, kernel_enum2str(k)))
+			return k;
+	return -1;
+}
+
 /* the rejection as the log and the HISTORY cards show it: the method, then
  * its two values unless it is none */
 static gchar *rejection_text(rejection r, const double sig[2]) {
@@ -172,9 +304,11 @@ static void apply_hist_overrides(struct lsf_cmd_args *a, lsf_settings *s) {
 }
 
 #define LSF_REG_PREFIX "lsf_r_"
+#define LSF_MAX_SCALE 3		// a whole number: REG_XFRM, grid expansion and grid.origin stay in whole pixels of the frames
 static sequence *apply_init_registration(sequence *seq, const struct lsf_cmd_args *a, int *ref,
-		int origin[2], Homography *base, gboolean *undistorted);
+		int origin[2], Homography *base, gboolean *undistorted, double *driz_norm);
 static int *map_to_sources(sequence *seq, sequence *rseq);
+static void sidecar_weight_scale(const lsf_drizzle_sidecar *d, const char *seqname, double wscale[3]);
 
 static gboolean any_pad(const int pad[4]) {
 	return pad[LSF_PAD_LEFT] || pad[LSF_PAD_RIGHT] || pad[LSF_PAD_FIRST] || pad[LSF_PAD_LAST];
@@ -201,7 +335,15 @@ static int lsf_init_run(struct lsf_cmd_args *a) {
 	int *src_index = NULL;
 	int origin[2] = { 0, 0 };
 	Homography base;
+	/* a sequence Siril's registration drizzled, with its sidecar (Section 13):
+	 * merged as it is, from the frames' source when it is still there */
+	lsf_drizzle_sidecar dsc = { 0 };
+	gboolean siril_drizzled = FALSE;
+	sequence *src = NULL;
+	const int asked_scale = a->scale;
 
+	if (a->scale < 1)
+		a->scale = 1;
 	if (g_file_test(a->path, G_FILE_TEST_EXISTS) && !a->overwrite) {
 		siril_log_error(_("LSF: %s already exists, use lsf_append to add frames to it, or -overwrite\n"), a->path);
 		g_ptr_array_free(rows, TRUE);
@@ -212,13 +354,97 @@ static int lsf_init_run(struct lsf_cmd_args *a) {
 		g_ptr_array_free(rows, TRUE);
 		return 1;
 	}
+	gchar *refused = refused_sequence(seq, a->drizzle, NULL);
+	if (refused) {
+		siril_log_error(_("LSF: %s\n"), refused);
+		g_free(refused);
+		goto end;
+	}
+	if (seq->is_drizzle && lsf_read_drizzle_sidecar(seq, &dsc, NULL)) {
+		/* the drizzle is done: options that ask for another one are refused */
+		if ((asked_scale > 0 && asked_scale != dsc.scale) || (a->pixfrac > 0.0 && fabs(a->pixfrac - dsc.pixfrac) > 1e-4)
+				|| (a->kernel >= 0 && a->kernel != dsc.kernel)) {
+			siril_log_error(_("LSF: %s was drizzled by Siril at scale %d, pixel fraction %g, kernel %s, and its frames are "
+						"merged as they are: drop -scale, -pixfrac and -kernel, or drizzle it again\n"), a->seqname,
+					dsc.scale, dsc.pixfrac, kernel_enum2str(dsc.kernel));
+			goto end;
+		}
+		siril_drizzled = TRUE;
+		a->drizzle = TRUE;
+		a->scale = dsc.scale;
+		a->pixfrac = dsc.pixfrac;
+		a->kernel = dsc.kernel;
+	}
+	if (a->drizzle) {
+		s->drizzled = TRUE;
+		s->oversample = a->scale;
+		if (a->pixfrac <= 0.0)
+			a->pixfrac = 1.0;
+		if (a->kernel < 0)
+			a->kernel = kernel_square;
+		gchar *problem = siril_drizzled ? NULL : drizzle_registration_problem(seq);
+		if (problem) {
+			siril_log_error(_("LSF: %s\n"), problem);
+			g_free(problem);
+			goto end;
+		}
+		if (a->feather > 0 || a->overlap_norm) {
+			siril_log_error(_("LSF: -drizzle does not support -feather or -overlap_norm yet\n"));
+			goto end;
+		}
+		/* the grid is known only once the registration is applied, which takes
+		 * disk and time: the size of the frames stands for it here */
+		int drz_nchan = lsf_sequence_is_cfa(seq) ? 3 : seq->nb_layers;
+		const guint64 s2 = siril_drizzled ? 1 : (guint64) a->scale * a->scale;	// Siril's frames are on the grid already
+		problem = accumulator_space_problem((guint64) seq->rx * seq->ry * s2 * drz_nchan, a->rejmaps, FALSE);
+		if (problem) {
+			siril_log_error(_("LSF: with a grid drizzled at scale %d, %s. Use a lower -scale, raise the memory limit, or "
+						"free some space\n"), a->scale, problem);
+			g_free(problem);
+			goto end;
+		}
+	}
 	gboolean listed = apply_frame_list(seq, a);
 	/* registration computed but not applied: lsf_init applies it, by default
 	 * onto the union of all the frames (Section 10.1) */
 	int ref = sequence_find_refimage(seq);
 	sequence *batch = seq;
 	int batch_ref = ref;
-	if (layer_has_usable_registration(seq, get_registration_layer(seq))) {
+	double driz_wscale[3] = { 0.0, 0.0, 0.0 };
+	if (siril_drizzled) {
+		/* the frames are on the grid the drizzle gave them: no registration,
+		 * and the sidecar gives what lsf_init computes when it applies one */
+		if (a->framing_set)
+			siril_log_warning(_("LSF: the frames of %s are drizzled already, -framing is ignored\n"), a->seqname);
+		siril_log_message(_("LSF: %s was drizzled by Siril's registration from %s at scale %d, pixel fraction %g, kernel "
+					"%s, %s framing: its frames and weights are merged as they are\n"), a->seqname, dsc.source,
+				dsc.scale, dsc.pixfrac, kernel_enum2str(dsc.kernel), dsc.framing);
+		for (int c = 0; c < 3; c++)
+			s->driz_norm[c] = dsc.max_weight[c];
+		sidecar_weight_scale(&dsc, a->seqname, driz_wscale);
+		/* a fact of the file from now on: its driz_norm includes the flat */
+		s->driz_flat = dsc.flat_weights;
+		if (s->driz_flat)
+			siril_log_message(_("LSF: the drizzle weights of %s include a master flat, and so does the file's weight "
+						"scale (weight.driz_flat): appends whose weights do not will be warned about\n"), a->seqname);
+		s->origin_x = dsc.origin[0];
+		s->origin_y = dsc.origin[1];
+		origin[0] = dsc.origin[0];
+		origin[1] = dsc.origin[1];
+		base = (Homography) { .h00 = dsc.base[0], .h01 = dsc.base[1], .h02 = dsc.base[2], .h10 = dsc.base[3],
+			.h11 = dsc.base[4], .h12 = dsc.base[5], .h20 = dsc.base[6], .h21 = dsc.base[7], .h22 = dsc.base[8] };
+		/* the source gives the ledger its file names and transforms */
+		gchar *src_file = g_strdup_printf("%s.seq", dsc.source);
+		if (g_file_test(src_file, G_FILE_TEST_EXISTS) && (src = load_batch(dsc.source))
+				&& !(src_index = map_to_sources(src, seq))) {
+			free_sequence(src, TRUE);
+			src = NULL;
+		}
+		if (!src)
+			siril_log_warning(_("LSF: %s, the sequence %s was drizzled from, cannot be read: the ledger will not hold "
+						"the frames' transforms\n"), src_file, a->seqname);
+		g_free(src_file);
+	} else if (layer_has_usable_registration(seq, get_registration_layer(seq))) {
 		/* Siril's apply undistorts the frames of a registration made with
 		 * distortion correction: the grid is then undistorted, for good, and
 		 * every append undistorts its frames with the same model (Section 10.4) */
@@ -250,7 +476,7 @@ static int lsf_init_run(struct lsf_cmd_args *a) {
 			g_free(model);
 		}
 		gboolean undistorted = FALSE;
-		rseq = apply_init_registration(seq, a, &ref, origin, &base, &undistorted);
+		rseq = apply_init_registration(seq, a, &ref, origin, &base, &undistorted, s->driz_norm);
 		if (!rseq || !(src_index = map_to_sources(seq, rseq)))
 			goto end;
 		/* an astrometric registration (seqplatesolve): Siril's apply
@@ -282,17 +508,20 @@ static int lsf_init_run(struct lsf_cmd_args *a) {
 	/* sensor and fixed settings */
 	fits refmeta = { 0 };
 	if (!seq_read_frame_metadata(seq, ref, &refmeta)) {
-		s->is_cfa = seq->nb_layers == 3;
+		s->is_cfa = seq->nb_layers == 3 || fit_is_cfa(&refmeta);
 		const char *pat = refmeta.keywords.bayer_pattern;
 		if (s->is_cfa)
-			g_strlcpy(s->bayer, (!strcmp(pat, "RGGB") || !strcmp(pat, "GRBG") || !strcmp(pat, "GBRG")
-						|| !strcmp(pat, "BGGR")) ? pat : "UNKNOWN", sizeof s->bayer);
+			g_strlcpy(s->bayer, bayer_is_known(pat) ? pat : "UNKNOWN", sizeof s->bayer);
 		s->binning = refmeta.keywords.binning_x ? (int) refmeta.keywords.binning_x : 1;
 		g_free(s->filter);
 		s->filter = g_strdup(refmeta.keywords.filter);
 		clearfits(&refmeta);
 	}
-	if (s->rgb_equal && seq->nb_layers != 3)
+	if (siril_drizzled) {	// Siril's drizzle dropped the pattern from the frames
+		s->is_cfa = dsc.bayer[0] != '\0';
+		g_strlcpy(s->bayer, dsc.bayer, sizeof s->bayer);
+	}
+	if (s->rgb_equal && batch->nb_layers != 3)
 		s->rgb_equal = FALSE;
 	s->rejmaps = a->rejmaps;
 	g_free(s->findstar_json);
@@ -307,10 +536,10 @@ static int lsf_init_run(struct lsf_cmd_args *a) {
 
 	struct lsf_batch_args bargs = { 0 };
 	bargs.seq = batch;
-	bargs.src_seq = rseq ? seq : NULL;
+	bargs.src_seq = rseq ? seq : src;
 	bargs.src_index = src_index;
-	bargs.xfrm_base = rseq ? &base : NULL;
-	bargs.framing = lsf_framing_name(a->framing);
+	bargs.xfrm_base = rseq || src ? &base : NULL;
+	bargs.framing = siril_drizzled ? dsc.framing : lsf_framing_name(a->framing);
 	bargs.disto = s->undistorted ? &s->disto : NULL;
 	bargs.settings = s;
 	bargs.hist = &h;
@@ -319,7 +548,8 @@ static int lsf_init_run(struct lsf_cmd_args *a) {
 	bargs.batch = 1;
 	bargs.gen = 1;
 	bargs.prev_frames = 0;
-	bargs.seq_name = seq->seqname;
+	bargs.seq_name = siril_drizzled ? dsc.source : seq->seqname;
+	memcpy(bargs.driz_wscale, driz_wscale, sizeof driz_wscale);
 	bargs.rows = rows;
 	bargs.primary = &primary;
 	bargs.wref = &wref;
@@ -327,6 +557,8 @@ static int lsf_init_run(struct lsf_cmd_args *a) {
 	bargs.max_threads = a->max_threads;
 	bargs.feather = a->feather;
 	bargs.overlap_norm = a->overlap_norm;
+	bargs.driz_pixfrac = (float) a->pixfrac;
+	bargs.driz_kernel = s->drizzled ? kernel_enum2str(a->kernel) : NULL;
 	if (lsf_process_batch(&bargs))
 		goto end;
 	/* a HISTORY card holds 72 characters: the undistortion has its own */
@@ -334,6 +566,15 @@ static int lsf_init_run(struct lsf_cmd_args *a) {
 		primary.history = g_slist_append(primary.history, g_strdup_printf(
 					"LSF gen 1: registration applied, %s framing, origin %d %d", bargs.framing,
 					origin[0], origin[1]));
+	if (s->drizzled)
+		primary.history = g_slist_append(primary.history, g_strdup_printf(
+					"LSF gen 1: %s at scale %d, pixel fraction %g, kernel %s", s->is_cfa ? "CFA drizzle" : "drizzle",
+					s->oversample, a->pixfrac, bargs.driz_kernel));
+	if (siril_drizzled)
+		primary.history = g_slist_append(primary.history, g_strdup_printf(
+					"LSF gen 1: frames drizzled by Siril, %.24s, %s framing", a->seqname, dsc.framing));
+	if (s->driz_flat)
+		primary.history = g_slist_append(primary.history, g_strdup("LSF gen 1: drizzle weights with a master flat"));
 	if (rseq && s->undistorted)
 		primary.history = g_slist_append(primary.history, g_strdup(s->disto.index == DISTO_FILES ?
 					"LSF gen 1: grid undistorted, each frame with its own SIP terms" :
@@ -356,9 +597,14 @@ end:
 	g_ptr_array_free(rows, TRUE);
 	if (rseq) {
 		remove_prefixed_sequence_files(seq, LSF_REG_PREFIX);
+		if (rseq->is_drizzle)
+			remove_prefixed_drizzle_files(seq, LSF_REG_PREFIX);
 		free_sequence(rseq, TRUE);
 	}
 	free(src_index);
+	if (src)
+		free_sequence(src, TRUE);
+	lsf_drizzle_sidecar_clear(&dsc);
 	free_sequence(seq, TRUE);
 	return retval;
 }
@@ -388,10 +634,41 @@ static struct registration_args *new_regargs(sequence *seq, const lsf_settings *
 	regargs->undistort = DISTO_UNDEF;
 	regargs->framing = FRAMING_CURRENT;
 	regargs->load_new_sequence = FALSE;
+	regargs->force_float_out = TRUE;	// 32 bits whatever the preferences (Section 13.5)
 	return regargs;
 }
 
+/* the scale s about the pixel centres, as Siril's apply makes it (cvPrepareH):
+ * a pixel of a frame covers s pixels of the grid (Section 10.4) */
+static Homography grid_scale(int s) {
+	Homography S;
+	cvGetEye(&S);
+	S.h00 = S.h11 = s;
+	S.h02 = S.h12 = (s - 1.0) / 2.0;
+	return S;
+}
+
+/* the apply drizzles the frames at this scale and keeps the weights as they
+ * are (Section 10.3) */
+static int use_drizzle(struct registration_args *regargs, int scale, double pixfrac, int kernel) {
+	struct driz_args_t *driz = calloc(1, sizeof(struct driz_args_t));
+	if (!driz) {
+		PRINT_ALLOC_ERR;
+		return 1;
+	}
+	regargs->output_scale = (float) scale;
+	driz->scale = regargs->output_scale;
+	driz->weight_scale = 1.f;
+	driz->pixel_fraction = (float) pixfrac;
+	driz->kernel = kernel;
+	regargs->driz = driz;
+	regargs->driz_raw_weights = TRUE;
+	regargs->clamp = FALSE;
+	return 0;
+}
+
 static void free_regargs(struct registration_args *regargs) {
+	free(regargs->driz);
 	free(regargs->prefix);
 	g_free(regargs->external_ref_path);
 	g_free(regargs->new_seq_name);
@@ -415,7 +692,10 @@ static int plan_expansion(const lsf_file *f, const struct lsf_cmd_args *a, const
 				need[LSF_PAD_LEFT], need[LSF_PAD_RIGHT], need[LSF_PAD_FIRST], need[LSF_PAD_LAST]);
 		return 0;
 	}
-	lsf_expand_pads(need, a->expand_step, pad);
+	/* a pixel of a frame covers oversample pixels of the grid: the grid stays a
+	 * multiple of it, and each side moves by whole pixels of the frames */
+	const int o = f->settings.oversample;
+	lsf_expand_pads(need, (a->expand_step + o - 1) / o * o, pad);
 	int nrx = f->rx + pad[LSF_PAD_LEFT] + pad[LSF_PAD_RIGHT];
 	int nry = f->ry + pad[LSF_PAD_FIRST] + pad[LSF_PAD_LAST];
 	if (!a->expand_force && (nrx > 2 * f->rx || nry > 2 * f->ry)) {
@@ -426,12 +706,11 @@ static int plan_expansion(const lsf_file *f, const struct lsf_cmd_args *a, const
 				f->rx, f->ry, nrx, nry);
 		return 1;
 	}
-	guint64 bytes = lsf_history_bytes((guint64) nrx * nry * f->nchan, f->settings.rejmaps, f->has_exp);
-	int max_mb = get_max_memory_in_MB();
-	if (bytes > (guint64) max_mb * BYTES_IN_A_MB) {
-		siril_log_error(_("LSF: the accumulator of the expanded %dx%d grid needs %.0f MB, more than the %d MB "
-					"Siril may use. Use -framing=current to crop the batch to the grid, or raise the memory limit\n"),
-				nrx, nry, (double) bytes / BYTES_IN_A_MB, max_mb);
+	gchar *problem = accumulator_space_problem((guint64) nrx * nry * f->nchan, f->settings.rejmaps, f->has_exp);
+	if (problem) {
+		siril_log_error(_("LSF: with the expanded %dx%d grid, %s. Use -framing=current to crop the batch to the grid, "
+					"raise the memory limit, or free some space\n"), nrx, nry, problem);
+		g_free(problem);
 		return 1;
 	}
 	siril_log_message(_("LSF: the grid grows from %dx%d to %dx%d: %d px on the left, %d on the right, "
@@ -489,10 +768,11 @@ static int compute_against_stack(sequence *seq, const lsf_file *f, const disto_p
 /* second pass: the footprint of the transforms of seq->regparam[layer]
  * decides the expansion of the grid (pad), and the registration is applied
  * onto the grid, expanded or not. Returns the registered sequence, written
- * with the lsf_r_ prefix. The transforms in seq stay relative to the grid
- * before the expansion. */
+ * with prefix (lsf_r_ for an append). The transforms in seq stay relative to
+ * the grid before the expansion. With drizzle, max_weight receives Siril's,
+ * when not NULL. */
 static sequence *apply_onto_grid(sequence *seq, const lsf_file *f, const struct lsf_cmd_args *a, int layer,
-		const disto_params *model, int pad[4]) {
+		const disto_params *model, int pad[4], const char *prefix, double *max_weight) {
 	const lsf_settings *s = &f->settings;
 	if (!seq->regparam || !seq->regparam[layer]) {
 		siril_log_error(_("LSF: the sequence has no registration on layer %d\n"), layer);
@@ -511,10 +791,12 @@ static sequence *apply_onto_grid(sequence *seq, const lsf_file *f, const struct 
 
 	/* footprint of the registered frames on the grid, without the edge
 	 * samples the merge drops: the outermost one lies outside the frame's
-	 * outer pixel centers already, each further one moves the edge in a pixel */
+	 * outer pixel centers already, each further one moves the edge in a pixel.
+	 * At a larger scale the outer pixels themselves reach several grid pixels
+	 * beyond their centers. */
 	double box[4];
 	int first = -1;
-	const double inset = MAX(lsf_edge_margin(s->interpolation) - 1, 0);
+	const double inset = s->oversample > 1 ? -0.5 : MAX(lsf_edge_margin(s->drizzled ? OPENCV_NEAREST : s->interpolation) - 1, 0);
 	lsf_footprint_init(box);
 	for (int i = 0; i < seq->number; i++) {
 		const Homography *H = &seq->regparam[layer][i].H;
@@ -541,22 +823,64 @@ static sequence *apply_onto_grid(sequence *seq, const lsf_file *f, const struct 
 	regargs->func = register_apply_reg;
 	regargs->layer = layer;
 	regargs->no_output = FALSE;
+	if (strcmp(prefix, LSF_REG_PREFIX)) {
+		free(regargs->prefix);
+		regargs->prefix = strdup(prefix);
+	}
 	regargs->ext_ref_undistorted = model != NULL;
 	regargs->keep_transforms = model && model->index == DISTO_FILES;	// -wcsreg, onto the Stack
+	if (s->drizzled && use_drizzle(regargs, s->oversample, a->pixfrac, a->kernel)) {
+		free_regargs(regargs);
+		return NULL;
+	}
+	if (regargs->driz && a->driz_flat) {	// the caller frees it
+		regargs->driz->flat = a->driz_flat;
+		regargs->driz->use_flats = TRUE;
+	}
+	/* the Stack is at the grid's scale, and Siril's apply scales the frames
+	 * itself: it takes the Stack's size, the canvas and the transforms at the
+	 * frames' scale, the last ones as S^-1 * H (Section 10.4). The transforms
+	 * onto the grid come back afterwards, for the ledger. */
+	const int o = s->oversample;
+	regargs->ext_ref_on_grid = o > 1;
 	if (any_pad(pad))
-		regargs->canvas =(framing_roi) { -pad[LSF_PAD_LEFT], -pad[LSF_PAD_LAST],
-			f->rx + pad[LSF_PAD_LEFT] + pad[LSF_PAD_RIGHT], f->ry + pad[LSF_PAD_FIRST] + pad[LSF_PAD_LAST] };
+		regargs->canvas =(framing_roi) { -pad[LSF_PAD_LEFT] / o, -pad[LSF_PAD_LAST] / o,
+			(f->rx + pad[LSF_PAD_LEFT] + pad[LSF_PAD_RIGHT]) / o, (f->ry + pad[LSF_PAD_FIRST] + pad[LSF_PAD_LAST]) / o };
+	Homography *onto_grid = NULL;
+	if (o > 1) {
+		onto_grid = malloc(seq->number * sizeof(Homography));
+		if (!onto_grid) {
+			PRINT_ALLOC_ERR;
+			free_regargs(regargs);
+			return NULL;
+		}
+		Homography Sinv = grid_scale(o);
+		cvInvertH(&Sinv);
+		for (int i = 0; i < seq->number; i++) {
+			Homography *H = &seq->regparam[layer][i].H;
+			onto_grid[i] = *H;
+			if (guess_transform_from_H(*H) != NULL_TRANSFORMATION)
+				cvMultH(Sinv, onto_grid[i], H);
+		}
+	}
 	int seq_ref = seq->reference_image;
 	seq->reference_image = first;
 	regargs->reference_image = first;
 	int ret = register_apply_reg(regargs);
 	seq->reference_image = seq_ref;
+	for (int c = 0; max_weight && regargs->driz && c < 3; c++)
+		max_weight[c] = regargs->driz->max_weight[c];
 	free_regargs(regargs);
+	if (onto_grid) {
+		for (int i = 0; i < seq->number; i++)
+			seq->regparam[layer][i].H = onto_grid[i];
+		free(onto_grid);
+	}
 	if (ret) {
 		siril_log_error(_("LSF: applying the registration onto the grid failed\n"));
 		return NULL;
 	}
-	gchar *rname = g_strdup_printf("%s%s", LSF_REG_PREFIX, seq->seqname);
+	gchar *rname = g_strdup_printf("%s%s", prefix, seq->seqname);
 	sequence *rseq = load_batch(rname);
 	g_free(rname);
 	return rseq;
@@ -568,7 +892,7 @@ static sequence *register_against_stack(sequence *seq, const lsf_file *f, const 
 	int layer;
 	if (compute_against_stack(seq, f, model, &layer))
 		return NULL;
-	return apply_onto_grid(seq, f, a, layer, model, pad);
+	return apply_onto_grid(seq, f, a, layer, model, pad, LSF_REG_PREFIX, NULL);
 }
 
 /* first pass through the WCS (lsf_append -wcsreg, Section 10.4): each
@@ -655,6 +979,13 @@ struct lsf_reg_data {
 	star_finder_params sf;	// the star detection stored in the file, regargs->sf_params
 	gchar *disto;		// the distortion model the frames were undistorted with (JSON), or NULL
 	gboolean registered;	// the registration succeeded
+	/* drizzle onto the Stack's grid after the registration (Section 13.4) */
+	gboolean drizzle;
+	double pixfrac;
+	int kernel;
+	gchar *prefix;		// of the drizzled sequence
+	gchar *drizzled;	// its name, once written
+	fits *flat;		// the master flat in the drizzle weights, the registration's, or NULL
 };
 
 static void free_reg_data(gpointer p) {
@@ -664,7 +995,22 @@ static void free_reg_data(gpointer p) {
 	g_free(d->path);
 	g_free(d->uid);
 	g_free(d->disto);
+	g_free(d->prefix);
+	g_free(d->drizzled);
 	g_free(d);
+}
+
+static void drizzle_onto_stack(struct registration_args *regargs, struct lsf_reg_data *d);
+static int resolve_drizzle_options(struct lsf_cmd_args *a, lsf_file *f);
+
+/* the sequence drizzled onto the Stack's grid by the registration args ran,
+ * or NULL; for the GUI, which then loads it for review. Valid until
+ * free_registration_hook_data(). */
+const gchar *lsf_registration_drizzled(const struct registration_args *regargs) {
+	if (regargs->hook_free != free_reg_data || !regargs->hook_data)
+		return NULL;
+	const struct lsf_reg_data *d = regargs->hook_data;
+	return d->registered ? d->drizzled : NULL;
 }
 
 /* the Living Stack the args registered against, if the registration
@@ -713,6 +1059,8 @@ static void lsf_registration_end(struct registration_args *regargs) {
 		g_free(bpath);
 		g_free(date);
 		g_key_file_free(kf);
+		if (d->drizzle)
+			drizzle_onto_stack(regargs, d);
 	}
 	g_free(fp);
 }
@@ -734,7 +1082,11 @@ int lsf_prepare_registration(struct registration_args *regargs, gboolean keep_ty
 	}
 	int ret = 1;
 	const lsf_settings *s = &info.file.settings;
-	if (info.no_append)
+	gchar *refused = refused_sequence(regargs->seq, s->drizzled, s->bayer);
+	if (refused) {
+		siril_log_error(_("LSF: %s\n"), refused);
+		g_free(refused);
+	} else if (info.no_append)
 		siril_log_error(_("LSF: frames cannot be appended to %s with this version (%s), so registering against it "
 					"is not useful\n"), path, info.no_append);
 	else if (regargs->func != register_star_alignment)
@@ -752,7 +1104,7 @@ int lsf_prepare_registration(struct registration_args *regargs, gboolean keep_ty
 		siril_log_error(_("LSF: %s undistorts each frame with the SIP terms of its own WCS, which star alignment "
 					"cannot use: plate-solve the frames and append them with lsf_append -wcsreg, or register "
 					"with -disto=file or -disto=master\n"), path);
-	else if (regargs->seq->nb_layers != info.file.nchan)
+	else if (!s->drizzled && regargs->seq->nb_layers != info.file.nchan)
 		siril_log_error(_("LSF: the Living Stack has %d channel(s) and the sequence %d\n"),
 				info.file.nchan, regargs->seq->nb_layers);
 	else ret = 0;
@@ -760,7 +1112,52 @@ int lsf_prepare_registration(struct registration_args *regargs, gboolean keep_ty
 		lsf_info_free(&info);
 		return ret;
 	}
+	/* with drizzle, the frames are drizzled onto the Stack's grid once they are
+	 * registered, as lsf_append would, for review before the append (Section
+	 * 13.4): the file's scale, and a pixel fraction and kernel it accepts */
 	struct lsf_reg_data *d = g_new0(struct lsf_reg_data, 1);
+	if (regargs->driz) {
+		struct driz_args_t *driz = regargs->driz;
+		const char *why = NULL;
+		if (!s->drizzled)
+			why = _("it is not drizzled: register without drizzle, and lsf_append applies the registration");
+		else if (driz->flat && !s->driz_flat)
+			siril_log_warning(_("LSF: the frames are drizzled with the master flat in their weights, and the weights of %s "
+						"do not include one: the append will merge them on another scale\n"), path);
+		else if (!driz->flat && s->driz_flat)
+			siril_log_warning(_("LSF: the weights of %s include a master flat, and the frames are drizzled without one: the "
+						"append will merge them on another scale\n"), path);
+		if (why) {
+			siril_log_error(_("LSF: the frames cannot be drizzled onto the grid of %s: %s\n"), path, why);
+			lsf_info_free(&info);
+			g_free(d);
+			return 1;
+		}
+		struct lsf_cmd_args *a = lsf_cmd_args_new(LSF_CMD_APPEND);
+		int refused = 1;
+		if (a) {
+			a->path = g_strdup(path);
+			a->pixfrac = driz->pixel_fraction;
+			a->kernel = driz->kernel;
+			refused = resolve_drizzle_options(a, &info.file);
+		}
+		if (!refused) {
+			d->drizzle = TRUE;
+			d->pixfrac = a->pixfrac;
+			d->kernel = a->kernel;
+			d->flat = driz->flat;	// freed with regargs->driz, after the end hook
+			d->prefix = g_strdup(regargs->prefix && regargs->prefix[0] ? regargs->prefix : "r_");
+			const float asked = driz->scale > 0.f ? driz->scale : regargs->output_scale;	// the GUI gives it there
+			if ((int) lroundf(asked) != s->oversample)
+				siril_log_message(_("LSF: the frames are drizzled at the scale of the Living Stack, %d\n"), s->oversample);
+		}
+		lsf_cmd_args_free(a);
+		if (refused) {
+			lsf_info_free(&info);
+			g_free(d);
+			return 1;
+		}
+	}
 	d->path = g_canonicalize_filename(path, NULL);
 	d->uid = g_strdup(info.file.uid);
 	d->gen = info.file.gen;
@@ -768,7 +1165,8 @@ int lsf_prepare_registration(struct registration_args *regargs, gboolean keep_ty
 	d->ry = info.file.ry;
 	d->origin_x = s->origin_x;
 	d->origin_y = s->origin_y;
-	/* applying belongs to lsf_append, which grows the grid as needed */
+	/* applying belongs to lsf_append, which grows the grid as needed, or to
+	 * the drizzle that follows the registration */
 	regargs->no_output = TRUE;
 	regargs->no_starlist = TRUE;
 	if (!keep_type)
@@ -805,7 +1203,12 @@ int lsf_prepare_registration(struct registration_args *regargs, gboolean keep_ty
 	regargs->hook_data = d;
 	regargs->hook_free = free_reg_data;
 	regargs->end_hook = lsf_registration_end;
-	siril_log_message(_("LSF: registering against the Living Stack %s (generation %d, %dx%d grid): transforms "
+	if (d->drizzle)
+		siril_log_message(_("LSF: registering against the Living Stack %s (generation %d, %dx%d grid), then drizzling "
+					"the frames onto its grid at scale %d, pixel fraction %g, kernel %s, as %s%s\n"), path,
+				info.file.gen, info.file.rx, info.file.ry, s->oversample, d->pixfrac, kernel_enum2str(d->kernel),
+				d->prefix, regargs->seq->seqname);
+	else siril_log_message(_("LSF: registering against the Living Stack %s (generation %d, %dx%d grid): transforms "
 				"only, applied by lsf_append\n"), path, info.file.gen, info.file.rx, info.file.ry);
 	lsf_info_free(&info);
 	return 0;
@@ -864,6 +1267,350 @@ gboolean lsf_binding_check(const sequence *seq, const lsf_file *f, const disto_p
 	g_free(current);
 	g_key_file_free(kf);
 	return ok;
+}
+
+/***** sequences drizzled by Siril's registration (Section 13) *****/
+
+#define LSF_DRIZZLE_GROUP "lsf_drizzle"
+
+void lsf_drizzle_sidecar_clear(lsf_drizzle_sidecar *d) {
+	g_free(d->source);
+	memset(d, 0, sizeof *d);
+}
+
+/* how apply_reg_image_hook saved the frames and their weights, by the same
+ * tests */
+static void drizzle_encoding(const struct registration_args *regargs, int *data_bits, int *weight_bits,
+		gboolean *rescaled) {
+	const gboolean ser = regargs->seq->type == SEQ_SER;
+	const gboolean data_ushort = ser || (com.pref.force_16bit && !regargs->force_float_out);
+	const gboolean match = com.pref.drizz_weight_match_bitpix;
+	*data_bits = data_ushort ? 16 : 32;
+	*rescaled = !regargs->driz_raw_weights && ((data_ushort && !com.pref.force_16bit) || !match);
+	if (regargs->driz_raw_weights)
+		*weight_bits = 32;
+	else if (!match || regargs->seq->bitpix == BYTE_IMG)
+		*weight_bits = 8;
+	else if (data_ushort && !com.pref.force_16bit)
+		*weight_bits = 16;
+	else *weight_bits = 32;
+}
+
+static void set_doubles(GKeyFile *kf, const char *key, const double *v, gsize n) {
+	g_key_file_set_double_list(kf, LSF_DRIZZLE_GROUP, key, (double *) v, n);
+}
+
+static gboolean get_doubles(GKeyFile *kf, const char *key, double *v, gsize n) {
+	gsize len = 0;
+	double *l = g_key_file_get_double_list(kf, LSF_DRIZZLE_GROUP, key, &len, NULL);
+	gboolean ok = l && len == n;
+	if (ok)
+		memcpy(v, l, n * sizeof(double));
+	g_free(l);
+	return ok;
+}
+
+/* the [lsf_drizzle] group into kf: the drizzle of driz, the origin and base
+ * as lsf_init would compute them, and the framing */
+static void fill_drizzle_group(GKeyFile *kf, const struct driz_args_t *driz, const sequence *out, const char *source,
+		int source_ref, const char *bayer, int data_bits, int weight_bits, gboolean rescaled, const char *framing,
+		const int origin[2], const Homography *base) {
+	gchar *date = lsf_now_utc_iso();
+	gchar *outname = g_path_get_basename(out->seqname);
+	g_key_file_set_string(kf, LSF_DRIZZLE_GROUP, "sequence", outname);
+	g_key_file_set_integer(kf, LSF_DRIZZLE_GROUP, "frames", out->number);
+	g_key_file_set_string(kf, LSF_DRIZZLE_GROUP, "source", source);
+	g_key_file_set_integer(kf, LSF_DRIZZLE_GROUP, "source_reference", source_ref);
+	g_key_file_set_integer(kf, LSF_DRIZZLE_GROUP, "scale", (int) lroundf(driz->scale));
+	g_key_file_set_double(kf, LSF_DRIZZLE_GROUP, "pixfrac", driz->pixel_fraction);
+	g_key_file_set_string(kf, LSF_DRIZZLE_GROUP, "kernel", kernel_enum2str(driz->kernel));
+	g_key_file_set_string(kf, LSF_DRIZZLE_GROUP, "cfa", bayer ? bayer : "");
+	const double mw[3] = { driz->max_weight[0], driz->max_weight[1], driz->max_weight[2] };
+	set_doubles(kf, "max_weight", mw, 3);
+	g_key_file_set_integer(kf, LSF_DRIZZLE_GROUP, "weight_bits", weight_bits);
+	g_key_file_set_boolean(kf, LSF_DRIZZLE_GROUP, "weights_rescaled", rescaled);
+	g_key_file_set_integer(kf, LSF_DRIZZLE_GROUP, "data_bits", data_bits);
+	g_key_file_set_boolean(kf, LSF_DRIZZLE_GROUP, "flat_weights", driz->flat != NULL);
+	g_key_file_set_string(kf, LSF_DRIZZLE_GROUP, "framing", framing);
+	g_key_file_set_boolean(kf, LSF_DRIZZLE_GROUP, "variable", out->is_variable);
+	g_key_file_set_integer(kf, LSF_DRIZZLE_GROUP, "origin_x", origin[0]);
+	g_key_file_set_integer(kf, LSF_DRIZZLE_GROUP, "origin_y", origin[1]);
+	const double b[9] = { base->h00, base->h01, base->h02, base->h10, base->h11, base->h12, base->h20, base->h21, base->h22 };
+	set_doubles(kf, "base", b, 9);
+	g_key_file_set_string(kf, LSF_DRIZZLE_GROUP, "date", date);
+	g_free(outname);
+	g_free(date);
+}
+
+static int save_sidecar(GKeyFile *kf, const sequence *out) {
+	gchar *bpath = binding_path(out);
+	GError *err = NULL;
+	int ret = !g_key_file_save_to_file(kf, bpath, &err);
+	if (ret) {
+		siril_log_error(_("LSF: could not save %s: %s. lsf_init and lsf_append will not accept %s\n"), bpath,
+				err ? err->message : "", out->seqname);
+		g_clear_error(&err);
+	}
+	g_free(bpath);
+	return ret;
+}
+
+/* the CFA pattern of the source frames, "" for mono */
+static void source_bayer(sequence *seq, int ref, gchar out[8]) {
+	fits meta = { 0 };
+	out[0] = '\0';
+	if (!seq_read_frame_metadata(seq, ref, &meta) && fit_is_cfa(&meta))
+		g_strlcpy(out, bayer_is_known(meta.keywords.bayer_pattern) ? meta.keywords.bayer_pattern : "UNKNOWN", 8);
+	clearfits(&meta);
+}
+
+/* Called by Siril's registration once it has written the drizzled sequence
+ * out, when the sidecar was asked for (regargs->lsf_sidecar): the
+ * [lsf_drizzle] group of its .lsfreg. A drizzle against a Living Stack
+ * writes its own (lsf_drizzle_onto_stack), not this one. */
+void lsf_write_drizzle_sidecar(const struct registration_args *regargs, const sequence *out) {
+	if (!regargs->driz || !out || out->number < 1)
+		return;
+	sequence *src = regargs->seq;
+	const int scale = MAX((int) lroundf(regargs->driz->scale), 1);
+	const int layer = regargs->layer, ref = regargs->reference_image;
+	gchar bayer[8];
+	source_bayer(src, ref, bayer);
+	int data_bits, weight_bits;
+	gboolean rescaled;
+	drizzle_encoding(regargs, &data_bits, &weight_bits, &rescaled);
+
+	/* as apply_init_registration: the apply maps each frame by Htransf^-1 * H,
+	 * and the reference frame's first stored pixel gives the origin */
+	Homography Href, base = regargs->framingd.Htransf, R;
+	cvGetEye(&Href);
+	if (layer >= 0 && src->regparam && src->regparam[layer] && ref >= 0 && ref < src->number)
+		Href = src->regparam[layer][ref].H;
+	if (guess_transform_from_H(base) == NULL_TRANSFORMATION)
+		cvGetEye(&base);
+	cvInvertH(&base);
+	cvMultH(base, Href, &R);
+	const double hr[9] = { R.h00, R.h01, R.h02, R.h10, R.h11, R.h12, R.h20, R.h21, R.h22 };
+	int rx = src->is_variable && ref >= 0 ? src->imgparam[ref].rx : src->rx;
+	int ry = src->is_variable && ref >= 0 ? src->imgparam[ref].ry : src->ry;
+	int nry = out->imgparam[0].ry;
+	int origin[2];
+	lsf_frame_origin(hr, rx, ry, nry / scale, origin);
+	origin[0] *= scale;
+	origin[1] *= scale;
+	if (scale > 1) {
+		Homography onto_sensor = base;
+		cvMultH(grid_scale(scale), onto_sensor, &base);
+	}
+	GKeyFile *kf = g_key_file_new();
+	gchar *srcname = g_path_get_basename(src->seqname);
+	fill_drizzle_group(kf, regargs->driz, out, srcname, ref, bayer, data_bits, weight_bits, rescaled,
+			lsf_framing_name(regargs->framing), origin, &base);
+	g_key_file_set_boolean(kf, LSF_DRIZZLE_GROUP, "undistorted", regargs->undistort != DISTO_UNDEF);
+	g_key_file_set_boolean(kf, LSF_DRIZZLE_GROUP, "external_reference", src->ext_ref || regargs->use_external_ref);
+	if (!save_sidecar(kf, out)) {
+		siril_log_message(_("LSF: %s.lsfreg records how %s was drizzled: lsf_init and lsf_append can merge it\n"),
+				out->seqname, out->seqname);
+		if (out->is_variable)
+			siril_log_warning(_("LSF: the frames of %s differ in size (max framing), which a Living Stack cannot merge "
+						"as they are: drizzle with another framing\n"), out->seqname);
+	}
+	g_free(srcname);
+	g_key_file_free(kf);
+}
+
+/* Reads the [lsf_drizzle] group of the .lsfreg beside seq. Returns TRUE when
+ * it is there and describes seq as it is; FALSE otherwise, with why when a
+ * sidecar exists but does not fit (stale, or unreadable). */
+gboolean lsf_read_drizzle_sidecar(const sequence *seq, lsf_drizzle_sidecar *d, gchar **why) {
+	memset(d, 0, sizeof *d);
+	if (why)
+		*why = NULL;
+	gchar *bpath = binding_path(seq);
+	GKeyFile *kf = g_key_file_new();
+	gboolean loaded = g_key_file_load_from_file(kf, bpath, G_KEY_FILE_NONE, NULL)
+		&& g_key_file_has_group(kf, LSF_DRIZZLE_GROUP);
+	g_free(bpath);
+	if (!loaded) {
+		g_key_file_free(kf);
+		return FALSE;
+	}
+	gchar *name = g_key_file_get_string(kf, LSF_DRIZZLE_GROUP, "sequence", NULL);
+	gchar *base = g_path_get_basename(seq->seqname);
+	gchar *kernel = g_key_file_get_string(kf, LSF_DRIZZLE_GROUP, "kernel", NULL);
+	gchar *cfa = g_key_file_get_string(kf, LSF_DRIZZLE_GROUP, "cfa", NULL);
+	gchar *framing = g_key_file_get_string(kf, LSF_DRIZZLE_GROUP, "framing", NULL);
+	d->source = g_key_file_get_string(kf, LSF_DRIZZLE_GROUP, "source", NULL);
+	d->frames = g_key_file_get_integer(kf, LSF_DRIZZLE_GROUP, "frames", NULL);
+	d->source_ref = g_key_file_get_integer(kf, LSF_DRIZZLE_GROUP, "source_reference", NULL);
+	d->scale = g_key_file_get_integer(kf, LSF_DRIZZLE_GROUP, "scale", NULL);
+	d->pixfrac = g_key_file_get_double(kf, LSF_DRIZZLE_GROUP, "pixfrac", NULL);
+	d->kernel = kernel ? lsf_kernel_from_name(kernel) : -1;
+	g_strlcpy(d->bayer, cfa ? cfa : "", sizeof d->bayer);
+	d->weight_bits = g_key_file_get_integer(kf, LSF_DRIZZLE_GROUP, "weight_bits", NULL);
+	d->rescaled = g_key_file_get_boolean(kf, LSF_DRIZZLE_GROUP, "weights_rescaled", NULL);
+	d->data_bits = g_key_file_get_integer(kf, LSF_DRIZZLE_GROUP, "data_bits", NULL);
+	d->flat_weights = g_key_file_get_boolean(kf, LSF_DRIZZLE_GROUP, "flat_weights", NULL);
+	d->variable = g_key_file_get_boolean(kf, LSF_DRIZZLE_GROUP, "variable", NULL);
+	d->undistorted = g_key_file_get_boolean(kf, LSF_DRIZZLE_GROUP, "undistorted", NULL);
+	d->ext_ref = g_key_file_get_boolean(kf, LSF_DRIZZLE_GROUP, "external_reference", NULL);
+	g_strlcpy(d->framing, framing ? framing : "current", sizeof d->framing);
+	d->origin[0] = g_key_file_get_integer(kf, LSF_DRIZZLE_GROUP, "origin_x", NULL);
+	d->origin[1] = g_key_file_get_integer(kf, LSF_DRIZZLE_GROUP, "origin_y", NULL);
+	gboolean has_base = get_doubles(kf, "base", d->base, 9);
+	gboolean has_mw = get_doubles(kf, "max_weight", d->max_weight, 3);
+	d->on_stack = g_key_file_has_key(kf, LSF_DRIZZLE_GROUP, "pad_left", NULL);
+	if (d->on_stack) {
+		d->pad[LSF_PAD_LEFT] = g_key_file_get_integer(kf, LSF_DRIZZLE_GROUP, "pad_left", NULL);
+		d->pad[LSF_PAD_RIGHT] = g_key_file_get_integer(kf, LSF_DRIZZLE_GROUP, "pad_right", NULL);
+		d->pad[LSF_PAD_FIRST] = g_key_file_get_integer(kf, LSF_DRIZZLE_GROUP, "pad_first", NULL);
+		d->pad[LSF_PAD_LAST] = g_key_file_get_integer(kf, LSF_DRIZZLE_GROUP, "pad_last", NULL);
+	}
+	const char *reason = NULL;
+	if (!name || strcmp(name, base) || d->frames != seq->number)
+		reason = _("the sequence was made again since its sidecar was written");
+	else if (!d->source || d->scale < 1 || d->scale > LSF_MAX_SCALE || d->kernel < 0 || !(d->pixfrac > 0.0)
+			|| !has_base || !has_mw || !(d->max_weight[0] > 0.0)
+			|| (d->weight_bits != 8 && d->weight_bits != 16 && d->weight_bits != 32))
+		reason = _("its sidecar is incomplete");
+	g_free(name);
+	g_free(base);
+	g_free(kernel);
+	g_free(cfa);
+	g_free(framing);
+	g_key_file_free(kf);
+	if (reason) {
+		if (why)
+			*why = g_strdup(reason);
+		lsf_drizzle_sidecar_clear(d);
+		return FALSE;
+	}
+	return TRUE;
+}
+
+/* the factors that turn the weights saved by Siril's drizzle into raw ones,
+ * for lsf_batch_args.driz_wscale, and a log of what the saving lost (E3) */
+static void sidecar_weight_scale(const lsf_drizzle_sidecar *d, const char *seqname, double wscale[3]) {
+	const double vmax = d->weight_bits == 8 ? 255.0 : d->weight_bits == 16 ? 65535.0 : 1.0;
+	for (int c = 0; c < 3; c++)
+		wscale[c] = (d->rescaled ? d->max_weight[c] : 1.0) / vmax;
+	if (d->data_bits < 32)
+		siril_log_message(_("LSF: the frames of %s were saved on 16 bits (Siril's 16-bit preference or a SER sequence): "
+					"they are merged as they are, with values above 1 clipped by the save\n"), seqname);
+	if (d->weight_bits < 32)
+		siril_log_message(_("LSF: the drizzle weights of %s were saved on %d bits: they are merged as they are, rounded "
+					"to steps of 1/%d of Siril's largest weight and clipped at it. The preference \"Match Drizzle "
+					"weights bitpix to sequence\", with 32-bit images, keeps them whole\n"), seqname,
+				d->weight_bits, d->weight_bits == 8 ? 255 : 65535);
+}
+
+/* a batch's drizzle weights include a master flat or not, against the file's
+ * (weight.driz_flat): they are merged as they are, with a warning when the
+ * two differ, as their weights are then on another scale (Section 13) */
+static void check_flat_weights(const lsf_settings *s, gboolean batch_flat, const char *seqname, const char *path,
+		fits *primary, int gen) {
+	if (batch_flat == s->driz_flat)
+		return;
+	if (batch_flat)
+		siril_log_warning(_("LSF: the drizzle weights of %s include a master flat, and those of %s do not: its frames "
+					"are merged as they are, but their weights are on another scale than the file's, lower by about "
+					"the level of the flat, and the history test is looser for them. Drizzle them again without the "
+					"flat to keep one scale\n"), seqname, path);
+	else siril_log_warning(_("LSF: the drizzle weights of %s include a master flat, and those of %s do not: its frames "
+				"are merged as they are, but their weights are on another scale than the file's, higher by about "
+				"1 / the largest value of that flat, and the history test is tighter for them\n"), path, seqname);
+	primary->history = g_slist_append(primary->history, g_strdup_printf(
+				"LSF gen %d: drizzle weights %s a flat, the file's %s", gen, batch_flat ? "with" : "without",
+				s->driz_flat ? "with" : "without"));
+}
+
+/* After a registration against a Living Stack with drizzle (Section 13.4):
+ * the frames drizzled onto its grid, as lsf_append would, with the growth
+ * they need, into a sequence named with the registration's prefix, and its
+ * sidecar: [lsf_drizzle] with the growth, [lsf_registration] binding it to
+ * the file and grid as they are now. lsf_append then merges it as it is. */
+static void drizzle_onto_stack(struct registration_args *regargs, struct lsf_reg_data *d) {
+	lsf_info info;
+	if (lsf_read_info(d->path, &info)) {
+		siril_log_error(_("LSF: %s cannot be read, the frames are not drizzled onto its grid: %s\n"), d->path,
+				info.problem);
+		lsf_info_free(&info);
+		return;
+	}
+	const lsf_file *f = &info.file;
+	struct lsf_cmd_args *a = lsf_cmd_args_new(LSF_CMD_APPEND);
+	if (!a) {
+		lsf_info_free(&info);
+		return;
+	}
+	a->pixfrac = d->pixfrac;
+	a->kernel = d->kernel;
+	a->driz_flat = d->flat;
+	sequence *seq = regargs->seq;
+	int pad[4] = { 0 };
+	double mw[3] = { 0.0, 0.0, 0.0 };
+	siril_log_message(_("LSF: drizzling %s onto the grid of %s\n"), seq->seqname, d->path);
+	sequence *rseq = apply_onto_grid(seq, f, a, regargs->layer, NULL, pad, d->prefix, mw);
+	if (!rseq) {
+		siril_log_error(_("LSF: %s could not be drizzled onto the grid of %s. Its registration against the file is "
+					"kept: lsf_append %s drizzles it itself\n"), seq->seqname, d->path, seq->seqname);
+		lsf_cmd_args_free(a);
+		lsf_info_free(&info);
+		return;
+	}
+	struct driz_args_t drz = { 0 };
+	drz.scale = (float) f->settings.oversample;
+	drz.pixel_fraction = (float) d->pixfrac;
+	drz.kernel = d->kernel;
+	drz.flat = d->flat;	// recorded as flat_weights
+	for (int c = 0; c < 3; c++)
+		drz.max_weight[c] = (float) mw[c];
+	gchar bayer[8];
+	source_bayer(seq, seq->reference_image, bayer);
+	const int origin[2] = { f->settings.origin_x, f->settings.origin_y };
+	Homography eye;
+	cvGetEye(&eye);
+	GKeyFile *kf = g_key_file_new();
+	gchar *srcname = g_path_get_basename(seq->seqname);
+	fill_drizzle_group(kf, &drz, rseq, srcname, seq->reference_image, bayer, 32, 32, FALSE,
+			lsf_framing_name(a->framing), origin, &eye);
+	g_key_file_set_integer(kf, LSF_DRIZZLE_GROUP, "pad_left", pad[LSF_PAD_LEFT]);
+	g_key_file_set_integer(kf, LSF_DRIZZLE_GROUP, "pad_right", pad[LSF_PAD_RIGHT]);
+	g_key_file_set_integer(kf, LSF_DRIZZLE_GROUP, "pad_first", pad[LSF_PAD_FIRST]);
+	g_key_file_set_integer(kf, LSF_DRIZZLE_GROUP, "pad_last", pad[LSF_PAD_LAST]);
+	/* bound to the file and its grid before the growth, as a registration
+	 * against it is (lsf_binding_check) */
+	int rlayer = get_registration_layer(rseq);
+	gchar *fp = transforms_fingerprint(rseq, rlayer);
+	gchar *date = lsf_now_utc_iso();
+	g_key_file_set_string(kf, LSF_BINDING_GROUP, "file", d->path);
+	g_key_file_set_string(kf, LSF_BINDING_GROUP, "uid", f->uid);
+	g_key_file_set_integer(kf, LSF_BINDING_GROUP, "generation", f->gen);
+	g_key_file_set_integer(kf, LSF_BINDING_GROUP, "width", f->rx);
+	g_key_file_set_integer(kf, LSF_BINDING_GROUP, "height", f->ry);
+	g_key_file_set_integer(kf, LSF_BINDING_GROUP, "origin_x", origin[0]);
+	g_key_file_set_integer(kf, LSF_BINDING_GROUP, "origin_y", origin[1]);
+	g_key_file_set_integer(kf, LSF_BINDING_GROUP, "layer", rlayer);
+	g_key_file_set_string(kf, LSF_BINDING_GROUP, "transforms", fp ? fp : "");
+	g_key_file_set_string(kf, LSF_BINDING_GROUP, "date", date);
+	if (!save_sidecar(kf, rseq)) {
+		g_free(d->drizzled);
+		d->drizzled = g_path_get_basename(rseq->seqname);
+		/* the GUI loads it for review, as after a registration with output */
+		regargs->load_new_sequence = TRUE;
+		free(regargs->new_seq_name);
+		regargs->new_seq_name = strdup(d->drizzled);
+		siril_log_info(_("LSF: %s holds the %d frames of %s drizzled onto the grid of %s, generation %d. Review them, "
+					"then append them with lsf_append %s %s while the file does not change\n"), d->drizzled,
+				rseq->number, srcname, d->path, f->gen, d->path, d->drizzled);
+	}
+	g_free(date);
+	g_free(fp);
+	g_free(srcname);
+	g_key_file_free(kf);
+	free_sequence(rseq, TRUE);
+	lsf_cmd_args_free(a);
+	lsf_info_free(&info);
 }
 
 /* grows the grid of the file in memory before merging (Section 10.5): the
@@ -993,7 +1740,7 @@ end:
 }
 
 static sequence *apply_init_registration(sequence *seq, const struct lsf_cmd_args *a, int *ref,
-		int origin[2], Homography *base, gboolean *undistorted) {
+		int origin[2], Homography *base, gboolean *undistorted, double *driz_norm) {
 	int layer = get_registration_layer(seq);
 	int pad[4] = { 0 };
 	if (seq->ext_ref) {
@@ -1052,6 +1799,10 @@ static sequence *apply_init_registration(sequence *seq, const struct lsf_cmd_arg
 	regargs->framing = a->framing == FRAMING_MAX ? FRAMING_CURRENT : a->framing;
 	regargs->keep_transforms = astrometric;
 	regargs->wcsref = wcsref;
+	if (a->drizzle && use_drizzle(regargs, a->scale, a->pixfrac, a->kernel)) {
+		free_regargs(regargs);
+		return NULL;
+	}
 	if (any_pad(pad))
 		regargs->canvas = (framing_roi) { -pad[LSF_PAD_LEFT], -pad[LSF_PAD_LAST],
 			rx + pad[LSF_PAD_LEFT] + pad[LSF_PAD_RIGHT], ry + pad[LSF_PAD_FIRST] + pad[LSF_PAD_LAST] };
@@ -1070,12 +1821,23 @@ static sequence *apply_init_registration(sequence *seq, const struct lsf_cmd_arg
 	Homography R, Ht = regargs->framingd.Htransf;
 	int nrx = regargs->framingd.roi_out.w, nry = regargs->framingd.roi_out.h;
 	*undistorted = regargs->undistort != DISTO_UNDEF;
+	/* weight.driz_norm, frozen from this first batch (Section 10.3) */
+	for (int c = 0; a->drizzle && c < 3; c++)
+		driz_norm[c] = regargs->driz->max_weight[c];
 	free_regargs(regargs);
 	*base = Ht;
 	cvInvertH(base);
 	cvMultH(*base, Href, &R);
 	const double hr[9] = { R.h00, R.h01, R.h02, R.h10, R.h11, R.h12, R.h20, R.h21, R.h22 };
-	lsf_frame_origin(hr, rx, ry, nry, origin);
+	/* the margins in grid pixels, a pixel of a frame covering scale of them, and
+	 * the ledger's transforms onto the grid itself */
+	lsf_frame_origin(hr, rx, ry, nry / a->scale, origin);
+	origin[0] *= a->scale;
+	origin[1] *= a->scale;
+	if (a->scale > 1) {
+		Homography onto_sensor = *base;
+		cvMultH(grid_scale(a->scale), onto_sensor, base);
+	}
 	siril_log_message(_("LSF: registration of %s applied with %s framing: grid %dx%d, origin %d %d "
 				"from the reference frame\n"), seq->seqname, lsf_framing_name(a->framing), nrx, nry,
 			origin[0], origin[1]);
@@ -1085,11 +1847,49 @@ static sequence *apply_init_registration(sequence *seq, const struct lsf_cmd_arg
 	return rseq;
 }
 
+/* the pixel fraction and kernel of an append to a drizzled file: those of the
+ * last frames unless asked otherwise (Section 6). A change is refused without
+ * -drizzle_force: the frames' noise moves with the drop, so a scaling
+ * normalization would change the level of their signal, and at other kernels
+ * the total weight of a frame is on another scale. Returns 0, or 1 when
+ * refused. */
+static int resolve_drizzle_options(struct lsf_cmd_args *a, lsf_file *f) {
+	const double last_pixfrac = isfinite(f->ledger_pixfrac) ? f->ledger_pixfrac : 1.0;
+	int last_kernel = lsf_kernel_from_name(f->ledger_kernel);
+	if (last_kernel < 0)
+		last_kernel = kernel_square;
+	if (a->pixfrac <= 0.0)
+		a->pixfrac = last_pixfrac;
+	if (a->kernel < 0)
+		a->kernel = last_kernel;
+	if (fabs(a->pixfrac - last_pixfrac) <= 1e-4 && a->kernel == last_kernel) {
+		a->pixfrac = last_pixfrac;
+		return 0;
+	}
+	if (!a->drizzle_force) {
+		siril_log_error(_("LSF: the last frames of %s were drizzled with a pixel fraction of %g and the %s kernel, and "
+					"this append asks for %g and %s. Their noise would differ, which changes the level of their "
+					"signal under a scaling normalization, and another kernel changes their weight. Keep the "
+					"file's, or use -drizzle_force\n"), a->path, last_pixfrac, kernel_enum2str(last_kernel),
+				a->pixfrac, kernel_enum2str(a->kernel));
+		return 1;
+	}
+	siril_log_warning(_("LSF: drizzling with a pixel fraction of %g and the %s kernel, where the last frames of %s used "
+				"%g and %s: the level of the signal and the weights of these frames may not match them\n"),
+			a->pixfrac, kernel_enum2str(a->kernel), a->path, last_pixfrac, kernel_enum2str(last_kernel));
+	f->primary.history = g_slist_append(f->primary.history, g_strdup_printf(
+				"LSF gen %d: drizzle forced to %g %s, was %g %s", f->gen + 1, a->pixfrac,
+				kernel_enum2str(a->kernel), last_pixfrac, kernel_enum2str(last_kernel)));
+	return 0;
+}
+
 static int lsf_append_run(struct lsf_cmd_args *a) {
 	lsf_file f;
 	int retval = 1;
-	sequence *seq = NULL, *rseq = NULL;
+	sequence *seq = NULL, *rseq = NULL, *src = NULL;
 	int *src_index = NULL;
+	lsf_drizzle_sidecar dsc = { 0 };
+	gboolean siril_drizzled = FALSE;
 	/* -out writes the appended stack to a new file and leaves the source as
 	 * it was, as lsf_util -out does */
 	const char *target = a->out ? a->out : a->path;
@@ -1107,11 +1907,11 @@ static int lsf_append_run(struct lsf_cmd_args *a) {
 	if (a->out)
 		f.primary.history = g_slist_append(f.primary.history, g_strdup_printf(
 					"LSF generation %d: written from %s", f.gen + 1, f.path));
-	/* this writer merges onto a grid at the frames' own scale only: frames
-	 * merged onto a drizzled grid (Section 6) would land on the wrong pixels */
-	if (f.settings.oversample != 1) {
-		siril_log_error(_("LSF: %s has a grid drizzled at scale %d, which this version cannot append to. "
-					"Only grid.oversample 1 is supported\n"), a->path, f.settings.oversample);
+	/* frames reach a grid at another scale than theirs through drizzle only:
+	 * merged otherwise (Section 6), they would land on the wrong pixels */
+	if (f.settings.oversample != 1 && !f.settings.drizzled) {
+		siril_log_error(_("LSF: %s has a grid at scale %d that is not drizzled, which this version cannot append to\n"),
+				a->path, f.settings.oversample);
 		goto end;
 	}
 	/* overrides of the defaults stored in the file apply from this append on
@@ -1222,7 +2022,56 @@ static int lsf_append_run(struct lsf_cmd_args *a) {
 	seq = load_batch(a->seqname);
 	if (!seq)
 		goto end;
-	if (seq->nb_layers != f.nchan) {
+	gchar *refused = refused_sequence(seq, f.settings.drizzled, file_pattern(&f.settings));
+	if (refused) {
+		siril_log_error(_("LSF: %s\n"), refused);
+		g_free(refused);
+		goto end;
+	}
+	/* a sequence Siril drizzled (Section 13): only onto this file's grid, by
+	 * Register to an existing Living Stack with drizzle, and merged as it is */
+	siril_drizzled = seq->is_drizzle && lsf_read_drizzle_sidecar(seq, &dsc, NULL);
+	if (siril_drizzled) {
+		if (!dsc.on_stack) {
+			siril_log_error(_("LSF: %s was drizzled onto its own reference frame, not onto the grid of %s, and drizzled "
+						"frames are not resampled again. Register %s to this Living Stack with drizzle (Registration "
+						"tab, or register -extref= with -drizzle), or append %s, which LSF drizzles itself\n"),
+					a->seqname, a->path, dsc.source, dsc.source);
+			goto end;
+		}
+		if (dsc.scale != f.settings.oversample) {
+			siril_log_error(_("LSF: %s was drizzled at scale %d, and %s is at scale %d\n"), a->seqname, dsc.scale,
+					a->path, f.settings.oversample);
+			goto end;
+		}
+		if (a->force_reg) {
+			siril_log_error(_("LSF: %s is drizzled already, and its frames cannot be registered again: register %s "
+						"again instead\n"), a->seqname, dsc.source);
+			goto end;
+		}
+		if ((a->pixfrac > 0.0 && fabs(a->pixfrac - dsc.pixfrac) > 1e-4) || (a->kernel >= 0 && a->kernel != dsc.kernel)) {
+			siril_log_error(_("LSF: %s was drizzled with a pixel fraction of %g and the %s kernel, and its frames are "
+						"merged as they are: drop -pixfrac and -kernel\n"), a->seqname, dsc.pixfrac,
+					kernel_enum2str(dsc.kernel));
+			goto end;
+		}
+		a->pixfrac = dsc.pixfrac;	// resolve_drizzle_options compares them with the file's
+		a->kernel = dsc.kernel;
+	}
+	if (f.settings.drizzled) {
+		if (a->noreg || a->wcsreg || a->overlap_norm || a->feather > 0) {
+			siril_log_error(_("LSF: %s is a drizzled file, which does not support -noreg, -wcsreg, -overlap_norm or "
+						"-feather\n"), a->path);
+			goto end;
+		}
+		if (resolve_drizzle_options(a, &f))
+			goto end;
+	} else if (a->pixfrac > 0.0 || a->kernel >= 0 || a->drizzle_force) {
+		siril_log_error(_("LSF: -pixfrac, -kernel and -drizzle_force apply to a drizzled file, and %s is not one\n"),
+				a->path);
+		goto end;
+	}
+	if (!f.settings.drizzled && seq->nb_layers != f.nchan) {
 		siril_log_error(_("LSF: the file has %d channel(s), the batch has %d\n"), f.nchan, seq->nb_layers);
 		goto end;
 	}
@@ -1231,12 +2080,49 @@ static int lsf_append_run(struct lsf_cmd_args *a) {
 	sequence *batch = seq;
 	int gen = f.gen + 1, batchnum = f.nb_batches + 1;
 	int pad[4] = { 0 };
-	if (!a->noreg) {
+	double driz_wscale[3] = { 0.0, 0.0, 0.0 };
+	if (siril_drizzled) {
+		/* the frames are on the grid as it was when they were drizzled, with
+		 * the growth they need: the file must not have changed since */
+		int layer = 0;
+		gchar *date = NULL, *why = NULL;
+		if (!lsf_binding_check(seq, &f, NULL, &layer, &date, &why)) {
+			siril_log_error(_("LSF: %s cannot be appended as it is: %s. Register and drizzle %s against %s again\n"),
+					a->seqname, why ? why : _("it was not drizzled against this Living Stack"), dsc.source, a->path);
+			g_free(why);
+			goto end;
+		}
+		siril_log_message(_("LSF: %s was drizzled onto the grid of this file by Siril's registration, %s: its frames and "
+					"weights are merged as they are\n"), a->seqname, date ? date : "");
+		g_free(date);
+		memcpy(pad, dsc.pad, sizeof pad);
+		sidecar_weight_scale(&dsc, a->seqname, driz_wscale);
+		if (any_pad(pad)) {
+			int nrx = f.rx + pad[LSF_PAD_LEFT] + pad[LSF_PAD_RIGHT], nry = f.ry + pad[LSF_PAD_FIRST] + pad[LSF_PAD_LAST];
+			siril_log_message(_("LSF: the grid grows from %dx%d to %dx%d: %d px on the left, %d on the right, "
+						"%d before row 1, %d after the last row\n"), f.rx, f.ry, nrx, nry,
+					pad[LSF_PAD_LEFT], pad[LSF_PAD_RIGHT], pad[LSF_PAD_FIRST], pad[LSF_PAD_LAST]);
+			if (expand_grid(&f, pad, gen))
+				goto end;
+			check_expanded_wcs(seq, &f.primary);
+		}
+		/* the source gives the ledger its file names and transforms */
+		gchar *src_file = g_strdup_printf("%s.seq", dsc.source);
+		if (g_file_test(src_file, G_FILE_TEST_EXISTS) && (src = load_batch(dsc.source))
+				&& !(src_index = map_to_sources(src, seq))) {
+			free_sequence(src, TRUE);
+			src = NULL;
+		}
+		if (!src)
+			siril_log_warning(_("LSF: %s, the sequence %s was drizzled from, cannot be read: the ledger will not hold "
+						"the frames' transforms\n"), src_file, a->seqname);
+		g_free(src_file);
+	} else if (!a->noreg) {
 		int layer = 0;
 		if (a->wcsreg) {
 			/* through the WCS: a registration made beforehand is not used */
 			if (!compute_against_stack_wcs(seq, &f, a, &layer))
-				rseq = apply_onto_grid(seq, &f, a, layer, model, pad);
+				rseq = apply_onto_grid(seq, &f, a, layer, model, pad, LSF_REG_PREFIX, NULL);
 		} else {
 			/* a registration made beforehand against this file
 			 * replaces the first pass, unless -reg asks for a new one */
@@ -1245,7 +2131,7 @@ static int lsf_append_run(struct lsf_cmd_args *a) {
 			if (reuse) {
 				siril_log_message(_("LSF: using the registration of %s against this file, made %s\n"),
 						a->seqname, date ? date : "");
-				rseq = apply_onto_grid(seq, &f, a, layer, model, pad);
+				rseq = apply_onto_grid(seq, &f, a, layer, model, pad, LSF_REG_PREFIX, NULL);
 			} else {
 				if (why && !a->force_reg)
 					siril_log_message(_("LSF: %s: registering the frames again\n"), why);
@@ -1276,11 +2162,16 @@ static int lsf_append_run(struct lsf_cmd_args *a) {
 		}
 	}
 
+	/* LSF's own drizzle never puts a flat in the weights */
+	if (f.settings.drizzled)
+		check_flat_weights(&f.settings, siril_drizzled && dsc.flat_weights, a->seqname, a->path, &f.primary, gen);
+
 	struct lsf_batch_args bargs = { 0 };
 	bargs.seq = batch;
-	bargs.src_seq = a->noreg ? NULL : seq;
+	bargs.src_seq = siril_drizzled ? src : a->noreg ? NULL : seq;
 	bargs.src_index = src_index;
-	bargs.framing = a->noreg ? NULL : lsf_framing_name(a->framing);
+	bargs.framing = siril_drizzled ? dsc.framing : a->noreg ? NULL : lsf_framing_name(a->framing);
+	memcpy(bargs.driz_wscale, driz_wscale, sizeof driz_wscale);
 	bargs.reg_method = a->wcsreg ? "wcs" : "stars";
 	bargs.disto = model;
 	bargs.settings = &f.settings;
@@ -1290,7 +2181,7 @@ static int lsf_append_run(struct lsf_cmd_args *a) {
 	bargs.gen = gen;
 	bargs.prev_frames = f.ledger_rows;
 	bargs.prev_exptime = f.ledger_exptime;
-	bargs.seq_name = seq->seqname;
+	bargs.seq_name = siril_drizzled ? dsc.source : seq->seqname;
 	bargs.rows = rows;
 	bargs.primary = &f.primary;
 	bargs.wref = &f.wref;
@@ -1298,6 +2189,8 @@ static int lsf_append_run(struct lsf_cmd_args *a) {
 	bargs.max_threads = a->max_threads;
 	bargs.overlap_norm = a->overlap_norm;
 	bargs.feather = a->feather;
+	bargs.driz_pixfrac = (float) a->pixfrac;
+	bargs.driz_kernel = f.settings.drizzled ? kernel_enum2str(a->kernel) : NULL;
 	if (lsf_process_batch(&bargs))
 		goto end;
 	/* the transforms of the new rows were computed onto the grid before its expansion */
@@ -1327,9 +2220,14 @@ static int lsf_append_run(struct lsf_cmd_args *a) {
 end:
 	if (rseq) {
 		remove_prefixed_sequence_files(seq, LSF_REG_PREFIX);
+		if (rseq->is_drizzle)
+			remove_prefixed_drizzle_files(seq, LSF_REG_PREFIX);
 		free_sequence(rseq, TRUE);
 	}
 	free(src_index);
+	if (src)
+		free_sequence(src, TRUE);
+	lsf_drizzle_sidecar_clear(&dsc);
 	if (seq)
 		free_sequence(seq, TRUE);
 	g_ptr_array_free(rows, TRUE);
@@ -1343,9 +2241,19 @@ static void print_summary(const lsf_file *f) {
 	siril_log_message(_("LSF file %s: version %s, id %s, generation %d\n"), f->path, LSF_VERSION, f->uid, f->gen);
 	siril_log_message(_("  %ld frames in %d batch(es), STACKCNT %u, live time %.1f s\n"), f->ledger_rows,
 			f->nb_batches, k->stackcnt, k->livetime > 0.0 ? k->livetime : 0.0);
-	if (s->is_cfa)
+	if (s->drizzled && s->is_cfa)
+		siril_log_message(_("  grid %dx%d, %d channel(s), CFA sensor %s (CFA drizzle at scale %d, last frames at pixel "
+					"fraction %g, kernel %s)\n"), f->rx, f->ry, f->nchan, s->bayer, s->oversample, f->ledger_pixfrac,
+				f->ledger_kernel);
+	else if (s->drizzled)
+		siril_log_message(_("  grid %dx%d, %d channel(s), mono sensor (drizzle at scale %d, last frames at pixel "
+					"fraction %g, kernel %s)\n"), f->rx, f->ry, f->nchan, s->oversample, f->ledger_pixfrac, f->ledger_kernel);
+	else if (s->is_cfa)
 		siril_log_message(_("  grid %dx%d, %d channel(s), CFA sensor %s (debayered)\n"), f->rx, f->ry, f->nchan, s->bayer);
 	else siril_log_message(_("  grid %dx%d, %d channel(s), mono sensor\n"), f->rx, f->ry, f->nchan);
+	if (s->drizzled && s->driz_flat)
+		siril_log_message(_("  drizzle weights with a master flat (weight.driz_flat), from frames drizzled by Siril's "
+					"registration\n"));
 	if (has_wcs((fits *) &f->primary)) {
 		gchar *desc = lsf_wcs_describe(f->primary.keywords.wcslib, f->rx, f->ry);
 		siril_log_message(_("  WCS: %s\n"), desc);
@@ -1432,22 +2340,70 @@ static int lsf_info_run(struct lsf_cmd_args *a) {
  * a channel count that differs is refused, and frames whose Section 7
  * keywords differ from the file are skipped, which the reference frame
  * shows. Returns a message for the user or NULL, *fatal when refused. */
+/* for the GUI: an append whose drizzle weights include a master flat or not,
+ * unlike the file's (weight.driz_flat) */
+static const char *flat_mismatch_note(gboolean batch_flat) {
+	return batch_flat ? _("The drizzle weights of these frames include a master flat, and those of the Living Stack do "
+			"not: they are merged, with their weights on another scale.")
+		: _("The drizzle weights of the Living Stack include a master flat, and those of these frames do not: they "
+			"are merged, with their weights on another scale.");
+}
+
 gchar *lsf_check_batch(const lsf_info *info, sequence *seq, gboolean *fatal) {
 	*fatal = FALSE;
-	if (seq->nb_layers != info->file.nchan) {
+	const lsf_settings *s = &info->file.settings;
+	gchar *refused = refused_sequence(seq, s->drizzled, file_pattern(s));
+	if (refused) {
+		*fatal = TRUE;
+		return refused;
+	}
+	if (!s->drizzled && seq->nb_layers != info->file.nchan) {
 		*fatal = TRUE;
 		return g_strdup_printf(_("The Living Stack has %d channel(s) and the sequence %d."),
 				info->file.nchan, seq->nb_layers);
 	}
+	/* drizzled by Siril's registration (Section 13): only onto this grid */
+	lsf_drizzle_sidecar dsc;
+	if (seq->is_drizzle && lsf_read_drizzle_sidecar(seq, &dsc, NULL)) {
+		gchar *why = NULL, *problem = NULL;
+		int layer;
+		if (!dsc.on_stack)
+			problem = g_strdup_printf(_("%s was drizzled onto its own reference frame, not onto the grid of this Living "
+						"Stack. Register %s to it with drizzle in the Registration tab, or append %s."),
+					seq->seqname, dsc.source, dsc.source);
+		else if (dsc.scale != s->oversample)
+			problem = g_strdup_printf(_("%s was drizzled at scale %d, and the Living Stack is at scale %d."),
+					seq->seqname, dsc.scale, s->oversample);
+		else if (!lsf_binding_check(seq, &info->file, NULL, &layer, NULL, &why))
+			problem = g_strdup_printf(_("%s cannot be appended as it is: %s. Register and drizzle %s against it again."),
+					seq->seqname, why ? why : _("it was not drizzled against this Living Stack"), dsc.source);
+		g_free(why);
+		const gboolean batch_flat = dsc.flat_weights;
+		lsf_drizzle_sidecar_clear(&dsc);
+		if (problem) {
+			*fatal = TRUE;
+			return problem;
+		}
+		if (batch_flat != s->driz_flat)
+			return g_strdup(flat_mismatch_note(batch_flat));
+		return NULL;	// the frames' metadata is the source's, checked when they were drizzled
+	}
 	fits meta = { 0 };
 	gchar *msg = NULL;
 	if (!seq_read_frame_metadata(seq, sequence_find_refimage(seq), &meta)) {
+		/* the frames keep the sensor's pixel size, which Siril's apply divides
+		 * by the scale, as it did for the Stack */
+		meta.keywords.pixel_size_x /= s->oversample;
+		meta.keywords.pixel_size_y /= s->oversample;
 		const char *bad = lsf_frame_mismatch(&info->file.primary, &meta);
 		if (bad)
 			msg = g_strdup_printf(_("The %s of the reference frame differs from the Living Stack. Frames "
 						"that differ are not merged."), bad);
 	}
 	clearfits(&meta);
+	/* LSF drizzles the frames itself, without a flat */
+	if (!msg && s->drizzled && s->driz_flat)
+		msg = g_strdup(flat_mismatch_note(FALSE));
 	return msg;
 }
 
@@ -1482,22 +2438,23 @@ gchar *lsf_append_preflight(const lsf_info *info, const char *wd, const char *ou
 	guint64 npix = (guint64) f->rx * f->ry * f->nchan;
 	/* an exposure map the append creates is not counted: the batch is not read yet */
 	guint64 hist = lsf_history_bytes(npix, rej, f->has_exp);
-	guint64 max_mem = (guint64) get_max_memory_in_MB() * BYTES_IN_A_MB;
-	if (hist >= max_mem) {
+	gchar *space = accumulator_space_problem(npix, rej, f->has_exp);
+	if (space) {
 		*fatal = TRUE;
-		return g_strdup_printf(_("The accumulator of this Living Stack needs %.0f MB of memory, and Siril may use "
-					"%.0f MB. Raise the memory limit in the preferences."),
-				(double) hist / BYTES_IN_A_MB, (double) max_mem / BYTES_IN_A_MB);
+		gchar *fatal_msg = g_strdup_printf(_("For this Living Stack, %s. Raise the memory limit in the preferences, or free "
+					"some space."), space);
+		g_free(space);
+		return fatal_msg;
 	}
 	GString *msg = g_string_new(NULL);
-	if (hist > max_mem / 4 * 3)
-		g_string_append_printf(msg, _("The accumulator needs %.0f MB of the %.0f MB Siril may use, which leaves "
-					"little memory for the frames: the append may be slow or fail. "),
-				(double) hist / BYTES_IN_A_MB, (double) max_mem / BYTES_IN_A_MB);
+	if (lsf_accumulator_spills(npix))
+		g_string_append_printf(msg, _("The accumulator needs %.0f MB, too much for the %d MB Siril may use: it is kept in "
+					"temporary files in %s, which is slower. "), (double) hist / BYTES_IN_A_MB,
+				get_max_memory_in_MB(), com.pref.swap_dir);
 
 	/* the new file is about the size of the old one, plus the growth */
 	gint64 need_file = info->file_bytes;
-	gint64 need_frames = noreg ? 0 : (gint64) nb_frames * (gint64) (npix * sizeof(float));
+	gint64 need_frames = noreg ? 0 : (gint64) nb_frames * (gint64) (npix * sizeof(float)) * (f->settings.drizzled ? 2 : 1);	// and their weights
 	gchar *dir = g_path_get_dirname(out ? out : f->path), *fs_file = NULL, *fs_wd = NULL;
 	gint64 free_file = free_space_of(dir, &fs_file), free_wd = free_space_of(wd, &fs_wd);
 	g_free(dir);
@@ -1527,28 +2484,41 @@ gchar *lsf_append_preflight(const lsf_info *info, const char *wd, const char *ou
  * frames stands for it, and max framing makes it larger. Returns a message
  * or NULL, *fatal when the creation cannot run. */
 gchar *lsf_init_preflight(sequence *seq, const char *wd, const char *path, int nb_frames, gboolean rejmaps,
-		gboolean *fatal) {
+		gboolean drizzle, int scale, gboolean *fatal) {
 	*fatal = FALSE;
-	int nchan = seq->nb_layers;
-	guint64 npix = (guint64) seq->rx * seq->ry * nchan;
-	guint64 hist = lsf_history_bytes(npix, rejmaps, FALSE);
-	guint64 max_mem = (guint64) get_max_memory_in_MB() * BYTES_IN_A_MB;
-	if (hist >= max_mem) {
+	gchar *refused = refused_sequence(seq, drizzle, NULL);
+	/* drizzled by Siril with its sidecar (Section 13): on the grid already,
+	 * nothing to apply or write but the file */
+	const gboolean siril_drizzled = !refused && seq->is_drizzle;
+	if (!refused && drizzle && !siril_drizzled)
+		refused = drizzle_registration_problem(seq);
+	if (refused) {
 		*fatal = TRUE;
-		return g_strdup_printf(_("The accumulator of this Living Stack needs at least %.0f MB of memory, and Siril may "
-					"use %.0f MB. Raise the memory limit in the preferences."),
-				(double) hist / BYTES_IN_A_MB, (double) max_mem / BYTES_IN_A_MB);
+		return refused;
+	}
+	if (siril_drizzled)
+		scale = 1;
+	int nchan = drizzle && lsf_sequence_is_cfa(seq) ? 3 : seq->nb_layers;
+	guint64 npix = (guint64) seq->rx * seq->ry * scale * scale * nchan;
+	guint64 hist = lsf_history_bytes(npix, rejmaps, FALSE);
+	gchar *space = accumulator_space_problem(npix, rejmaps, FALSE);
+	if (space) {
+		*fatal = TRUE;
+		gchar *fatal_msg = g_strdup_printf(_("For this Living Stack, %s. Raise the memory limit in the preferences, or free "
+					"some space."), space);
+		g_free(space);
+		return fatal_msg;
 	}
 	GString *msg = g_string_new(NULL);
-	if (hist > max_mem / 4 * 3)
-		g_string_append_printf(msg, _("The accumulator needs at least %.0f MB of the %.0f MB Siril may use, which "
-					"leaves little memory for the frames: the creation may be slow or fail. "),
-				(double) hist / BYTES_IN_A_MB, (double) max_mem / BYTES_IN_A_MB);
+	if (lsf_accumulator_spills(npix))
+		g_string_append_printf(msg, _("The accumulator needs at least %.0f MB, too much for the %d MB Siril may use: it is "
+					"kept in temporary files in %s, which is slower. "), (double) hist / BYTES_IN_A_MB,
+				get_max_memory_in_MB(), com.pref.swap_dir);
 
 	/* the file: the Stack (float32) and the accumulator, uncompressed */
 	gint64 need_file = (gint64) (npix * sizeof(float) + hist);
-	gboolean applied = !layer_has_usable_registration(seq, get_registration_layer(seq));
-	gint64 need_frames = applied ? 0 : (gint64) nb_frames * (gint64) (npix * sizeof(float));
+	gboolean applied = siril_drizzled || !layer_has_usable_registration(seq, get_registration_layer(seq));
+	gint64 need_frames = applied ? 0 : (gint64) nb_frames * (gint64) (npix * sizeof(float)) * (drizzle ? 2 : 1);	// and their weights
 	gchar *dir = g_path_get_dirname(path), *fs_file = NULL, *fs_wd = NULL;
 	gint64 free_file = free_space_of(dir, &fs_file), free_wd = free_space_of(wd, &fs_wd);
 	g_free(dir);
@@ -2040,6 +3010,15 @@ gchar *lsf_cmd_args_to_command(const struct lsf_cmd_args *a) {
 			g_string_append(cmd, " -output_norm");
 		if (a->overlap_norm)
 			g_string_append(cmd, " -overlap_norm");
+		if (a->drizzle) {
+			g_string_append(cmd, " -drizzle");
+			if (a->scale > 1)
+				g_string_append_printf(cmd, " -scale=%d", a->scale);
+			if (a->pixfrac > 0.0)
+				g_string_append_printf(cmd, " -pixfrac=%g", a->pixfrac);
+			if (a->kernel >= 0)
+				g_string_append_printf(cmd, " -kernel=%s", kernel_enum2str(a->kernel));
+		}
 		add_hist_and_common_args(cmd, a);
 		if (a->overwrite)
 			g_string_append(cmd, " -overwrite");
@@ -2063,6 +3042,12 @@ gchar *lsf_cmd_args_to_command(const struct lsf_cmd_args *a) {
 			g_string_append(cmd, " -reg");
 		if (a->overlap_norm)
 			g_string_append(cmd, " -overlap_norm");
+		if (a->pixfrac > 0.0)
+			g_string_append_printf(cmd, " -pixfrac=%g", a->pixfrac);
+		if (a->kernel >= 0)
+			g_string_append_printf(cmd, " -kernel=%s", kernel_enum2str(a->kernel));
+		if (a->drizzle_force)
+			g_string_append(cmd, " -drizzle_force");
 		if (a->disto.index == DISTO_MASTER)
 			g_string_append(cmd, " -disto=master");
 		else if (a->disto.index == DISTO_FILES)
@@ -2212,6 +3197,24 @@ static int parse_common_option(struct lsf_cmd_args *a, const char *w) {
 		a->feather = (int) v;
 		return 1;
 	}
+	if (g_str_has_prefix(w, "-pixfrac=")) {
+		gchar *end;
+		double v = g_ascii_strtod(w + 9, &end);
+		if (end == w + 9 || *end || !(v > 0.0 && v <= 1.0)) {
+			siril_log_error(_("Wrong parameter values. %s is not valid (above 0, up to 1), aborting.\n"), w);
+			return -1;
+		}
+		a->pixfrac = v;
+		return 1;
+	}
+	if (g_str_has_prefix(w, "-kernel=")) {
+		a->kernel = lsf_kernel_from_name(w + 8);
+		if (a->kernel < 0) {
+			siril_log_error(_("Invalid argument to %s, aborting.\n"), w);
+			return -1;
+		}
+		return 1;
+	}
 	if (!strcmp(w, "-nocompress"))
 		return set_compression_opt(a, LSF_COMP_NONE);
 	return parse_compress_option(a, w);
@@ -2282,6 +3285,16 @@ int process_lsf_init(int nb) {
 		else if (!strcmp(w, "-rgb_equal")) s->rgb_equal = TRUE;
 		else if (!strcmp(w, "-output_norm")) s->outnorm = TRUE;
 		else if (!strcmp(w, "-overlap_norm")) a->overlap_norm = TRUE;
+		else if (!strcmp(w, "-drizzle")) a->drizzle = TRUE;
+		else if (g_str_has_prefix(w, "-scale=")) {
+			gchar *end;
+			gint64 v = g_ascii_strtoll(w + 7, &end, 10);
+			if (end == w + 7 || *end || v < 1 || v > LSF_MAX_SCALE) {
+				siril_log_error(_("Wrong parameter values. %s is not valid (a whole number, 1 to %d), aborting.\n"), w, LSF_MAX_SCALE);
+				goto failure;
+			}
+			a->scale = (int) v;
+		}
 		else if (!strcmp(w, "-overwrite")) a->overwrite = TRUE;
 		else if (g_str_has_prefix(w, "-weight_floor=")) {
 			gchar *end;
@@ -2320,6 +3333,10 @@ int process_lsf_init(int nb) {
 	if (s->norm == NO_NORM) {
 		s->lite_norm = FALSE;
 		s->rgb_equal = FALSE;
+	}
+	if (!a->drizzle && (a->pixfrac > 0.0 || a->kernel >= 0 || a->scale > 0)) {
+		siril_log_error(_("-scale, -pixfrac and -kernel need -drizzle\n"));
+		goto failure;
 	}
 	if (lsf_start(a))
 		return CMD_GENERIC_ERROR;
@@ -2368,6 +3385,7 @@ int process_lsf_append(int nb) {
 		if (!strcmp(w, "-noreg")) a->noreg = TRUE;
 		else if (!strcmp(w, "-reg")) a->force_reg = TRUE;
 		else if (!strcmp(w, "-wcsreg")) a->wcsreg = TRUE;
+		else if (!strcmp(w, "-drizzle_force")) a->drizzle_force = TRUE;
 		else if (!strcmp(w, "-weight_model=inverse")) a->weight_inverse = TRUE;
 		else if (!strcmp(w, "-overlap_norm")) a->overlap_norm = TRUE;
 		else if (!strcmp(w, "-disto=master")) {

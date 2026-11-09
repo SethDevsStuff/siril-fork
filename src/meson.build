@@ -216,6 +216,7 @@ src_files = [
   'lsf/lsf_fits.c',
   'lsf/lsf_math.c',
   'lsf/lsf_settings.c',
+  'lsf/lsf_spill.c',
   'lsf/lsf_stack.c',
   'lsf/lsf_wcs.c',
   'lsf/lsf_weights.c',

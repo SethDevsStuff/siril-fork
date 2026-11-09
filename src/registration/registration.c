@@ -23,6 +23,7 @@
 #include "core/proto.h"
 #include "core/siril_log.h"
 #include "drizzle/cdrizzleutil.h"
+#include "lsf/lsf_commands.h"
 #include "opencv/opencv.h"
 
 /* end_register_idle: defined in gui/registration.c (GUI) or
@@ -147,6 +148,10 @@ void create_output_sequence_for_registration(struct registration_args *args, int
 		seq.reference_image = refindex; //applyreg
 	seq.needs_saving = TRUE;
 	writeseqfile(&seq);
+	/* how the frames were drizzled, for lsf_init and lsf_append (Section 13
+	 * of the LSF drizzle plan) */
+	if (args->driz && args->lsf_sidecar)
+		lsf_write_drizzle_sidecar(args, &seq);
 	g_free(seqname);
 	free_sequence(&seq, FALSE);
 }

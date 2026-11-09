@@ -173,7 +173,8 @@ gchar *lsf_gui_describe(const lsf_info *in) {
 	const lsf_settings *s = &f->settings;
 	gchar *first = short_date(in->first_date), *last = short_date(in->last_date),
 	      *added = short_date(in->last_added), *size = g_format_size(in->file_bytes);
-	gchar *grid = s->oversample > 1 ? g_strdup_printf(_("%dx%d grid, drizzled x%d"), f->rx, f->ry, s->oversample) :
+	gchar *grid = s->drizzled ? g_strdup_printf(_("%dx%d grid, %s at scale %d, last frames at pixel fraction %g with the %s kernel"),
+			f->rx, f->ry, s->is_cfa ? _("CFA drizzle") : _("drizzle"), s->oversample, f->ledger_pixfrac, f->ledger_kernel) :
 		g_strdup_printf(_("%dx%d grid"), f->rx, f->ry);
 	gchar *expmap = f->has_exp ? g_strdup(_("exposure map kept")) : isfinite(f->ledger_exptime) ?
 		g_strdup_printf(_("every frame %g s"), f->ledger_exptime) : g_strdup(_("exposure per pixel unknown"));

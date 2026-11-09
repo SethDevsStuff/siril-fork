@@ -128,6 +128,33 @@ Test(lsf_math, sigma_pred_equal_weights) {
 	cr_assert(lsf_sigma_pred2(NOISE_WEIGHT, 1.0, 0.0, 1.0, 1, 1.0) < 0.0);
 }
 
+/* Section 10.3 and 10.7: under drizzle w_new is the sample's own weight, the
+ * frame's times its drizzle weight. Under noise weighting a sample with less
+ * weight is predicted to spread more, and one with none has no prediction. */
+Test(lsf_math, sigma_pred_per_sample_noise) {
+	double W = 10.0, M2 = 0.09, s02 = M2 / 9.0;
+	cr_assert_float_eq(lsf_sigma_pred2(NOISE_WEIGHT, W, M2, W, 10, 1.0), s02 * (1.0 + 0.1), 1e-12);
+	/* a frame weight of 1.2 and a drizzle weight of 0.25 */
+	double w_new = 1.2 * 0.25;
+	cr_assert_float_eq(lsf_sigma_pred2(NOISE_WEIGHT, W, M2, W, 10, w_new), s02 * (1.0 / w_new + 0.1), 1e-12);
+	cr_assert(lsf_sigma_pred2(NOISE_WEIGHT, W, M2, W, 10, 0.25) > lsf_sigma_pred2(NOISE_WEIGHT, W, M2, W, 10, 0.5));
+	cr_assert(lsf_sigma_pred2(NOISE_WEIGHT, W, M2, W, 10, 0.0) < 0.0);
+	/* a weight above 1 is fine: a real frame's can exceed driz_norm (Section 10.3) */
+	cr_assert_float_eq(lsf_sigma_pred2(NOISE_WEIGHT, W, M2, W, 10, 2.4), s02 * (1.0 / 2.4 + 0.1), 1e-12);
+}
+
+/* under reliability weights the sample's own weight enters only through W and
+ * W2, as in Section 10.7: the prediction is the same whatever its weight */
+Test(lsf_math, sigma_pred_per_sample_reliability) {
+	double W = 4.0, W2 = 2.0, M2 = 0.07;
+	double s2 = M2 / (W - W2 / W), expect = s2 * (1.0 + W2 / (W * W));
+	for (int i = 0; i < 2; i++) {
+		weightingType scheme = i ? WFWHM_WEIGHT : NO_WEIGHT;
+		cr_assert_float_eq(lsf_sigma_pred2(scheme, W, M2, W2, 9, 1.0), expect, 1e-12);
+		cr_assert_float_eq(lsf_sigma_pred2(scheme, W, M2, W2, 9, 0.25), expect, 1e-12);
+	}
+}
+
 Test(lsf_math, sigma_hist_floor) {
 	/* sigma_frame is a floor */
 	cr_assert_float_eq(lsf_sigma_hist(0.0001, 1.0, 0.05, 1.0), 0.05, 1e-12);

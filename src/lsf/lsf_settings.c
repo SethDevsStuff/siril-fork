@@ -201,7 +201,7 @@ GPtrArray *lsf_settings_to_rows(const lsf_settings *s, int nchan) {
 	add_str(rows, "sensor.class", s->is_cfa ? "CFA" : "MONO");
 	add_str(rows, "sensor.bayer", s->bayer);
 	add_int(rows, "sensor.binning", s->binning);
-	add_str(rows, "cfa.mode", s->is_cfa ? "DEBAYER" : "NONE");
+	add_str(rows, "cfa.mode", !s->is_cfa ? "NONE" : s->drizzled ? "CFADRIZ" : "DEBAYER");
 	/* written back as read, so a rewrite never changes what the grid is.
 	 * The drizzle pixel fraction and kernel are choices of each append, not
 	 * stored (Section 6) */
@@ -246,6 +246,10 @@ GPtrArray *lsf_settings_to_rows(const lsf_settings *s, int nchan) {
 		add_flt(rows, "weight.floor", s->weight_floor);
 		add_flt(rows, "weight.range", s->weight_range);
 	}
+	if (s->drizzled)
+		add_row(rows, "weight.driz_norm", "JSON", json_array(s->driz_norm, nchan));
+	if (s->drizzled && s->driz_flat)	// absent means no flat, as in files made before it
+		add_bool(rows, "weight.driz_flat", TRUE);
 	add_str(rows, "norm.method", lsf_norm_name(s->norm));
 	add_str(rows, "norm.estimator", s->lite_norm ? "lite" : "ikss");
 	add_bool(rows, "norm.rgb_equal", s->rgb_equal);
@@ -368,6 +372,11 @@ int lsf_settings_from_rows(lsf_settings *s, GPtrArray *rows, int nchan) {
 		else if (!strcmp(k, "reject.hist_margin")) s->hist_margin = g_ascii_strtod(v, NULL);
 		else if (!strcmp(k, "weight.scheme")) err |= !lsf_weight_from_name(v, &s->weighting);
 		else if (!strcmp(k, "weight.noise_norm")) err |= parse_json_array(v, s->noise_norm, nchan);
+		else if (!strcmp(k, "weight.driz_norm")) {	// a drizzled file, CFA or mono
+			err |= parse_json_array(v, s->driz_norm, nchan);
+			s->drizzled = TRUE;
+		}
+		else if (!strcmp(k, "weight.driz_flat")) s->driz_flat = parse_bool(v);
 		else if (!strcmp(k, "weight.fwhm_min")) s->fwhm_min = g_ascii_strtod(v, NULL);
 		else if (!strcmp(k, "weight.fwhm_max")) s->fwhm_max = g_ascii_strtod(v, NULL);
 		else if (!strcmp(k, "weight.fwhm_norm")) s->fwhm_norm = g_ascii_strtod(v, NULL);
@@ -387,12 +396,9 @@ int lsf_settings_from_rows(lsf_settings *s, GPtrArray *rows, int nchan) {
 		else if (!strcmp(k, "rejmaps.enabled")) s->rejmaps = parse_bool(v);
 		else if (!strcmp(k, "filter")) { g_free(s->filter); s->filter = g_strdup(v); }
 		else if (!strcmp(k, "created_utc")) { g_free(s->created_utc); s->created_utc = g_strdup(v); }
-		else if (!strcmp(k, "cfa.mode") || !strcmp(k, "writer")) {
-			/* fixed values in this version, rewritten on save */
-			if (!strcmp(k, "cfa.mode") && !g_ascii_strcasecmp(v, "CFADRIZ")) {
-				siril_log_error(_("LSF: CFA drizzle files are not supported yet\n"));
-				err = 1;
-			}
+		else if (!strcmp(k, "cfa.mode")) s->drizzled |= !g_ascii_strcasecmp(v, "CFADRIZ");
+		else if (!strcmp(k, "writer")) {
+			/* a fixed value in this version, rewritten on save */
 		}
 		else {
 			lsf_setting_row *u = g_new(lsf_setting_row, 1);
@@ -414,6 +420,12 @@ int lsf_settings_from_rows(lsf_settings *s, GPtrArray *rows, int nchan) {
 					"weight.range at least 1)\n"));
 		err = 1;
 	}
+	for (int c = 0; s->drizzled && c < nchan; c++)
+		if (!(s->driz_norm[c] > 0.0)) {
+			siril_log_error(_("LSF: a drizzled file needs weight.driz_norm, above 0 for every channel\n"));
+			err = 1;
+			break;
+		}
 	return err;
 }
 

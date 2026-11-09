@@ -42,6 +42,7 @@ int lsf_history_alloc(lsf_history *h, int rx, int ry, int nchan);
 int lsf_history_alloc_rej(lsf_history *h, int first_gen);
 int lsf_history_alloc_exp(lsf_history *h);
 guint64 lsf_history_bytes(guint64 npix, gboolean rej, gboolean exp);
+gboolean lsf_accumulator_spills(guint64 npix);
 int lsf_history_grow(lsf_history *h, const int pad[4]);
 void lsf_history_free(lsf_history *h);
 void lsf_file_free(lsf_file *f);

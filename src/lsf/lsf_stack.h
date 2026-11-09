@@ -32,6 +32,9 @@ struct lsf_batch_args {
 	int max_threads;		// thread budget of the merge, at least 1
 	gboolean overlap_norm;		// append: normalize against the Stack on the overlap
 	int feather;			// feathering distance of the frames' edges, px, 0 for none
+	float driz_pixfrac;		// drizzled file: the pixel fraction the frames were drizzled with
+	const char *driz_kernel;	// drizzled file: the kernel they were drizzled with, for the ledger
+	double driz_wscale[3];		// frames drizzled by Siril's registration (Section 13): turns their saved weights into raw ones; 0 for 1
 	guint64 rejected[3][2], hist_rejected[3][2];
 };
 

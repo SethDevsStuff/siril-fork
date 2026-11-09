@@ -351,11 +351,12 @@ int map_image_coordinates_h(fits *fit, Homography H, imgmap_t *p, int target_rx,
 		float y1 = y0 * Harr[7] + Harr[8];
 		float y2 = y0 * Harr[1] + Harr[2];
 		float y3 = y0 * Harr[4] + Harr[5];
+		size_t line = (size_t) y * source_rx;	// not a shared counter: the rows run in parallel
 		for (int x = 0; x < source_rx; x++) {
 			float x0 = (float) x;
 			float z = 1. / (x0 * Harr[6] + y1);
-			p->xmap[index] = (x0 * Harr[0] + y2) * z;
-			p->ymap[index++] = (x0 * Harr[3] + y3) * z;
+			p->xmap[line + x] = (x0 * Harr[0] + y2) * z;
+			p->ymap[line + x] = (x0 * Harr[3] + y3) * z;
 		}
 	}
 	return 0;

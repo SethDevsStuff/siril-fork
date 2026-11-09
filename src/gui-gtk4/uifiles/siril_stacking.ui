@@ -1888,6 +1888,117 @@ They can also be added later by an append, and then count from that append on.</
                             </layout>
                           </object>
                         </child>
+                        <child>
+                          <object class="GtkCheckButton" id="stack_lsf_drizzle">
+                            <property name="focusable">1</property>
+                            <property name="halign">start</property>
+                            <property name="label" translatable="yes">Drizzle the frames</property>
+                            <property name="tooltip-text" translatable="yes">The frames are drizzled onto the grid instead of interpolated, each sample with its own weight. CFA frames that are not debayered can only be drizzled. This is chosen for good when the file is created. It needs a registration that is not applied yet, and it cannot be combined with feathering or with the normalization on the overlaps.</property>
+                            <signal name="toggled" handler="on_stack_lsf_append_option_changed"/>
+                            <layout>
+                              <property name="column">0</property>
+                              <property name="row">9</property>
+                              <property name="column-span">4</property>
+                            </layout>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkLabel" id="stack_lsf_drizzle_scale_label">
+                            <property name="halign">end</property>
+                            <property name="label" translatable="yes">Scale:</property>
+                            <layout>
+                              <property name="column">0</property>
+                              <property name="row">10</property>
+                            </layout>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkSpinButton" id="stack_lsf_drizzle_scale">
+                            <property name="focusable">1</property>
+                            <property name="numeric">1</property>
+                            <property name="tooltip-text" translatable="yes">The grid of the Living Stack, in pixels per pixel of the frames, chosen for good when the file is created. The accumulator and the registered frames take the square of it in memory and on disk, and the values are multiplied by the square of it, as in Siril's drizzle: a sky above 1 / scale² clips the whole stacked image, and frames can then no longer be registered against it. Output normalization avoids this.</property>
+                            <property name="adjustment">
+                              <object class="GtkAdjustment">
+                                <property name="lower">1</property>
+                                <property name="upper">3</property>
+                                <property name="value">1</property>
+                                <property name="step-increment">1</property>
+                                <property name="page-increment">1</property>
+                              </object>
+                            </property>
+                            <signal name="value-changed" handler="on_stack_lsf_append_option_changed"/>
+                            <layout>
+                              <property name="column">1</property>
+                              <property name="row">10</property>
+                            </layout>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkLabel" id="stack_lsf_drizzle_pixfrac_label">
+                            <property name="halign">end</property>
+                            <property name="label" translatable="yes">Pixel fraction:</property>
+                            <layout>
+                              <property name="column">2</property>
+                              <property name="row">10</property>
+                            </layout>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkSpinButton" id="stack_lsf_drizzle_pixfrac">
+                            <property name="focusable">1</property>
+                            <property name="numeric">1</property>
+                            <property name="digits">2</property>
+                            <property name="tooltip-text" translatable="yes">The size of the drop of each pixel, as a fraction of the pixel. A smaller drop is sharper and noisier, and needs more frames to fill the grid. The frames of a file should keep the same value: a change raises their noise and changes the level of their signal under a scaling normalization, so an append asks to confirm it.</property>
+                            <property name="adjustment">
+                              <object class="GtkAdjustment">
+                                <property name="lower">0.01</property>
+                                <property name="upper">1</property>
+                                <property name="value">1</property>
+                                <property name="step-increment">0.05</property>
+                                <property name="page-increment">0.1</property>
+                              </object>
+                            </property>
+                            <signal name="value-changed" handler="on_stack_lsf_append_option_changed"/>
+                            <layout>
+                              <property name="column">3</property>
+                              <property name="row">10</property>
+                            </layout>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkLabel" id="stack_lsf_drizzle_kernel_label">
+                            <property name="halign">end</property>
+                            <property name="label" translatable="yes">Kernel:</property>
+                            <layout>
+                              <property name="column">0</property>
+                              <property name="row">11</property>
+                            </layout>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkDropDown" id="stack_lsf_drizzle_kernel">
+                            <property name="model">
+                              <object class="GtkStringList">
+                                <items>
+                                  <item>square</item>
+                                  <item>gaussian</item>
+                                  <item>point</item>
+                                  <item>turbo</item>
+                                  <item>lanczos2</item>
+                                  <item>lanczos3</item>
+                                </items>
+                              </object>
+                            </property>
+                            <property name="selected">0</property>
+                            <property name="tooltip-text" translatable="yes">The shape of the drop. Square is the usual choice. The frames of a file should keep the same kernel: at a scale above 1, another kernel can give a frame several times the total weight of the others, so an append asks to confirm it.</property>
+                            <signal name="notify::selected" handler="on_stack_lsf_append_option_changed"/>
+                            <layout>
+                              <property name="column">1</property>
+                              <property name="row">11</property>
+                              <property name="column-span">3</property>
+                            </layout>
+                          </object>
+                        </child>
                       </object>
                     </child>
                     <child>

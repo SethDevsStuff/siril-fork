@@ -24,9 +24,11 @@
  * does the rest, as for the register command. lsf_append then uses these
  * transforms. registration.c calls the lsf_registration_* functions. */
 
+#include <math.h>
 #include <glib/gstdio.h>
 
 #include "core/siril.h"
+#include "drizzle/cdrizzleutil.h"
 #include "gui-gtk4/dialogs.h"
 #include "gui-gtk4/gui_state.h"
 #include "gui-gtk4/lsf_manager.h"
@@ -86,6 +88,17 @@ static void load_reg_lsf(void) {
 		}
 	}
 	g_free(path);
+	update_reg_interface(TRUE);
+}
+
+/* the frames are drizzled onto the grid of the file after the registration,
+ * for review (Section 13.4 of the drizzle plan): offered for a drizzled file */
+gboolean lsf_registration_drizzle_now(void) {
+	GtkWidget *b = w("reg_lsf_drizzle");
+	return lsf_registration_mode() && gtk_widget_get_visible(b) && siril_toggle_get_active(b);
+}
+
+void on_reg_lsf_drizzle_toggled(GtkCheckButton *button, gpointer user_data) {
 	update_reg_interface(TRUE);
 }
 
@@ -183,6 +196,33 @@ gboolean lsf_registration_update_widgets(void) {
 	gtk_widget_set_visible(info, lsf);
 	gtk_widget_set_sensitive(w("comboboxregmethod"), !lsf);
 	gtk_widget_set_sensitive(w("reg_2pass"), !lsf);
+	/* drizzled onto the grid: raw frames, CFA or mono, not a sequence Siril
+	 * already drizzled or debayered, which the file refuses anyway */
+	const gboolean drizzled_file = lsf && reg_lsf && !reg_lsf_problem && reg_lsf->file.settings.drizzled
+		&& sequence_is_loaded() && !com.seq.is_drizzle && com.seq.nb_layers == 1;
+	gtk_widget_set_visible(w("reg_lsf_drizzle"), drizzled_file);
+	const gboolean drizzle_now = lsf_registration_drizzle_now();
+	/* the drizzle onto the grid is at the file's scale */
+	gtk_widget_set_sensitive(w("reg_scaling_spin"), !drizzle_now);
+	if (drizzle_now && (int) gtk_spin_button_get_value(GTK_SPIN_BUTTON(w("reg_scaling_spin"))) != reg_lsf->file.settings.oversample)
+		gtk_spin_button_set_value(GTK_SPIN_BUTTON(w("reg_scaling_spin")), reg_lsf->file.settings.oversample);
+	/* and with the pixel fraction and the kernel of its last frames, which
+	 * lsf_prepare_registration() refuses to change (D5) */
+	GtkSpinButton *pixfrac = GTK_SPIN_BUTTON(w("spin_driz_dropsize"));
+	GtkDropDown *kernel = GTK_DROP_DOWN(w("combo_driz_kernel"));
+	gtk_widget_set_sensitive(GTK_WIDGET(pixfrac), !drizzle_now);
+	gtk_widget_set_sensitive(GTK_WIDGET(kernel), !drizzle_now);
+	if (drizzle_now) {
+		const lsf_file *f = &reg_lsf->file;
+		const double last_pixfrac = isfinite(f->ledger_pixfrac) ? f->ledger_pixfrac : 1.0;
+		int last_kernel = lsf_kernel_from_name(f->ledger_kernel);
+		if (last_kernel < 0)
+			last_kernel = kernel_square;
+		if (fabs(gtk_spin_button_get_value(pixfrac) - last_pixfrac) > 1e-6)
+			gtk_spin_button_set_value(pixfrac, last_pixfrac);
+		if ((int) gtk_drop_down_get_selected(kernel) != last_kernel)
+			gtk_drop_down_set_selected(kernel, last_kernel);
+	}
 	if (!lsf) {
 		gtk_widget_set_sensitive(w("comboreg_undistort"), TRUE);
 		return TRUE;
@@ -201,7 +241,9 @@ gboolean lsf_registration_update_widgets(void) {
 	if (gtk_drop_down_get_selected(undistort) != DISTO_UNDEF)
 		gtk_drop_down_set_selected(undistort, DISTO_UNDEF);
 	gtk_widget_set_sensitive(GTK_WIDGET(undistort), FALSE);
-	gtk_widget_set_visible(w("output_reg_frame"), FALSE);
+	/* the output is the drizzle onto the grid, or none: the append applies */
+	gtk_widget_set_visible(w("output_reg_frame"), drizzle_now);
+	gtk_widget_set_sensitive(w("output_reg_frame"), drizzle_now);
 
 	gboolean fatal = reg_lsf == NULL || reg_lsf_problem != NULL;
 	gchar *batch = NULL;
@@ -219,7 +261,13 @@ gboolean lsf_registration_update_widgets(void) {
 					"stars are matched."), text->len ? "\n" : "", model);
 		g_free(model);
 	}
-	if (!fatal)
+	if (!fatal && drizzle_now) {
+		gchar *drz = g_strdup_printf(_("The frames are drizzled onto the grid of this Living Stack at its scale, %d, "
+					"and saved with the prefix below for review. Append that sequence afterwards, while the Living "
+					"Stack does not change."), reg_lsf->file.settings.oversample);
+		g_string_append_printf(text, "%s%s", text->len ? "\n" : "", drz);
+		g_free(drz);
+	} else if (!fatal)
 		g_string_append_printf(text, "%s%s", text->len ? "\n" : "", _("Only the transforms are computed: the append "
 					"to this Living Stack applies them. Do not apply them before appending."));
 	gtk_label_set_text(GTK_LABEL(info), text->str);

@@ -75,6 +75,7 @@ typedef struct {
 	/* exposure map (Section 3), the EXP planes of LSF_ACC, NULL when the file
 	 * has none: sum of EXPTIME over the accepted samples, seconds */
 	float *exp[3];
+	GSList *spill;			// the planes in temporary files (lsf_spill), when they do not fit in memory (Section 10.10)
 } lsf_history;
 
 /* one row of LSF_SETTINGS that this writer does not know, kept (C7) */
@@ -89,7 +90,8 @@ typedef struct {
 	int binning;			// sensor.binning
 	/* grid */
 	int origin_x, origin_y;		// grid.origin_*, total padding before the data (Section 10.5)
-	int oversample;			// grid.oversample, the drizzle scale: this writer merges onto 1 only
+	int oversample;			// grid.oversample, the drizzle scale, 1 without drizzle
+	gboolean drizzled;		// the frames are drizzled by LSF, each sample weighted (Section 10.3): weight.driz_norm is set, and cfa.mode is CFADRIZ on a CFA sensor
 	gboolean undistorted;		// grid.undistorted: every frame is undistorted before it is merged
 	/* registration */
 	transformation_type transform;	// align.transform
@@ -109,6 +111,8 @@ typedef struct {
 	double weight_floor;		// weight.floor, the least weight before the norm
 	double weight_range;		// weight.range, multiplier of the first batch's span (1: Siril's)
 	double stars_min, stars_max, stars_norm;
+	double driz_norm[3];		// weight.driz_norm, Siril's max_weight of the first batch, per channel (drizzled files)
+	gboolean driz_flat;		// weight.driz_flat: the first batch's drizzle weights, and so driz_norm, include a master flat (Section 13: frames drizzled by Siril's registration)
 	/* normalization against a frozen baseline frame */
 	normalization norm;		// norm.method
 	gboolean lite_norm;		// norm.estimator: lite or ikss
@@ -155,6 +159,10 @@ typedef struct {
 	/* EXPTIME of every ledger row when they all have the same, known one, so
 	 * that the exposure map is COUNT times it; NAN otherwise */
 	double ledger_exptime;
+	/* DRZ_PIXF and DRZ_KERN of the last ledger row, the defaults of an append
+	 * to a drizzled file (Section 6): NAN and "" when the ledger has none */
+	double ledger_pixfrac;
+	gchar ledger_kernel[16];
 	lsf_compression compression;	// of LSF_ACC, as found in the file
 	gchar acc_codec[FLEN_VALUE], count_codec[FLEN_VALUE], rej_codec[FLEN_VALUE];	// ZCMPTYPE, "none" when not compressed
 	long long acc_bytes, count_bytes, rej_bytes;	// size of the data units as stored
@@ -178,6 +186,8 @@ typedef struct {
 	double norm_sc[3], norm_off[3];
 	gchar norm_mth[3][13];
 	int feather;		// FEATHER: the feathering distance the frame was merged with, px, 0 for none
+	float pixfrac;		// DRZ_PIXF: the drizzle pixel fraction, drizzled files only
+	gchar kernel[9];	// DRZ_KERN: the drizzle kernel, empty when the frame was not drizzled
 	double weight[3];
 	float fwhm, wfwhm, round, regq, regbg;
 	int nstars;

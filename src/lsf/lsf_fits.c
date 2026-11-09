@@ -35,6 +35,7 @@
 #include <fitsio.h>
 #include <glib/gstdio.h>
 
+#include "core/OS_utils.h"
 #include "core/siril.h"
 #include "core/siril_alloc.h"
 #include "core/siril_log.h"
@@ -43,6 +44,7 @@
 #include "lsf/lsf_fits.h"
 #include "lsf/lsf_math.h"
 #include "lsf/lsf_settings.h"
+#include "lsf/lsf_spill.h"
 
 static const char *plane_kind[LSF_NB_PL] = { "MEAN", "W", "M2", "W2" };
 static const char *chan_suffix[3] = { "_R", "_G", "_B" };
@@ -55,16 +57,51 @@ static const char *lsf_keys[] = { "LSF", "LSFVER", "LSFUID", "LSFGEN", "LSFSENS"
 static const char *primary_banned_keys[] = { "BAYERPAT", "XBAYROFF", "YBAYROFF",
 	"MIPS-HI", "MIPS-LO", "MIPS-FHI", "MIPS-FLO" };
 
+/* An accumulator of npix pixels times channels that would leave too little of
+ * the memory Siril may use for the frames goes to temporary files (Section
+ * 10.10). Its optional planes count, so that all its planes are kept alike. */
+gboolean lsf_accumulator_spills(guint64 npix) {
+	return lsf_history_bytes(npix, TRUE, TRUE) > (guint64) get_max_memory_in_MB() * BYTES_IN_A_MB / 4 * 3;
+}
+
+/* a zeroed plane of n pixels, in memory or in a temporary file, or NULL */
+static void *plane_alloc(lsf_history *h, size_t n, size_t elsize) {
+	if (!lsf_accumulator_spills((guint64) n * h->nchan))
+		return siril_calloc(n, elsize);
+	if (!h->spill)
+		siril_log_message(_("LSF: the accumulator does not fit in the %d MB Siril may use: it is kept in temporary files "
+					"in %s, up to %.0f MB, which is slower\n"), get_max_memory_in_MB(), com.pref.swap_dir,
+				(double) lsf_history_bytes((guint64) n * h->nchan, TRUE, TRUE) / BYTES_IN_A_MB);
+	lsf_spill *sp = lsf_spill_new(com.pref.swap_dir, n * elsize);
+	if (!sp) {
+		siril_log_error(_("LSF: could not create a temporary file of %.0f MB in %s\n"),
+				(double) (n * elsize) / BYTES_IN_A_MB, com.pref.swap_dir);
+		return NULL;
+	}
+	h->spill = g_slist_prepend(h->spill, sp);
+	return lsf_spill_data(sp);
+}
+
+static void plane_free(lsf_history *h, void *plane) {
+	for (GSList *l = h->spill; l; l = l->next)
+		if (lsf_spill_data(l->data) == plane) {
+			lsf_spill_free(l->data);
+			h->spill = g_slist_delete_link(h->spill, l);
+			return;
+		}
+	siril_free(plane);
+}
+
 int lsf_history_alloc(lsf_history *h, int rx, int ry, int nchan) {
 	memset(h, 0, sizeof(lsf_history));
 	h->rx = rx; h->ry = ry; h->nchan = nchan;
 	size_t n = (size_t) rx * ry;
 	for (int c = 0; c < nchan; c++) {
 		for (int k = 0; k < LSF_NB_PL; k++) {
-			h->plane[k][c] = siril_calloc(n, sizeof(float));
+			h->plane[k][c] = plane_alloc(h, n, sizeof(float));
 			if (!h->plane[k][c]) goto fail;
 		}
-		h->count[c] = siril_calloc(n, sizeof(WORD));
+		h->count[c] = plane_alloc(h, n, sizeof(WORD));
 		if (!h->count[c]) goto fail;
 	}
 	return 0;
@@ -79,7 +116,7 @@ int lsf_history_alloc_rej(lsf_history *h, int first_gen) {
 	size_t n = (size_t) h->rx * h->ry;
 	for (int d = 0; d < 2; d++)
 		for (int c = 0; c < h->nchan; c++) {
-			h->rej[d][c] = siril_calloc(n, sizeof(WORD));
+			h->rej[d][c] = plane_alloc(h, n, sizeof(WORD));
 			if (!h->rej[d][c]) {
 				PRINT_ALLOC_ERR;
 				return 1;
@@ -94,7 +131,7 @@ int lsf_history_alloc_rej(lsf_history *h, int first_gen) {
 int lsf_history_alloc_exp(lsf_history *h) {
 	size_t n = (size_t) h->rx * h->ry;
 	for (int c = 0; c < h->nchan; c++) {
-		h->exp[c] = siril_calloc(n, sizeof(float));
+		h->exp[c] = plane_alloc(h, n, sizeof(float));
 		if (!h->exp[c]) {
 			PRINT_ALLOC_ERR;
 			return 1;
@@ -124,13 +161,13 @@ int lsf_history_grow(lsf_history *h, const int pad[4]) {
 			void **plane = k < 0 ? (void **) &h->exp[c] : k < LSF_NB_PL ? (void **) &h->plane[k][c] :
 				k == LSF_NB_PL ? (void **) &h->count[c] : (void **) &h->rej[k - LSF_NB_PL - 1][c];
 			size_t elsize = k < LSF_NB_PL ? sizeof(float) : sizeof(WORD);
-			void *grown = siril_calloc(n, elsize);
+			void *grown = plane_alloc(h, n, elsize);
 			if (!grown) {
 				PRINT_ALLOC_ERR;
 				return 1;	// planes already grown and not: the history is unusable
 			}
 			lsf_pad_plane(*plane, grown, elsize, h->rx, h->ry, pad);
-			siril_free(*plane);
+			plane_free(h, *plane);
 			*plane = grown;
 		}
 	}
@@ -142,15 +179,15 @@ int lsf_history_grow(lsf_history *h, const int pad[4]) {
 void lsf_history_free(lsf_history *h) {
 	for (int c = 0; c < 3; c++) {
 		for (int k = 0; k < LSF_NB_PL; k++) {
-			siril_free(h->plane[k][c]);
+			plane_free(h, h->plane[k][c]);
 			h->plane[k][c] = NULL;
 		}
-		siril_free(h->count[c]);
+		plane_free(h, h->count[c]);
 		h->count[c] = NULL;
-		siril_free(h->exp[c]);
+		plane_free(h, h->exp[c]);
 		h->exp[c] = NULL;
 		for (int d = 0; d < 2; d++) {
-			siril_free(h->rej[d][c]);
+			plane_free(h, h->rej[d][c]);
 			h->rej[d][c] = NULL;
 		}
 	}
@@ -644,6 +681,25 @@ static int open_and_validate(const char *path, lsf_file *f, gboolean tolerate_ed
 	f->nb_batches = 0;
 	int has_batch = !fits_get_colnum(fptr, CASEINSEN, "BATCH", &cbatch, &status);
 	status = 0;
+	/* the drizzle parameters of the last row, the defaults of the next append */
+	int cpix = 0, ckern = 0, dstatus = 0;
+	f->ledger_pixfrac = NAN;
+	f->ledger_kernel[0] = '\0';
+	fits_write_errmark();
+	gboolean has_drz = !fits_get_colnum(fptr, CASEINSEN, "DRZ_PIXF", &cpix, &dstatus)
+		&& !fits_get_colnum(fptr, CASEINSEN, "DRZ_KERN", &ckern, &dstatus);
+	fits_clear_errmark();
+	dstatus = 0;
+	if (f->ledger_rows > 0 && has_drz) {
+		float pixf = NAN;
+		char kern[FLEN_VALUE] = { 0 }, *pk = kern;
+		fits_read_col(fptr, TFLOAT, cpix, f->ledger_rows, 1, 1, NULL, &pixf, NULL, &dstatus);
+		fits_read_col(fptr, TSTRING, ckern, f->ledger_rows, 1, 1, NULL, &pk, NULL, &dstatus);
+		if (!dstatus) {
+			f->ledger_pixfrac = pixf;
+			g_strlcpy(f->ledger_kernel, g_strstrip(kern), sizeof f->ledger_kernel);
+		}
+	}
 	/* and the exposure all the frames share, if they do */
 	int cexp = 0;
 	gboolean has_exptime = !fits_get_colnum(fptr, CASEINSEN, "EXPTIME", &cexp, &status);
@@ -940,9 +996,9 @@ int lsf_read_info(const char *path, lsf_info *info) {
 	if (!g_stat(path, &st))
 		info->file_bytes = st.st_size;
 	read_ledger_summary(path, info->file.ledger_hdu, info);
-	if (info->file.settings.oversample != 1)
-		info->no_append = g_strdup_printf(_("the grid is drizzled at scale %d, and this version can append "
-					"only to a grid at the frames' own scale"), info->file.settings.oversample);
+	if (info->file.settings.oversample != 1 && !info->file.settings.drizzled)
+		info->no_append = g_strdup_printf(_("the grid is at scale %d and is not drizzled, which this version cannot "
+					"append to"), info->file.settings.oversample);
 	return 0;
 }
 
@@ -1237,6 +1293,20 @@ static void add_feather_column(fitsfile *fptr, GPtrArray *rows, int *status) {
 		fits_write_col(fptr, TINT, ncols + 1, r, 1, 1, &zero, status);
 }
 
+/* DRZ_PIXF and DRZ_KERN (Section 9) exist in drizzled files only, whose
+ * first commit adds them */
+static void add_drizzle_columns(fitsfile *fptr, GPtrArray *rows, int *status) {
+	gboolean drizzled = FALSE;
+	for (guint i = 0; i < rows->len; i++)
+		drizzled |= ((lsf_ledger_row *) g_ptr_array_index(rows, i))->kernel[0] != '\0';
+	if (!drizzled || *status || colnum(fptr, "DRZ_PIXF"))
+		return;
+	int ncols = 0;
+	fits_get_num_cols(fptr, &ncols, status);
+	fits_insert_col(fptr, ncols + 1, "DRZ_PIXF", "E", status);
+	fits_insert_col(fptr, ncols + 2, "DRZ_KERN", "8A", status);
+}
+
 /* NORM_MTH, 12 characters per channel (Section 9). CFITSIO reads its TDIM
  * (12,P) as P strings of 12 in a table it opened, but as one string of 12 P
  * in the table it has just created, or in one without TDIM: written as one
@@ -1295,6 +1365,10 @@ static void write_ledger_rows(fitsfile *fptr, GPtrArray *rows, long first_row, i
 		put(fptr, TFLOAT, "REGBG", row, 1, &r->regbg, status);
 		put(fptr, TINT, "NSTARS", row, 1, &r->nstars, status);
 		put(fptr, TINT, "FEATHER", row, 1, &r->feather, status);	// once a commit has feathered
+		if (r->kernel[0] != '\0') {
+			put(fptr, TFLOAT, "DRZ_PIXF", row, 1, &r->pixfrac, status);
+			put_str(fptr, "DRZ_KERN", row, r->kernel, status);
+		}
 		put(fptr, TFLOAT, "BKG_MED", row, nchan, r->bkg_med, status);
 		put(fptr, TFLOAT, "NOISE", row, nchan, r->noise, status);
 		put(fptr, TFLOAT, "NOISE_N", row, nchan, r->noise_n, status);
@@ -1466,7 +1540,7 @@ int lsf_write_file(const char *path, lsf_file *old, const lsf_settings *s, lsf_h
 		if (s->is_cfa)
 			fits_update_key(fptr, TSTRING, "LSFBAYR", (void *) s->bayer, "LSF Bayer pattern of the sensor", &status);
 		else delete_key_quiet(fptr, "LSFBAYR");
-		fits_update_key(fptr, TSTRING, "LSFDMOD", (char *) (s->is_cfa ? "DEBAYER" : "NONE"), "LSF demosaic mode", &status);
+		fits_update_key(fptr, TSTRING, "LSFDMOD", (char *) (!s->is_cfa ? "NONE" : s->drizzled ? "CFADRIZ" : "DEBAYER"), "LSF demosaic mode", &status);
 		fits_update_key(fptr, TLOGICAL, "LSFNORM", s->outnorm ? &t : &f,
 				"Stack is output-normalized", &status);
 		if (s->outnorm) {
@@ -1601,6 +1675,7 @@ int lsf_write_file(const char *path, lsf_file *old, const lsf_settings *s, lsf_h
 		create_ledger_hdu(fptr, nchan, &status);
 	}
 	add_feather_column(fptr, new_rows, &status);
+	add_drizzle_columns(fptr, new_rows, &status);
 	write_identity(fptr, NULL, uid, gen, &status);
 	write_ledger_rows(fptr, new_rows, first_row, nchan, batch, gen, added, &status);
 	if (status) {

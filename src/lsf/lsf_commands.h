@@ -61,6 +61,12 @@ struct lsf_cmd_args {
 	gboolean weight_inverse;	// append: -weight_model=inverse, from this append on (Section 10.3)
 	gboolean overlap_norm;		// append: -overlap_norm, normalization against the Stack on the overlap
 	int feather;			// init and append: -feather=, px, 0 for none
+	gboolean drizzle;		// init: -drizzle, the file is a CFA drizzle file (Section 10.1)
+	gboolean drizzle_force;		// append: -drizzle_force, drizzle with another pixel fraction or kernel than the last frames
+	int scale;			// init: -scale=, grid.oversample, 0 when not given
+	double pixfrac;			// init and append: -pixfrac=, 0 when not given
+	int kernel;			// init and append: -kernel=, an enum e_kernel_t, -1 when not given
+	fits *driz_flat;		// a drizzle onto the grid after a registration: the master flat in the weights, not owned, or NULL
 	disto_params disto;	// append: -disto=, the distortion model of an undistorted grid; DISTO_UNDEF: the file's
 	gchar *wcs_file;	// util: -wcs=, the plate-solved image or .wcs file whose WCS is imported (Section 8)
 	int *image_indices;	// init and append: frames chosen by the GUI's stacking filters, or NULL
@@ -81,12 +87,44 @@ gchar *lsf_check_batch(const lsf_info *info, sequence *seq, gboolean *fatal);
 int lsf_prepare_registration(struct registration_args *regargs, gboolean keep_type, gboolean keep_pairs,
 		gboolean keep_findstar);
 const gchar *lsf_registration_result(const struct registration_args *regargs);
+const gchar *lsf_registration_drizzled(const struct registration_args *regargs);
 gboolean lsf_binding_check(const sequence *seq, const lsf_file *f, const disto_params *model, int *layer,
 		gchar **date, gchar **why);
 gchar *lsf_append_preflight(const lsf_info *info, const char *wd, const char *out, int nb_frames, gboolean noreg,
 		gboolean add_rejmaps, gboolean *fatal);
 gboolean lsf_same_file(const char *p1, const char *p2);
 gchar *lsf_init_preflight(sequence *seq, const char *wd, const char *path, int nb_frames, gboolean rejmaps,
-		gboolean *fatal);
+		gboolean drizzle, int scale, gboolean *fatal);
+gboolean lsf_sequence_is_cfa(sequence *seq);
+int lsf_kernel_from_name(const char *name);
+
+/* The [lsf_drizzle] group of the .lsfreg sidecar of a sequence drizzled by
+ * Siril's registration (Section 13): how it was drizzled, so that lsf_init
+ * and lsf_append merge its frames and weights as they are. */
+typedef struct {
+	gchar *source;		// the sequence it was drizzled from
+	int frames;		// frames of the drizzled sequence when it was written
+	int source_ref;		// reference frame of the source
+	int scale, kernel;
+	double pixfrac;
+	gchar bayer[8];		// CFA pattern of the source, "" for mono
+	double max_weight[3];	// Siril's max_weight per channel
+	int weight_bits;	// how the weights were saved: 8, 16 or 32
+	gboolean rescaled;	// the weights were divided by max_weight before saving
+	int data_bits;		// how the frames were saved: 16 or 32
+	gboolean flat_weights;	// a master flat was in the weights
+	gboolean variable;	// the frames differ in size (max framing)
+	gboolean undistorted;	// the frames were undistorted
+	gboolean ext_ref;	// registered against an external reference
+	gchar framing[8];
+	int origin[2];		// grid.origin, as lsf_init computes it
+	double base[9];		// the source's registration onto the grid of the frames
+	gboolean on_stack;	// drizzled onto a Living Stack's grid: pad and [lsf_registration] apply
+	int pad[4];		// LSF_PAD_*: the growth of that grid the frames need
+} lsf_drizzle_sidecar;
+
+void lsf_write_drizzle_sidecar(const struct registration_args *regargs, const sequence *out);
+gboolean lsf_read_drizzle_sidecar(const sequence *seq, lsf_drizzle_sidecar *d, gchar **why);
+void lsf_drizzle_sidecar_clear(lsf_drizzle_sidecar *d);
 
 #endif /* SRC_LSF_LSF_COMMANDS_H_ */

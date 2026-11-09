@@ -242,7 +242,7 @@ static void fill_ledger_row(lsf_ledger_row *r, struct lsf_batch_args *args, cons
 	 * source frame when the batch was registered against the Stack, or, when
 	 * lsf_init applied the registration of the sequence, that one mapped onto
 	 * the grid */
-	int src_layer = args->xfrm_base ? get_registration_layer(src) : reglayer;
+	int src_layer = args->xfrm_base || src->nb_layers != seq->nb_layers ? get_registration_layer(src) : reglayer;
 	regdata *src_reg = (src_layer >= 0 && layer_has_registration(src, src_layer)) ? &src->regparam[src_layer][src_idx] : NULL;
 	regdata *reg = (layer_has_registration(seq, reglayer)) ? &seq->regparam[reglayer][idx] : NULL;
 	Homography H;
@@ -296,6 +296,10 @@ static void fill_ledger_row(lsf_ledger_row *r, struct lsf_batch_args *args, cons
 	r->round = b->round[k];
 	r->nstars = b->nstars[k];
 	r->feather = args->feather;
+	if (args->driz_kernel) {
+		r->pixfrac = args->driz_pixfrac;
+		g_strlcpy(r->kernel, args->driz_kernel, sizeof r->kernel);
+	}
 
 	for (int c = 0; c < nchan; c++) {
 		r->norm_sc[c] = b->pscale[c][k] * b->pmul[c][k];
@@ -328,11 +332,21 @@ typedef struct {
 	void *mem;
 	float **mask;		// [frame] feathering weights of the block, NULL without feathering
 	void *mask_mem;
+	float **drz;		// [frame] drizzle weights of the block, NULL for a file that is not drizzled
+	void *drz_mem;
 } lsf_thread_data;
 
 static int alloc_thread_data(lsf_thread_data *t, int nb, size_t block_pix, gboolean ushort_input, rejection rej,
-		gboolean masks) {
+		gboolean masks, gboolean drizzled) {
 	memset(t, 0, sizeof(lsf_thread_data));
+	if (drizzled) {
+		t->drz = malloc(nb * sizeof(float *));
+		t->drz_mem = siril_malloc((size_t) nb * block_pix * sizeof(float));
+		if (!t->drz || !t->drz_mem)
+			return 1;
+		for (int f = 0; f < nb; f++)
+			t->drz[f] = (float *) t->drz_mem + (size_t) f * block_pix;
+	}
 	if (masks) {
 		t->mask = malloc(nb * sizeof(float *));
 		t->mask_mem = siril_malloc((size_t) nb * block_pix * sizeof(float));
@@ -377,6 +391,7 @@ static int alloc_thread_data(lsf_thread_data *t, int nb, size_t block_pix, gbool
 static void free_thread_data(lsf_thread_data *t) {
 	free(t->pix); siril_free(t->mem); free(t->wbuf); free(t->xbuf); free(t->wbufd); free(t->sel);
 	free(t->mask); siril_free(t->mask_mem);
+	free(t->drz); siril_free(t->drz_mem);
 	free(t->db.stack); free(t->db.o_stack); free(t->db.w_stack); free(t->db.rejected);
 	free(t->db.xf);
 }
@@ -483,6 +498,18 @@ static void remove_feather_masks(sequence *seq) {
 			g_unlink(maskfile);
 		g_free(maskfile);
 	}
+}
+
+/* the raw drizzle weights of frame idx of seq on a block, as Siril's stack
+ * reads them. Returns non-zero on error. */
+static int read_drizzle_block(sequence *seq, int idx, int layer, const rectangle *area, float *out) {
+	gchar *file = get_sequence_cache_filename(seq, idx, "drizztmp", "fit", NULL);
+	int ret = read_drizz_fits_area(file, seq->nb_layers == 3 ? layer : 0, (rectangle *) area, seq->ry, out)
+		|| !flip_buffer(FLOAT_IMG, out, area);
+	if (ret)
+		siril_log_error(_("LSF: could not read the drizzle weights of frame %d\n"), seq->imgparam[idx].filenum);
+	g_free(file);
+	return ret;
 }
 
 static double normalize_sample(normalization norm, float v, double pscale, double poffset, double pmul) {
@@ -626,12 +653,94 @@ static int bin_frame(const fits *fit, batch_frames *b, int k) {
 	return 0;
 }
 
+/* A drizzled frame is 0 where no input pixel of the channel landed, and the
+ * star finder takes these holes for dark pixels. For the star measures only,
+ * each one takes the mean of the linear interpolations along its row and its
+ * column, between the data around it. Returns 0, or 1 on error. */
+static int fill_drizzle_holes(fits *fit, int layer) {
+	const size_t rx = fit->rx, ry = fit->ry, n = rx * ry;
+	const size_t plane = n * (fit->naxes[2] > 1 ? layer : 0);
+	float *sum = calloc(n, sizeof(float));
+	guint8 *cnt = calloc(n, 1);
+	if (!sum || !cnt) {
+		PRINT_ALLOC_ERR;
+		free(sum);
+		free(cnt);
+		return 1;
+	}
+#define HOLE_VAL(p) (fit->type == DATA_FLOAT ? (double) fit->fdata[plane + (p)] : (double) fit->data[plane + (p)])
+	/* along the rows (step 1), then the columns (step rx) */
+	for (int pass = 0; pass < 2; pass++) {
+		const size_t step = pass ? rx : 1, lines = pass ? rx : ry, len = pass ? ry : rx, next = pass ? 1 : rx;
+		for (size_t l = 0; l < lines; l++) {
+			const size_t start = l * next;
+			long last = -1;
+			for (size_t i = 0; i < len; i++) {
+				double v = HOLE_VAL(start + i * step);
+				if (v == 0.0)
+					continue;
+				if (last >= 0 && i > (size_t) last + 1) {
+					double v0 = HOLE_VAL(start + last * step);
+					for (size_t j = last + 1; j < i; j++) {
+						sum[start + j * step] += (float) (v0 + (v - v0) * (j - last) / (double) (i - last));
+						cnt[start + j * step]++;
+					}
+				}
+				last = i;
+			}
+		}
+	}
+#undef HOLE_VAL
+	for (size_t p = 0; p < n; p++) {
+		if (!cnt[p])
+			continue;
+		if (fit->type == DATA_FLOAT)
+			fit->fdata[plane + p] = sum[p] / cnt[p];
+		else fit->data[plane + p] = (WORD) lroundf(sum[p] / cnt[p]);
+	}
+	free(sum);
+	free(cnt);
+	return 0;
+}
+
+/* On a grid at a larger scale, a pixel of a frame covers several of the grid,
+ * and its holes are as wide: stars would be measured on blocks and interpolated
+ * gaps. For the star measures only, layer is binned back to the frames' scale,
+ * the mean of the data in each block, and to their level, as Siril's drizzle
+ * multiplies the values by the square of the scale. Returns the image, or NULL
+ * on error. */
+static fits *bin_for_stars(const fits *fit, int layer, int o) {
+	fits *binned = NULL;
+	const size_t rx = fit->rx, ry = fit->ry, brx = rx / o, bry = ry / o;
+	if (new_fit_image(&binned, (int) brx, (int) bry, 1, DATA_FLOAT))
+		return NULL;
+	const size_t plane = rx * ry * (fit->naxes[2] > 1 ? layer : 0);
+	const float norm = fit->type == DATA_FLOAT ? 1.f : 1.f / USHRT_MAX_SINGLE;
+	for (size_t y = 0; y < bry; y++)
+		for (size_t x = 0; x < brx; x++) {
+			float sum = 0.f;
+			int n = 0;
+			for (int j = 0; j < o; j++)
+				for (int i = 0; i < o; i++) {
+					size_t at = plane + (y * o + j) * rx + x * o + i;
+					float v = fit->type == DATA_FLOAT ? fit->fdata[at] : fit->data[at] * norm;
+					if (v != 0.f) {
+						sum += v;
+						n++;
+					}
+				}
+			binned->fdata[y * brx + x] = n ? sum / (n * o * o) : 0.f;
+		}
+	return binned;
+}
+
 /* the stars of frame i of seq, detected with sf on layer, in Siril
  * coordinates (FITS order, 0-based), and its FWHM, roundness, and the number
  * of reference stars where it has data. With edges, the edge limits of the
  * frame for its batch slot k too, and with hist its overlap with the Stack.
+ * All are in pixels of the grid, at scale oversample.
  * Returns the number of stars, 0 when none, -1 on error. */
-static int detect_frame_stars(sequence *seq, int i, struct starfinder_data *sf, int threads, const lsf_wref *ref,
+static int detect_frame_stars(sequence *seq, int i, struct starfinder_data *sf, int oversample, int threads, const lsf_wref *ref,
 		batch_frames *edges, int k, int margin, const lsf_history *hist, double **x, double **y, float *fwhm,
 		float *round, int *covered) {
 	fits fit = { 0 };
@@ -653,21 +762,51 @@ static int detect_frame_stars(sequence *seq, int i, struct starfinder_data *sf, 
 		clearfits(&fit);
 		return -1;
 	}
+	fits *binned = oversample > 1 ? bin_for_stars(&fit, sf->layer, oversample) : NULL;
+	if ((oversample > 1 && !binned) || (seq->is_drizzle && fill_drizzle_holes(&fit, sf->layer))
+			|| (binned && fill_drizzle_holes(binned, 0))) {
+		if (binned) {
+			clearfits(binned);
+			free(binned);
+		}
+		clearfits(&fit);
+		return -1;
+	}
 	*covered = ref ? count_covered(&fit, sf->layer, ref) : 0;
 	psf_star **stars = NULL;
 	int nb = 0;
-	struct starfinder_data *found = findstar_image_worker(sf, -1, i, &fit, NULL, threads);
-	if (found) {
-		stars = *found->stars;
-		nb = *found->nb_stars;
-		free(found);
+	if (binned) {
+		/* not a frame of the sequence, whose cached statistics and star lists
+		 * are not those of this image */
+		struct starfinder_data bsf = { 0 };
+		bsf.im.fit = binned;
+		bsf.im.index_in_seq = -1;
+		bsf.params = sf->params;
+		bsf.max_stars_fitted = sf->max_stars_fitted;
+		bsf.stars = &stars;
+		bsf.nb_stars = &nb;
+		bsf.threading = threads;
+		if (GPOINTER_TO_INT(findstar_worker(&bsf)))
+			nb = 0;
+	} else {
+		struct starfinder_data *found = findstar_image_worker(sf, -1, i, &fit, NULL, threads);
+		if (found) {
+			stars = *found->stars;
+			nb = *found->nb_stars;
+			free(found);
+		}
+	}
+	const int star_ry = binned ? (int) binned->ry : (int) fit.ry;
+	if (binned) {
+		clearfits(binned);
+		free(binned);
 	}
 	*fwhm = *round = NAN;
 	if (stars && nb > 0) {
 		float FWHMx, FWHMy, B;
 		char *units;
 		FWHM_stats(stars, nb, seq->bitpix, &FWHMx, &FWHMy, &units, &B, NULL, 0.);
-		*fwhm = FWHMx;
+		*fwhm = FWHMx * oversample;
 		*round = FWHMy / FWHMx;
 		*x = malloc(nb * sizeof(double));
 		*y = malloc(nb * sizeof(double));
@@ -675,8 +814,11 @@ static int detect_frame_stars(sequence *seq, int i, struct starfinder_data *sf, 
 			PRINT_ALLOC_ERR;
 			nb = -1;
 		}
-		for (int k = 0; k < nb; k++)
-			display_to_siril(stars[k]->xpos, stars[k]->ypos, *x + k, *y + k, fit.ry);
+		for (int k = 0; k < nb; k++) {
+			display_to_siril(stars[k]->xpos, stars[k]->ypos, *x + k, *y + k, star_ry);
+			(*x)[k] *= oversample;	// these coordinates run along the pixels' edges
+			(*y)[k] *= oversample;
+		}
 	} else nb = 0;
 	if (stars)
 		free_fitted_stars(stars);
@@ -690,15 +832,16 @@ static int detect_frame_stars(sequence *seq, int i, struct starfinder_data *sf, 
 }
 
 /* pairs between a frame's stars and the reference stars, both on the grid,
- * each reference star used once, within LSF_PAIR_RADIUS */
-static int count_pairs(const double *x, const double *y, int nb, const lsf_wref *ref) {
+ * each reference star used once, within LSF_PAIR_RADIUS pixels of the frames:
+ * a pixel of a frame covers oversample of the grid */
+static int count_pairs(const double *x, const double *y, int nb, const lsf_wref *ref, int oversample) {
 	gboolean *used = calloc(ref->n, sizeof(gboolean));
 	if (!used) {
 		PRINT_ALLOC_ERR;
 		return 0;
 	}
 	int pairs = 0;
-	const double r2 = LSF_PAIR_RADIUS * LSF_PAIR_RADIUS;
+	const double r2 = LSF_PAIR_RADIUS * LSF_PAIR_RADIUS * oversample * oversample;
 	for (int i = 0; i < nb; i++) {
 		int best = -1;
 		double bd = r2;
@@ -768,12 +911,12 @@ static int measure_frames(struct lsf_batch_args *args, const int *cand, int nb, 
 		b->nbinned = nb;
 	}
 	/* the frames are read here anyway: their edges are found on the way */
-	const int margin = lsf_edge_margin(args->settings->interpolation);
+	const int margin = lsf_edge_margin(args->settings->drizzled ? OPENCV_NEAREST : args->settings->interpolation);
 	if (args->init && ref->n == 0) {
 		double *x, *y;
 		float fwhm, round;
 		int covered;
-		int n = detect_frame_stars(seq, args->ref_image, &sfd, threads, NULL, NULL, 0, 0, NULL, &x, &y, &fwhm, &round,
+		int n = detect_frame_stars(seq, args->ref_image, &sfd, args->settings->oversample, threads, NULL, NULL, 0, 0, NULL, &x, &y, &fwhm, &round,
 				&covered);
 		if (n <= 0) {
 			siril_log_error(_("LSF: no star found in the reference frame %d, the star measures of the frames cannot "
@@ -796,11 +939,11 @@ static int measure_frames(struct lsf_batch_args *args, const int *cand, int nb, 
 	for (int k = 0; k < nb; k++) {
 		double *x, *y;
 		int covered;
-		int n = detect_frame_stars(seq, cand[k], &sfd, threads, ref, b, k, margin,
+		int n = detect_frame_stars(seq, cand[k], &sfd, args->settings->oversample, threads, ref, b, k, margin,
 				args->overlap_norm && !args->init ? args->hist : NULL, &x, &y, &b->fwhm[k], &b->round[k], &covered);
 		if (n < 0)
 			return 1;
-		int pairs = n > 0 ? count_pairs(x, y, n, ref) : 0;
+		int pairs = n > 0 ? count_pairs(x, y, n, ref, args->settings->oversample) : 0;
 		free(x);
 		free(y);
 		int fitted = MIN(covered, MAX_STARS_FITTED);
@@ -1581,8 +1724,17 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 		goto end;
 	}
 	opened = TRUE;
-	if (sargs.drizzle) {
-		siril_log_error(_("LSF: drizzle sequences are not supported yet\n"));
+	/* the weights of a drizzled file come from the apply LSF ran, unscaled */
+	const gboolean drizzled = s->drizzled;
+	/* a saved weight times drz_unit is the per-sample factor d / driz_norm:
+	 * frames drizzled by Siril's registration may have their weights divided
+	 * by max_weight and stored on 8 or 16 bits (Section 13) */
+	double drz_unit[3] = { 0.0, 0.0, 0.0 };
+	for (int c = 0; drizzled && c < 3; c++)
+		drz_unit[c] = (args->driz_wscale[c] > 0.0 ? args->driz_wscale[c] : 1.0) / s->driz_norm[c];
+	if (sargs.drizzle != drizzled) {
+		siril_log_error(_("LSF: the frames of a drizzled file must be drizzled by LSF, and no other file can take "
+					"drizzled frames\n"));
 		goto end;
 	}
 	naxes[2] = nchan;
@@ -1641,20 +1793,20 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 	if (nb_threads > 1 && (seq->type == SEQ_REGULAR || seq->type == SEQ_FITSEQ) && !fits_is_reentrant())
 		nb_threads = 1;
 #endif
-	/* the accumulator stays in memory during the merge, so it counts against
-	 * Siril's memory limit. With a limit set as a ratio of the available
-	 * memory, the part already read may be counted twice, which only makes
-	 * the blocks smaller. */
-	guint64 hist_bytes = lsf_history_bytes((guint64) h->rx * h->ry * h->nchan, h->rej[0][0] != NULL, h->exp[0] != NULL);
+	/* the accumulator stays in memory during the merge, unless it is in
+	 * temporary files, so it counts against Siril's memory limit. With a limit
+	 * set as a ratio of the available memory, the part already read may be
+	 * counted twice, which only makes the blocks smaller. */
+	guint64 hist_bytes = h->spill ? 0 : lsf_history_bytes((guint64) h->rx * h->ry * h->nchan, h->rej[0][0] != NULL, h->exp[0] != NULL);
 	guint64 mem = (guint64) get_max_memory_in_MB() * BYTES_IN_A_MB;
 	mem = mem > hist_bytes ? mem - hist_bytes : 0;
 	guint64 row_bytes = (guint64) nb * naxes[0] * (sizeof(float) + (ushort_input ? sizeof(WORD) : 0)
-			+ (feather ? sizeof(float) : 0));
+			+ (feather ? sizeof(float) : 0) + (drizzled ? sizeof(float) : 0));
 	long max_rows = (long) (mem / (MAX(row_bytes, 1) * nb_threads));
 	if (max_rows < 1) {
-		siril_log_error(_("LSF: not enough memory to process the batch: the accumulator uses %.0f MB of the "
-					"%d MB Siril may use, and reading the frames needs at least %.0f MB more\n"),
-				(double) hist_bytes / BYTES_IN_A_MB, get_max_memory_in_MB(),
+		siril_log_error(_("LSF: not enough memory to process the batch: the accumulator of this grid at scale %d uses "
+					"%.0f MB of the %d MB Siril may use, and reading the frames needs at least %.0f MB more\n"),
+				s->oversample, (double) hist_bytes / BYTES_IN_A_MB, get_max_memory_in_MB(),
 				(double) row_bytes * nb_threads / BYTES_IN_A_MB);
 		goto end;
 	}
@@ -1670,7 +1822,7 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 		goto end;
 	}
 	for (int t = 0; t < nb_threads; t++) {
-		if (alloc_thread_data(&tdata[t], nb, block_pix, ushort_input, rargs.type_of_rejection, feather)) {
+		if (alloc_thread_data(&tdata[t], nb, block_pix, ushort_input, rargs.type_of_rejection, feather, drizzled)) {
 			PRINT_ALLOC_ERR;
 			goto end;
 		}
@@ -1718,6 +1870,8 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 					td->pix[f][p] = (float) (td->wbuf[p] * INV_USHRT_MAX_DOUBLE);
 			if (feather && read_feather_block(seq, b.idx[f], &area, args->feather, &fcols, td->mask[f]))
 				block_err = TRUE;
+			if (drizzled && read_drizzle_block(seq, b.idx[f], layer, &area, td->drz[f]))
+				block_err = TRUE;
 		}
 		if (block_err) {
 			g_atomic_int_set(&err, 1);
@@ -1741,6 +1895,9 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 			for (long x = 0; x < rx; x++, pdata_idx++) {
 				for (int f = 0; f < nb; f++) {
 					float v = td->pix[f][line_idx + x];
+					/* where no input pixel landed there is no sample (Section 10.3) */
+					if (drizzled && !(td->drz[f][line_idx + x] > 0.f))
+						v = 0.f;
 					/* frame-edge samples are not data (Section 10.5) */
 					size_t r = (size_t) f * ry + srow, c = (size_t) f * rx + x;
 					if (v != 0.f && (x < b.row_lo[r] || x > b.row_hi[r] || srow < b.col_lo[c] || srow > b.col_hi[c])) {
@@ -1781,7 +1938,7 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 					sel[f] = val >= pmin && val <= pmax && val != 0.f;
 					nsel += sel[f];
 				}
-				if (nsel != kept_pixels && s->weighting == NO_WEIGHT && !feather && s->rej != SIGMEDIAN) {
+				if (nsel != kept_pixels && s->weighting == NO_WEIGHT && !feather && !drizzled && s->rej != SIGMEDIAN) {
 					memset(sel, 0, nb * sizeof(gboolean));
 					for (int k = 0; k < kept_pixels; k++)
 						for (int f = 0; f < nb; f++)
@@ -1805,6 +1962,8 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 					if (!(m > 0.f))
 						continue;
 					double wf = b.weight[layer][f];
+					if (drizzled)	// the per-sample weight, Section 10.3
+						wf *= td->drz[f][line_idx + x] * drz_unit[layer];
 					if (testable) {	// history test, Section 10.6
 						double sp2 = lsf_sigma_pred2(s->weighting, Wh, m2_h[pdata_idx],
 								w2_h[pdata_idx], count_h[pdata_idx], wf);
@@ -1864,7 +2023,7 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 
 	double nb_tot = (double) rx * ry * nb;
 	siril_log_message(_("LSF: %" G_GUINT64_FORMAT " frame-edge samples of channel #0 not merged (%d px at each edge "
-				"of a frame inside the grid)\n"), edge_drop[0], lsf_edge_margin(s->interpolation));
+				"of a frame inside the grid)\n"), edge_drop[0], lsf_edge_margin(s->drizzled ? OPENCV_NEAREST : s->interpolation));
 	if (!args->init)
 		siril_log_message(_("LSF: %" G_GUINT64_FORMAT " samples of channel #0 merged without the history test, "
 					"where the history holds fewer than %g effective samples\n"), thin[0], LSF_HIST_MIN_NEFF);

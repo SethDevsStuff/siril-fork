@@ -602,7 +602,7 @@ int apply_reg_image_hook(struct generic_seq_args *args, int out_index, int in_in
 		if (wcs_out) {
 			fit->keywords.wcslib = wcs_out;
 		}
-		if (args->seq->type == SEQ_SER || com.pref.force_16bit) {
+		if (args->seq->type == SEQ_SER || (com.pref.force_16bit && !regargs->force_float_out)) {
 			fit_replace_buffer(fit, float_buffer_to_ushort(fit->fdata, fit->rx * fit->ry * fit->naxes[2]), DATA_USHORT);
 			if (!fit->data) {
 				PRINT_ALLOC_ERR;
@@ -633,7 +633,7 @@ int apply_reg_image_hook(struct generic_seq_args *args, int out_index, int in_in
 		const gchar *count_filename = get_sequence_cache_filename(args->seq, in_index, "drizztmp", "fit", args->new_seq_prefix);
 		// if original data is USHORT or drizz_weight_match_bitpix is FALSE,
 		// weights need to be renormed in the [0,1] range, because they will be saved as 8b or 16b
-		if ((fit->type == DATA_USHORT && !com.pref.force_16bit) || !com.pref.drizz_weight_match_bitpix) {
+		if (!regargs->driz_raw_weights && ((fit->type == DATA_USHORT && !com.pref.force_16bit) || !com.pref.drizz_weight_match_bitpix)) {
 			size_t nbpix_per_channel = output_counts->rx * output_counts->ry;
 			for (int c = 0; c < output_counts->naxes[2]; c++) {
 				float *counts = output_counts->fpdata[c];
@@ -643,7 +643,9 @@ int apply_reg_image_hook(struct generic_seq_args *args, int out_index, int in_in
 				}
 			}
 		}
-		if (!com.pref.drizz_weight_match_bitpix || fit->bitpix == BYTE_IMG) { // we save as 8b
+		if (regargs->driz_raw_weights) { // the caller needs them as they are
+			output_counts->bitpix = FLOAT_IMG;
+		} else if (!com.pref.drizz_weight_match_bitpix || fit->bitpix == BYTE_IMG) { // we save as 8b
 			output_counts->bitpix = BYTE_IMG;
 		} else if (fit->type == DATA_USHORT && !com.pref.force_16bit) { // we save as 16b
 			output_counts->bitpix = USHORT_IMG;
@@ -1137,7 +1139,8 @@ int initialize_drizzle_params(struct generic_seq_args *args, struct registration
 	if (driz->is_bayer)
 		driz->cfadim = (int)cfadim;
 	int status = 0;
-	if 	(!(com.pref.drizz_weight_match_bitpix && (fit.bitpix == DATA_FLOAT || !com.pref.force_16bit))) { // we save as 32b, we don't need to renorm the weights
+	/* the Living Stack sidecar records max_weight whatever the weights are saved as */
+	if (regargs->driz_raw_weights || regargs->lsf_sidecar || !(com.pref.drizz_weight_match_bitpix && (fit.bitpix == DATA_FLOAT || !com.pref.force_16bit))) { // we save as 32b, we don't need to renorm the weights
 		disto_data *disto = NULL;
 		gboolean free_disto = FALSE;
 		if (regargs->undistort) {
@@ -1162,7 +1165,7 @@ int initialize_drizzle_params(struct generic_seq_args *args, struct registration
 
 int register_apply_reg(struct registration_args *regargs) {
 	struct generic_seq_args *args = create_default_seqargs(regargs->seq);
-	args->force_float = !com.pref.force_16bit && regargs->seq->type != SEQ_SER;
+	args->force_float = (!com.pref.force_16bit || regargs->force_float_out) && regargs->seq->type != SEQ_SER;
 	gui_iface.show_panel("output_logs", TRUE);
 	int retval = 0;
 	int *included = NULL;
@@ -1228,6 +1231,17 @@ int register_apply_reg(struct registration_args *regargs) {
 					regargs->wcsref = wcs_deepcopy(ext_fit.keywords.wcslib, NULL);
 				regargs->external_ref_rx = ext_fit.rx;
 				regargs->external_ref_ry = ext_fit.ry;
+				if (regargs->ext_ref_on_grid) {
+					Homography Hunscale = { 0 };
+					cvGetEye(&Hunscale);
+					Hunscale.h00 = 1. / regargs->output_scale;
+					Hunscale.h11 = 1. / regargs->output_scale;
+					regargs->external_ref_rx = (unsigned int) roundf((float) ext_fit.rx / regargs->output_scale);
+					regargs->external_ref_ry = (unsigned int) roundf((float) ext_fit.ry / regargs->output_scale);
+					cvApplyFlips(&Hunscale, ext_fit.ry, regargs->external_ref_ry);
+					if (regargs->wcsref)
+						reframe_wcs(regargs->wcsref, &Hunscale);
+				}
 				regargs->use_external_ref = TRUE;
 				regargs->external_ref_path = g_strdup(regargs->seq->ext_ref_path);
 				// H matrices are absolute (relative to external ref): use identity so they are applied as-is

@@ -17,6 +17,8 @@ script does no registration; the appends use lsf_append -noreg). Only the frames
 (sizes differ by at most one frame; contiguous blocks by default, or --split interleaved).
 Every stacking command works on the current selection: lsf_init / lsf_append use the included
 frames, `stack` gets -filter-included.
+CFA drizzle files are not covered: lsf_append -noreg refuses them, and lsf_init refuses a CFA or
+drizzled sequence without -drizzle, which this script does not pass.
 
 PRODUCTS  (all written to --outdir, default <Siril working dir>/lsf_compare; prefix --prefix)
 --------

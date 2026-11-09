@@ -10716,6 +10716,8 @@ int process_register(int nb) {
 		if (!strcmp(word[i], "-2pass")) {
 			regargs->two_pass = TRUE;
 			regargs->no_output = TRUE;
+		} else if (!strcmp(word[i], "-lsfreg")) {
+			regargs->lsf_sidecar = TRUE;
 		} else if (!strcmp(word[i], "-noclamp")) {
 			regargs->clamp = FALSE;
 		} else if (!strcmp(word[i], "-nostarlist")) {
@@ -11042,6 +11044,12 @@ int process_register(int nb) {
 		free(driz);
 		driz = NULL;
 	}
+	/* the Living Stack sidecar records a drizzle, which only an applied
+	 * registration makes */
+	if (regargs->lsf_sidecar && (!drizzle || regargs->two_pass)) {
+		siril_log_error(_("-lsfreg records how the frames are drizzled: it needs -drizzle, without -2pass\n"));
+		goto terminate_register_on_error;
+	}
 
 	/* getting the selected registration method */
 	method = calloc(1, sizeof(struct registration_method));
@@ -11295,6 +11303,8 @@ int process_seq_applyreg(int nb) {
 				goto terminate_register_on_error;
 			}
 			drizzle = TRUE;
+		} else if (!strcmp(word[i], "-lsfreg")) {
+			regargs->lsf_sidecar = TRUE;
 		// Drizzle options
 		} else if (g_str_has_prefix(word[i], "-scale=")) {
 			char *arg = word[i] + 7;
@@ -11483,6 +11493,10 @@ int process_seq_applyreg(int nb) {
 	if (seq->ext_ref && regargs->framing != FRAMING_CURRENT) {
 		siril_log_message(_("External reference alignment detected: forcing framing to 'current'\n"));
 		regargs->framing = FRAMING_CURRENT;
+	}
+	if (regargs->lsf_sidecar && !drizzle) {
+		siril_log_error(_("-lsfreg records how the frames are drizzled: it needs -drizzle\n"));
+		goto terminate_register_on_error;
 	}
 
 	if (drizzle) {

@@ -46,6 +46,7 @@
 #include "lsf/lsf_fits.h"
 #include "lsf/lsf_settings.h"
 #include "lsf/lsf_weights.h"
+#include "drizzle/cdrizzleutil.h"
 #include "registration/registration.h"
 #include "stacking/stacking.h"
 
@@ -255,7 +256,8 @@ static void block_handlers(GObject *obj, const char *signal, gboolean block) {
  * the weighting only store the user's stacking preferences, so they are
  * blocked; the rejection handler sets the range of the sigma values and
  * runs, its preference is put back. */
-static void fill_widgets_from_lsf(const lsf_settings *s) {
+static void fill_widgets_from_lsf(const lsf_file *f) {
+	const lsf_settings *s = &f->settings;
 	GObject *siglow = gtk_builder_get_object(gui.builder, "stack_siglow_button");
 	GObject *sighigh = gtk_builder_get_object(gui.builder, "stack_sighigh_button");
 	GObject *weighing = gtk_builder_get_object(gui.builder, "comboweighing");
@@ -279,6 +281,16 @@ static void fill_widgets_from_lsf(const lsf_settings *s) {
 	gtk_spin_button_set_value(GTK_SPIN_BUTTON(gtk_builder_get_object(gui.builder, "stack_lsf_hist_high")), s->hist_high);
 	gtk_spin_button_set_value(GTK_SPIN_BUTTON(gtk_builder_get_object(gui.builder, "stack_lsf_hist_margin")), s->hist_margin);
 	siril_toggle_set_active(GTK_WIDGET(gtk_builder_get_object(gui.builder, "stack_lsf_rejmaps")), FALSE);
+	/* the scale is a fact of the file; the pixel fraction and the kernel are
+	 * those of its last frames, and a change is confirmed (Section 6) */
+	if (s->drizzled) {
+		const int kernel = lsf_kernel_from_name(f->ledger_kernel);
+		gtk_spin_button_set_value(GTK_SPIN_BUTTON(gtk_builder_get_object(gui.builder, "stack_lsf_drizzle_scale")), s->oversample);
+		gtk_spin_button_set_value(GTK_SPIN_BUTTON(gtk_builder_get_object(gui.builder, "stack_lsf_drizzle_pixfrac")),
+				isfinite(f->ledger_pixfrac) ? f->ledger_pixfrac : 1.0);
+		gtk_drop_down_set_selected(GTK_DROP_DOWN(gtk_builder_get_object(gui.builder, "stack_lsf_drizzle_kernel")),
+				kernel >= 0 ? kernel : kernel_square);
+	}
 }
 
 /* the name suggested for the new file of an append: the file's, with the
@@ -329,7 +341,7 @@ static void load_append_info(gboolean fill) {
 			append_info = info;
 			append_summary = lsf_gui_describe(info);
 			if (fill) {
-				fill_widgets_from_lsf(&info->file.settings);
+				fill_widgets_from_lsf(&info->file);
 				/* a switch is chosen for one file */
 				siril_toggle_set_active(GTK_WIDGET(gtk_builder_get_object(gui.builder, "stack_lsf_weight_inverse")),
 						FALSE);
@@ -430,14 +442,72 @@ static guint append_regmethod() {
 	return gtk_drop_down_get_selected(GTK_DROP_DOWN(gtk_builder_get_object(gui.builder, "stack_lsf_append_regmethod")));
 }
 
+/* the frames of the sequence are CFA and not debayered: this reads a frame, so
+ * it is kept for the sequence loaded, as update_stack_interface() runs on most
+ * widget changes */
+static gboolean sequence_is_cfa() {
+	static gchar *key = NULL;
+	static gboolean cfa = FALSE;
+	gchar *now = g_strdup_printf("%s|%s|%d", com.wd ? com.wd : "", com.seq.seqname ? com.seq.seqname : "", com.seq.number);
+	if (g_strcmp0(now, key)) {
+		g_free(key);
+		key = now;
+		cfa = com.seq.seqname && com.seq.number > 0 && com.seq.nb_layers == 1 && lsf_sequence_is_cfa(&com.seq);
+	} else g_free(now);
+	return cfa;
+}
+
+/* the sidecar of a sequence drizzled by Siril's registration (Section 13 of
+ * the drizzle plan), or NULL when there is none or it does not fit: kept for
+ * the sequence loaded, as sequence_is_cfa() */
+static const lsf_drizzle_sidecar *sequence_sidecar() {
+	static gchar *key = NULL;
+	static lsf_drizzle_sidecar d = { 0 };
+	static gboolean ok = FALSE;
+	gchar *now = g_strdup_printf("%s|%s|%d|%d", com.wd ? com.wd : "", com.seq.seqname ? com.seq.seqname : "",
+			com.seq.number, com.seq.is_drizzle);
+	if (g_strcmp0(now, key)) {
+		g_free(key);
+		key = now;
+		lsf_drizzle_sidecar_clear(&d);
+		ok = com.seq.seqname && com.seq.number > 0 && com.seq.is_drizzle && lsf_read_drizzle_sidecar(&com.seq, &d, NULL);
+	} else g_free(now);
+	return ok ? &d : NULL;
+}
+
+/* the frames are drizzled: as the file says for an append, as asked otherwise */
+static gboolean drizzle_chosen() {
+	if (stack_lsf_append_mode())
+		return append_info && append_info->file.settings.drizzled;
+	GtkWidget *drizzle = GTK_WIDGET(gtk_builder_get_object(gui.builder, "stack_lsf_drizzle"));
+	return gtk_widget_get_visible(drizzle) && siril_toggle_get_active(drizzle);
+}
+
+/* the pixel fraction and the kernel chosen for an append differ from those of
+ * the last frames of the file, compared at the precision the widget shows */
+static gboolean append_drizzle_changed(double *pixfrac, int *kernel) {
+	const lsf_file *f = &append_info->file;
+	const double last_pixfrac = isfinite(f->ledger_pixfrac) ? f->ledger_pixfrac : 1.0;
+	int last_kernel = lsf_kernel_from_name(f->ledger_kernel);
+	if (last_kernel < 0)
+		last_kernel = kernel_square;
+	*pixfrac = gtk_spin_button_get_value(GTK_SPIN_BUTTON(gtk_builder_get_object(gui.builder, "stack_lsf_drizzle_pixfrac")));
+	*kernel = gtk_drop_down_get_selected(GTK_DROP_DOWN(gtk_builder_get_object(gui.builder, "stack_lsf_drizzle_kernel")));
+	return fabs(*pixfrac - last_pixfrac) > 0.005 || *kernel != last_kernel;
+}
+
 /* the feathering distance of the Living Stack options, in the units of
- * stacking's Borders feathering, and their normalization on the overlaps */
+ * stacking's Borders feathering, and their normalization on the overlaps.
+ * Neither is supported on drizzled frames, whose holes they would take for
+ * the edges of the frames. */
 static int blend_feather() {
+	if (drizzle_chosen())
+		return 0;
 	return gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(gtk_builder_get_object(gui.builder, "stack_lsf_feather")));
 }
 
 static gboolean blend_overlap_norm() {
-	return siril_toggle_get_active(GTK_WIDGET(gtk_builder_get_object(gui.builder, "stack_lsf_overlap_norm")));
+	return !drizzle_chosen() && siril_toggle_get_active(GTK_WIDGET(gtk_builder_get_object(gui.builder, "stack_lsf_overlap_norm")));
 }
 
 /* the masks of Siril's feathering are at a tenth of the image size
@@ -520,6 +590,10 @@ static gchar *append_problems(gboolean *fatal) {
 	gchar *batch = lsf_check_batch(append_info, &com.seq, &batch_fatal);
 	if (batch_fatal)
 		return batch;
+	if (append_info->file.settings.drizzled && append_regmethod() != APPEND_REG_STARS) {
+		g_free(batch);
+		return g_strdup(_("The frames of a drizzled Living Stack are registered with stars: choose that method."));
+	}
 	/* a file made from an astrometric registration: star alignment cannot
 	 * undistort with the frames' own SIP terms, only with the master */
 	const lsf_settings *s = &append_info->file.settings;
@@ -707,6 +781,22 @@ static void start_lsf_append() {
 	 * replace the settings stored in the file: compared at the precision
 	 * the spin buttons show, and confirmed */
 	const lsf_settings *s = &append_info->file.settings;
+	double driz_pixfrac = 0.0;
+	int driz_kernel = -1;
+	gboolean driz_set = s->drizzled && append_drizzle_changed(&driz_pixfrac, &driz_kernel);
+	if (driz_set) {
+		gchar *msg = g_strdup_printf(_("The last frames of this Living Stack were drizzled with a pixel fraction of %g and "
+					"the %s kernel, and this append asks for %g and %s. Their noise would differ, which changes the "
+					"level of their signal under a scaling normalization, and another kernel changes their weight."),
+				isfinite(append_info->file.ledger_pixfrac) ? append_info->file.ledger_pixfrac : 1.0,
+				append_info->file.ledger_kernel, driz_pixfrac, kernel_enum2str(driz_kernel));
+		gboolean go = siril_confirm_dialog(_("Drizzle these frames differently?"), msg, _("Append"));
+		g_free(msg);
+		if (!go) {
+			g_free(out);
+			return;
+		}
+	}
 	gboolean rej_set = rej != s->rej || (rej != NO_REJEC &&
 			(fabs(sig_low - s->sig[0]) > 0.005 || fabs(sig_high - s->sig[1]) > 0.005));
 	gboolean low_set = fabs(low - s->hist_low) > 0.005, high_set = fabs(high - s->hist_high) > 0.005,
@@ -759,6 +849,11 @@ static void start_lsf_append() {
 		a->settings.sig[0] = rej == NO_REJEC ? 0.0 : sig_low;
 		a->settings.sig[1] = rej == NO_REJEC ? 0.0 : sig_high;
 		a->rej_set = TRUE;
+	}
+	if (driz_set) {
+		a->pixfrac = driz_pixfrac;
+		a->kernel = driz_kernel;
+		a->drizzle_force = TRUE;
 	}
 	a->seqname = g_strdup(com.seq.seqname);
 	a->noreg = append_regmethod() == APPEND_REG_NONE;
@@ -857,8 +952,11 @@ static void start_lsf_stacking() {
 
 	/* memory and disk first */
 	gboolean fatal = FALSE;
+	const gboolean drizzle = drizzle_chosen();
+	const int driz_scale = drizzle ? gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(gtk_builder_get_object(gui.builder,
+					"stack_lsf_drizzle_scale"))) : 1;
 	gchar *flight = lsf_init_preflight(&com.seq, com.wd, path, stack_gui_args()->nb_images_to_stack,
-			siril_toggle_get_active(rejmaps), &fatal);
+			siril_toggle_get_active(rejmaps), drizzle, driz_scale, &fatal);
 	if (flight) {
 		gboolean go = !fatal && siril_confirm_dialog(_("Create anyway?"), flight, _("Create"));
 		if (fatal)
@@ -926,7 +1024,7 @@ static void start_lsf_stacking() {
 	}
 	s->norm = norm;
 	s->lite_norm = norm != NO_NORM && siril_toggle_get_active(fast_norm);
-	s->rgb_equal = norm != NO_NORM && com.seq.nb_layers == 3 && siril_toggle_get_active(rgb_equal);
+	s->rgb_equal = norm != NO_NORM && (com.seq.nb_layers == 3 || (drizzle && sequence_is_cfa())) && siril_toggle_get_active(rgb_equal);
 	s->weighting = weighting;
 	/* the floor and range frozen with the first batch (Section 10.3) */
 	if (weighting == WFWHM_WEIGHT || weighting == NBSTARS_WEIGHT) {
@@ -952,6 +1050,12 @@ static void start_lsf_stacking() {
 	/* feathering, and the levels of the frames matched on their overlaps */
 	a->feather = blend_feather();
 	a->overlap_norm = blend_overlap_norm();
+	if (drizzle) {
+		a->drizzle = TRUE;
+		a->scale = driz_scale;
+		a->pixfrac = gtk_spin_button_get_value(GTK_SPIN_BUTTON(gtk_builder_get_object(gui.builder, "stack_lsf_drizzle_pixfrac")));
+		a->kernel = gtk_drop_down_get_selected(GTK_DROP_DOWN(gtk_builder_get_object(gui.builder, "stack_lsf_drizzle_kernel")));
+	}
 	guint comp = gtk_drop_down_get_selected(comp_combo);
 	if (comp == 1 || comp == 2) {
 		a->compression = comp == 1 ? LSF_COMP_GZIP2 : LSF_COMP_GZIP1;
@@ -971,6 +1075,62 @@ void lsf_stacking_start(void) {
 	if (stack_lsf_append_mode())
 		start_lsf_append();
 	else start_lsf_stacking();
+}
+
+/* The drizzle options of the panel. A new file: CFA frames can only be drizzled,
+ * mono frames may be, and neither can once their registration is applied, which
+ * lsf_init_preflight() then explains; debayered frames are not drizzled. An
+ * append shows the file's. Feathering and the normalization on the overlaps
+ * do not apply to drizzled frames. */
+static void update_drizzle_widgets(gboolean append, gboolean can_reframe) {
+	static GtkWidget *drizzle = NULL, *scale_label, *scale, *pixfrac_label, *pixfrac, *kernel_label, *kernel, *feather, *overlap;
+	static gboolean forced = FALSE;
+	if (!drizzle) {
+		drizzle = GTK_WIDGET(gtk_builder_get_object(gui.builder, "stack_lsf_drizzle"));
+		scale_label = GTK_WIDGET(gtk_builder_get_object(gui.builder, "stack_lsf_drizzle_scale_label"));
+		scale = GTK_WIDGET(gtk_builder_get_object(gui.builder, "stack_lsf_drizzle_scale"));
+		pixfrac_label = GTK_WIDGET(gtk_builder_get_object(gui.builder, "stack_lsf_drizzle_pixfrac_label"));
+		pixfrac = GTK_WIDGET(gtk_builder_get_object(gui.builder, "stack_lsf_drizzle_pixfrac"));
+		kernel_label = GTK_WIDGET(gtk_builder_get_object(gui.builder, "stack_lsf_drizzle_kernel_label"));
+		kernel = GTK_WIDGET(gtk_builder_get_object(gui.builder, "stack_lsf_drizzle_kernel"));
+		feather = GTK_WIDGET(gtk_builder_get_object(gui.builder, "stack_lsf_feather"));
+		overlap = GTK_WIDGET(gtk_builder_get_object(gui.builder, "stack_lsf_overlap_norm"));
+	}
+	/* drizzled by Siril's registration, with its sidecar: the drizzle is
+	 * done, and the panel shows how, read-only (Section 13) */
+	const lsf_drizzle_sidecar *dsc = sequence_sidecar();
+	const gboolean cfa = !append && !dsc && sequence_is_cfa();
+	const gboolean mono = !append && !dsc && !cfa && !com.seq.is_drizzle && com.seq.nb_layers == 1;
+	gtk_widget_set_visible(drizzle, cfa || mono || (dsc && !append));
+	gtk_widget_set_sensitive(drizzle, mono && can_reframe);
+	if ((cfa || (dsc && !append)) && !siril_toggle_get_active(drizzle)) {
+		forced = TRUE;
+		siril_toggle_set_active(drizzle, TRUE);
+	} else if (!cfa && !(dsc && !append) && forced) {
+		forced = FALSE;
+		siril_toggle_set_active(drizzle, FALSE);
+	} else if (mono && !can_reframe && siril_toggle_get_active(drizzle))
+		siril_toggle_set_active(drizzle, FALSE);
+	if (dsc) {
+		if (gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(scale)) != dsc->scale && !append)
+			gtk_spin_button_set_value(GTK_SPIN_BUTTON(scale), dsc->scale);
+		if (fabs(gtk_spin_button_get_value(GTK_SPIN_BUTTON(pixfrac)) - dsc->pixfrac) > 1e-4)
+			gtk_spin_button_set_value(GTK_SPIN_BUTTON(pixfrac), dsc->pixfrac);
+		if ((int) gtk_drop_down_get_selected(GTK_DROP_DOWN(kernel)) != dsc->kernel)
+			gtk_drop_down_set_selected(GTK_DROP_DOWN(kernel), dsc->kernel);
+	}
+	const gboolean shown = drizzle_chosen();
+	gtk_widget_set_visible(scale_label, shown);
+	gtk_widget_set_visible(scale, shown);
+	gtk_widget_set_sensitive(scale, !append && !dsc);
+	gtk_widget_set_visible(pixfrac_label, shown);
+	gtk_widget_set_visible(pixfrac, shown);
+	gtk_widget_set_sensitive(pixfrac, !dsc);
+	gtk_widget_set_visible(kernel_label, shown);
+	gtk_widget_set_visible(kernel, shown);
+	gtk_widget_set_sensitive(kernel, !dsc);
+	gtk_widget_set_sensitive(feather, !shown);
+	gtk_widget_set_sensitive(overlap, !shown);
 }
 
 /* The widgets of the tab for the result mode, from update_stack_interface()
@@ -1078,6 +1238,7 @@ gboolean lsf_stacking_update_widgets(int stack_method, gboolean can_reframe) {
 	gtk_widget_set_visible(merge_rejmaps, FALSE);
 	/* with the registration already applied, the frames define the grid */
 	gtk_widget_set_sensitive(lsf_framing, can_reframe);
+	update_drizzle_widgets(append, can_reframe);
 	lsf_stacking_update_hist_widgets();
 	lsf_stacking_update_weight_widgets();
 	/* an append can only add rejection maps to a file that has none */
@@ -1168,6 +1329,11 @@ void lsf_stacking_update_append(gboolean listed) {
 		g_string_append_printf(text, "\n%s", append_checks.problems);
 	if (append_checks.note)
 		g_string_append_printf(text, "\n%s", append_checks.note);
+	double note_pixfrac;
+	int note_kernel;
+	if (ws && ws->drizzled && append_drizzle_changed(&note_pixfrac, &note_kernel))
+		g_string_append_printf(text, _("\nThis append drizzles with a pixel fraction of %g and the %s kernel, unlike the "
+					"last frames of the file: their noise and weight would differ."), note_pixfrac, kernel_enum2str(note_kernel));
 	if (can_switch && siril_toggle_get_active(weight_inverse))
 		g_string_append(text, _("\nThis append switches the file to inverse weighting, for good: the frames already "
 					"merged keep their weights."));

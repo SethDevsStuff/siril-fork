@@ -173,7 +173,11 @@ struct registration_args {
 	framing_roi canvas;	// apply reg with FRAMING_CURRENT: output canvas in the reference's pixels, opencv convention, origin may be negative (w = 0: the reference itself)
 	disto_data *disto_ext;			// undistortion information for an external reference
 	gboolean ext_ref_undistorted;	// the external reference is already undistorted: its stars are not corrected
+	gboolean ext_ref_on_grid;	// apply reg with a scale: the external reference is at the output scale already, so its size and WCS are divided by it, and the transforms are given at the images' scale
 	gboolean keep_transforms;	// astrometric registration (DISTO_FILES): the transforms were computed by the caller, the images' astrometry only gives their distortion
+	gboolean driz_raw_weights;	// drizzle: the weights are saved as float32 and not divided by max_weight, whatever the preferences; max_weight is still computed
+	gboolean force_float_out;	// the images are read and written as float32 whatever com.pref.force_16bit, except SER which cannot hold them (Living Stacks)
+	gboolean lsf_sidecar;		// drizzle: the output sequence gets a Living Stack sidecar (.lsfreg, [lsf_drizzle]) recording how it was drizzled
 };
 
 struct registration_method *new_reg_method(const char *name, registration_function f,
