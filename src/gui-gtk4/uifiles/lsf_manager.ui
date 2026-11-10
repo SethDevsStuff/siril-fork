@@ -235,8 +235,14 @@
                             <child>
                               <object class="GtkButton" id="lsfm_export">
                                 <property name="label" translatable="yes">Export the stack as an image…</property>
-                                <property name="tooltip-text" translatable="yes">Saves the stacked image as a plain FITS image, without the Living Stack data, with the FITS extension and compression of the preferences. Process this image, not the Living Stack file.</property>
+                                <property name="tooltip-text" translatable="yes">Saves the stacked image as a plain FITS image, without the Living Stack data, with the FITS extension, compression and bit depth of the preferences. Process this image, not the Living Stack file.</property>
                                 <signal name="clicked" handler="on_lsfm_export_clicked"/>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="GtkCheckButton" id="lsfm_export_32b">
+                                <property name="label" translatable="yes">Force 32b output</property>
+                                <property name="tooltip-text" translatable="yes">With 16-bit mode set in the preferences, the exported image is saved on 32 bits instead of 16. Without it, it is always 32-bit. The Living Stack itself is always 32-bit.</property>
                               </object>
                             </child>
                             <child>

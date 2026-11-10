@@ -336,7 +336,7 @@ static void load_file() {
 	g_free(summary);
 
 	gboolean ok = info != NULL;
-	const char *actions[] = { "lsfm_check", "lsfm_compress", "lsfm_compression", "lsfm_copy", "lsfm_export",
+	const char *actions[] = { "lsfm_check", "lsfm_compress", "lsfm_compression", "lsfm_copy", "lsfm_export", "lsfm_export_32b",
 		"lsfm_import_wcs", "lsfm_maps_save" };
 	for (int i = 0; i < (int) G_N_ELEMENTS(actions); i++)
 		gtk_widget_set_sensitive(w(actions[i]), ok);
@@ -645,6 +645,7 @@ void on_lsfm_export_clicked(GtkButton *button, gpointer user_data) {
 	}
 	a->path = g_strdup(info->file.path);
 	a->out = out;
+	a->force32b = siril_toggle_get_active(w("lsfm_export_32b"));
 	a->end_func = end_export;
 	g_free(pending_out);
 	pending_out = set_right_extension(out);

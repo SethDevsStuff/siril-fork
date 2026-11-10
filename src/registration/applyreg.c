@@ -602,7 +602,7 @@ int apply_reg_image_hook(struct generic_seq_args *args, int out_index, int in_in
 		if (wcs_out) {
 			fit->keywords.wcslib = wcs_out;
 		}
-		if (args->seq->type == SEQ_SER || (com.pref.force_16bit && !regargs->force_float_out)) {
+		if (args->seq->type == SEQ_SER || com.pref.force_16bit) {
 			fit_replace_buffer(fit, float_buffer_to_ushort(fit->fdata, fit->rx * fit->ry * fit->naxes[2]), DATA_USHORT);
 			if (!fit->data) {
 				PRINT_ALLOC_ERR;
@@ -1167,7 +1167,7 @@ int initialize_drizzle_params(struct generic_seq_args *args, struct registration
 
 int register_apply_reg(struct registration_args *regargs) {
 	struct generic_seq_args *args = create_default_seqargs(regargs->seq);
-	args->force_float = (!com.pref.force_16bit || regargs->force_float_out) && regargs->seq->type != SEQ_SER;
+	args->force_float = !com.pref.force_16bit && regargs->seq->type != SEQ_SER;
 	gui_iface.show_panel("output_logs", TRUE);
 	int retval = 0;
 	int *included = NULL;

@@ -645,7 +645,7 @@ static int bin_frame(const fits *fit, batch_frames *b, int k) {
 							break;
 						}
 						size_t at = c * plane + (size_t) y * fit->rx + x;
-						sum += fit->type == DATA_FLOAT ? fit->fdata[at] : fit->data[at] * INV_USHRT_MAX_DOUBLE;
+						sum += fit->type == DATA_FLOAT ? fit->fdata[at] : fit->data[at] * lsf_sample_unit(fit->bitpix);
 					}
 				out[((size_t) c * box[3] + j) * box[2] + i] = full ? (float) (sum / (B * B)) : NAN;
 			}
@@ -715,7 +715,7 @@ static fits *bin_for_stars(const fits *fit, int layer, int o) {
 	if (new_fit_image(&binned, (int) brx, (int) bry, 1, DATA_FLOAT))
 		return NULL;
 	const size_t plane = rx * ry * (fit->naxes[2] > 1 ? layer : 0);
-	const float norm = fit->type == DATA_FLOAT ? 1.f : 1.f / USHRT_MAX_SINGLE;
+	const float norm = fit->type == DATA_FLOAT ? 1.f : (float) lsf_sample_unit(fit->bitpix);
 	for (size_t y = 0; y < bry; y++)
 		for (size_t x = 0; x < brx; x++) {
 			float sum = 0.f;
@@ -1083,7 +1083,7 @@ static int overlap_baseline(struct lsf_batch_args *args, const batch_frames *b, 
 				size_t p = y * fit.rx + x;
 				if (W[p] > 0.f && is_data(&fit, c, x, y, rlo, rhi, clo, chi)) {
 					size_t at = (size_t) c * npix + p;
-					fv[n] = fit.type == DATA_FLOAT ? fit.fdata[at] : (float) (fit.data[at] * INV_USHRT_MAX_DOUBLE);
+					fv[n] = fit.type == DATA_FLOAT ? fit.fdata[at] : (float) (fit.data[at] * lsf_sample_unit(fit.bitpix));
 					sv[n] = M[p];
 					n++;
 				}
@@ -1382,6 +1382,11 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 		siril_log_error(_("LSF: unsupported number of channels (%d)\n"), nchan);
 		return 1;
 	}
+	/* Siril's stack refuses them in 16-bit mode, as its result would be
+	 * 16-bit: the Living Stack is 32-bit, so they are merged as they are */
+	if (com.pref.force_16bit && seq->bitpix == FLOAT_IMG)
+		siril_log_message(_("LSF: the frames are 32-bit while 16-bit mode is set in the preferences; they are merged "
+					"at full precision\n"));
 	if (h->plane[0][0]) {
 		if (seq->rx != h->rx || seq->ry != h->ry || nchan != h->nchan) {
 			siril_log_error(_("LSF: the batch is %dx%dx%d, the LSF grid is %dx%dx%d. Frames that are "
@@ -1465,6 +1470,25 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 				free(cand);
 				goto end;
 			}
+		/* the statistics of integer frames are in their units, the samples
+		 * are merged in [0, 1]: private copies are scaled, the ones the
+		 * sequence caches stay as Siril made them */
+		if (seq->bitpix != FLOAT_IMG) {
+			const double unit = lsf_sample_unit(seq->bitpix);
+			for (int c = 0; c < nchan; c++) {
+				imstats *u = malloc(sizeof(imstats));
+				if (!u) {
+					PRINT_ALLOC_ERR;
+					free(cand);
+					goto end;
+				}
+				*u = *stats[i][c];
+				u->_nb_refs = 1;
+				lsf_stats_to_unit(u, unit);
+				free_stats(stats[i][c]);
+				stats[i][c] = u;
+			}
+		}
 		gui_iface.set_progress((double) (k + 1) / nb_incl, NULL);
 		if (!processing_should_continue()) {
 			free(cand);
@@ -1739,6 +1763,7 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 	}
 	naxes[2] = nchan;
 	gboolean ushort_input = get_data_type(bitpix) == DATA_USHORT;
+	const double sample_unit = lsf_sample_unit(bitpix);
 
 	/* feathering masks, Siril's: a distance to each frame's edge, cached
 	 * beside the sequence. Made for all the frames of the sequence, as the
@@ -1829,7 +1854,7 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 	}
 
 	gui_iface.set_progress(PROGRESS_RESET, _("LSF: merging the batch"));
-	guint64 irej[3][2] = { { 0 } }, hrej[3][2] = { { 0 } }, edge_drop[3] = { 0 }, thin[3] = { 0 };
+	guint64 irej[3][2] = { { 0 } }, hrej[3][2] = { { 0 } }, edge_drop[3] = { 0 }, thin[3] = { 0 }, clip16[3] = { 0 };
 	int err = 0, done_blocks = 0;
 	gboolean saturated = FALSE, rej_saturated = FALSE;
 	const long rx = naxes[0], ry = naxes[1];
@@ -1850,7 +1875,7 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 		struct _image_block *blk = blocks + bi;
 		int layer = (int) blk->channel;
 		td->db.layer = layer;
-		guint64 brej[2] = { 0, 0 }, bhrej[2] = { 0, 0 }, bedge = 0, bthin = 0;
+		guint64 brej[2] = { 0, 0 }, bhrej[2] = { 0, 0 }, bedge = 0, bthin = 0, bclip = 0;
 		gboolean bsat = FALSE, brsat = FALSE;
 
 		/* read the block from all frames */
@@ -1866,8 +1891,12 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 				break;
 			}
 			if (ushort_input)
-				for (size_t p = 0; p < npix; p++)
-					td->pix[f][p] = (float) (td->wbuf[p] * INV_USHRT_MAX_DOUBLE);
+				for (size_t p = 0; p < npix; p++) {
+					td->pix[f][p] = (float) (td->wbuf[p] * sample_unit);
+					/* 16-bit drizzled frames clip at 1, after the scale² of Siril's drizzle */
+					if (drizzled && td->wbuf[p] == USHRT_MAX)
+						bclip++;
+				}
 			if (feather && read_feather_block(seq, b.idx[f], &area, args->feather, &fcols, td->mask[f]))
 				block_err = TRUE;
 			if (drizzled && read_drizzle_block(seq, b.idx[f], layer, &area, td->drz[f]))
@@ -2008,6 +2037,7 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 			hrej[layer][1] += bhrej[1];
 			edge_drop[layer] += bedge;
 			thin[layer] += bthin;
+			clip16[layer] += bclip;
 			saturated |= bsat;
 			rej_saturated |= brsat;
 			done_blocks++;
@@ -2027,6 +2057,10 @@ int lsf_process_batch(struct lsf_batch_args *args) {
 	if (!args->init)
 		siril_log_message(_("LSF: %" G_GUINT64_FORMAT " samples of channel #0 merged without the history test, "
 					"where the history holds fewer than %g effective samples\n"), thin[0], LSF_HIST_MIN_NEFF);
+	for (int c = 0; c < nchan; c++)
+		if (clip16[c])
+			siril_log_warning(_("LSF: %" G_GUINT64_FORMAT " samples of channel #%d (%.4f%% of the batch) are at the top "
+						"of the 16-bit drizzled frames and were clipped there\n"), clip16[c], c, clip16[c] / nb_tot * 100.0);
 	for (int c = 0; c < nchan; c++) {
 		siril_log_message(_("LSF pixel rejection in channel #%d: batch %.3lf%% - %.3lf%%, history %.3lf%% - %.3lf%%\n"),
 				c, irej[c][0] / nb_tot * 100.0, irej[c][1] / nb_tot * 100.0,

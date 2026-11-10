@@ -634,7 +634,6 @@ static struct registration_args *new_regargs(sequence *seq, const lsf_settings *
 	regargs->undistort = DISTO_UNDEF;
 	regargs->framing = FRAMING_CURRENT;
 	regargs->load_new_sequence = FALSE;
-	regargs->force_float_out = TRUE;	// 32 bits whatever the preferences (Section 13.5)
 	return regargs;
 }
 
@@ -664,6 +663,13 @@ static int use_drizzle(struct registration_args *regargs, int scale, double pixf
 	regargs->driz = driz;
 	regargs->driz_raw_weights = TRUE;
 	regargs->clamp = FALSE;
+	/* Siril's drizzle multiplies the values by scale², and the 16-bit frames
+	 * of its 16-bit mode clip at 1: what is lost there no merge can recover */
+	if (com.pref.force_16bit && scale > 1)
+		siril_log_warning(_("LSF: 16-bit mode is set in the preferences, so the drizzled frames are saved on 16 bits. "
+					"Drizzle at scale %d multiplies the values by %d, and every sample above %.3g in the frames "
+					"(%.0f ADU on 16 bits) is clipped. Use 32-bit mode to keep them.\n"),
+				scale, scale * scale, 1.0 / (scale * scale), USHRT_MAX_DOUBLE / (scale * scale));
 	return 0;
 }
 
@@ -1283,7 +1289,7 @@ void lsf_drizzle_sidecar_clear(lsf_drizzle_sidecar *d) {
 static void drizzle_encoding(const struct registration_args *regargs, int *data_bits, int *weight_bits,
 		gboolean *rescaled) {
 	const gboolean ser = regargs->seq->type == SEQ_SER;
-	const gboolean data_ushort = ser || (com.pref.force_16bit && !regargs->force_float_out);
+	const gboolean data_ushort = ser || com.pref.force_16bit;
 	const gboolean match = com.pref.drizz_weight_match_bitpix;
 	*data_bits = data_ushort ? 16 : 32;
 	*rescaled = !regargs->driz_raw_weights && ((data_ushort && !com.pref.force_16bit) || !match);
@@ -2836,12 +2842,13 @@ static int lsf_maps_run(struct lsf_cmd_args *a) {
 	return retval;
 }
 
-static int lsf_export_run(const char *path, const char *out) {
-	int retval = lsf_export_master(path, out);
+static int lsf_export_run(const char *path, const char *out, gboolean force32b) {
+	int retval = lsf_export_master(path, out, force32b);
 	if (!retval) {
 		/* the name savefits gave the file */
 		gchar *name = set_right_extension(out);
-		siril_log_message(_("LSF: master of %s exported to %s\n"), path, name ? name : out);
+		siril_log_message(_("LSF: master of %s exported to %s (%d-bit)\n"), path, name ? name : out,
+				lsf_export_is_16bit(force32b) ? 16 : 32);
 		g_free(name);
 	}
 	return retval;
@@ -2852,7 +2859,8 @@ static int lsf_export_run(const char *path, const char *out) {
  * is never saved over (Section 13), or of the plain image exported with it. */
 static void lsf_load_result(const char *path, const char *export_name) {
 	fits fit = { 0 };
-	if (readfits(export_name ? export_name : path, &fit, NULL, TRUE)) {
+	/* the exported image at its own depth, as a 16-bit stack is loaded */
+	if (readfits(export_name ? export_name : path, &fit, NULL, export_name == NULL)) {
 		clearfits(&fit);
 		return;
 	}
@@ -2897,6 +2905,19 @@ static gboolean lsf_end_job(gpointer p) {
 static gpointer lsf_worker(gpointer p) {
 	struct lsf_cmd_args *a = p;
 	int retval;
+	/* Siril's 16-bit preference applies to the images LSF saves for Siril,
+	 * never to the Living Stack, whose accumulator must not round */
+	if (com.pref.force_16bit) {
+		if (a->mode == LSF_CMD_INIT || a->mode == LSF_CMD_APPEND)
+			siril_log_message(_("LSF: 16-bit mode is set in the preferences. The Living Stack keeps 32-bit precision; "
+						"the frames LSF registers and the images it exports are saved on 16 bits\n"));
+		else if (a->mode == LSF_CMD_UTIL)
+			siril_log_message(_("LSF: 16-bit mode is set in the preferences. The Living Stack keeps 32-bit precision\n"));
+		else if (a->mode == LSF_CMD_MAPS)
+			siril_log_message(_("LSF: 16-bit mode is set in the preferences. The maps of neff, noise, sigma, SNR and "
+						"exposure are saved on 32 bits, as their values are not in [0, 1]; rejection maps are counts "
+						"and stay on 16 bits\n"));
+	}
 	switch (a->mode) {
 	case LSF_CMD_INIT:
 		retval = lsf_init_run(a);
@@ -2911,7 +2932,7 @@ static gpointer lsf_worker(gpointer p) {
 		retval = lsf_maps_run(a);
 		break;
 	default:
-		retval = lsf_export_run(a->path, a->out);
+		retval = lsf_export_run(a->path, a->out, a->force32b);
 		break;
 	}
 	/* the plain image of the new Stack, as lsf_export makes it */
@@ -2919,7 +2940,7 @@ static gpointer lsf_worker(gpointer p) {
 	const char *written = a->mode == LSF_CMD_APPEND && a->out ? a->out : a->path;
 	gchar *export_name = commit && a->export_out ? set_right_extension(a->export_out) : NULL;
 	if (!retval && export_name)
-		retval = lsf_export_run(written, a->export_out);
+		retval = lsf_export_run(written, a->export_out, a->force32b);
 	if (!retval && commit && a->load_result)
 		lsf_load_result(written, export_name);
 	lsf_job_result *r = a->end_func ? calloc(1, sizeof(lsf_job_result)) : NULL;
@@ -3074,6 +3095,8 @@ gchar *lsf_cmd_args_to_command(const struct lsf_cmd_args *a) {
 		g_string_append(cmd, "lsf_export");
 		add_arg(cmd, a->path);
 		add_arg(cmd, a->out);
+		if (a->force32b)
+			g_string_append(cmd, " -32b");
 		break;
 	case LSF_CMD_UTIL:
 		g_string_append(cmd, "lsf_util");
@@ -3111,6 +3134,8 @@ gchar *lsf_cmd_args_to_command(const struct lsf_cmd_args *a) {
 		g_string_append(cmd, "\nlsf_export");
 		add_arg(cmd, a->path);
 		add_arg(cmd, a->export_out);
+		if (a->force32b)
+			g_string_append(cmd, " -32b");
 	}
 	return g_string_free(cmd, FALSE);
 }
@@ -3492,13 +3517,22 @@ failure:
 	return CMD_ARG_ERROR;
 }
 
-/* lsf_export file.lsf.fits output.fit */
+/* lsf_export file.lsf.fits output.fit [-32b] */
 int process_lsf_export(int nb) {
 	struct lsf_cmd_args *a = lsf_cmd_args_new(LSF_CMD_EXPORT);
 	if (!a)
 		return CMD_ALLOC_ERROR;
 	a->path = g_strdup(word[1]);
 	a->out = g_strdup(word[2]);
+	for (int i = 3; i < nb && word[i]; i++) {
+		if (!strcmp(word[i], "-32b"))
+			a->force32b = TRUE;
+		else {
+			siril_log_error(_("Unknown parameter %s, aborting.\n"), word[i]);
+			lsf_cmd_args_free(a);
+			return CMD_ARG_ERROR;
+		}
+	}
 	if (lsf_start(a))
 		return CMD_GENERIC_ERROR;
 	return CMD_OK;

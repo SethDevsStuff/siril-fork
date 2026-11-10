@@ -899,6 +899,7 @@ static void start_lsf_append() {
 	const char *target = a->out ? a->out : a->path;
 	if (siril_toggle_get_active(export_image) && g_str_has_suffix(target, ".lsf.fits"))
 		a->export_out = g_strndup(target, strlen(target) - strlen(".lsf.fits"));
+	a->force32b = siril_toggle_get_active(GTK_WIDGET(gtk_builder_get_object(gui.builder, "check_force32b")));
 	a->load_result = TRUE;
 	a->end_func = end_lsf_append;
 	log_and_start_lsf(a);
@@ -1064,6 +1065,7 @@ static void start_lsf_stacking() {
 	a->overwrite = replace;
 	if (gtk_drop_down_get_selected(mode_combo) == STACK_RESULT_LSF_IMAGE)
 		a->export_out = g_strndup(path, strlen(path) - strlen(".lsf.fits"));
+	a->force32b = siril_toggle_get_active(GTK_WIDGET(gtk_builder_get_object(gui.builder, "check_force32b")));
 	a->load_result = TRUE;
 	a->end_func = end_lsf_stacking;
 	log_and_start_lsf(a);
@@ -1188,7 +1190,12 @@ gboolean lsf_stacking_update_widgets(int stack_method, gboolean can_reframe) {
 	gtk_widget_set_sensitive(GTK_WIDGET(method_combo), !lsf);
 	gtk_button_set_label(GTK_BUTTON(go_stack), append ? _("Append to Living Stack") :
 			lsf ? _("Create Living Stack") : _("Start stacking"));
-	gtk_widget_set_visible(force32b, !lsf);
+	/* in LSF mode it acts on the exported image only: the Living Stack is
+	 * always 32-bit */
+	gtk_widget_set_tooltip_text(force32b, lsf ?
+			_("With 16-bit mode set in the preferences, the image exported with the Living Stack is saved on 32 bits "
+				"instead of 16. The Living Stack itself is always 32-bit.") :
+			_("If you check this button, the final image bitdepth will be forced to 32b even if the input images are in 16b."));
 	gtk_widget_set_visible(force_norm, !lsf);
 	/* an append takes these from the file (fill_widgets_from_lsf) */
 	gtk_widget_set_visible(append_box, append);

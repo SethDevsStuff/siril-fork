@@ -54,6 +54,7 @@ struct lsf_cmd_args {
 	gboolean compression_set;	// append: keeps the compression of the file when not set
 	guint maps;		// maps, LSF_MAP_* flags
 	gchar *export_out;	// init and append: also export the new Stack to this plain image (GUI)
+	gboolean force32b;	// export, and export_out: -32b, the plain image is 32-bit whatever core.force_16bit
 	gboolean load_result;	// init and append: the new Stack becomes the result image (GUI)
 	gboolean rej_set;	// append: settings.rej and sig override the rejection stored in the file
 	gboolean force_reg;	// append: -reg, register again even with a registration made against the file

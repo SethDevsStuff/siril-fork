@@ -24,6 +24,7 @@
 
 #include <criterion/criterion.h>
 
+#include "algos/statistics.h"
 #include "core/siril.h"
 #include "lsf/lsf.h"
 #include "lsf/lsf_fits.h"
@@ -501,6 +502,57 @@ Test(lsf_math, pad_plane) {
 	int p2[4] = { 0, 0, 0, 1 };
 	lsf_pad_plane(c, cd, sizeof(WORD), 2, 1, p2);
 	cr_assert(cd[0] == 7 && cd[1] == 9 && cd[2] == 0 && cd[3] == 0);
+}
+
+/* integer samples and their statistics come to [0, 1]: 8-bit by 255, 16-bit by 65535 */
+Test(lsf_math, sample_unit) {
+	cr_assert_float_eq(lsf_sample_unit(USHORT_IMG) * 65535.0, 1.0, 1e-8);
+	cr_assert_float_eq(lsf_sample_unit(SHORT_IMG) * 65535.0, 1.0, 1e-8);
+	cr_assert_float_eq(lsf_sample_unit(BYTE_IMG) * 255.0, 1.0, 1e-12);
+}
+
+/* the statistics of a 16-bit frame scaled to [0, 1], uncomputed ones kept */
+Test(lsf_math, stats_to_unit) {
+	imstats st = { 0 };
+	st.total = 100;
+	st.ngoodpix = 90;
+	st.mean = 1100.0;
+	st.median = 1015.0;
+	st.sigma = 30.0;
+	st.avgDev = 20.0;
+	st.mad = 14.0;
+	st.sqrtbwmv = 25.0;
+	st.location = 1016.0;
+	st.scale = 21.0;
+	st.min = 0.0;
+	st.max = 65535.0;
+	st.normValue = 65535.0;
+	st.bgnoise = 14.4;
+	st._nb_refs = 1;
+	double unit = lsf_sample_unit(USHORT_IMG);
+	lsf_stats_to_unit(&st, unit);
+	cr_assert_float_eq(st.median, 1015.0 * unit, 1e-15);
+	cr_assert_float_eq(st.location, 1016.0 * unit, 1e-15);
+	cr_assert_float_eq(st.scale, 21.0 * unit, 1e-15);
+	cr_assert_float_eq(st.mad, 14.0 * unit, 1e-15);
+	cr_assert_float_eq(st.bgnoise, 14.4 * unit, 1e-15);
+	cr_assert_float_eq(st.max, 1.0, 1e-8);
+	cr_assert_float_eq(st.normValue, 1.0, 1e-8);
+	cr_assert_eq(st.total, 100);
+	cr_assert_eq(st.ngoodpix, 90);
+	cr_assert_eq(st._nb_refs, 1);
+
+	imstats lite = { 0 };	// IKSS not computed (STATS_LITENORM)
+	lite.median = 200.0;
+	lite.mad = 4.0;
+	lite.location = NULL_STATS;
+	lite.scale = NULL_STATS;
+	lite.bgnoise = 3.0;
+	lsf_stats_to_unit(&lite, lsf_sample_unit(BYTE_IMG));
+	cr_assert_float_eq(lite.median, 200.0 / 255.0, 1e-15);
+	cr_assert_float_eq(lite.mad, 4.0 / 255.0, 1e-15);
+	cr_assert_eq(lite.location, NULL_STATS);
+	cr_assert_eq(lite.scale, NULL_STATS);
 }
 
 /* Section 10.3: a frame worse than the worst of the first batch keeps the

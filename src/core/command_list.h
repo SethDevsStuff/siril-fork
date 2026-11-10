@@ -117,7 +117,7 @@ static command commands[] = {
 	{"ls", 0, "ls", process_ls, STR_LS, FALSE, REQ_CMD_NONE},
 #endif
 	{"lsf_append", 2, "lsf_append file.lsf.fits sequencename [rej [type] sigma_low sigma_high] [-noreg | -reg | -wcsreg] [-pixfrac=] [-kernel=] [-drizzle_force] [-disto={master|file filename|frames}] [-weight_model=inverse] [-framing={max|current}] [-noexpand] [-expand_step=] [-expand_force] [-out=file.lsf.fits [-overwrite] | -backup] [-hist_low=] [-hist_high=] [-hist_margin=] [-rejmaps] [-overlap_norm] [-feather=] [-compress[={gzip2|gzip1}] | -nocompress]", process_lsf_append, STR_LSF_APPEND, TRUE, REQ_CMD_NONE},
-	{"lsf_export", 2, "lsf_export file.lsf.fits output_filename", process_lsf_export, STR_LSF_EXPORT, TRUE, REQ_CMD_NONE},
+	{"lsf_export", 2, "lsf_export file.lsf.fits output_filename [-32b]", process_lsf_export, STR_LSF_EXPORT, TRUE, REQ_CMD_NONE},
 	{"lsf_init", 2, "lsf_init sequencename file.lsf.fits [rej [rejection type] [sigma_low sigma_high]] [-drizzle [-scale=] [-pixfrac=] [-kernel=]] [-nonorm, -norm=] [-fastnorm] [-rgb_equal] [-weight={noise|wfwhm|nbstars}] [-weight_floor=] [-weight_range=] [-output_norm] [-framing={max|current|min|cog}] [-hist_low=] [-hist_high=] [-hist_margin=] [-rejmaps] [-overlap_norm] [-feather=] [-compress[={gzip2|gzip1}]] [-overwrite]", process_lsf_init, STR_LSF_INIT, TRUE, REQ_CMD_NONE},
 	{"lsf_maps", 2, "lsf_maps file.lsf.fits prefix [-neff] [-noise] [-sigma] [-snr] [-rejlo] [-rejhi] [-exp]", process_lsf_maps, STR_LSF_MAPS, TRUE, REQ_CMD_NONE},
 	{"lsf_util", 2, "lsf_util file.lsf.fits [-info | -check] [-repair | -adopt] [-compress[={gzip2|gzip1}] | -decompress] [-wcs=file] [-out=file.lsf.fits [-overwrite]] [-backup]", process_lsf_util, STR_LSF_UTIL, TRUE, REQ_CMD_NONE},

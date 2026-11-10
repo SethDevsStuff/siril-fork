@@ -61,7 +61,8 @@ int lsf_write_file(const char *path, lsf_file *old, const lsf_settings *s, lsf_h
 		fits *primary, const char *uid, int gen, GPtrArray *new_rows, int batch, gboolean backup,
 		lsf_compression comp, gchar **replace_msg);
 const char *lsf_compression_name(lsf_compression comp);
-int lsf_export_master(const char *lsf_path, const char *out_path);
+gboolean lsf_export_is_16bit(gboolean force32b);
+int lsf_export_master(const char *lsf_path, const char *out_path, gboolean force32b);
 void lsf_strip_lsf_keys(fits *fit);
 void lsf_read_view_uid(const fits *fit, char *uid, size_t n);
 

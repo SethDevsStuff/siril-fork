@@ -37,5 +37,7 @@ void lsf_edge_limits(const guint8 *has, int rx, int ry, int margin,
 void lsf_expand_pads(const int need[4], int step, int pad[4]);
 void lsf_xfrm_shift(double h[9], double dx, double dy);
 void lsf_pad_plane(const void *src, void *dst, size_t elsize, int rx, int ry, const int pad[4]);
+double lsf_sample_unit(int bitpix);
+void lsf_stats_to_unit(imstats *st, double unit);
 
 #endif /* SRC_LSF_LSF_MATH_H_ */

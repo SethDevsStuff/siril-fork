@@ -26,6 +26,7 @@
 
 #include <gsl/gsl_cdf.h>
 
+#include "algos/statistics.h"
 #include "lsf/lsf.h"
 #include "lsf/lsf_math.h"
 
@@ -361,4 +362,21 @@ void lsf_pad_plane(const void *src, void *dst, size_t elsize, int rx, int ry, co
 	for (int y = 0; y < ry; y++)
 		memcpy((char *) dst + (((size_t) y + pad[LSF_PAD_FIRST]) * nrx + pad[LSF_PAD_LEFT]) * elsize,
 				(const char *) src + (size_t) y * rx * elsize, (size_t) rx * elsize);
+}
+
+/* the [0, 1] value of one unit of an integer sample: Siril keeps 8-bit images
+ * in WORDs holding 0 to 255, 16-bit ones 0 to 65535 */
+double lsf_sample_unit(int bitpix) {
+	return bitpix == BYTE_IMG ? 1.0 / UCHAR_MAX_DOUBLE : INV_USHRT_MAX_DOUBLE;
+}
+
+/* Siril's statistics of an integer image are in its own units, the samples
+ * LSF merges in [0, 1]: multiplies every level and spread by unit
+ * (lsf_sample_unit). Counts and the reference count are not touched. */
+void lsf_stats_to_unit(imstats *st, double unit) {
+	double *v[] = { &st->mean, &st->median, &st->sigma, &st->avgDev, &st->mad, &st->sqrtbwmv,
+		&st->location, &st->scale, &st->min, &st->max, &st->normValue, &st->bgnoise };
+	for (size_t i = 0; i < G_N_ELEMENTS(v); i++)
+		if (*v[i] != NULL_STATS)
+			*v[i] *= unit;
 }

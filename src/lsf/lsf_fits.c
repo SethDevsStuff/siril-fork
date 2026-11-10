@@ -36,6 +36,7 @@
 #include <glib/gstdio.h>
 
 #include "core/OS_utils.h"
+#include "core/proto.h"
 #include "core/siril.h"
 #include "core/siril_alloc.h"
 #include "core/siril_log.h"
@@ -1820,10 +1821,17 @@ void lsf_strip_lsf_keys(fits *fit) {
 	fit->unknown_keys = g_string_free(kept, FALSE);
 }
 
+/* the bit depth of the flattened master follows Siril's preference, as a
+ * stack does: 16-bit with core.force_16bit unless forced to 32 bits (-32b,
+ * Siril's "Force 32b output"). The Living Stack itself is always 32-bit. */
+gboolean lsf_export_is_16bit(gboolean force32b) {
+	return com.pref.force_16bit && !force32b;
+}
+
 /* Flattened master (Section 10.8): HDU 0 without the LSF keywords, saved
- * like any image Siril saves, so the extension and compression preferences
- * apply */
-int lsf_export_master(const char *lsf_path, const char *out_path) {
+ * like any image Siril saves, so the extension, compression and bit depth
+ * preferences apply */
+int lsf_export_master(const char *lsf_path, const char *out_path, gboolean force32b) {
 	/* the file is validated first (Section 8). A Stack edited outside Siril
 	 * is exported as it is, which is what the user sees when opening it */
 	lsf_file f;
@@ -1843,6 +1851,15 @@ int lsf_export_master(const char *lsf_path, const char *out_path) {
 		return 1;
 	}
 	lsf_strip_lsf_keys(&fit);
+	/* rounded and clipped to [0, 1] as Siril's 16-bit results are */
+	if (lsf_export_is_16bit(force32b)) {
+		WORD *data = float_buffer_to_ushort(fit.fdata, fit.naxes[0] * fit.naxes[1] * fit.naxes[2]);
+		if (!data) {
+			clearfits(&fit);
+			return 1;
+		}
+		fit_replace_buffer(&fit, data, DATA_USHORT);
+	}
 	fit.history = g_slist_append(fit.history, g_strdup_printf("Exported from LSF file %s, generation %d", uid, gen));
 	int ret = savefits(out_path, &fit);
 	clearfits(&fit);

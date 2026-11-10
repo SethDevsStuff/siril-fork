@@ -65,6 +65,33 @@ Stage stats  <p>_noise.csv          one row per file and channel; the .lsf.fits 
 --export-fits additionally writes <name>.fit next to every LSF product with `lsf_export` (<name>.fit.fz
 when FITS compression is enabled in Siril's preferences).
 
+16-BIT MODE  (--depth 16 | both, lsf_poc/16-bit mode plan.md)
+-----------
+--depth 16   The selected frames are copied into <outdir>/<p>_frames16 as 16-bit frames (Siril's own
+             float-to-16-bit conversion) and as their float twin (the same values / 65535), with
+             the registration lines of the sequence, so that Siril picks the same reference frame.
+             Siril is put in 16-bit mode (set16bits) for the run and set back after. Every stage
+             then runs on the copy:
+               siril_*  are Siril's 16-bit stacks (`stack` without -32b);
+               lsf_*    are compared and measured through their 16-bit exports (lsf_export);
+               stage twin: lsf_twin_cum_1234, lsf_init of the float twin, must match lsf_cum_1234
+                        (LSF converts 16-bit samples and statistics to [0, 1]): <p>_twin.csv;
+               parity:  not expected identical (LSF does not reproduce Siril's 16-bit path, which
+                        rounds every normalized sample to 16 bits and clips it at 65535), fails above
+                        a 99th percentile of --parity16-tol-p99 ADU or --parity16-tol-pct percent
+                        of pixels differing by more than 1 ADU, both on full-coverage pixels
+                        (at partial coverage LSF drops frame-edge samples by design, also at 32 bits).
+--depth both The 32-bit run on the sequence with prefix <p>_32, then the 16-bit one: same frames,
+             same reference, for the "cost of 16 bits" comparison.
+set16bits writes Siril's configuration file: run 16-bit tests headless with a private one.
+
+HEADLESS
+--------
+siril-cli runs everything in script mode, where load_seq is refused. Headless (siril-cli),
+--seq is required and sequences are only named: their frames, selection and reference are read from
+their .seq files, and the frames of a 16-bit copy from their FITS files. lsf_compare_run.py (same
+folder) runs suites of this script that way and writes one report.
+
 The stack of set 1 is the same frames with the same settings whichever way it is stacked, so it
 is computed once (lsf_set_1) and copied to lsf_cum_1 and lsf_1 (siril_set_1 -> siril_cum_1).
 
@@ -112,6 +139,7 @@ Needs a Siril build with the lsf_init / lsf_append / lsf_export commands; no oth
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import gc
 import hashlib
@@ -139,7 +167,14 @@ except ImportError:
 N_SETS = 4
 STAT_FIELDS = ("total", "ngoodpix", "mean", "median", "sigma", "avgDev", "mad", "sqrtbwmv",
                "location", "scale", "min", "max", "normValue", "bgnoise")
-STAGES = ("base", "siril", "sos", "iter", "check", "flip", "parity", "ssim", "stats")   # run order
+STAGES = ("base", "twin", "siril", "sos", "iter", "check", "flip", "parity", "ssim", "stats")   # run order
+# 16-bit parity (D6 of lsf_poc/16-bit mode plan.md): LSF's 16-bit export against Siril's 16-bit stack
+# fails above these. Set from the first suite S1 run (2026-11-08, panel 11, 80 frames, 8 pairs x 3
+# channels): median |d| 0, 99th percentile <= 2 ADU, at most 1.02% of pixels above 1 ADU. The rms is
+# not a test: Siril clips every normalized 16-bit sample at 65535, so near-saturated star cores read
+# 1000-3000 ADU lower than LSF and dominate it (1 to 7 ADU; 0.3 to 1.7 ADU below 0.75).
+PARITY16_TOL_P99 = 4.0          # ADU, 2x the worst of S1
+PARITY16_TOL_PCT = 3.0          # % of pixels differing by more than 1 ADU, 3x the worst of S1
 SKIPPABLE = STAGES
 
 # Siril's 8 rejection methods -> `stack` / lsf_init token, and Siril's default low/high
@@ -347,10 +382,15 @@ def channel_diffs(x, y) -> list:
 _FITS_DTYPES = {8: ">u1", 16: ">i2", 32: ">i4", 64: ">i8", -32: ">f4", -64: ">f8"}
 
 
-def fits_image(path: str, extname=None):
+INT_RANGE = {8: 255.0, 16: 65535.0}     # Siril's [0, 1] range of 8- and 16-bit images
+
+
+def fits_image(path: str, extname=None, unit: bool = False):
     """Image HDU (the primary, or the one named `extname`) read straight from the file as float64
     (channels, h, w) in file row order, with BSCALE/BZERO applied. None when the HDU is missing or
-    tile-compressed. Reading every image the same way keeps LSF and Siril files in one orientation."""
+    tile-compressed. Reading every image the same way keeps LSF and Siril files in one orientation.
+    unit: an 8- or 16-bit image is brought to [0, 1] as Siril does (/255, /65535), so that it can
+    be compared with a float image; never for count planes."""
     for h in read_hdus(path):
         c = h["cards"]
         if extname is not None and c.get("EXTNAME") != extname:
@@ -362,6 +402,8 @@ def fits_image(path: str, extname=None):
             f.seek(h["data_offset"])
             a = np.frombuffer(f.read(h["data_size"]), dtype=_FITS_DTYPES[int(c["BITPIX"])]).reshape(dims)
         a = a.astype(np.float64) * float(c.get("BSCALE", 1)) + float(c.get("BZERO", 0))
+        if unit and int(c["BITPIX"]) in INT_RANGE:
+            a /= INT_RANGE[int(c["BITPIX"])]
         return a[None] if a.ndim == 2 else a
     return None
 
@@ -394,19 +436,118 @@ def noise_estimation(img) -> tuple:
     return (0.70710678 * float(np.median(ok)) if ok.size else 0.0), rows
 
 
-def write_fits_float32(path: str, data, history=()) -> None:
-    """Minimal float32 FITS writer (primary HDU only), stdlib + numpy, for diagnostic images."""
-    a = np.asarray(data, dtype=">f4")
+def _write_fits(path: str, a: np.ndarray, bitpix: int, scaling=(), cards=(), history=()) -> None:
     if a.ndim == 3 and a.shape[0] == 1:
         a = a[0]
-    cards = ["SIMPLE  =                    T", "BITPIX  =                  -32", f"NAXIS   = {a.ndim:20d}"]
-    cards += [f"NAXIS{i + 1:<3d}= {n:20d}" for i, n in enumerate(reversed(a.shape))]
-    cards += [f"HISTORY {h}"[:80] for h in history] + ["END"]
-    head = "".join(c.ljust(80) for c in cards).encode("ascii")
+    head = ["SIMPLE  =                    T", f"BITPIX  = {bitpix:20d}", f"NAXIS   = {a.ndim:20d}"]
+    head += [f"NAXIS{i + 1:<3d}= {n:20d}" for i, n in enumerate(reversed(a.shape))]
+    head += list(scaling) + [c[:80] for c in cards] + [f"HISTORY {h}"[:80] for h in history] + ["END"]
+    raw_head = "".join(c.ljust(80) for c in head).encode("ascii", "replace")
     with open(path, "wb") as f:
-        f.write(head + b" " * (-len(head) % 2880))
+        f.write(raw_head + b" " * (-len(raw_head) % 2880))
         raw = a.tobytes()
         f.write(raw + b"\0" * (-len(raw) % 2880))
+
+
+def write_fits_float32(path: str, data, history=(), cards=()) -> None:
+    """Minimal float32 FITS writer (primary HDU only), stdlib + numpy, for diagnostic images and
+    the float twin of the 16-bit frames. cards: extra 80-character header cards."""
+    _write_fits(path, np.asarray(data, dtype=">f4"), -32, cards=cards, history=history)
+
+
+def write_fits_uint16(path: str, data, cards=(), history=()) -> None:
+    """Minimal unsigned 16-bit FITS writer (BITPIX 16, BZERO 32768, as Siril writes them)."""
+    u = np.asarray(data, dtype=np.uint16)
+    _write_fits(path, (u.astype(np.int32) - 32768).astype(">i2"), 16,
+                scaling=("BZERO   =                32768", "BSCALE  =                    1"),
+                cards=cards, history=history)
+
+
+# header cards a copied frame keeps: what normalization, weighting and the ledger read
+FRAME_KEYS = ("DATE-OBS", "EXPTIME", "EXPOSURE", "STACKCNT", "LIVETIME", "GAIN", "OFFSET", "XBINNING",
+              "YBINNING", "FOCALLEN", "XPIXSZ", "YPIXSZ", "FILTER", "CCD-TEMP", "INSTRUME", "TELESCOP",
+              "OBJECT")
+
+
+def frame_cards(header: str) -> list:
+    """The FRAME_KEYS cards of a FITS header given as text (as sirilpy returns it)."""
+    out = []
+    for line in (header or "").replace("\r", "").split("\n"):
+        card = line[:80]
+        if card[:8].strip() in FRAME_KEYS and card[8:10] == "= ":
+            out.append(card)
+    return out
+
+
+def read_seq_file(path: str):
+    """What lsf_compare uses of a sequence, read from its .seq file: siril-cli runs everything in
+    script mode, where load_seq is refused, so a headless run cannot ask Siril for the loaded
+    sequence. Returns an object like sirilpy's Sequence (seqname, number, nb_layers,
+    reference_image 0-based, imgparam[i].incl and .filenum), plus fixed (digits of the frame
+    numbers), fz and type ('regular', or the letter of the T line: S for SER, F for FITS sequence)."""
+    from types import SimpleNamespace
+    seq = SimpleNamespace(seqname=None, number=0, nb_layers=1, reference_image=0, imgparam=[], fixed=5, fz=False,
+                          type="regular")
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            if line.startswith("S "):
+                m = re.match(r"S '(.*)' (.*)", line.rstrip("\n"))
+                if not m:
+                    raise RuntimeError(f"{path}: unreadable S line")
+                f = m.group(2).split()
+                seq.seqname, seq.number, seq.fixed, seq.reference_image = m.group(1), int(f[1]), int(f[3]), int(f[4])
+                seq.fz = len(f) > 7 and f[7] == "1"
+            elif line.startswith("L "):
+                seq.nb_layers = abs(int(line.split()[1])) or 1
+            elif line.startswith("T"):
+                seq.type = line[1:].strip()[:1] or "regular"
+            elif line.startswith("I "):
+                f = line.split()
+                seq.imgparam.append(SimpleNamespace(filenum=int(f[1]), incl=f[2] != "0"))
+    if seq.seqname is None:
+        raise RuntimeError(f"{path} is not a Siril sequence file")
+    return seq      # reference_image -1: none set, Siril picks the best registered frame of the selection
+
+
+def seq_reg_lines(path: str, frames: list) -> list:
+    """The registration lines (R<layer> ...) of the frames (0-based) of a .seq file, layer by layer,
+    in the order of `frames`: appended to the .seq of a copy of those frames, they give it the same
+    registration data, so that Siril picks the same reference frame for every selection
+    (sequence_find_refimage: the best FWHM of the selected frames). Siril reads them one per image,
+    in order, per layer."""
+    per_layer = {}
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            if line.startswith("R") and len(line) > 2 and line[1] != "*":
+                per_layer.setdefault(line[1], []).append(line.rstrip("\n"))
+    out = []
+    for layer in sorted(per_layer):
+        rows = per_layer[layer]
+        out += [rows[i] for i in frames if i < len(rows)]
+    return out
+
+
+def header_cards_text(path: str) -> str:
+    """The primary header of a FITS file as text, one 80-character card per line."""
+    out = []
+    with open(path, "rb") as f:
+        while True:
+            block = f.read(2880)
+            if len(block) < 2880:
+                break
+            for i in range(0, 2880, 80):
+                card = block[i:i + 80].decode("ascii", "replace")
+                if card.startswith("END") and not card[3:].strip():
+                    return "\n".join(out)
+                out.append(card)
+    return "\n".join(out)
+
+
+def to_uint16(x) -> np.ndarray:
+    """A [0, 1] float frame as Siril's float_to_ushort_range makes it: in float32, x * 65535 + 0.5,
+    clipped to [0, 65535], truncated."""
+    f = np.asarray(x, dtype=np.float32) * np.float32(65535.0) + np.float32(0.5)
+    return np.clip(f, 0, 65535).astype(np.uint16)
 
 
 _TFORM_BYTES = {"L": 1, "X": 1, "B": 1, "I": 2, "J": 4, "K": 8, "A": 1, "E": 4, "D": 8, "C": 8, "M": 16,
@@ -485,7 +626,9 @@ def fits_memmap(path: str):
         return None
     dims = tuple(int(c[f"NAXIS{i}"]) for i in range(int(c["NAXIS"]), 0, -1))
     mm = np.memmap(path, dtype=_FITS_DTYPES[int(c["BITPIX"])], mode="r", offset=h["data_offset"], shape=dims)
-    return (mm[None] if mm.ndim == 2 else mm), float(c.get("BSCALE", 1)), float(c.get("BZERO", 0))
+    # integer images come out in [0, 1], like float ones: the scaling folds in Siril's range
+    k = INT_RANGE.get(int(c["BITPIX"]), 1.0)
+    return (mm[None] if mm.ndim == 2 else mm), float(c.get("BSCALE", 1)) / k, float(c.get("BZERO", 0)) / k
 
 
 def channel_f32(img, c: int) -> np.ndarray:
@@ -820,12 +963,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--overwrite", action="store_true", help="Replace existing products instead of refusing to run.")
     p.add_argument("--dry-run", action="store_true", help="Print the plan (sets, files, commands) and stop.")
     p.add_argument("--skip", nargs="+", choices=SKIPPABLE, default=[],
-                   help="Leave out stages: base (lsf_init per-set + running stacks), siril (native stack), "
+                   help="Leave out stages: base (lsf_init per-set + running stacks), twin (16-bit runs: "
+                        "lsf_init of the float twin, which must match lsf_cum_1234), siril (native stack), "
                         "sos (stack on stack), iter (lsf_append chain), check (v0.4 structure), "
                         "flip (repair/adopt test), parity (LSF vs Siril), ssim (SSIM of the full stacks), "
                         "stats (noise export).")
     p.add_argument("--export-fits", action="store_true",
                    help="Also write <name>.fit next to every LSF file with lsf_export.")
+    g = p.add_argument_group("bit depth (16-bit mode, core.force_16bit)")
+    g.add_argument("--depth", choices=["32", "16", "both"], default="32",
+                   help="32: today's run. 16: the selected frames are copied as 16-bit frames (and a float "
+                        "twin of the same values), Siril is put in 16-bit mode for the run, the LSF products "
+                        "are compared through their 16-bit exports with Siril's 16-bit stacks. both: the "
+                        "32-bit run on the sequence (prefix <prefix>_32), then the 16-bit one, with the same "
+                        "reference frame.")
+    g.add_argument("--parity16-tol-p99", type=float, default=PARITY16_TOL_P99,
+                   help=f"16-bit parity: 99th percentile of |LSF - Siril| in ADU above which a pair fails "
+                        f"(default {PARITY16_TOL_P99:g}).")
+    g.add_argument("--parity16-tol-pct", type=float, default=PARITY16_TOL_PCT,
+                   help=f"16-bit parity: percent of pixels differing by more than 1 ADU above which a pair fails "
+                        f"(default {PARITY16_TOL_PCT:g}).")
+    g.add_argument("--keep-frames", action="store_true",
+                   help="Keep the 16-bit copy of the frames and its float twin (<outdir>/<prefix>_frames16).")
     g = p.add_argument_group("stacking settings (shared by lsf_init and stack)")
     g.add_argument("--rejection", choices=list(REJECTION), default="winsorized")
     g.add_argument("--sigma-low", type=float, default=None, help="Default depends on the method (Siril's).")
@@ -873,6 +1032,18 @@ class Comparison:
         self._own_noise_ok = True
         self.selection_touched = False  # only restore the user's selection if we ever changed it
         self.t0 = time.perf_counter()
+        # 16-bit pass (--depth 16, or the second pass of --depth both)
+        self.depth16 = args.depth == "16"
+        self.seqdir = None              # folder of the sequence the stages use (Siril's cwd during them)
+        self.frames_dir = None          # the 16-bit copy and its float twin
+        self.twin_seq = None
+        self.pref16_orig = None         # core.force_16bit before the run, restored in cleanup
+        self.pref16_set = False
+        # siril-cli runs in script mode, where load_seq is refused: sequences are then only named
+        try:
+            self.headless = bool(siril.is_headless())
+        except Exception:  # noqa: BLE001
+            self.headless = False
 
     # ---- paths -------------------------------------------------------------
     def p(self, suffix: str) -> str:
@@ -892,7 +1063,9 @@ class Comparison:
             out.append(self.p("lsf_sos.lsf.fits"))
         if "iter" not in a.skip:
             out += [self.p(f"lsf_{k}.lsf.fits") for k in range(1, N_SETS + 1)]
-        if a.export_fits:
+        if self.depth16 and "twin" not in a.skip:
+            out.append(self.p("lsf_twin_cum_1234.lsf.fits"))
+        if a.export_fits or self.depth16:
             out += [plain_path(f) for f in out if f.endswith(".lsf.fits")]
         for st, name in (("check", "check.csv"), ("flip", "flip.csv"), ("parity", "parity.csv"),
                          ("ssim", "ssim.csv"), ("stats", "noise.csv")):
@@ -931,21 +1104,161 @@ class Comparison:
         return ["lsf_append", _q(path), _q(self.seqname), "-noreg"]
 
     def siril_stack_cmd(self, dest: str) -> list:
+        # a 16-bit run compares with Siril's 16-bit stack (D6): no -32b
         return (["stack", _q(self.seqname)] + self.rej_args() + self.common_opts()
-                + ["-32b", "-filter-included", _q(f"-out={dest}")])
+                + ([] if self.depth16 else ["-32b"]) + ["-filter-included", _q(f"-out={dest}")])
+
+    def lsf_label_path(self, path: str) -> str:
+        """What a 16-bit run measures and compares of an LSF product: its 16-bit export."""
+        if self.depth16 and path.endswith(".lsf.fits"):
+            exp = saved_path(plain_path(path))
+            if os.path.exists(exp):
+                return exp
+        return path
+
+    # ---- 16-bit pass ----------------------------------------------------------
+    def set_pref16(self, on: bool) -> None:
+        run_cmd(self.siril, "set16bits" if on else "set32bits")
+
+    def setup_depth16(self) -> None:
+        """Copies the selected frames into <outdir>/<prefix>_frames16 as 16-bit frames (Siril's own
+        float-to-16-bit conversion, so the copy is what a 16-bit calibration or registration would
+        have saved) and as their float twin (the same values / 65535). Siril's cwd moves there and
+        the stages work on the copy, all of whose frames are selected. The reference frame is the
+        one the sequence has, at its new place, so a --depth both run shares it with the 32-bit pass.
+        Siril is put in 16-bit mode; cleanup puts the preference back."""
+        siril = self.siril
+        try:
+            self.pref16_orig = bool(siril.get_siril_config("core", "force_16bit"))
+        except Exception as e:  # noqa: BLE001
+            self.pref16_orig = False
+            self.log(f"Could not read core.force_16bit ({e}); it will be set back to off (32-bit).", LogColor.SALMON)
+        self.log("16-bit run: set16bits / set32bits write Siril's configuration file. Run headless with a private "
+                 "configuration (siril-cli -i) to leave yours alone.", LogColor.SALMON)
+        self.ensure_seq()
+        seq = self.current_seq()
+        src_ref = int(getattr(seq, "reference_image", -1))
+        sel = list(self.original_selected)
+        new_ref = sel.index(src_ref) if src_ref in sel else None
+        self.frames_dir = os.path.join(self.outdir, f"{self.a.prefix}_frames16")
+        if os.path.isdir(self.frames_dir):
+            shutil.rmtree(self.frames_dir)
+        os.makedirs(self.frames_dir)
+        root, twin = f"{self.a.prefix}u16_", f"{self.a.prefix}f16_"
+        try:            # create_new_seq finds frames by the extension of the preferences
+            ext = siril.get_siril_config("core", "extension") or ".fit"
+        except Exception:  # noqa: BLE001
+            ext = ".fit"
+        t = time.perf_counter()
+        already16 = 0
+        # frames of a FITS sequence are read from their files, in file row order (as every image of
+        # this script); Siril gives the others, which only a GUI run can load
+        sfile = os.path.join(self.wd, f"{self.seqname}.seq")
+        fseq = read_seq_file(sfile) if os.path.exists(sfile) else None
+        from_files = fseq is not None and fseq.type == "regular"
+        if not from_files and self.headless:
+            raise RuntimeError("A headless 16-bit run needs a sequence of FITS files, not SER or a FITS sequence.")
+        for n, i in enumerate(sel, 1):
+            if from_files:
+                path = self.frame_path(fseq, i)
+                bitpix = int(read_fits_header(path).get("BITPIX", 0))
+                data = fits_image(path)
+                if data is None:
+                    raise RuntimeError(f"{os.path.basename(path)} is compressed: decompress the sequence first.")
+                header = header_cards_text(path)
+                data = data.astype(np.uint16) if bitpix == 16 else data.astype(np.float32) if bitpix < 0 else data
+            else:
+                fr = siril.get_seq_frame(i, with_pixels=True)
+                if fr is None or fr.data is None:
+                    raise RuntimeError(f"Could not read frame {i + 1} of {self.seqname}.")
+                data, header = np.asarray(fr.data), fr.header
+                del fr
+            if data.dtype == np.uint16:
+                u = data
+                already16 += 1
+            elif data.dtype.kind == "f":
+                u = to_uint16(data)
+            else:
+                raise RuntimeError(f"Frame {i + 1} has pixel type {data.dtype}: only 16-bit and float frames are copied.")
+            cards = frame_cards(header)
+            hist = (f"16-bit copy of frame {i + 1} of {self.seqname} (lsf_compare --depth 16)",)
+            write_fits_uint16(os.path.join(self.frames_dir, f"{root}{n:05d}{ext}"), u, cards, hist)
+            write_fits_float32(os.path.join(self.frames_dir, f"{twin}{n:05d}{ext}"),
+                               u.astype(np.float64) / 65535.0, hist + ("float twin: the 16-bit values / 65535",), cards)
+            del data, u
+        self.log(f"16-bit copy: {len(sel)} frames ({already16} already 16-bit) and their float twin written to "
+                 f"{self.frames_dir} in {time.perf_counter() - t:.1f} s")
+        run_cmd(siril, "cd", _q(self.frames_dir))
+        self.seqdir = self.frames_dir
+        # the registration lines of the selected frames: with them Siril picks the same reference
+        # frame in the copy as in the sequence, for every selection, when none is set
+        reg = seq_reg_lines(sfile, sel) if os.path.exists(sfile) else []
+        for r in (twin, root):          # the main copy last: it stays loaded
+            if not siril.create_new_seq(r):
+                raise RuntimeError(f"Siril could not create the sequence {r}.")
+            name = next((c for c in (r, r.rstrip("_")) if os.path.exists(os.path.join(self.frames_dir, c + ".seq"))), r)
+            if reg:     # a new .seq says L -1 (layers not known yet), which refuses any R line
+                spath = os.path.join(self.frames_dir, f"{name}.seq")
+                with open(spath, encoding="utf-8") as fh:
+                    lines = [ln.rstrip("\n") for ln in fh]
+                lines = [f"L {fseq.nb_layers}" if ln.startswith("L ") else ln for ln in lines]
+                with open(spath, "w", encoding="utf-8", newline="\n") as fh:
+                    fh.write("\n".join(lines + reg) + "\n")
+            self.load_seq(name)
+            if new_ref is not None:
+                run_cmd(siril, "setref", _q(name), new_ref + 1)
+            if r == twin:
+                self.twin_seq = name
+            else:
+                self.seqname = name
+        if src_ref >= 0 and new_ref is None:
+            self.log(f"The reference frame of the sequence ({src_ref + 1}) is not selected: the copy keeps Siril's "
+                     f"default reference.", LogColor.SALMON)
+        elif src_ref < 0:
+            self.log(f"No reference frame is set in {self.seqname}: the copy has its registration data "
+                     f"({len(reg)} lines), so Siril picks the same frame in both." if reg else
+                     "No reference frame is set and the sequence has no registration data: Siril's default applies.")
+        self.nframes = len(sel)
+        self.original_selected = list(range(len(sel)))
+        self.sets = split_sets(self.original_selected, N_SETS, self.a.split)
+        self.selection_touched = False      # the user's sequence is not touched by this pass
+        self.set_pref16(True)
+        self.pref16_set = True
+        self.a.export_fits = True           # the 16-bit exports are what this pass compares
 
     # ---- sequence / selection ----------------------------------------------
     def current_seq(self):
+        if self.headless:       # no sequence can be loaded: read its .seq file
+            if not self.seqname:
+                return None
+            path = os.path.join(self.seqdir or self.wd or self.siril.get_siril_wd(), f"{self.seqname}.seq")
+            return read_seq_file(path) if os.path.exists(path) else None
         try:
             return self.siril.get_seq()
         except Exception:  # noqa: BLE001
             return None
 
+    def load_seq(self, name: str) -> None:
+        """load_seq, which siril-cli refuses (script mode): headless, every command takes the
+        sequence by name instead."""
+        if not self.headless:
+            run_cmd(self.siril, "load_seq", _q(name))
+
     def ensure_seq(self) -> None:
         """Make sure our sequence is the loaded one (loading single images closes it)."""
+        if self.headless:
+            return
         seq = self.current_seq()
         if seq is None or seq.seqname != self.seqname:
             run_cmd(self.siril, "load_seq", _q(self.seqname))
+
+    def frame_path(self, seq, i: int) -> str:
+        """The file of frame i (0-based) of a regular FITS sequence read with read_seq_file."""
+        if seq.type != "regular":
+            raise RuntimeError("A headless 16-bit run needs a sequence of FITS files, not SER or a FITS sequence.")
+        ext = self.siril.get_siril_config("core", "extension") or ".fit"
+        name = f"{seq.seqname}{seq.imgparam[i].filenum:0{seq.fixed}d}{ext}" + (".fz" if seq.fz else "")
+        return os.path.join(self.seqdir or self.wd, name)
 
     def apply_selection(self, wanted: list) -> None:
         """Make exactly the frames `wanted` (0-based) the selected ones, using Siril's own
@@ -1032,6 +1345,43 @@ class Comparison:
             self.timed(self.lsf_init_cmd(dest), f"lsf_cum_{cum_tag(k)}", f"{len(frames)} frames stacked")
             self.register(f"lsf_cum_{cum_tag(k)}", "lsf_base", dest, len(frames))
 
+    def stage_twin(self, step) -> None:
+        """16-bit runs: lsf_init of the float twin (the 16-bit values as float) with all the frames,
+        against lsf_cum_1234 from the 16-bit frames. LSF converts 16-bit samples and statistics to
+        [0, 1], so both Stacks must match, apart from Siril's statistics of 16-bit and float images
+        of the same values (about 1e-7) flipping a rejection at a few pixels. Writes <p>_twin.csv."""
+        if not self.depth16 or not self.twin_seq:
+            return
+        step("lsf_init of the float twin")
+        dest = self.p("lsf_twin_cum_1234.lsf.fits")
+        self.prime_stats_cache(self.twin_seq)
+        self.timed(self.lsf_init_cmd(dest, self.twin_seq), "lsf_twin_cum_1234", f"{self.nframes} float frames stacked")
+        self.register("lsf_twin_cum_1234", "lsf_twin", dest, self.nframes)
+        ref = self.p("lsf_cum_1234.lsf.fits")
+        if not os.path.exists(ref):
+            self.log("twin: lsf_cum_1234 is missing (base skipped?), not compared.", LogColor.SALMON)
+            return
+        x, y = fits_image(dest), fits_image(ref)
+        rows, bad = [], False
+        for c in range(x.shape[0]):
+            d = np.abs(x[c] - y[c]) * 65535.0
+            nz = d[d > 0]
+            big = int((d > 0.5).sum())
+            rows.append(["twin_vs_16bit", c, repr(float(d.max())), repr(float(np.median(nz)) if nz.size else 0.0),
+                         int(nz.size), big])
+            # a units error moves every pixel by far more than a few rejection flips
+            bad |= nz.size > 0 and float(np.median(nz)) > 0.5
+            self.log(f"  twin c{c}: {nz.size} pixels differ, median {float(np.median(nz)) if nz.size else 0:.2g} ADU, "
+                     f"{big} by more than 0.5 ADU (max {float(d.max()):.3g})",
+                     LogColor.RED if bad else LogColor.GREEN)
+        with open(self.p("twin.csv"), "w", newline="", encoding="utf-8") as fh:
+            w = csv.writer(fh)
+            w.writerow(["pair", "channel", "max_abs_adu", "median_nonzero_adu", "n_diff", "n_above_0_5_adu"])
+            w.writerows(rows)
+        if bad:
+            raise RuntimeError("twin: the Stack from the 16-bit frames differs from the one from their float twin by "
+                               "more than rounding: the 16-bit units are wrong")
+
     def stage_siril(self, step) -> None:
         """Native Siril stack of each set and of each running set, same settings."""
         S = self.sets
@@ -1100,14 +1450,14 @@ class Comparison:
             if not self.siril.create_new_seq(root):
                 raise RuntimeError("Siril could not create the stack-on-stack sequence.")
             name = next((c for c in (root, root + "_") if os.path.exists(os.path.join(sos_dir, c + ".seq"))), root)
-            run_cmd(self.siril, "load_seq", _q(name))
+            self.load_seq(name)
             dest = self.p("lsf_sos.lsf.fits")
             self.timed(self.lsf_init_cmd(dest, name, a.sos_rejection, a.sos_sigma_low, a.sos_sigma_high),
                        "lsf_sos", f"4 per-set stacks stacked (rejection {a.sos_rejection or a.rejection})")
         finally:
             if cd_done:
                 try:
-                    run_cmd(self.siril, "cd", _q(self.wd))
+                    run_cmd(self.siril, "cd", _q(self.seqdir or self.wd))
                 except Exception as e:  # noqa: BLE001
                     self.log(f"Could not restore Siril's working directory: {e}", LogColor.SALMON)
         self.register("lsf_sos", "lsf_base", dest, N_SETS)
@@ -1169,6 +1519,11 @@ class Comparison:
     BREAKDOWN_FIELDS = ("n_diff", "max_abs_both_data", "n_one_zero", "n_diff_full", "max_abs_full",
                         "n_diff_partial", "max_abs_partial", "noise_lsf_adu", "noise_siril_adu", "noise_ratio",
                         "rows_noise_differ")
+    # 16-bit tail metrics are taken on full-coverage pixels (LSF_COUNT == STACKCNT): at partial
+    # coverage LSF drops frame-edge samples by design (Section 10.5), so the 32-bit pass differs there
+    # too; the all-pixel values are kept as *_all_* columns
+    PARITY16_FIELDS = ("parity16_pixels", "rms_adu", "rms_below_0_75_adu", "p99_adu", "p99_9_adu", "pct_above_1_adu",
+                       "n_above_1_adu", "n_above_1_adu_on_stars", "p99_all_adu", "pct_above_1_all_adu")
 
     def stage_parity(self, step) -> None:
         """LSF vs native Siril stacks, per channel. Same frames, same reference and settings, so the
@@ -1180,30 +1535,64 @@ class Comparison:
         pairs += [(f"cum_{cum_tag(k)}", f"lsf_cum_{cum_tag(k)}.lsf.fits", f"siril_cum_{cum_tag(k)}.fit")
                   for k in range(1, N_SETS + 1)]
         exc = self.known_exceptions()
+        if self.depth16:
+            # D6: LSF does not reproduce Siril's 16-bit path (normalized samples rounded to WORDs,
+            # rejection on WORDs), so a difference is expected and measured against a tolerance
+            exc = exc + [f"16-bit run: LSF's 16-bit export against Siril's 16-bit stack, differences are reported "
+                         f"and fail above a 99th percentile of {self.a.parity16_tol_p99:g} ADU or "
+                         f"{self.a.parity16_tol_pct:g}% of pixels differing by more than 1 ADU, "
+                         f"both on full-coverage pixels"]
+            pairs = [(t, os.path.basename(plain_path(self.p(ln)))[len(self.a.prefix) + 1:], sn) for t, ln, sn in pairs]
         if exc:
             self.log("Parity: known exceptions apply, differences are expected: " + "; ".join(exc), LogColor.SALMON)
         csv_path = self.p("parity.csv")
-        mismatched = []
+        mismatched, over_tol = [], []
         with open(csv_path, "w", newline="", encoding="utf-8") as fh:
             w = csv.writer(fh)
             w.writerow(["pair", "lsf_file", "siril_file", "channel", "max_abs_diff", "max_rel_diff"]
-                       + list(self.BREAKDOWN_FIELDS) + ["known_exception"])
+                       + list(self.BREAKDOWN_FIELDS) + list(self.PARITY16_FIELDS) + ["known_exception"])
             for tag, lname, sname in pairs:
-                lp, sp = self.p(lname), self.p(sname)
+                lp, sp = saved_path(self.p(lname)), saved_path(self.p(sname))
+                count_src = self.p(lname.replace(".fit", ".lsf.fits")) if self.depth16 else lp
                 if not (os.path.exists(lp) and os.path.exists(sp)):
                     self.log(f"  parity {tag}: missing {lname if not os.path.exists(lp) else sname}, skipped",
                              LogColor.SALMON)
                     continue
                 step(f"Parity {tag}")
                 try:
-                    x, y = fits_image(lp), fits_image(sp)
+                    x, y = fits_image(lp, unit=True), fits_image(sp, unit=True)
                     if x is None or y is None:      # tile-compressed: Siril reads both the same way
                         x, y = self.load_pixels(lp), self.load_pixels(sp)
                         count = None
                     else:
-                        count = fits_image(lp, "LSF_COUNT")
+                        count = fits_image(count_src, "LSF_COUNT")
                     diffs = channel_diffs(x, y)
-                    brk = parity_breakdown(x, y, count, header_int(lp, "STACKCNT"))
+                    brk = parity_breakdown(x, y, count, header_int(count_src, "STACKCNT"))
+                    extra = []
+                    stackcnt = header_int(count_src, "STACKCNT")
+                    for c in range(x.shape[0]):     # in ADU: spread, tail, and how much lies on stars
+                        d = (x[c] - y[c]) * 65535.0
+                        ad_all = np.abs(d)
+                        sel, where = None, "all"
+                        if count is not None and stackcnt:
+                            sel = (count[c] if count.shape[0] > c else count[0]) == stackcnt
+                            where = "full coverage"
+                        if sel is None or not sel.any():
+                            sel, where = np.ones(d.shape, dtype=bool), "all"
+                        dd, ad, yy = d[sel], ad_all[sel], y[c][sel]
+                        sky = np.median(y[c][y[c] > 0]) if (y[c] > 0).any() else 0.0
+                        sig = 1.4826 * np.median(np.abs(y[c][y[c] > 0] - sky)) if (y[c] > 0).any() else 0.0
+                        stars = yy > sky + 10 * sig
+                        big = ad > 1.0
+                        low = yy < 0.75         # away from saturated cores, where Siril's 16-bit
+                        #                         normalization clips each sample at 65535
+                        extra.append({"parity16_pixels": where,
+                                      "rms_adu": float(dd.std()), "rms_below_0_75_adu": float(dd[low].std()) if low.any() else 0.0,
+                                      "p99_adu": float(np.percentile(ad, 99)), "p99_9_adu": float(np.percentile(ad, 99.9)),
+                                      "pct_above_1_adu": float(big.mean() * 100), "n_above_1_adu": int(big.sum()),
+                                      "n_above_1_adu_on_stars": int((big & stars).sum()),
+                                      "p99_all_adu": float(np.percentile(ad_all, 99)),
+                                      "pct_above_1_all_adu": float((ad_all > 1.0).mean() * 100)})
                     dpath = self.p(f"diff_{tag}.fit")
                     if any(b["n_diff"] for b in brk):
                         write_fits_float32(dpath, x - y, (f"LSF - Siril: {lname} - {sname}",))
@@ -1212,13 +1601,26 @@ class Comparison:
                     del x, y, count
                 except Exception as e:  # noqa: BLE001
                     self.log(f"  parity {tag}: failed ({e})", LogColor.SALMON)
-                    w.writerow([tag, lname, sname, "", "", ""] + [""] * len(self.BREAKDOWN_FIELDS) + ["; ".join(exc)])
+                    w.writerow([tag, lname, sname, "", "", ""] + [""] * len(self.BREAKDOWN_FIELDS)
+                               + [""] * len(self.PARITY16_FIELDS) + ["; ".join(exc)])
                     continue
-                for c, ((ab, rel), b) in enumerate(zip(diffs, brk)):
+                for c, ((ab, rel), b, e) in enumerate(zip(diffs, brk, extra)):
                     b["noise_lsf_adu"], b["noise_siril_adu"] = b["noise_lsf"] * 65535, b["noise_siril"] * 65535
                     w.writerow([tag, lname, sname, c, repr(ab), repr(rel)]
                                + ["" if b.get(k) is None else repr(b[k]) for k in self.BREAKDOWN_FIELDS]
+                               + [e[k] if isinstance(e[k], str) else repr(e[k]) for k in self.PARITY16_FIELDS]
                                + ["; ".join(exc)])
+                    if self.depth16:
+                        bad = e["p99_adu"] > self.a.parity16_tol_p99 or e["pct_above_1_adu"] > self.a.parity16_tol_pct
+                        self.log(f"  parity16 {tag:<9s} c{c} ({e['parity16_pixels']}): 99th percentile "
+                                 f"{e['p99_adu']:.3g} ADU, {e['pct_above_1_adu']:.3f}% of pixels differ by more than "
+                                 f"1 ADU ({e['n_above_1_adu_on_stars']} on stars); rms {e['rms_adu']:.3f} ADU, "
+                                 f"{e['rms_below_0_75_adu']:.3f} below 0.75; all pixels: 99th percentile "
+                                 f"{e['p99_all_adu']:.3g} ADU, {e['pct_above_1_all_adu']:.3f}% above 1 ADU",
+                                 LogColor.RED if bad else LogColor.GREEN)
+                        if bad:
+                            over_tol.append(f"{tag} c{c} (99th percentile {e['p99_adu']:.3g} ADU, "
+                                            f"{e['pct_above_1_adu']:.3g}% above 1 ADU)")
                     self.log(f"  parity {tag:<9s} c{c}: max abs {ab:.3g} ({b['n_diff']} pixels differ"
                              + (f": {b['n_diff_full']} full / {b['n_diff_partial']} partial coverage"
                                 if "n_diff_full" in b else "")
@@ -1234,6 +1636,11 @@ class Comparison:
                 fh.flush()
                 gc.collect()
         self.log(f"Parity table written to {csv_path}", LogColor.GREEN)
+        if self.depth16:
+            if over_tol:
+                raise RuntimeError(f"16-bit parity above the tolerance (99th percentile {self.a.parity16_tol_p99:g} ADU, "
+                                   f"{self.a.parity16_tol_pct:g}% of pixels above 1 ADU): " + ", ".join(over_tol))
+            return
         if mismatched:
             self.log("Full stacks that differ from Siril's: " + ", ".join(mismatched)
                      + (" (known exceptions apply)" if exc else " -- unexpected, see the diff_*.fit images"),
@@ -1246,8 +1653,10 @@ class Comparison:
     def siril_image(self, path: str) -> tuple:
         """A tile-compressed file, read through Siril, in fits_memmap's form."""
         run_cmd(self.siril, "load", _q(path))
-        a = np.asarray(self.siril.get_image_pixeldata(), dtype=np.float32)
-        return (a[None] if a.ndim == 2 else a), 1.0, 0.0
+        raw = np.asarray(self.siril.get_image_pixeldata())
+        a = raw.astype(np.float32)
+        k = 65535.0 if raw.dtype == np.uint16 else 1.0      # [0, 1], as fits_memmap gives
+        return (a[None] if a.ndim == 2 else a), 1.0 / k, 0.0
 
     def stage_ssim(self, step) -> None:
         """SSIM and MS-SSIM, per channel, between every pair of the four full stacks (SSIM_FILES). The
@@ -1255,7 +1664,7 @@ class Comparison:
         is scored the same way. Files are read one channel at a time; when one is tile-compressed,
         all are read through Siril so that they share one orientation."""
         a = self.a
-        files = [(lbl, saved_path(self.p(name))) for lbl, name in self.SSIM_FILES]
+        files = [(lbl, self.lsf_label_path(saved_path(self.p(name)))) for lbl, name in self.SSIM_FILES]
         for lbl, path in files:
             if not os.path.exists(path):
                 self.log(f"  ssim: {os.path.basename(path)} missing, left out", LogColor.SALMON)
@@ -1400,7 +1809,10 @@ class Comparison:
             band_h = max(2, min(64, h))
             ys = sorted({int(y) for y in np.linspace(0, max(h - band_h, 0), 8)})
             bands = [np.asarray(self.siril.get_image_pixeldata(shape=[0, y, w, band_h])) for y in ys]
-            return own_noise_from_bands(bands, channels)
+            out = own_noise_from_bands(bands, channels)
+            if bands and bands[0].dtype == np.uint16:      # in [0, 1], as for float images
+                out = [None if v is None else v / 65535.0 for v in out]
+            return out
         except Exception as e:  # noqa: BLE001
             self._own_noise_ok = False
             self.log(f"Independent noise estimate unavailable ({e}); continuing with Siril's statistics only.",
@@ -1426,6 +1838,11 @@ class Comparison:
         known = [v for v in noise_est if v is not None]
         noise_mean = sum(known) / len(known) if len(known) == channels else None
         own = self.measure_own_noise(channels, shape) if (a.own_noise and shape) else [None] * channels
+        try:        # Siril's statistics of a 16-bit image are in ADU, the own estimate in [0, 1]
+            med_unit = 1.0 if int(getattr(self.siril.get_image(with_pixels=False), "bitpix", -32)) in (-32, -64) \
+                else 65535.0
+        except Exception:  # noqa: BLE001
+            med_unit = 1.0
         summary = []
         for c in range(channels):
             st = None
@@ -1441,7 +1858,7 @@ class Comparison:
                             + ["" if noise_est[c] is None else repr(noise_est[c]),
                                "" if noise_mean is None else repr(noise_mean)]
                             + ["" if on is None else repr(on),
-                               "" if (on is None or not med) else repr(on / float(med))])
+                               "" if (on is None or not med) else repr(on / (float(med) / med_unit))])
             summary.append((noise_est[c], on))
         fh.flush()
         return summary
@@ -1478,7 +1895,7 @@ class Comparison:
         except Exception as e:  # noqa: BLE001
             self.log(f"  analyse_image_from_file failed ({e}); using the Python noise estimate.", LogColor.SALMON)
         if any(v is None for v in out):
-            x = fits_image(path)
+            x = fits_image(path, unit=True)
             for c in range(channels):
                 if out[c] is None and x is not None and c < x.shape[0]:
                     out[c] = noise_estimation(x[c])[0] * 65535.0
@@ -1495,6 +1912,8 @@ class Comparison:
                 files.append((label, kind, path, None))
         order = {name: i for i, (_, _, name) in enumerate(self.known_outputs())}
         files.sort(key=lambda pr: order.get(os.path.basename(pr[2])[len(self.a.prefix) + 1:], 99))
+        # a 16-bit run measures the 16-bit exports of the LSF products, Siril's stacks being 16-bit
+        files = [(lb, kd, self.lsf_label_path(pt), ex) for lb, kd, pt, ex in files]
         with open(csv_path, "w", newline="", encoding="utf-8") as fh:
             writer = csv.writer(fh)
             writer.writerow(["label", "kind", "file", "frames_expected", "stackcnt_header", "channel"]
@@ -1522,6 +1941,7 @@ class Comparison:
         out = [(f"lsf_cum_{t}", "lsf_base", f"lsf_cum_{t}.lsf.fits") for t in tags]
         out += [(f"lsf_set_{k}", "lsf_base", f"lsf_set_{k}.lsf.fits") for k in range(1, N_SETS + 1)]
         out.append(("lsf_sos", "lsf_base", "lsf_sos.lsf.fits"))
+        out.append(("lsf_twin_cum_1234", "lsf_twin", "lsf_twin_cum_1234.lsf.fits"))
         out += [(f"lsf_{k}", "lsf_iter", f"lsf_{k}.lsf.fits") for k in range(1, N_SETS + 1)]
         out += [(f"siril_cum_{t}", "siril", f"siril_cum_{t}.fit") for t in tags]
         out += [(f"siril_set_{k}", "siril", f"siril_set_{k}.fit") for k in range(1, N_SETS + 1)]
@@ -1530,21 +1950,26 @@ class Comparison:
     # ---- driver -------------------------------------------------------------------
     def prepare(self) -> None:
         a, siril = self.a, self.siril
-        if a.seq:
+        self.wd = siril.get_siril_wd()
+        if self.headless:       # siril-cli: the sequence is named, never loaded
+            if not a.seq:
+                raise RuntimeError("A headless run (siril-cli) needs --seq.")
+            self.seqname = a.seq[:-4] if a.seq.endswith(".seq") else a.seq
+        elif a.seq:
             run_cmd(siril, "load_seq", _q(a.seq))
         seq = self.current_seq()
         if seq is None:
-            raise RuntimeError("No sequence is loaded in Siril (pass --seq or load one first).")
+            raise RuntimeError("No sequence is loaded in Siril (pass --seq or load one first)."
+                               if not self.headless else f"{self.seqname}.seq was not found in {self.wd}.")
         self.seqname, self.nframes = seq.seqname, int(seq.number)
         if a.rgb_equal and int(getattr(seq, "nb_layers", 1)) != 3:
             a.rgb_equal = False
             self.log("Sequence is not 3-channel: RGB equalization turned off.")
         self.original_selected = [i for i in range(self.nframes) if seq.imgparam[i].incl]
         self.sets = split_sets(self.original_selected, N_SETS, a.split)
-        self.wd = siril.get_siril_wd()
         self.outdir = os.path.abspath(a.outdir or os.path.join(self.wd, "lsf_compare"))
 
-    def prime_stats_cache(self) -> None:
+    def prime_stats_cache(self, seqname=None) -> None:
         """Make every stack of this run normalize with the same frame statistics. Siril keeps the
         statistics it computes in the .seq file, with 6 significant digits: the first command that
         needs them on a fresh sequence uses the full-precision values, later ones read the rounded
@@ -1553,10 +1978,14 @@ class Comparison:
         scale, IKSS and lite) of the selected frames, and reloading the sequence puts the cached
         values in memory for `stack` too; lsf_init reads them from the .seq file."""
         t = time.perf_counter()
-        self.ensure_seq()
-        run_cmd(self.siril, "seqstat", _q(self.seqname), _q(os.path.join(self.workdir, "seqstat.csv")), "full")
-        run_cmd(self.siril, "load_seq", _q(self.seqname))
-        self.log(f"Frame statistics cached in {self.seqname}.seq ({time.perf_counter() - t:.1f} s), so that "
+        name = seqname or self.seqname
+        if seqname is None:
+            self.ensure_seq()
+        else:
+            self.load_seq(name)
+        run_cmd(self.siril, "seqstat", _q(name), _q(os.path.join(self.workdir, "seqstat.csv")), "full")
+        self.load_seq(name)
+        self.log(f"Frame statistics cached in {name}.seq ({time.perf_counter() - t:.1f} s), so that "
                  f"LSF and Siril stacks use the same values.")
 
     def describe_plan(self) -> None:
@@ -1597,15 +2026,19 @@ class Comparison:
                 return
             os.makedirs(self.outdir, exist_ok=True)
             self.workdir = tempfile.mkdtemp(prefix=".lsfcmp_", dir=self.outdir)
+            self.seqdir = self.wd
+            if self.depth16:
+                self.setup_depth16()
             if "base" not in a.skip or "siril" not in a.skip:
                 self.prime_stats_cache()
 
-            weights = {"base": 7, "siril": 7, "sos": 1, "iter": 4, "check": 1, "flip": 1, "parity": 8, "ssim": 7,
-                       "stats": 21}
-            stages = {"base": self.stage_base, "siril": self.stage_siril, "sos": self.stage_sos,
-                      "iter": self.stage_iter, "check": self.stage_check, "parity": self.stage_parity,
-                      "ssim": self.stage_ssim, "stats": self.stage_stats, "flip": self.stage_flip}
-            todo = [st for st in STAGES if st not in a.skip]
+            weights = {"base": 7, "twin": 1, "siril": 7, "sos": 1, "iter": 4, "check": 1, "flip": 1, "parity": 8,
+                       "ssim": 7, "stats": 21}
+            stages = {"base": self.stage_base, "twin": self.stage_twin, "siril": self.stage_siril,
+                      "sos": self.stage_sos, "iter": self.stage_iter, "check": self.stage_check,
+                      "parity": self.stage_parity, "ssim": self.stage_ssim, "stats": self.stage_stats,
+                      "flip": self.stage_flip}
+            todo = [st for st in STAGES if st not in a.skip and (st != "twin" or self.depth16)]
             total_steps = sum(weights[st] for st in todo)
             done = [0]
 
@@ -1627,7 +2060,21 @@ class Comparison:
         try:
             if self.workdir:
                 shutil.rmtree(self.workdir, ignore_errors=True)
-            if self.selection_touched and self.seqname and self.original_selected:
+            if self.pref16_set:
+                try:
+                    self.set_pref16(bool(self.pref16_orig))
+                except Exception as e:  # noqa: BLE001
+                    self.log(f"Could not put core.force_16bit back to {self.pref16_orig}: {e}", LogColor.SALMON)
+            if self.frames_dir:
+                try:        # Windows cannot delete the frames of a loaded sequence
+                    run_cmd(self.siril, "close")
+                    run_cmd(self.siril, "cd", _q(self.wd))
+                except Exception as e:  # noqa: BLE001
+                    self.log(f"Could not restore Siril's working directory: {e}", LogColor.SALMON)
+                if not self.a.keep_frames:
+                    shutil.rmtree(self.frames_dir, ignore_errors=True)
+            if self.selection_touched and self.seqname and self.original_selected and not self.frames_dir:
+                # (a 16-bit pass works on its own frame copy, removed above: nothing to restore)
                 try:
                     self.apply_selection(self.original_selected)      # reloads the sequence if needed
                 except Exception as e:  # noqa: BLE001
@@ -1666,18 +2113,31 @@ def main():
     try:
         argv = sys.argv[1:]
         args = build_arg_parser().parse_args(argv)
-        job = Comparison(siril, args)
-        if not argv and not siril.is_cli() and not confirm_gui(job):
+        # --depth both: the 32-bit pass on the sequence (prefix <prefix>_32), then the 16-bit pass on
+        # its copy, which keeps the sequence's reference frame
+        passes = [args]
+        if args.depth == "both":
+            a32, a16 = copy.copy(args), copy.copy(args)
+            a32.depth, a32.prefix = "32", f"{args.prefix}_32"
+            a16.depth = "16"
+            passes = [a32, a16]
+        jobs = [Comparison(siril, p) for p in passes]
+        if not argv and not siril.is_cli() and not confirm_gui(jobs[0]):
             siril.log("LSF compare cancelled by user.")
             return
-        job.run()
+        for job in jobs:
+            if len(jobs) > 1:
+                siril.log(f"LSF compare: {'16' if job.depth16 else '32'}-bit pass, prefix {job.a.prefix}",
+                          LogColor.GREEN)
+            job.run()
     except Exception as e:  # noqa: BLE001
         siril.log(f"LSF compare failed: {e}", LogColor.RED)
         traceback.print_exc()
-        try:
-            siril.error_messagebox(f"LSF compare failed:\n{e}")
-        except Exception:  # noqa: BLE001
-            pass
+        if not siril.is_cli():     # siril-cli logs the payload as a printf format: '%' gets mangled
+            try:
+                siril.error_messagebox(f"LSF compare failed:\n{e}")
+            except Exception:  # noqa: BLE001
+                pass
         sys.exit(1)
     finally:
         siril.disconnect()
