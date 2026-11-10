@@ -167,9 +167,9 @@ static gboolean candidate_is_duplicate(int xx, int yy, int boxradius, starc *can
  * profiles (PSF).
  */
 
-static int minimize_candidates(fits *image, star_finder_params *sf, starc *candidates, int nb_candidates, int layer, double bg, double dynrange, psf_star ***retval, gboolean limit_nbstars, int maxstars, starprofile profile, int threads);
+static int minimize_candidates(fits *image, const star_finder_params *sf, starc *candidates, int nb_candidates, int layer, double bg, double dynrange, psf_star ***retval, gboolean limit_nbstars, int maxstars, starprofile profile, int threads);
 
-psf_star **peaker(image *image, int layer, star_finder_params *sf, int *nb_stars, rectangle *area, gboolean showtime, gboolean limit_nbstars, int maxstars, starprofile profile, int threads) {
+psf_star **peaker(image *image, int layer, const star_finder_params *sf, int *nb_stars, rectangle *area, gboolean showtime, gboolean limit_nbstars, int maxstars, starprofile profile, int threads) {
 	int nx = image->fit->rx;
 	int ny = image->fit->ry;
 	int areaX0 = 0;
@@ -511,7 +511,7 @@ psf_star **peaker(image *image, int layer, star_finder_params *sf, int *nb_stars
 				float dA = max(Ar,Ac)/min(Ar,Ac);
 				float dSr = max(-srl,srr)/min(-srl,srr);
 				float dSc = max(-scu,scd)/min(-scu,scd);
-				if (!com.pref.starfinder_conf.relax_checks)
+				if (!sf->relax_checks)
 					if (dA > 2. || dSr > 2. || dSc > 2. || max(Ar,Ac) < locthreshold)
 						bingo = FALSE;
 
@@ -565,13 +565,13 @@ psf_star **peaker(image *image, int layer, star_finder_params *sf, int *nb_stars
 }
 
 /* returns number of stars found, result is in parameters */
-static int minimize_candidates(fits *image, star_finder_params *sf, starc *candidates, int nb_candidates, int layer, double bg, double dynrange, psf_star ***retval, gboolean limit_nbstars, int maxstars, starprofile profile, int threads) {
+static int minimize_candidates(fits *image, const star_finder_params *sf, starc *candidates, int nb_candidates, int layer, double bg, double dynrange, psf_star ***retval, gboolean limit_nbstars, int maxstars, starprofile profile, int threads) {
 	int nx = image->rx;
 	int ny = image->ry;
 	WORD **image_ushort = NULL;
 	float **image_float = NULL;
 	gint nbstars = 0;
-	sf_errors accepted_level = (com.pref.starfinder_conf.relax_checks) ? SF_RMSE_TOO_LARGE : SF_OK;
+	sf_errors accepted_level = (sf->relax_checks) ? SF_RMSE_TOO_LARGE : SF_OK;
 	int psf_failure = 0;
 	double minA = 0.0, maxA = 0.0;
 	if (sf->min_A > 0.0 || sf->max_A > 0.0) {
@@ -649,7 +649,7 @@ static int minimize_candidates(fits *image, star_finder_params *sf, starc *candi
 				}
 			}
 			psf_error error;
-			psf_star *cur_star = psf_global_minimisation(z, bg, candidates[candidate].sat, com.pref.starfinder_conf.convergence, TRUE, FALSE, NULL, FALSE, profile, &error);
+			psf_star *cur_star = psf_global_minimisation(z, bg, candidates[candidate].sat, sf->convergence, TRUE, FALSE, NULL, FALSE, profile, &error);
 			gsl_matrix_free(z);
 			if (cur_star) {
 				gchar errmsg[SF_ERRMSG_LEN] = "";
@@ -889,7 +889,7 @@ static gboolean check_star_list(gchar *filename, struct starfinder_data *sfargs)
 	siril_log_debug("star list file %s found, checking...\n", filename);
 	char buffer[300];
 	gboolean params_ok = FALSE, read_failure = FALSE, discard_file = FALSE;;
-	const star_finder_params *sf = &com.pref.starfinder_conf;
+	const star_finder_params *sf = sfargs->params ? sfargs->params : &com.pref.starfinder_conf;
 	int star = 0, nb_stars = -1;
 	while (fgets(buffer, 300, fd)) {
 		if (buffer[0] != '#' && !params_ok) {
@@ -1443,6 +1443,7 @@ gboolean end_findstar(gpointer p);	// in the GUI file
 // for a single image
 gpointer findstar_worker(gpointer p) {
 	struct starfinder_data *args = (struct starfinder_data *)p;
+	const star_finder_params *sf = args->params ? args->params : &com.pref.starfinder_conf;
 	int retval = 0;
 	int nbstars = 0;
 	gboolean limit_stars = (args->max_stars_fitted > 0);
@@ -1458,8 +1459,8 @@ gpointer findstar_worker(gpointer p) {
 		args->im.fit = green_fit;
 		siril_log_warning(_("Undebayered CFA image. Detection is done on green pixels only, using interpolation\n"));
 	}
-	psf_star **stars = peaker(&args->im, args->layer, &com.pref.starfinder_conf, &nbstars,
-			&args->selection, args->update_GUI, limit_stars, args->max_stars_fitted, com.pref.starfinder_conf.profile, threads);
+	psf_star **stars = peaker(&args->im, args->layer, sf, &nbstars,
+			&args->selection, args->update_GUI, limit_stars, args->max_stars_fitted, sf->profile, threads);
 	if (green_fit) {
 		args->im.fit = orig;
 		clearfits(green_fit);
@@ -1515,11 +1516,11 @@ gpointer findstar_worker(gpointer p) {
 		gui_iface.update_star_list(stars, TRUE, com.python_script);
 
 	siril_log_message(_("Found %d %s profile stars in %s, channel #%d (FWHM %f)\n"), nbstars,
-			com.pref.starfinder_conf.profile == PSF_GAUSSIAN ? _("Gaussian") : _("Moffat"),
+			sf->profile == PSF_GAUSSIAN ? _("Gaussian") : _("Moffat"),
 			has_selection ? _("selection") : _("image"), args->layer, fwhm);
 	if (args->starfile &&
 			save_list(args->starfile, args->max_stars_fitted, stars, nbstars,
-				&com.pref.starfinder_conf, args->layer, args->update_GUI)) {
+				sf, args->layer, args->update_GUI)) {
 		retval = 1;
 	}
 

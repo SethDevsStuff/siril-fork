@@ -1,0 +1,399 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<interface>
+  <!-- interface-name lsf_manager.ui -->
+  <requires lib="gtk" version="4.0"/>
+  <object class="GtkWindow" id="lsf_manager_dialog">
+    <property name="default-height">640</property>
+    <property name="default-width">860</property>
+    <property name="title" translatable="yes">Living Stack</property>
+    <signal name="close-request" handler="lsf_manager_hide_on_delete"/>
+    <property name="child">
+      <object class="GtkBox">
+        <property name="margin-bottom">8</property>
+        <property name="margin-end">8</property>
+        <property name="margin-start">8</property>
+        <property name="margin-top">8</property>
+        <property name="orientation">vertical</property>
+        <property name="spacing">8</property>
+        <child>
+          <object class="GtkBox">
+            <property name="spacing">5</property>
+            <child>
+              <object class="GtkLabel">
+                <property name="label" translatable="yes">Living Stack:</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkEntry" id="lsfm_entry">
+                <property name="focusable">1</property>
+                <property name="hexpand">1</property>
+                <property name="input-hints">no-emoji|none</property>
+                <property name="tooltip-text" translatable="yes">The Living Stack file (.lsf.fits) to look at or maintain.</property>
+                <signal name="changed" handler="on_lsfm_entry_changed"/>
+              </object>
+            </child>
+            <child>
+              <object class="GtkButton" id="lsfm_browse">
+                <property name="focusable">1</property>
+                <property name="tooltip-text" translatable="yes">Browse for the Living Stack file.</property>
+                <signal name="clicked" handler="on_lsfm_browse_clicked"/>
+                <child>
+                  <object class="GtkImage">
+                    <property name="icon-name">document-open-symbolic</property>
+                  </object>
+                </child>
+              </object>
+            </child>
+          </object>
+        </child>
+        <child>
+          <object class="GtkLabel" id="lsfm_summary">
+            <property name="halign">start</property>
+            <property name="label" translatable="yes">Choose a Living Stack file.</property>
+            <property name="selectable">1</property>
+            <property name="wrap">1</property>
+            <property name="xalign">0</property>
+          </object>
+        </child>
+        <child>
+          <object class="GtkNotebook" id="lsfm_notebook">
+            <property name="vexpand">1</property>
+            <child>
+              <object class="GtkNotebookPage">
+                <property name="tab">
+                  <object class="GtkLabel">
+                    <property name="label" translatable="yes">Frames</property>
+                  </object>
+                </property>
+                <property name="child">
+                  <object class="GtkBox">
+                    <property name="margin-bottom">5</property>
+                    <property name="margin-end">5</property>
+                    <property name="margin-start">5</property>
+                    <property name="margin-top">5</property>
+                    <property name="orientation">vertical</property>
+                    <property name="spacing">5</property>
+                    <child>
+                      <object class="GtkLabel" id="lsfm_batches">
+                        <property name="halign">start</property>
+                        <property name="selectable">1</property>
+                        <property name="wrap">1</property>
+                        <property name="xalign">0</property>
+                      </object>
+                    </child>
+                    <child>
+                      <object class="GtkScrolledWindow" id="lsfm_ledger_scrolled">
+                        <property name="hexpand">1</property>
+                        <property name="vexpand">1</property>
+                      </object>
+                    </child>
+                  </object>
+                </property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkNotebookPage">
+                <property name="tab">
+                  <object class="GtkLabel">
+                    <property name="label" translatable="yes">History</property>
+                  </object>
+                </property>
+                <property name="child">
+                  <object class="GtkScrolledWindow">
+                    <property name="hexpand">1</property>
+                    <property name="vexpand">1</property>
+                    <property name="child">
+                      <object class="GtkTextView" id="lsfm_history">
+                        <property name="cursor-visible">0</property>
+                        <property name="editable">0</property>
+                        <property name="left-margin">5</property>
+                        <property name="monospace">1</property>
+                        <property name="top-margin">5</property>
+                        <property name="wrap-mode">word</property>
+                      </object>
+                    </property>
+                  </object>
+                </property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkNotebookPage">
+                <property name="tab">
+                  <object class="GtkLabel">
+                    <property name="label" translatable="yes">Maintenance</property>
+                  </object>
+                </property>
+                <property name="child">
+                  <object class="GtkBox">
+                    <property name="margin-bottom">5</property>
+                    <property name="margin-end">5</property>
+                    <property name="margin-start">5</property>
+                    <property name="margin-top">5</property>
+                    <property name="orientation">vertical</property>
+                    <property name="spacing">8</property>
+                    <child>
+                      <object class="GtkFrame">
+                        <property name="label" translatable="yes">Check</property>
+                        <child>
+                          <object class="GtkBox">
+                            <property name="margin-bottom">5</property>
+                            <property name="margin-end">5</property>
+                            <property name="margin-start">5</property>
+                            <property name="margin-top">5</property>
+                            <property name="orientation">vertical</property>
+                            <property name="spacing">5</property>
+                            <child>
+                              <object class="GtkLabel">
+                                <property name="halign">start</property>
+                                <property name="label" translatable="yes">Reads the whole file and runs every check of the format, including the checksums of the accumulator and whether the stacked image was edited outside Siril.</property>
+                                <property name="wrap">1</property>
+                                <property name="xalign">0</property>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="GtkBox">
+                                <property name="spacing">5</property>
+                                <child>
+                                  <object class="GtkButton" id="lsfm_check">
+                                    <property name="label" translatable="yes">Check</property>
+                                    <signal name="clicked" handler="on_lsfm_check_clicked"/>
+                                  </object>
+                                </child>
+                                <child>
+                                  <object class="GtkButton" id="lsfm_repair">
+                                    <property name="label" translatable="yes">Repair</property>
+                                    <property name="sensitive">0</property>
+                                    <property name="tooltip-text" translatable="yes">Rebuilds the stacked image from the accumulator, undoing the edit made outside Siril. Available when the check finds such an edit.</property>
+                                    <signal name="clicked" handler="on_lsfm_repair_clicked"/>
+                                  </object>
+                                </child>
+                                <child>
+                                  <object class="GtkButton" id="lsfm_adopt">
+                                    <property name="label" translatable="yes">Adopt the edit</property>
+                                    <property name="sensitive">0</property>
+                                    <property name="tooltip-text" translatable="yes">Keeps the edit made outside Siril: the edited pixels become the new mean of the accumulator, without changing its variance, so this is meant for small cosmetic fixes. Available when the check finds such an edit.</property>
+                                    <signal name="clicked" handler="on_lsfm_adopt_clicked"/>
+                                  </object>
+                                </child>
+                              </object>
+                            </child>
+                          </object>
+                        </child>
+                      </object>
+                    </child>
+                    <child>
+                      <object class="GtkFrame">
+                        <property name="label" translatable="yes">Compression</property>
+                        <child>
+                          <object class="GtkBox">
+                            <property name="margin-bottom">5</property>
+                            <property name="margin-end">5</property>
+                            <property name="margin-start">5</property>
+                            <property name="margin-top">5</property>
+                            <property name="spacing">5</property>
+                            <child>
+                              <object class="GtkDropDown" id="lsfm_compression">
+                                <property name="model">
+                                  <object class="GtkStringList">
+                                    <items>
+                                      <item translatable="yes">None</item>
+                                      <item translatable="yes">Lossless, smaller (gzip2)</item>
+                                      <item translatable="yes">Lossless, faster (gzip1)</item>
+                                    </items>
+                                  </object>
+                                </property>
+                                <property name="tooltip-text" translatable="yes">Compression of the accumulated statistics in the file. The stacked image itself is never compressed.</property>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="GtkButton" id="lsfm_compress">
+                                <property name="label" translatable="yes">Apply</property>
+                                <signal name="clicked" handler="on_lsfm_compress_clicked"/>
+                              </object>
+                            </child>
+                          </object>
+                        </child>
+                      </object>
+                    </child>
+                    <child>
+                      <object class="GtkFrame">
+                        <property name="label" translatable="yes">Copy and export</property>
+                        <child>
+                          <object class="GtkBox">
+                            <property name="margin-bottom">5</property>
+                            <property name="margin-end">5</property>
+                            <property name="margin-start">5</property>
+                            <property name="margin-top">5</property>
+                            <property name="spacing">5</property>
+                            <child>
+                              <object class="GtkButton" id="lsfm_copy">
+                                <property name="label" translatable="yes">Save a copy…</property>
+                                <property name="tooltip-text" translatable="yes">Writes a copy of the Living Stack under another name, for example to keep the state before a risky append. The file itself is not changed.</property>
+                                <signal name="clicked" handler="on_lsfm_copy_clicked"/>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="GtkButton" id="lsfm_export">
+                                <property name="label" translatable="yes">Export the stack as an image…</property>
+                                <property name="tooltip-text" translatable="yes">Saves the stacked image as a plain FITS image, without the Living Stack data, with the FITS extension, compression and bit depth of the preferences. Process this image, not the Living Stack file.</property>
+                                <signal name="clicked" handler="on_lsfm_export_clicked"/>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="GtkCheckButton" id="lsfm_export_32b">
+                                <property name="label" translatable="yes">Force 32b output</property>
+                                <property name="tooltip-text" translatable="yes">With 16-bit mode set in the preferences, the exported image is saved on 32 bits instead of 16. Without it, it is always 32-bit. The Living Stack itself is always 32-bit.</property>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="GtkButton" id="lsfm_import_wcs">
+                                <property name="label" translatable="yes">Import a WCS…</property>
+                                <property name="tooltip-text" translatable="yes">Writes into the Living Stack the astrometric solution (WCS) of a plate-solved image of its stack, such as the exported image once plate-solved, or of a .wcs file. It must have the size of the stack. The image itself does not change. Registering frames through their WCS needs it. On an undistorted Living Stack, the distortion terms of the solution are dropped.</property>
+                                <signal name="clicked" handler="on_lsfm_import_wcs_clicked"/>
+                              </object>
+                            </child>
+                          </object>
+                        </child>
+                      </object>
+                    </child>
+                    <child>
+                      <object class="GtkCheckButton" id="lsfm_newfile">
+                        <property name="label" translatable="yes">Save Repair, Adopt, Compression and WCS import to a new file</property>
+                        <property name="tooltip-text" translatable="yes">Repair, Adopt, Compression and the WCS import rewrite the file. With this, they ask for the name of a new file to write, and the file is left as it was; the dialog then shows the new file. Without it, the file is overwritten. The new file continues the same stack: append to one of the two files only.</property>
+                      </object>
+                    </child>
+                    <child>
+                      <object class="GtkLabel" id="lsfm_result">
+                        <property name="halign">start</property>
+                        <property name="selectable">1</property>
+                        <property name="wrap">1</property>
+                        <property name="xalign">0</property>
+                      </object>
+                    </child>
+                  </object>
+                </property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkNotebookPage">
+                <property name="tab">
+                  <object class="GtkLabel">
+                    <property name="label" translatable="yes">Maps</property>
+                  </object>
+                </property>
+                <property name="child">
+                  <object class="GtkBox">
+                    <property name="margin-bottom">5</property>
+                    <property name="margin-end">5</property>
+                    <property name="margin-start">5</property>
+                    <property name="margin-top">5</property>
+                    <property name="orientation">vertical</property>
+                    <property name="spacing">5</property>
+                    <child>
+                      <object class="GtkLabel">
+                        <property name="halign">start</property>
+                        <property name="label" translatable="yes">Images computed from the accumulated statistics, saved as plain FITS images named prefix_map. They show where the stack is deep or thin, and how much was rejected.</property>
+                        <property name="wrap">1</property>
+                        <property name="xalign">0</property>
+                      </object>
+                    </child>
+                    <child>
+                      <object class="GtkCheckButton" id="lsfm_map_neff">
+                        <property name="active">1</property>
+                        <property name="label" translatable="yes">Effective number of frames (neff)</property>
+                      </object>
+                    </child>
+                    <child>
+                      <object class="GtkCheckButton" id="lsfm_map_noise">
+                        <property name="active">1</property>
+                        <property name="label" translatable="yes">Noise of the stack, the standard deviation of the mean (noise)</property>
+                      </object>
+                    </child>
+                    <child>
+                      <object class="GtkCheckButton" id="lsfm_map_sigma">
+                        <property name="active">1</property>
+                        <property name="label" translatable="yes">Noise of one frame (sigma)</property>
+                      </object>
+                    </child>
+                    <child>
+                      <object class="GtkCheckButton" id="lsfm_map_snr">
+                        <property name="active">1</property>
+                        <property name="label" translatable="yes">Signal to noise ratio (snr)</property>
+                      </object>
+                    </child>
+                    <child>
+                      <object class="GtkCheckButton" id="lsfm_map_rejlo">
+                        <property name="label" translatable="yes">Samples rejected low (rejlo)</property>
+                        <property name="tooltip-text" translatable="yes">Counts, at each pixel, of the samples rejected low since the rejection maps were added to the file. Only for files that keep rejection maps.</property>
+                      </object>
+                    </child>
+                    <child>
+                      <object class="GtkCheckButton" id="lsfm_map_rejhi">
+                        <property name="label" translatable="yes">Samples rejected high (rejhi)</property>
+                        <property name="tooltip-text" translatable="yes">Counts, at each pixel, of the samples rejected high since the rejection maps were added to the file. Only for files that keep rejection maps.</property>
+                      </object>
+                    </child>
+                    <child>
+                      <object class="GtkCheckButton" id="lsfm_map_exp">
+                        <property name="label" translatable="yes">Exposure (exp)</property>
+                        <property name="tooltip-text" translatable="yes">Integration time at each pixel, in seconds: the exposure map of the file, or the count of frames times their exposure when they all have the same one. Not available when the exposures of the frames differ or are not all known and the file has no exposure map.</property>
+                      </object>
+                    </child>
+                    <child>
+                      <object class="GtkBox">
+                        <property name="spacing">5</property>
+                        <child>
+                          <object class="GtkLabel">
+                            <property name="label" translatable="yes">Prefix:</property>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkEntry" id="lsfm_maps_prefix">
+                            <property name="focusable">1</property>
+                            <property name="hexpand">1</property>
+                            <property name="input-hints">no-emoji|none</property>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkButton" id="lsfm_maps_save">
+                            <property name="label" translatable="yes">Save maps</property>
+                            <signal name="clicked" handler="on_lsfm_maps_save_clicked"/>
+                          </object>
+                        </child>
+                      </object>
+                    </child>
+                    <child>
+                      <object class="GtkCheckButton" id="lsfm_maps_open">
+                        <property name="label" translatable="yes">Open the first map when saved</property>
+                        <property name="tooltip-text" translatable="yes">Opens the first saved map as the current image, which closes the loaded sequence.</property>
+                      </object>
+                    </child>
+                    <child>
+                      <object class="GtkLabel" id="lsfm_maps_result">
+                        <property name="halign">start</property>
+                        <property name="selectable">1</property>
+                        <property name="wrap">1</property>
+                        <property name="xalign">0</property>
+                      </object>
+                    </child>
+                  </object>
+                </property>
+              </object>
+            </child>
+          </object>
+        </child>
+        <child>
+          <object class="GtkBox">
+            <property name="halign">end</property>
+            <child>
+              <object class="GtkButton" id="lsfm_close">
+                <property name="label" translatable="yes">Close</property>
+                <signal name="clicked" handler="on_lsfm_close_clicked"/>
+              </object>
+            </child>
+          </object>
+        </child>
+      </object>
+    </property>
+  </object>
+</interface>

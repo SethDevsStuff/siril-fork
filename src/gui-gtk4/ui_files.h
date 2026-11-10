@@ -62,6 +62,7 @@ const char* ui_files[] = {
 	"/org/siril/ui/icc_gamut_dialog.ui",
 	"/org/siril/ui/linearmatch_dialog.ui",
 	"/org/siril/ui/livestacking_player.ui",
+	"/org/siril/ui/lsf_manager.ui",
 	"/org/siril/ui/mask_from_chromaticity.ui",
 	"/org/siril/ui/mask_from_image.ui",
 	"/org/siril/ui/mask_from_stars.ui",

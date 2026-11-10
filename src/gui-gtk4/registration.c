@@ -30,6 +30,8 @@
 #include "gui-gtk4/dialogs.h"
 #include "gui-gtk4/image_display.h"
 #include "gui-gtk4/image_interactions.h"
+#include "gui-gtk4/lsf_registration.h"
+#include "gui-gtk4/lsf_stacking.h"
 #include "gui-gtk4/message_dialog.h"
 #include "gui-gtk4/mpp_shift_viewer.h"
 #include "gui-gtk4/plot.h"
@@ -42,6 +44,7 @@
 #include "io/path_parse.h"
 #include "io/sequence.h"
 #include "io/single_image.h"
+#include "lsf/lsf_commands.h"
 #include "opencv/opencv.h"
 #include "registration/3stars.h"
 #include "registration/mpp.h"
@@ -155,6 +158,8 @@ static GtkStackSwitcher *interp_drizzle_stack_switcher = NULL;
 static void on_interp_drizzle_stack_visible_child_changed(GObject *obj,
 		GParamSpec *pspec, gpointer user_data);
 static GtkCheckButton *checkStarSelect = NULL, *reg_2pass = NULL, *followStarCheckButton = NULL, *onlyshift_checkbutton = NULL, *toggle_reg_clamp = NULL, *driz_use_flats = NULL, *checkbutton_displayref = NULL, *reg_reference_checkbutton = NULL;
+static GtkCheckButton *driz_lsf_sidecar = NULL;	// the Living Stack sidecar of a drizzle
+static GtkLabel *driz_lsf_sidecar_info = NULL;
 static GtkToggleButton *toggle_reg_manual1 = NULL, *toggle_reg_manual2 = NULL;
 GtkWindow *control_window = NULL;
 
@@ -314,6 +319,8 @@ static void registration_init_statics() {
 		onlyshift_checkbutton = GTK_CHECK_BUTTON(gtk_builder_get_object(gui.builder, "onlyshift_checkbutton"));
 		toggle_reg_clamp = GTK_CHECK_BUTTON(gtk_builder_get_object(gui.builder, "toggle_reg_clamp"));
 		driz_use_flats = GTK_CHECK_BUTTON(gtk_builder_get_object(gui.builder, "driz_use_flats"));
+		driz_lsf_sidecar = GTK_CHECK_BUTTON(gtk_builder_get_object(gui.builder, "driz_lsf_sidecar"));
+		driz_lsf_sidecar_info = GTK_LABEL(gtk_builder_get_object(gui.builder, "driz_lsf_sidecar_info"));
 		checkbutton_displayref = GTK_CHECK_BUTTON(gtk_builder_get_object(gui.builder, "checkbutton_displayref"));
 		reg_reference_checkbutton = GTK_CHECK_BUTTON(gtk_builder_get_object(gui.builder, "reg_reference_checkbutton"));
 		toggle_reg_manual1 = GTK_TOGGLE_BUTTON(gtk_builder_get_object(gui.builder, "toggle_reg_manual1"));
@@ -418,6 +425,44 @@ void initialize_registration_methods() {
 /****************************************************************/
 /* GUI elements callbacks                                       */
 /****************************************************************/
+
+/* how the drizzle will save what the Living Stack sidecar describes, under
+ * the current preferences (Section 13 of the LSF drizzle plan): a hint, a
+ * Living Stack merges the frames whatever their precision */
+static void update_lsf_sidecar_info(gboolean has_drizzle, gboolean lsf_drizzle) {
+	if (!driz_lsf_sidecar_info || !driz_lsf_sidecar)
+		return;
+	GtkWidget *label = GTK_WIDGET(driz_lsf_sidecar_info);
+	gboolean show = has_drizzle && siril_toggle_get_active(GTK_WIDGET(driz_lsf_sidecar));
+	gtk_widget_set_visible(label, show);
+	if (!show)
+		return;
+	if (lsf_drizzle) {
+		gtk_label_set_text(GTK_LABEL(label), _("The Living Stack drizzles the frames with its own settings: images and "
+					"weights are saved whole."));
+		return;
+	}
+	const gboolean ser = sequence_is_loaded() && com.seq.type == SEQ_SER;
+	const gboolean data16 = ser || com.pref.force_16bit;
+	GString *text = g_string_new(NULL);
+	if (!com.pref.drizz_weight_match_bitpix)
+		g_string_append(text, _("The drizzle weights will be saved on 8 bits, as fractions of the largest one: a Living "
+					"Stack merges them as they are, rounded and clipped. \"Match Drizzle weights bitpix to "
+					"sequence\" in Preferences keeps them whole."));
+	else if (ser && !com.pref.force_16bit)
+		g_string_append(text, _("The drizzle weights will be saved on 16 bits, as fractions of the largest one: a Living "
+					"Stack merges them as they are, rounded and clipped."));
+	else g_string_append(text, _("The drizzle weights will be saved whole."));
+	if (data16)
+		g_string_append(text, _(" The images will be saved on 16 bits, which clips values above 1."));
+	gtk_label_set_text(GTK_LABEL(label), text->str);
+	g_string_free(text, TRUE);
+}
+
+void on_driz_lsf_sidecar_toggled(GtkCheckButton *button, gpointer user_data) {
+	gboolean has_drizzle = gtk_widget_get_sensitive(GTK_WIDGET(button)) || lsf_registration_drizzle_now();
+	update_lsf_sidecar_info(has_drizzle, lsf_registration_drizzle_now());
+}
 
 void on_reg_2pass_toggled(GtkCheckButton *togglebutton, gpointer user_data) {
 	gboolean toggled = siril_toggle_get_active(GTK_WIDGET(togglebutton));
@@ -1084,6 +1129,17 @@ void update_reg_interface(gboolean dont_change_reg_radio) {
 		return;
 	}
 
+	/* a Living Stack is registered against with global star alignment only;
+	 * the handlers of these widgets come back here */
+	gboolean lsf = lsf_registration_mode();
+	if (lsf && regindex != REG_GLOBAL) {
+		if (siril_toggle_get_active(GTK_WIDGET(reg_2pass)))
+			siril_toggle_set_active(GTK_WIDGET(reg_2pass), FALSE);
+		if (gtk_drop_down_get_selected(GTK_DROP_DOWN(comboboxregmethod)) != REG_GLOBAL)
+			gtk_drop_down_set_selected(GTK_DROP_DOWN(comboboxregmethod), REG_GLOBAL);
+		return;
+	}
+
 	/* specific methods */
 	isapplyreg = regindex == REG_APPLY;
 	is_global = regindex == REG_GLOBAL;
@@ -1091,13 +1147,17 @@ void update_reg_interface(gboolean dont_change_reg_radio) {
 
 	/* registration data exists for the selected layer */
 	has_reg = layer_has_registration(&com.seq, gtk_drop_down_get_selected(GTK_DROP_DOWN(comboboxreglayer)));
-	/* registration will produce output */
-	has_output = isapplyreg || is_global;
+	/* registration will produce output, except the transforms against a
+	 * Living Stack, which the append applies, unless they are drizzled onto
+	 * its grid for review */
+	const gboolean lsf_drizzle = lsf && lsf_registration_drizzle_now();
+	has_output = (isapplyreg || is_global) && (!lsf || lsf_drizzle);
 	/* drizzle is selected */
 	has_drizzle = has_output && gtk_stack_get_visible_child(interp_drizzle_stack) == GTK_WIDGET(grid_drizzle_controls);
 	/* must enforce drizzle/interp */
-	must_have_drizzle = has_output && gfit->naxes[2] == 1 && gfit->keywords.bayer_pattern[0] != '\0';
-	must_have_interp  = has_output && gfit->naxes[2] == 3;
+	must_have_drizzle = has_output && ((gfit->naxes[2] == 1 && gfit->keywords.bayer_pattern[0] != '\0') || lsf_drizzle);
+	/* not both: each page switch comes back here, which switched forever */
+	must_have_interp  = has_output && !must_have_drizzle && gfit->naxes[2] == 3;
 
 
 	/* initialize default */
@@ -1132,6 +1192,9 @@ void update_reg_interface(gboolean dont_change_reg_radio) {
 		}
 		gtk_widget_set_sensitive(GTK_WIDGET(checkStarSelect), !com.seq.is_variable);
 	}
+	/* a sequence registered against a Living Stack shows it again */
+	if (!dont_change_reg_radio && lsf_registration_show_ext_ref())
+		return;	// the handler of the mode comes back here
 	/* external reference image: available for global and 2-pass star alignment */
 	if (!dont_change_reg_radio && com.seq.ext_ref && com.seq.ext_ref_path) {
 		gtk_check_button_set_active(reg_reference_checkbutton, TRUE);
@@ -1157,6 +1220,10 @@ void update_reg_interface(gboolean dont_change_reg_radio) {
 	} else {
 		gtk_widget_set_sensitive(GTK_WIDGET(comboreg_framing), TRUE);
 	}
+	/* after the external reference and the output frame, which it overrides */
+	gboolean lsf_ready = lsf_registration_update_widgets();
+	if (lsf)
+		disto_source_index = DISTO_UNDEF;
 	if (must_have_drizzle) {
 		gtk_stack_set_visible_child(interp_drizzle_stack, GTK_WIDGET(grid_drizzle_controls));
 		has_drizzle = TRUE;
@@ -1167,6 +1234,12 @@ void update_reg_interface(gboolean dont_change_reg_radio) {
 	}
 	gtk_widget_set_sensitive(GTK_WIDGET(interp_drizzle_stack_switcher), !(must_have_drizzle || must_have_interp));
 	set_switcher_buttons_colors(switcher_buttons, (has_drizzle) ? 1 : 0);
+	/* the Living Stack sidecar of a drizzle: asked for, or always written
+	 * by the drizzle onto a Living Stack's grid */
+	if (lsf_drizzle && !siril_toggle_get_active(GTK_WIDGET(driz_lsf_sidecar)))
+		siril_toggle_set_active(GTK_WIDGET(driz_lsf_sidecar), TRUE);
+	gtk_widget_set_sensitive(GTK_WIDGET(driz_lsf_sidecar), has_drizzle && !lsf_drizzle);
+	update_lsf_sidecar_info(has_drizzle, lsf_drizzle);
 	if (has_output && !has_drizzle) {
 		gint interpolation_item = gtk_drop_down_get_selected(GTK_DROP_DOWN(ComboBoxRegInter));
 		gtk_widget_set_sensitive(GTK_WIDGET(toggle_reg_clamp), interpolation_item == OPENCV_CUBIC || interpolation_item == OPENCV_LANCZOS4);
@@ -1229,7 +1302,8 @@ void update_reg_interface(gboolean dont_change_reg_radio) {
 			check_comet(regindex) &&
 			check_3stars(regindex) &&
 			check_disto(disto_source_index) &&
-			check_ext_ref(disto_source_index);
+			check_ext_ref(disto_source_index) &&
+			lsf_ready;
 
 	if (!ready) { // all the other cases not set by the checkers
 		if (method->sel > REQUIRES_NO_SELECTION && !selection_is_done ) {
@@ -1354,6 +1428,10 @@ static int fill_registration_structure_from_GUI(struct registration_args *regarg
 	/* registration will produce output */
 	gboolean has_output_images = isapplyreg || is_global;
 	gboolean has_drizzle = has_output_images && gtk_stack_get_visible_child(interp_drizzle_stack) == GTK_WIDGET(grid_drizzle_controls);
+	/* against a Living Stack: transforms only, unless asked to drizzle the
+	 * frames onto its grid (the drizzle page may be left over, hidden) */
+	if (lsf_registration_mode() && !lsf_registration_drizzle_now())
+		has_drizzle = FALSE;
 
 	regargs->func = method->method_ptr;
 	regargs->seq = &com.seq;
@@ -1454,6 +1532,7 @@ static int fill_registration_structure_from_GUI(struct registration_args *regarg
 			if (populate_drizzle_data(regargs->driz, regargs->seq)) {
 				return 1;
 			}
+			regargs->lsf_sidecar = siril_toggle_get_active(GTK_WIDGET(driz_lsf_sidecar));
 		} else { // interpolation
 			regargs->interpolation = gtk_drop_down_get_selected(GTK_DROP_DOWN(ComboBoxRegInter));
 			regargs->clamp = siril_toggle_get_active(GTK_WIDGET(toggle_reg_clamp)) && (regargs->interpolation == OPENCV_CUBIC || regargs->interpolation == OPENCV_LANCZOS4);
@@ -1486,7 +1565,11 @@ static int fill_registration_structure_from_GUI(struct registration_args *regarg
 	}
 #endif
 
-	if (regindex == REG_GLOBAL && regargs->interpolation == OPENCV_NONE) { // seqpplyreg case is dealt with in the sanity checks of the method
+	/* to an existing Living Stack: transforms only, applied by the append */
+	if (lsf_registration_mode() && lsf_registration_fill_args(regargs))
+		return 1;
+
+	if (regindex == REG_GLOBAL && regargs->interpolation == OPENCV_NONE && !lsf_registration_mode()) { // seqpplyreg case is dealt with in the sanity checks of the method
 		if (regargs->output_scale != 1.f || com.seq.is_variable) {
 			siril_log_error(_("When interpolation is set to None, the images must be of same size and no scaling can be applied. Aborting\n"));
 			return 1;
@@ -1526,6 +1609,7 @@ void on_seqregister_button_clicked(GtkButton *button, gpointer user_data) {
 
 	char *msg;
 	if (fill_registration_structure_from_GUI(regargs)) {
+		free_registration_hook_data(regargs);
 		free(regargs->mpp_cfg);
 		free(regargs);
 		unreserve_thread();
@@ -1535,6 +1619,7 @@ void on_seqregister_button_clicked(GtkButton *button, gpointer user_data) {
 	int ret = seq_read_frame_metadata(regargs->seq, regargs->reference_image, &fit_ref);
 	if (ret) {
 		siril_log_message(_("Error: unable to read reference frame metadata\n"));
+		free_registration_hook_data(regargs);
 		free(regargs->mpp_cfg);
 		free(regargs);
 		unreserve_thread();
@@ -1558,6 +1643,7 @@ void on_seqregister_button_clicked(GtkButton *button, gpointer user_data) {
 	set_progress_bar_data(msg, PROGRESS_RESET);
 
 	if (!start_in_reserved_thread(register_thread_func, regargs)) {
+		free_registration_hook_data(regargs);
 		free(regargs->mpp_cfg);
 		free(regargs);
 		unreserve_thread();
@@ -1589,6 +1675,7 @@ void on_seqmpp_analyze_button_clicked(GtkButton *button, gpointer user_data) {
 	}
 
 	if (fill_registration_structure_from_GUI(regargs)) {
+		free_registration_hook_data(regargs);
 		free(regargs->mpp_cfg);
 		free(regargs);
 		unreserve_thread();
@@ -1911,7 +1998,14 @@ gboolean end_register_idle(gpointer p) {
 	                      : _("Registration complete."), PROGRESS_DONE);
 	args->seq->reg_invalidated = FALSE;
 	drawPlot();
+	/* the registration may have changed what the Living Stack append checks found */
+	lsf_stacking_invalidate_checks();
 	update_stack_interface(TRUE);
+	/* registered against a Living Stack: the stacking appends to it */
+	const gchar *lsf_path = lsf_registration_result(args);
+	if (lsf_path)
+		stack_set_lsf_append(lsf_path);
+	free_registration_hook_data(args);
 	adjust_sellabel();
 
 	set_cursor_waiting(FALSE);

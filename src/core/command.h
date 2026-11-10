@@ -7,6 +7,8 @@
 #  include <config.h>
 #endif
 
+#include "core/settings.h"
+
 #define MAX_COMMAND_WORDS 50		// max number of words to split in command line input
 
 typedef enum {
@@ -34,6 +36,12 @@ struct {
 extern char *word[MAX_COMMAND_WORDS];  // NULL terminated
 
 gboolean image_cfa_warning_check();
+
+/* the [type] and the two values of rej, the rejection argument of stack, shared with
+ * the lsf commands */
+gboolean parse_rejection_type(const char *arg, gboolean allow_none, rejection *type);
+const char *rejection_type_letter(rejection type);
+gboolean check_rejection_values(rejection type, double low, double high);
 
 int	process_addmax(int nb);
 int	process_addwcs(int nb);
@@ -124,6 +132,11 @@ int	process_load(int nb);
 int	process_load_seq(int nb);
 int	process_log(int nb);
 int	process_ls(int nb);
+int	process_lsf_append(int nb);
+int	process_lsf_export(int nb);
+int	process_lsf_init(int nb);
+int	process_lsf_maps(int nb);
+int	process_lsf_util(int nb);
 
 int	process_makepsf(int nb);
 int process_mask_bitpix(int nb);

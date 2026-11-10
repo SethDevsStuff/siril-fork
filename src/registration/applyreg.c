@@ -145,6 +145,15 @@ static gboolean compute_framing(struct registration_args *regargs) {
 				}
 			}
 			total_Mpix = (double)n * rx * ry * regargs->output_scale * regargs->output_scale * 1.e-6;
+			if (regargs->canvas.w > 0 && regargs->canvas.h > 0) {
+				// output onto a canvas around the reference (LSF): every image keeps the
+				// size of the canvas, shifted by its origin as max framing does
+				rx_0 = regargs->canvas.w;
+				ry_0 = regargs->canvas.h;
+				Hshift.h02 = (double) regargs->canvas.x;
+				Hshift.h12 = (double) regargs->canvas.y;
+				total_Mpix = (double)n * rx_0 * ry_0 * regargs->output_scale * regargs->output_scale * 1.e-6;
+			}
 			break;
 		case FRAMING_MAX:
 			xmin = DBL_MAX;
@@ -624,7 +633,7 @@ int apply_reg_image_hook(struct generic_seq_args *args, int out_index, int in_in
 		const gchar *count_filename = get_sequence_cache_filename(args->seq, in_index, "drizztmp", "fit", args->new_seq_prefix);
 		// if original data is USHORT or drizz_weight_match_bitpix is FALSE,
 		// weights need to be renormed in the [0,1] range, because they will be saved as 8b or 16b
-		if ((fit->type == DATA_USHORT && !com.pref.force_16bit) || !com.pref.drizz_weight_match_bitpix) {
+		if (!regargs->driz_raw_weights && ((fit->type == DATA_USHORT && !com.pref.force_16bit) || !com.pref.drizz_weight_match_bitpix)) {
 			size_t nbpix_per_channel = output_counts->rx * output_counts->ry;
 			for (int c = 0; c < output_counts->naxes[2]; c++) {
 				float *counts = output_counts->fpdata[c];
@@ -634,7 +643,9 @@ int apply_reg_image_hook(struct generic_seq_args *args, int out_index, int in_in
 				}
 			}
 		}
-		if (!com.pref.drizz_weight_match_bitpix || fit->bitpix == BYTE_IMG) { // we save as 8b
+		if (regargs->driz_raw_weights) { // the caller needs them as they are
+			output_counts->bitpix = FLOAT_IMG;
+		} else if (!com.pref.drizz_weight_match_bitpix || fit->bitpix == BYTE_IMG) { // we save as 8b
 			output_counts->bitpix = BYTE_IMG;
 		} else if (fit->type == DATA_USHORT && !com.pref.force_16bit) { // we save as 16b
 			output_counts->bitpix = USHORT_IMG;
@@ -1130,7 +1141,8 @@ int initialize_drizzle_params(struct generic_seq_args *args, struct registration
 	if (driz->is_bayer)
 		driz->cfadim = (int)cfadim;
 	int status = 0;
-	if 	(!(com.pref.drizz_weight_match_bitpix && (fit.bitpix == DATA_FLOAT || !com.pref.force_16bit))) { // we save as 32b, we don't need to renorm the weights
+	/* the Living Stack sidecar records max_weight whatever the weights are saved as */
+	if (regargs->driz_raw_weights || regargs->lsf_sidecar || !(com.pref.drizz_weight_match_bitpix && (fit.bitpix == DATA_FLOAT || !com.pref.force_16bit))) { // we save as 32b, we don't need to renorm the weights
 		disto_data *disto = NULL;
 		gboolean free_disto = FALSE;
 		if (regargs->undistort) {
@@ -1204,6 +1216,8 @@ int register_apply_reg(struct registration_args *regargs) {
 			siril_log_warning(_("Warning: the number of images after collecting astrometry is different from the number of images before filtering.\n"));
 			siril_log_warning(_("The registration will be applied to the filtered images only.\n"));
 		}
+	}
+	if (regargs->undistort == DISTO_FILES && !regargs->keep_transforms) {
 		Homography Href = { 0 };
 		if (compute_Hs_from_astrometry(regargs->seq, included, regargs->reference_image, regargs->WCSDATA, regargs->framing, regargs->layer, &Href, &regargs->wcsref)) {
 			retval = -1;
@@ -1219,6 +1233,17 @@ int register_apply_reg(struct registration_args *regargs) {
 					regargs->wcsref = wcs_deepcopy(ext_fit.keywords.wcslib, NULL);
 				regargs->external_ref_rx = ext_fit.rx;
 				regargs->external_ref_ry = ext_fit.ry;
+				if (regargs->ext_ref_on_grid) {
+					Homography Hunscale = { 0 };
+					cvGetEye(&Hunscale);
+					Hunscale.h00 = 1. / regargs->output_scale;
+					Hunscale.h11 = 1. / regargs->output_scale;
+					regargs->external_ref_rx = (unsigned int) roundf((float) ext_fit.rx / regargs->output_scale);
+					regargs->external_ref_ry = (unsigned int) roundf((float) ext_fit.ry / regargs->output_scale);
+					cvApplyFlips(&Hunscale, ext_fit.ry, regargs->external_ref_ry);
+					if (regargs->wcsref)
+						reframe_wcs(regargs->wcsref, &Hunscale);
+				}
 				regargs->use_external_ref = TRUE;
 				regargs->external_ref_path = g_strdup(regargs->seq->ext_ref_path);
 				// H matrices are absolute (relative to external ref): use identity so they are applied as-is
@@ -1234,6 +1259,8 @@ int register_apply_reg(struct registration_args *regargs) {
 				regargs->framingd.Htransf = regargs->seq->regparam[regargs->layer][regargs->reference_image].H;
 			}
 		}
+	} else if (regargs->keep_transforms) {
+		cvGetEye(&regargs->framingd.Htransf); // as compute_Hs_from_astrometry gives
 	} else {
 		regargs->framingd.Htransf = regargs->seq->regparam[regargs->layer][regargs->reference_image].H;
 	}
@@ -1284,7 +1311,7 @@ int register_apply_reg(struct registration_args *regargs) {
 		int status = 1, status2 = 0;
 		index = regargs->distoparam.index; // to keep track if DISTO_FILES as if no distorsion is effectively present, it will be set to UNDEF
 		regargs->disto = init_disto_data(&regargs->distoparam, regargs->seq, regargs->WCSDATA, regargs->driz != NULL, &status);
-		if (regargs->use_external_ref) { // we fetch its model to undistort its stars
+		if (regargs->use_external_ref && !regargs->ext_ref_undistorted) { // we fetch its model to undistort its stars
 			fits ext_fit = { 0 };
 			// status intentionally ignored: the external ref was already loaded successfully before
 			(void) read_fits_metadata_from_path_first_HDU(regargs->seq->ext_ref_path, &ext_fit);
@@ -1310,7 +1337,7 @@ int register_apply_reg(struct registration_args *regargs) {
 			remove_dis_from_wcs(regargs->wcsref); // we remove distortions as the output is undistorted, so its astrometry should be as well
 		if (!regargs->undistort && regargs->wcsref->lin.dispre)
 			siril_log_warning(_("Distortion was found in reference image astrometry but you did not include distortion correction when registering the images\n"));
-		if (index == DISTO_FILES && image_is_flipped_from_wcs(regargs->wcsref)) { // we are in astrometric reg, we will need to flip the solution if required
+		if (index == DISTO_FILES && !regargs->use_external_ref && image_is_flipped_from_wcs(regargs->wcsref)) { // we are in astrometric reg, we will need to flip the solution if required
 			Homography H = { 0 };
 			cvGetEye(&H);
 			H.h11 = -1.;
@@ -1318,10 +1345,12 @@ int register_apply_reg(struct registration_args *regargs) {
 			reframe_wcs(regargs->wcsref, &H);
 		}
 		// we can't apply same for max framing as the individual image size is different from regargs->framingd.roi_out.h / scale
-		if (regargs->framing == FRAMING_MIN || regargs->framing == FRAMING_COG) {
+		gboolean canvas = regargs->framing == FRAMING_CURRENT && regargs->canvas.w > 0 && regargs->canvas.h > 0;
+		if (regargs->framing == FRAMING_MIN || regargs->framing == FRAMING_COG || canvas) {
 			Homography H = regargs->framingd.Hshift;
 			cvInvertH(&H);
-			int orig_ry = (regargs->seq->is_variable) ? regargs->seq->imgparam[regargs->reference_image].ry : regargs->seq->ry;
+			int orig_ry = (canvas && regargs->use_external_ref) ? (int) regargs->external_ref_ry :
+				(regargs->seq->is_variable) ? regargs->seq->imgparam[regargs->reference_image].ry : regargs->seq->ry;
 			cvApplyFlips(&H, orig_ry, regargs->framingd.roi_out.h / regargs->output_scale);
 			reframe_wcs(regargs->wcsref, &H);
 		}

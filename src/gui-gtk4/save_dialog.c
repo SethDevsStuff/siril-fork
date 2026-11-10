@@ -250,6 +250,16 @@ static gchar *get_filename_and_replace_ext() {
 	if (!basename)
 		basename = g_path_get_basename(com.uniq && com.uniq->filename ?
 				com.uniq->filename : "image");
+	/* a plain image saved from a Living Stack must not take its name:
+	 * name.lsf.fits becomes name with the default extension */
+	if (com.uniq && com.uniq->is_lsf) {
+		char *file_no_ext = remove_ext_from_filename(basename);
+		if (g_str_has_suffix(file_no_ext, ".lsf"))
+			file_no_ext[strlen(file_no_ext) - 4] = '\0';
+		g_free(basename);
+		basename = g_strdup_printf("%s%s", file_no_ext, com.pref.ext);
+		free(file_no_ext);
+	}
 
 	gboolean is_format_valid = get_type_from_filename(basename)
 			& (TYPEFITS | TYPEBMP | TYPETIFF | TYPEPNG | TYPEJPG | TYPEPNM);
@@ -550,6 +560,7 @@ static gpointer mini_save_dialog(gpointer p) {
 				com.uniq->filename = strdup(actual);
 				g_free(actual);
 				com.uniq->fileexist = TRUE;
+				com.uniq->is_lsf = FALSE;	// savefits() never writes over a Living Stack
 			}
 			break;
 		case TYPEPNM:
@@ -988,7 +999,9 @@ void on_header_snapshot_button_clicked(gboolean clipboard) {
 
 void on_header_save_button_clicked() {
 	if (single_image_is_loaded() && com.uniq->fileexist) {
-		savefits(com.uniq->filename, gfit);
+		if (com.uniq->is_lsf)
+			on_header_save_as_button_clicked();	// a Living Stack is never saved over
+		else savefits(com.uniq->filename, gfit);
 	}
 }
 

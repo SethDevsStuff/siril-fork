@@ -41,6 +41,7 @@ src/gui-gtk4/uifiles/icc_gamut_dialog.ui
 src/gui-gtk4/uifiles/keywords_dialog.ui
 src/gui-gtk4/uifiles/linearmatch_dialog.ui
 src/gui-gtk4/uifiles/livestacking_player.ui
+src/gui-gtk4/uifiles/lsf_manager.ui
 src/gui-gtk4/uifiles/mask_blur_dialog.ui
 src/gui-gtk4/uifiles/mask_feather_dialog.ui
 src/gui-gtk4/uifiles/mask_fmul_dialog.ui
@@ -180,6 +181,9 @@ src/gui-gtk4/image_display.c
 src/gui-gtk4/keywords_tree.c
 src/gui-gtk4/linear_match.c
 src/gui-gtk4/livestacking_gui.c
+src/gui-gtk4/lsf_manager.c
+src/gui-gtk4/lsf_registration.c
+src/gui-gtk4/lsf_stacking.c
 src/gui-gtk4/masks_gui.c
 src/gui-gtk4/median.c
 src/gui-gtk4/menu_gray_geometry.c
@@ -254,6 +258,11 @@ src/io/siril_pythoncommands.c
 src/io/siril_pythonmodule.c
 src/io/spcc_json.c
 src/livestacking/livestacking.c
+src/lsf/lsf_commands.c
+src/lsf/lsf_fits.c
+src/lsf/lsf_settings.c
+src/lsf/lsf_stack.c
+src/lsf/lsf_weights.c
 src/main-cli.c
 src/main.c
 src/opencv/opencv.cpp

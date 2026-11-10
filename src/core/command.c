@@ -117,6 +117,7 @@
 #include "io/healpix/healpix_cat.h"
 #include "io/healpix/healpix_image.h"
 #include "livestacking/livestacking.h"
+#include "lsf/lsf_commands.h"
 #include "pixelMath/pixel_math_runner.h"
 #include "registration/mpp.h"
 #include "registration/mpp/mpp_ap.h"
@@ -421,6 +422,7 @@ int process_save(int nb){
 			com.uniq->filename = strdup(savename);
 		}
 		com.uniq->fileexist = TRUE;
+		com.uniq->is_lsf = fits_file_is_lsf(com.uniq->filename);
 		if (!com.headless) {
 			gui_iface.display_filename();
 			gui_iface.adjust_sellabel();
@@ -10701,6 +10703,7 @@ int process_register(int nb) {
 	struct registration_method *method = NULL;
 	char *msg = NULL;
 	gboolean drizzle = FALSE;
+	gboolean transf_set = FALSE, pairs_set = FALSE;	// kept over the settings of a Living Stack reference
 
 	sequence *seq = load_sequence(word[1], NULL);
 	if (!seq) {
@@ -10742,6 +10745,8 @@ int process_register(int nb) {
 		if (!strcmp(word[i], "-2pass")) {
 			regargs->two_pass = TRUE;
 			regargs->no_output = TRUE;
+		} else if (!strcmp(word[i], "-lsfreg")) {
+			regargs->lsf_sidecar = TRUE;
 		} else if (!strcmp(word[i], "-noclamp")) {
 			regargs->clamp = FALSE;
 		} else if (!strcmp(word[i], "-nostarlist")) {
@@ -10749,6 +10754,7 @@ int process_register(int nb) {
 		} else if (!strcmp(word[i], "-selected")) {
 			regargs->filters.filter_included = TRUE;
 		} else if (g_str_has_prefix(word[i], "-transf=")) {
+			transf_set = TRUE;
 			char *current = word[i], *value;
 			value = current + 8;
 			if (value[0] == '\0') {
@@ -10819,6 +10825,7 @@ int process_register(int nb) {
 				goto terminate_register_on_error;
 			}
 			regargs->min_pairs = min_pairs;
+			pairs_set = TRUE;
 		} else if (g_str_has_prefix(word[i], "-maxstars=")) {
 			char *current = word[i], *value;
 			value = current + 10;
@@ -11066,6 +11073,12 @@ int process_register(int nb) {
 		free(driz);
 		driz = NULL;
 	}
+	/* the Living Stack sidecar records a drizzle, which only an applied
+	 * registration makes */
+	if (regargs->lsf_sidecar && (!drizzle || regargs->two_pass)) {
+		siril_log_error(_("-lsfreg records how the frames are drizzled: it needs -drizzle, without -2pass\n"));
+		goto terminate_register_on_error;
+	}
 
 	/* getting the selected registration method */
 	method = calloc(1, sizeof(struct registration_method));
@@ -11117,6 +11130,12 @@ int process_register(int nb) {
 	if (regargs->clamp)
 		siril_log_message(_("Interpolation clamping active\n"));
 
+	/* a Living Stack as reference: transforms only, applied by lsf_append,
+	 * with the registration settings stored in the file unless given here */
+	if (regargs->use_external_ref && fits_file_is_lsf(regargs->external_ref_path)
+			&& lsf_prepare_registration(regargs, transf_set, pairs_set, FALSE))
+		goto terminate_register_on_error;
+
 	gui_iface.set_progress(PROGRESS_RESET, msg);
 
 	if (!start_in_new_thread(register_thread_func, regargs)) {
@@ -11126,6 +11145,7 @@ int process_register(int nb) {
 	return CMD_OK;
 
 terminate_register_on_error:
+	free_registration_hook_data(regargs);
 	free(regargs->prefix);
 	g_free(regargs->external_ref_path);
 	free(regargs);
@@ -11312,6 +11332,8 @@ int process_seq_applyreg(int nb) {
 				goto terminate_register_on_error;
 			}
 			drizzle = TRUE;
+		} else if (!strcmp(word[i], "-lsfreg")) {
+			regargs->lsf_sidecar = TRUE;
 		// Drizzle options
 		} else if (g_str_has_prefix(word[i], "-scale=")) {
 			char *arg = word[i] + 7;
@@ -11501,6 +11523,10 @@ int process_seq_applyreg(int nb) {
 		siril_log_message(_("External reference alignment detected: forcing framing to 'current'\n"));
 		regargs->framing = FRAMING_CURRENT;
 	}
+	if (regargs->lsf_sidecar && !drizzle) {
+		siril_log_error(_("-lsfreg records how the frames are drizzled: it needs -drizzle\n"));
+		goto terminate_register_on_error;
+	}
 
 	if (drizzle) {
 		regargs->driz = driz;
@@ -11555,6 +11581,59 @@ terminate_register_on_error:
 	free(regargs->new_seq_name);
 	free(regargs);
 	return errval;
+}
+
+/* the [type] of rej in the stack command: letter and name of each rejection */
+static const struct {
+	const char *letter, *name;
+	rejection type;
+} rejection_args[] = {
+	{ "n", "none", NO_REJEC },
+	{ "p", "percentile", PERCENTILE },
+	{ "s", "sigma", SIGMA },
+	{ "a", "mad", MAD },
+	{ "m", "median", SIGMEDIAN },
+	{ "w", "winsorized", WINSORIZED },
+	{ "l", "linear", LINEARFIT },
+	{ "g", "generalized", GESDT },
+};
+
+/* the rejection named by arg, its letter or its name; none only when
+ * allow_none. Returns FALSE when arg names no rejection. */
+gboolean parse_rejection_type(const char *arg, gboolean allow_none, rejection *type) {
+	if (!arg)
+		return FALSE;
+	for (int i = 0; i < (int) G_N_ELEMENTS(rejection_args); i++) {
+		if (rejection_args[i].type == NO_REJEC && !allow_none)
+			continue;
+		if (!strcmp(arg, rejection_args[i].letter) || !strcmp(arg, rejection_args[i].name)) {
+			*type = rejection_args[i].type;
+			return TRUE;
+		}
+	}
+	return FALSE;
+}
+
+/* the letter of the rejection in the stack command, for a command line */
+const char *rejection_type_letter(rejection type) {
+	for (int i = 0; i < (int) G_N_ELEMENTS(rejection_args); i++)
+		if (rejection_args[i].type == type)
+			return rejection_args[i].letter;
+	return "w";
+}
+
+/* the two values of GESDT and percentile rejection are in [0, 1]. Returns
+ * FALSE with the reason logged when they are not. */
+gboolean check_rejection_values(rejection type, double low, double high) {
+	if (type == GESDT && (low > 1.0 || high > 1.0)) {
+		siril_log_error(_("Extra parameters of GESDT rejection algorithm must be between 0 and 1, default is 0.3 and 0.05.\n"));
+		return FALSE;
+	}
+	if (type == PERCENTILE && (low > 1.0 || high > 1.0)) {
+		siril_log_error(_("Extra parameters of percentile rejection algorithm must be between 0 and 1, default is 0.2 and 0.1.\n"));
+		return FALSE;
+	}
+	return TRUE;
 }
 
 // parse normalization and filters from the stack command line, starting at word `first'
@@ -12087,23 +12166,7 @@ int process_stackone(int nb) {
 				siril_log_error(_("Missing arguments for rejection stacking.\n"));
 				goto failure;
 			}
-			if (!strcmp(word[3], "p") || !strcmp(word[3], "percentile")) {
-				arg->type_of_rejection = PERCENTILE;
-			} else if (!strcmp(word[3], "s") || !strcmp(word[3], "sigma")) {
-				arg->type_of_rejection = SIGMA;
-			} else if (!strcmp(word[3], "a") || !strcmp(word[3], "mad")) {
-				arg->type_of_rejection = MAD;
-			} else if (!strcmp(word[3], "m") || !strcmp(word[3], "median")) {
-				arg->type_of_rejection = SIGMEDIAN;
-			} else if (!strcmp(word[3], "l") || !strcmp(word[3], "linear")) {
-				arg->type_of_rejection = LINEARFIT;
-			} else if (!strcmp(word[3], "w") || !strcmp(word[3], "winsorized")) {
-				arg->type_of_rejection = WINSORIZED;
-			} else if (!strcmp(word[3], "g") || !strcmp(word[3], "generalized")) {
-				arg->type_of_rejection = GESDT;
-			} else if (!strcmp(word[3], "n") || !strcmp(word[3], "none")) {
-				arg->type_of_rejection = NO_REJEC;
-			} else {
+			if (!parse_rejection_type(word[3], TRUE, &arg->type_of_rejection)) {
 				arg->type_of_rejection = WINSORIZED;
 				shift = 0;
 			}
@@ -12120,16 +12183,8 @@ int process_stackone(int nb) {
 					base_shift = 3;
 				}
 			}
-			if (((arg->type_of_rejection == GESDT))
-					&& (arg->sig[0] > 1.0 || (arg->sig[1] > 1.0))) {
-				siril_log_error(_("Extra parameters of GESDT rejection algorithm must be between 0 and 1, default is 0.3 and 0.05.\n"));
+			if (!check_rejection_values(arg->type_of_rejection, arg->sig[0], arg->sig[1]))
 				goto failure;
-			}
-			if (((arg->type_of_rejection == PERCENTILE))
-					&& (arg->sig[0] > 1.0 || (arg->sig[1] > 1.0))) {
-				siril_log_error(_("Extra parameters of percentile rejection algorithm must be between 0 and 1, default is 0.2 and 0.1.\n"));
-				goto failure;
-			}
 			arg->method = stack_mean_with_rejection;
 			start_arg_opt = base_shift + shift;
 			allow_med_options = TRUE;

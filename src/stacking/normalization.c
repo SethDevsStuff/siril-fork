@@ -293,7 +293,7 @@ static int compute_normalization(struct stacking_args *args) {
 	return retval;
 }
 
-static void solve_overlap_coeffs(int nb_frames, int *index, int index_ref, size_t **Nij, double **Mij, gboolean additive, double *coeffs) {
+void solve_overlap_coeffs(int nb_frames, int *index, int index_ref, size_t **Nij, double **Mij, gboolean additive, double *coeffs) {
 	int c = 0;
 	int N = nb_frames - 1;
 	double *A = calloc(N * N, sizeof(double));

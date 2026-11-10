@@ -106,6 +106,7 @@ gboolean end_register_idle(gpointer p) {
 	stop_processing_thread();
 	if (args) {
 		args->seq->reg_invalidated = FALSE;
+		free_registration_hook_data(args);
 		free(args->new_seq_name);
 		free(args);
 	}

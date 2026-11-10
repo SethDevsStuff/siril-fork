@@ -23,6 +23,7 @@
 #include "core/proto.h"
 #include "core/siril_log.h"
 #include "drizzle/cdrizzleutil.h"
+#include "lsf/lsf_commands.h"
 #include "opencv/opencv.h"
 
 /* end_register_idle: defined in gui/registration.c (GUI) or
@@ -165,6 +166,10 @@ void create_output_sequence_for_registration(struct registration_args *args, int
 		seq.reference_image = refindex; //applyreg
 	seq.needs_saving = TRUE;
 	writeseqfile(&seq);
+	/* how the frames were drizzled, for lsf_init and lsf_append (Section 13
+	 * of the LSF drizzle plan) */
+	if (args->driz && args->lsf_sidecar)
+		lsf_write_drizzle_sidecar(args, &seq);
 	g_free(seqname);
 	free_sequence(&seq, FALSE);
 }
@@ -259,6 +264,14 @@ void get_the_registration_area(struct registration_args *regargs, const struct r
 	}
 }
 
+/* frees the data of end_hook, wherever the registration args are freed */
+void free_registration_hook_data(struct registration_args *args) {
+	if (args->hook_free && args->hook_data)
+		args->hook_free(args->hook_data);
+	args->hook_data = NULL;
+	args->hook_free = NULL;
+}
+
 // worker thread function for the registration
 gpointer register_thread_func(gpointer p) {
 	struct registration_args *args = (struct registration_args *) p;
@@ -274,6 +287,9 @@ gpointer register_thread_func(gpointer p) {
 	}
 	if (!args->retval)
 		writeseqfile(args->seq);
+	/* e.g. the binding of a registration against a Living Stack */
+	if (args->end_hook)
+		args->end_hook(args);
 	retval = args->retval;
 	if (args->disto) {
 		free_disto_args(args->disto);
@@ -298,6 +314,7 @@ gpointer register_thread_func(gpointer p) {
 		stop_processing_thread();
 		if (args->seq->type != SEQ_INTERNAL && !check_seq_is_comseq(args->seq)) // RGB align needs the sequence preserved
 			free_sequence(args->seq, TRUE);
+		free_registration_hook_data(args);
 		free(args);
 	}
 	return GINT_TO_POINTER(retval);

@@ -1177,6 +1177,333 @@ The &lt;b&gt;Generalized Extreme Studentized Deviate Test&lt;/b&gt; algorithm [3
                     <property name="orientation">vertical</property>
                     <property name="spacing">5</property>
                     <child>
+                      <object class="GtkBox">
+                        <property name="spacing">5</property>
+                        <child>
+                          <object class="GtkLabel">
+                            <property name="halign">end</property>
+                            <property name="label" translatable="yes" comments="Must be short">Result:</property>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkDropDown" id="stack_result_mode">
+                            <property name="model">
+                              <object class="GtkStringList">
+                                <items>
+                                  <item translatable="yes">Image</item>
+                                  <item translatable="yes">Living Stack (LSF) file</item>
+                                  <item translatable="yes">Living Stack file and image</item>
+                                  <item translatable="yes">Append to a Living Stack</item>
+                                </items>
+                              </object>
+                            </property>
+                            <property name="selected">0</property>
+                            <property name="tooltip-markup" translatable="yes">&lt;b&gt;Image&lt;/b&gt;: the stack is saved as an image.
+
+&lt;b&gt;Living Stack (LSF) file&lt;/b&gt;: the stack is saved as a .lsf.fits file, which keeps the accumulated statistics so that frames from later sessions can be appended to it without stacking the earlier frames again. Any FITS reader opens it as the stacked image. Only average stacking with rejection is supported. The registration of the sequence is applied by the stack itself, with the framing chosen below.
+
+&lt;b&gt;Living Stack file and image&lt;/b&gt;: also saves the stack as a plain image, named like the LSF file.
+
+&lt;b&gt;Append to a Living Stack&lt;/b&gt;: merges the selected frames into an existing .lsf.fits file. They are registered against its stacked image and processed with the settings stored in it, shown above. Normalization and weighting are locked; changing the rejection or the history test overwrites the file's settings for this append and the next ones.</property>
+                            <signal name="notify::selected" handler="on_stack_result_mode_changed"/>
+                          </object>
+                        </child>
+                      </object>
+                    </child>
+                    <child>
+                      <object class="GtkBox" id="stack_lsf_append_box">
+                        <property name="orientation">vertical</property>
+                        <property name="spacing">5</property>
+                        <property name="visible">0</property>
+                        <child>
+                          <object class="GtkBox">
+                            <property name="spacing">5</property>
+                            <child>
+                              <object class="GtkLabel">
+                                <property name="halign">end</property>
+                                <property name="label" translatable="yes" comments="Must be short">Living Stack:</property>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="GtkEntry" id="stack_lsf_append_entry">
+                                <property name="focusable">1</property>
+                                <property name="hexpand">1</property>
+                                <property name="input-hints">no-emoji|none</property>
+                                <property name="tooltip-text" translatable="yes">The Living Stack file (.lsf.fits) to append the selected frames to.</property>
+                                <signal name="changed" handler="on_stack_lsf_append_entry_changed"/>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="GtkButton" id="stack_lsf_append_button">
+                                <property name="focusable">1</property>
+                                <property name="tooltip-text" translatable="yes">Browse for the Living Stack file.</property>
+                                <signal name="clicked" handler="on_stack_lsf_append_button_clicked"/>
+                                <child>
+                                  <object class="GtkImage">
+                                    <property name="icon-name">document-open-symbolic</property>
+                                  </object>
+                                </child>
+                              </object>
+                            </child>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkLabel" id="stack_lsf_info_label">
+                            <property name="halign">start</property>
+                            <property name="xalign">0</property>
+                            <property name="wrap">1</property>
+                            <property name="selectable">1</property>
+                            <property name="label" translatable="yes">Choose a Living Stack file.</property>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkGrid">
+                            <property name="column-spacing">10</property>
+                            <property name="row-spacing">5</property>
+                            <child>
+                              <object class="GtkLabel">
+                                <property name="halign">end</property>
+                                <property name="label" translatable="yes">Grid:</property>
+                                <layout>
+                                  <property name="column">0</property>
+                                  <property name="row">0</property>
+                                </layout>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="GtkDropDown" id="stack_lsf_append_framing">
+                                <property name="model">
+                                  <object class="GtkStringList">
+                                    <items>
+                                      <item translatable="yes">Grow to hold all the frames</item>
+                                      <item translatable="yes">Crop the frames to the grid</item>
+                                    </items>
+                                  </object>
+                                </property>
+                                <property name="selected">0</property>
+                                <property name="tooltip-text" translatable="yes">When registered frames reach beyond the grid of the stack, the grid grows to hold them, in steps on each side, and the pixels already stacked do not change. Or the frames are cropped to the grid. The grid never shrinks.</property>
+                                <signal name="notify::selected" handler="on_stack_lsf_append_option_changed"/>
+                                <layout>
+                                  <property name="column">1</property>
+                                  <property name="row">0</property>
+                                  <property name="column-span">2</property>
+                                </layout>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="GtkLabel">
+                                <property name="halign">end</property>
+                                <property name="label" translatable="yes">Step:</property>
+                                <layout>
+                                  <property name="column">0</property>
+                                  <property name="row">1</property>
+                                </layout>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="GtkSpinButton" id="stack_lsf_expand_step">
+                                <property name="focusable">1</property>
+                                <property name="tooltip-text" translatable="yes">Each side of the grid grows by a multiple of this number of pixels, so that small drifts of the framing do not rewrite the file on every append.</property>
+                                <property name="adjustment">
+                                  <object class="GtkAdjustment">
+                                    <property name="lower">1</property>
+                                    <property name="upper">4096</property>
+                                    <property name="step-increment">8</property>
+                                    <property name="page-increment">64</property>
+                                    <property name="value">64</property>
+                                  </object>
+                                </property>
+                                <layout>
+                                  <property name="column">1</property>
+                                  <property name="row">1</property>
+                                </layout>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="GtkCheckButton" id="stack_lsf_expand_force">
+                                <property name="focusable">1</property>
+                                <property name="label" translatable="yes">Allow more than twice the size</property>
+                                <property name="tooltip-text" translatable="yes">An append that would more than double the grid on one axis is refused, as it usually means a wrong registration. Check this to grow it anyway.</property>
+                                <layout>
+                                  <property name="column">2</property>
+                                  <property name="row">1</property>
+                                </layout>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="GtkLabel">
+                                <property name="halign">end</property>
+                                <property name="label" translatable="yes">Registration:</property>
+                                <layout>
+                                  <property name="column">0</property>
+                                  <property name="row">2</property>
+                                </layout>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="GtkBox">
+                                <property name="spacing">5</property>
+                                <layout>
+                                  <property name="column">1</property>
+                                  <property name="row">2</property>
+                                  <property name="column-span">2</property>
+                                </layout>
+                                <child>
+                                  <object class="GtkDropDown" id="stack_lsf_append_regmethod">
+                                    <property name="model">
+                                      <object class="GtkStringList">
+                                        <items>
+                                          <item translatable="yes">With stars</item>
+                                          <item translatable="yes">Through the WCS</item>
+                                          <item translatable="yes">None, already on the grid</item>
+                                        </items>
+                                      </object>
+                                    </property>
+                                    <property name="selected">0</property>
+                                    <property name="tooltip-text" translatable="yes">How the frames are registered against the stacked image. With stars: Siril's global star alignment. Through the WCS: from the astrometric solution of each frame and of the stack, for frames that share too few stars with it; the frames must be plate-solved, and the Living Stack must have a WCS. None: the frames must already be registered and resampled onto the exact grid of the Living Stack.</property>
+                                    <signal name="notify::selected" handler="on_stack_lsf_append_option_changed"/>
+                                  </object>
+                                </child>
+                                <child>
+                                  <object class="GtkLabel" id="stack_lsf_append_disto_label">
+                                    <property name="label" translatable="yes">Distortion model:</property>
+                                    <property name="visible">0</property>
+                                  </object>
+                                </child>
+                                <child>
+                                  <object class="GtkDropDown" id="stack_lsf_append_disto">
+                                    <property name="model">
+                                      <object class="GtkStringList">
+                                        <items>
+                                          <item translatable="yes">The file's</item>
+                                          <item translatable="yes">Master of the preferences</item>
+                                        </items>
+                                      </object>
+                                    </property>
+                                    <property name="selected">0</property>
+                                    <property name="visible">0</property>
+                                    <property name="tooltip-text" translatable="yes">This Living Stack is undistorted: every append undistorts its frames before merging them. By default with the distortion model stored in the file; the master of the preferences replaces it, for this append and the ones that follow. Another model file can be given with lsf_append -disto=file.</property>
+                                    <signal name="notify::selected" handler="on_stack_lsf_append_option_changed"/>
+                                  </object>
+                                </child>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="GtkLabel">
+                                <property name="halign">end</property>
+                                <property name="label" translatable="yes">Compression:</property>
+                                <layout>
+                                  <property name="column">0</property>
+                                  <property name="row">3</property>
+                                </layout>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="GtkDropDown" id="stack_lsf_append_compression">
+                                <property name="model">
+                                  <object class="GtkStringList">
+                                    <items>
+                                      <item translatable="yes">Keep the file's</item>
+                                      <item translatable="yes">None</item>
+                                      <item translatable="yes">Lossless, smaller (gzip2)</item>
+                                      <item translatable="yes">Lossless, faster (gzip1)</item>
+                                    </items>
+                                  </object>
+                                </property>
+                                <property name="selected">0</property>
+                                <property name="tooltip-text" translatable="yes">Compression of the accumulated statistics in the file after this append. By default the file keeps the compression it has.</property>
+                                <layout>
+                                  <property name="column">1</property>
+                                  <property name="row">3</property>
+                                  <property name="column-span">2</property>
+                                </layout>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="GtkBox">
+                                <property name="spacing">5</property>
+                                <layout>
+                                  <property name="column">0</property>
+                                  <property name="row">4</property>
+                                  <property name="column-span">3</property>
+                                </layout>
+                                <child>
+                                  <object class="GtkCheckButton" id="stack_lsf_append_newfile">
+                                    <property name="focusable">1</property>
+                                    <property name="label" translatable="yes">Save to a new file:</property>
+                                    <property name="tooltip-text" translatable="yes">An append cannot be undone. With this, the appended stack is written to a new Living Stack file and the chosen file is left as it was, so an append that turns out bad can be dropped. Without it, the chosen file is overwritten. The new file continues the same stack: append to one of the two files only.</property>
+                                    <signal name="toggled" handler="on_stack_lsf_append_newfile_toggled"/>
+                                  </object>
+                                </child>
+                                <child>
+                                  <object class="GtkEntry" id="stack_lsf_append_out">
+                                    <property name="focusable">1</property>
+                                    <property name="hexpand">1</property>
+                                    <property name="sensitive">0</property>
+                                    <property name="input-hints">no-emoji|none</property>
+                                    <property name="tooltip-text" translatable="yes">Name of the new Living Stack file. It may use $seqname$ and header keys such as $FILTER:%s$, taken from the reference frame. The .lsf.fits extension is added when it is missing.</property>
+                                    <signal name="changed" handler="on_stack_lsf_append_out_changed"/>
+                                  </object>
+                                </child>
+                                <child>
+                                  <object class="GtkButton" id="stack_lsf_append_out_button">
+                                    <property name="focusable">1</property>
+                                    <property name="sensitive">0</property>
+                                    <property name="tooltip-text" translatable="yes">Choose the name of the new Living Stack file.</property>
+                                    <signal name="clicked" handler="on_stack_lsf_append_out_button_clicked"/>
+                                    <child>
+                                      <object class="GtkImage">
+                                        <property name="icon-name">document-save-symbolic</property>
+                                      </object>
+                                    </child>
+                                  </object>
+                                </child>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="GtkCheckButton" id="stack_lsf_force_reg">
+                                <property name="focusable">1</property>
+                                <property name="label" translatable="yes">Register again</property>
+                                <property name="tooltip-text" translatable="yes">The sequence was registered against this Living Stack in the Registration tab, and the append uses that registration. Check this to register the frames again instead.</property>
+                                <property name="visible">0</property>
+                                <layout>
+                                  <property name="column">0</property>
+                                  <property name="row">6</property>
+                                  <property name="column-span">3</property>
+                                </layout>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="GtkCheckButton" id="stack_lsf_append_export">
+                                <property name="focusable">1</property>
+                                <property name="label" translatable="yes">Also save the updated stack as an image</property>
+                                <property name="tooltip-text" translatable="yes">After the append, also saves the stacked image as a plain FITS image named like the Living Stack file, without its Living Stack data, with the FITS extension and compression of the preferences. Process this image, not the Living Stack file.</property>
+                                <layout>
+                                  <property name="column">0</property>
+                                  <property name="row">5</property>
+                                  <property name="column-span">3</property>
+                                </layout>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="GtkCheckButton" id="stack_lsf_weight_inverse">
+                                <property name="focusable">1</property>
+                                <property name="label" translatable="yes">Switch to inverse weighting from this append</property>
+                                <property name="tooltip-text" translatable="yes">The weights of this Living Stack are scaled between the best and the worst frame of its first batch. Frames beyond that range all get the top weight, or the weight of the worst or the floor, whatever their quality. Inverse weighting has no range: the weight follows the frame's wFWHM (or star count) however good or bad it is. It applies from this append on and cannot be undone. The frames already merged keep their weights, and the new ones are put on the same scale on average.</property>
+                                <property name="visible">0</property>
+                                <signal name="toggled" handler="on_stack_lsf_append_option_changed"/>
+                                <layout>
+                                  <property name="column">0</property>
+                                  <property name="row">7</property>
+                                  <property name="column-span">3</property>
+                                </layout>
+                              </object>
+                            </child>
+                          </object>
+                        </child>
+                      </object>
+                    </child>
+                    <child>
                       <object class="GtkGrid">
                         <property name="column-spacing">10</property>
                         <property name="row-spacing">5</property>
@@ -1253,7 +1580,435 @@ WARNING: This option should not be checked for master stacking.</property>
                       </object>
                     </child>
                     <child>
-                      <object class="GtkBox">
+                      <object class="GtkGrid" id="stack_lsf_grid">
+                        <property name="column-spacing">10</property>
+                        <property name="row-spacing">5</property>
+                        <property name="visible">0</property>
+                        <child>
+                          <object class="GtkLabel" id="stack_lsf_framing_label">
+                            <property name="halign">end</property>
+                            <property name="label" translatable="yes">Framing:</property>
+                            <layout>
+                              <property name="column">0</property>
+                              <property name="row">0</property>
+                            </layout>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkDropDown" id="stack_lsf_framing">
+                            <property name="model">
+                              <object class="GtkStringList">
+                                <items>
+                                  <item translatable="yes">Maximum (all frames)</item>
+                                  <item translatable="yes">Reference frame</item>
+                                  <item translatable="yes">Minimum (common area)</item>
+                                  <item translatable="yes">Centre of gravity</item>
+                                </items>
+                              </object>
+                            </property>
+                            <property name="selected">0</property>
+                            <property name="tooltip-text" translatable="yes">The grid of the Living Stack, when the registration of the sequence is not applied yet. Maximum covers every frame, so none is cropped, and later appends grow it as needed. The other choices are Siril's framings: the reference frame, the area common to all the frames, or the reference frame's size centred on the frames' centre of gravity.</property>
+                            <layout>
+                              <property name="column">1</property>
+                              <property name="row">0</property>
+                              <property name="column-span">3</property>
+                            </layout>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkLabel" id="stack_lsf_compression_label">
+                            <property name="halign">end</property>
+                            <property name="label" translatable="yes">Compression:</property>
+                            <layout>
+                              <property name="column">0</property>
+                              <property name="row">1</property>
+                            </layout>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkDropDown" id="stack_lsf_compression">
+                            <property name="model">
+                              <object class="GtkStringList">
+                                <items>
+                                  <item translatable="yes">None</item>
+                                  <item translatable="yes">Lossless, smaller (gzip2)</item>
+                                  <item translatable="yes">Lossless, faster (gzip1)</item>
+                                </items>
+                              </object>
+                            </property>
+                            <property name="selected">0</property>
+                            <property name="tooltip-text" translatable="yes">Lossless compression of the accumulated statistics stored in the file. The stacked image itself is never compressed. Compression makes the file smaller but saving and appending slower.</property>
+                            <layout>
+                              <property name="column">1</property>
+                              <property name="row">1</property>
+                              <property name="column-span">3</property>
+                            </layout>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkLabel">
+                            <property name="halign">end</property>
+                            <property name="label" translatable="yes">History test:</property>
+                            <property name="tooltip-text" translatable="yes">Later appends also test each new sample against the accumulated stack, and reject it when it is too far from it. These are the thresholds of that test, in sigma units.</property>
+                            <layout>
+                              <property name="column">0</property>
+                              <property name="row">2</property>
+                            </layout>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkCheckButton" id="stack_lsf_hist_same">
+                            <property name="active">1</property>
+                            <property name="label" translatable="yes">Same as rejection</property>
+                            <property name="tooltip-text" translatable="yes">Use the low and high sigma of the rejection for the history test, or 3 when the rejection has no sigma thresholds.</property>
+                            <signal name="toggled" handler="on_stack_lsf_hist_same_toggled"/>
+                            <layout>
+                              <property name="column">1</property>
+                              <property name="row">2</property>
+                              <property name="column-span">3</property>
+                            </layout>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkLabel">
+                            <property name="halign">end</property>
+                            <property name="label" translatable="yes">Low:</property>
+                            <layout>
+                              <property name="column">0</property>
+                              <property name="row">3</property>
+                            </layout>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkSpinButton" id="stack_lsf_hist_low">
+                            <property name="focusable">1</property>
+                            <property name="digits">1</property>
+                            <property name="sensitive">0</property>
+                            <property name="tooltip-text" translatable="yes">Low threshold of the history test, in sigma units, above 0.</property>
+                            <property name="adjustment">
+                              <object class="GtkAdjustment">
+                                <property name="lower">0.1</property>
+                                <property name="upper">10</property>
+                                <property name="step-increment">0.1</property>
+                                <property name="page-increment">1</property>
+                                <property name="value">3</property>
+                              </object>
+                            </property>
+                            <layout>
+                              <property name="column">1</property>
+                              <property name="row">3</property>
+                            </layout>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkLabel">
+                            <property name="halign">end</property>
+                            <property name="label" translatable="yes">High:</property>
+                            <layout>
+                              <property name="column">2</property>
+                              <property name="row">3</property>
+                            </layout>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkSpinButton" id="stack_lsf_hist_high">
+                            <property name="focusable">1</property>
+                            <property name="digits">1</property>
+                            <property name="sensitive">0</property>
+                            <property name="tooltip-text" translatable="yes">High threshold of the history test, in sigma units, above 0.</property>
+                            <property name="adjustment">
+                              <object class="GtkAdjustment">
+                                <property name="lower">0.1</property>
+                                <property name="upper">10</property>
+                                <property name="step-increment">0.1</property>
+                                <property name="page-increment">1</property>
+                                <property name="value">3</property>
+                              </object>
+                            </property>
+                            <layout>
+                              <property name="column">3</property>
+                              <property name="row">3</property>
+                            </layout>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkLabel">
+                            <property name="halign">end</property>
+                            <property name="label" translatable="yes">Margin:</property>
+                            <layout>
+                              <property name="column">0</property>
+                              <property name="row">4</property>
+                            </layout>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkSpinButton" id="stack_lsf_hist_margin">
+                            <property name="focusable">1</property>
+                            <property name="digits">2</property>
+                            <property name="tooltip-text" translatable="yes">Widens the history test: 1 uses the thresholds as they are, larger values reject fewer samples.</property>
+                            <property name="adjustment">
+                              <object class="GtkAdjustment">
+                                <property name="lower">1</property>
+                                <property name="upper">5</property>
+                                <property name="step-increment">0.05</property>
+                                <property name="page-increment">0.5</property>
+                                <property name="value">1</property>
+                              </object>
+                            </property>
+                            <layout>
+                              <property name="column">1</property>
+                              <property name="row">4</property>
+                            </layout>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkCheckButton" id="stack_lsf_rejmaps">
+                            <property name="active">1</property>
+                            <property name="focusable">1</property>
+                            <property name="halign">start</property>
+                            <property name="label" translatable="yes">Keep rejection maps in the file</property>
+                            <property name="tooltip-markup" translatable="yes">Keeps, in the Living Stack file, two maps counting for each pixel the samples rejected low and the samples rejected high: by the rejection of this stack, and by the rejection and the history test of every later append. They work with any rejection method, also with none, as the history test still rejects on appends.
+
+Unlike the rejection maps of a normal stack, they are not saved as separate images and not divided by a number of frames: they are 16-bit counts stored in the file, adding 4 bytes per pixel and channel. They are exported as images with &lt;b&gt;lsf_maps -rejlo -rejhi&lt;/b&gt;.
+
+They can also be added later by an append, and then count from that append on.</property>
+                            <layout>
+                              <property name="column">0</property>
+                              <property name="row">5</property>
+                              <property name="column-span">4</property>
+                            </layout>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkLabel" id="stack_lsf_weight_label">
+                            <property name="halign">end</property>
+                            <property name="label" translatable="yes">Weight floor:</property>
+                            <property name="visible">0</property>
+                            <layout>
+                              <property name="column">0</property>
+                              <property name="row">6</property>
+                            </layout>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkSpinButton" id="stack_lsf_weight_floor">
+                            <property name="focusable">1</property>
+                            <property name="digits">3</property>
+                            <property name="visible">0</property>
+                            <property name="tooltip-text" translatable="yes">The least weight a frame gets, where 1 is the best frame of this first batch. Siril gives the worst frame of a stack 0; a Living Stack keeps a little of every frame, because frames of later appends that are worse than this batch's worst would otherwise count for nothing. Stored in the file.</property>
+                            <property name="adjustment">
+                              <object class="GtkAdjustment">
+                                <property name="lower">0.001</property>
+                                <property name="upper">0.5</property>
+                                <property name="step-increment">0.005</property>
+                                <property name="page-increment">0.05</property>
+                                <property name="value">0.01</property>
+                              </object>
+                            </property>
+                            <layout>
+                              <property name="column">1</property>
+                              <property name="row">6</property>
+                            </layout>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkLabel" id="stack_lsf_weight_range_label">
+                            <property name="halign">end</property>
+                            <property name="label" translatable="yes">Range ×:</property>
+                            <property name="visible">0</property>
+                            <layout>
+                              <property name="column">2</property>
+                              <property name="row">6</property>
+                            </layout>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkSpinButton" id="stack_lsf_weight_range">
+                            <property name="focusable">1</property>
+                            <property name="digits">2</property>
+                            <property name="visible">0</property>
+                            <property name="tooltip-text" translatable="yes">The weights are scaled between the best and the worst frame of this first batch, as Siril does, and that range is kept for every later append. A value above 1 widens it toward worse frames, so that later frames a little worse than this batch's worst still get different weights. 1 is Siril's rule. Stored in the file.</property>
+                            <property name="adjustment">
+                              <object class="GtkAdjustment">
+                                <property name="lower">1</property>
+                                <property name="upper">10</property>
+                                <property name="step-increment">0.1</property>
+                                <property name="page-increment">1</property>
+                                <property name="value">1</property>
+                              </object>
+                            </property>
+                            <layout>
+                              <property name="column">3</property>
+                              <property name="row">6</property>
+                            </layout>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkLabel">
+                            <property name="halign">end</property>
+                            <property name="label" translatable="yes">Feathering:</property>
+                            <layout>
+                              <property name="column">0</property>
+                              <property name="row">7</property>
+                            </layout>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkSpinButton" id="stack_lsf_feather">
+                            <property name="focusable">1</property>
+                            <property name="numeric">1</property>
+                            <property name="tooltip-text" translatable="yes">Blends the edges of the frames into the stack over this distance, as the Borders feathering of stacking does: 0 keeps hard edges. As there, the distance is measured on masks at a tenth of the image size, so each unit is about 10 pixels. For mosaics, keep the blend within the overlap of the panels. Recorded for each frame in the file.</property>
+                            <property name="adjustment">
+                              <object class="GtkAdjustment">
+                                <property name="upper">2000</property>
+                                <property name="step-increment">1</property>
+                                <property name="page-increment">10</property>
+                              </object>
+                            </property>
+                            <layout>
+                              <property name="column">1</property>
+                              <property name="row">7</property>
+                            </layout>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkLabel" id="stack_lsf_feather_px">
+                            <property name="halign">start</property>
+                            <property name="label">≈ 0 px</property>
+                            <layout>
+                              <property name="column">2</property>
+                              <property name="row">7</property>
+                              <property name="column-span">2</property>
+                            </layout>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkCheckButton" id="stack_lsf_overlap_norm">
+                            <property name="focusable">1</property>
+                            <property name="halign">start</property>
+                            <property name="label" translatable="yes">Normalize on the overlaps (mosaics)</property>
+                            <layout>
+                              <property name="column">0</property>
+                              <property name="row">8</property>
+                              <property name="column-span">4</property>
+                            </layout>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkCheckButton" id="stack_lsf_drizzle">
+                            <property name="focusable">1</property>
+                            <property name="halign">start</property>
+                            <property name="label" translatable="yes">Drizzle the frames</property>
+                            <property name="tooltip-text" translatable="yes">The frames are drizzled onto the grid instead of interpolated, each sample with its own weight. CFA frames that are not debayered can only be drizzled. This is chosen for good when the file is created. It needs a registration that is not applied yet, and it cannot be combined with feathering or with the normalization on the overlaps.</property>
+                            <signal name="toggled" handler="on_stack_lsf_append_option_changed"/>
+                            <layout>
+                              <property name="column">0</property>
+                              <property name="row">9</property>
+                              <property name="column-span">4</property>
+                            </layout>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkLabel" id="stack_lsf_drizzle_scale_label">
+                            <property name="halign">end</property>
+                            <property name="label" translatable="yes">Scale:</property>
+                            <layout>
+                              <property name="column">0</property>
+                              <property name="row">10</property>
+                            </layout>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkSpinButton" id="stack_lsf_drizzle_scale">
+                            <property name="focusable">1</property>
+                            <property name="numeric">1</property>
+                            <property name="tooltip-text" translatable="yes">The grid of the Living Stack, in pixels per pixel of the frames, chosen for good when the file is created. The accumulator and the registered frames take the square of it in memory and on disk, and the values are multiplied by the square of it, as in Siril's drizzle: a sky above 1 / scale² clips the whole stacked image, and frames can then no longer be registered against it. Output normalization avoids this.</property>
+                            <property name="adjustment">
+                              <object class="GtkAdjustment">
+                                <property name="lower">1</property>
+                                <property name="upper">3</property>
+                                <property name="value">1</property>
+                                <property name="step-increment">1</property>
+                                <property name="page-increment">1</property>
+                              </object>
+                            </property>
+                            <signal name="value-changed" handler="on_stack_lsf_append_option_changed"/>
+                            <layout>
+                              <property name="column">1</property>
+                              <property name="row">10</property>
+                            </layout>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkLabel" id="stack_lsf_drizzle_pixfrac_label">
+                            <property name="halign">end</property>
+                            <property name="label" translatable="yes">Pixel fraction:</property>
+                            <layout>
+                              <property name="column">2</property>
+                              <property name="row">10</property>
+                            </layout>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkSpinButton" id="stack_lsf_drizzle_pixfrac">
+                            <property name="focusable">1</property>
+                            <property name="numeric">1</property>
+                            <property name="digits">2</property>
+                            <property name="tooltip-text" translatable="yes">The size of the drop of each pixel, as a fraction of the pixel. A smaller drop is sharper and noisier, and needs more frames to fill the grid. The frames of a file should keep the same value: a change raises their noise and changes the level of their signal under a scaling normalization, so an append asks to confirm it.</property>
+                            <property name="adjustment">
+                              <object class="GtkAdjustment">
+                                <property name="lower">0.01</property>
+                                <property name="upper">1</property>
+                                <property name="value">1</property>
+                                <property name="step-increment">0.05</property>
+                                <property name="page-increment">0.1</property>
+                              </object>
+                            </property>
+                            <signal name="value-changed" handler="on_stack_lsf_append_option_changed"/>
+                            <layout>
+                              <property name="column">3</property>
+                              <property name="row">10</property>
+                            </layout>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkLabel" id="stack_lsf_drizzle_kernel_label">
+                            <property name="halign">end</property>
+                            <property name="label" translatable="yes">Kernel:</property>
+                            <layout>
+                              <property name="column">0</property>
+                              <property name="row">11</property>
+                            </layout>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkDropDown" id="stack_lsf_drizzle_kernel">
+                            <property name="model">
+                              <object class="GtkStringList">
+                                <items>
+                                  <item>square</item>
+                                  <item>gaussian</item>
+                                  <item>point</item>
+                                  <item>turbo</item>
+                                  <item>lanczos2</item>
+                                  <item>lanczos3</item>
+                                </items>
+                              </object>
+                            </property>
+                            <property name="selected">0</property>
+                            <property name="tooltip-text" translatable="yes">The shape of the drop. Square is the usual choice. The frames of a file should keep the same kernel: at a scale above 1, another kernel can give a frame several times the total weight of the others, so an append asks to confirm it.</property>
+                            <signal name="notify::selected" handler="on_stack_lsf_append_option_changed"/>
+                            <layout>
+                              <property name="column">1</property>
+                              <property name="row">11</property>
+                              <property name="column-span">3</property>
+                            </layout>
+                          </object>
+                        </child>
+                      </object>
+                    </child>
+                    <child>
+                      <object class="GtkBox" id="stack_output_box">
                         <property name="spacing">5</property>
                         <child>
                           <object class="GtkLabel" id="label30">

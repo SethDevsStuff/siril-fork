@@ -76,6 +76,7 @@ static const SirilDialogEntry entries[] =
 	{"keywords_dialog", NULL, INFORMATION_DIALOG, FALSE, NULL},
 	{"icc_dialog", NULL, IMAGE_PROCESSING_DIALOG, FALSE, NULL},
 	{"linearmatch_dialog", NULL, IMAGE_PROCESSING_DIALOG, FALSE, NULL},
+	{"lsf_manager_dialog", NULL, OTHER_DIALOG, FALSE, NULL},
 	{"Median_dialog", NULL, IMAGE_PROCESSING_DIALOG, TRUE, median_close},
 	{"merge_cfa_dialog", NULL, IMAGE_PROCESSING_DIALOG, FALSE, NULL},
 	{"mouse_actions_dialog", NULL, INFORMATION_DIALOG, FALSE, NULL},

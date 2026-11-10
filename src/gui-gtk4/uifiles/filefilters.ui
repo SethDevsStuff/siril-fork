@@ -36,6 +36,12 @@
       <pattern>*.FITS.FZ</pattern>
     </patterns>
   </object>
+  <object class="GtkFileFilter" id="filefilter_lsf">
+    <patterns>
+      <pattern>*.lsf.fits</pattern>
+      <pattern>*.LSF.FITS</pattern>
+    </patterns>
+  </object>
   <object class="GtkFileFilter" id="filefilter_seq">
     <patterns>
       <pattern>*.seq</pattern>

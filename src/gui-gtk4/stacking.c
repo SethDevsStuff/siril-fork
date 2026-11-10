@@ -22,6 +22,7 @@
 
 #include "core/siril.h"
 #include "core/siril_log.h"
+#include "gui-gtk4/lsf_stacking.h"
 #include "gui-gtk4/message_dialog.h"
 #include "gui-gtk4/progress_and_log.h"
 #include "gui-gtk4/stacking.h"
@@ -34,6 +35,11 @@
 #include "stacking/sum.h"
 
 static struct stacking_args stackparam = { 0 };
+
+/* the stacking parameters the widgets set, for the Living Stack modes */
+const struct stacking_args *stack_gui_args(void) {
+	return &stackparam;
+}
 
 static struct filtering_tuple stackfilters[MAX_FILTERS];
 /* Values for seq filtering for % or k value*/
@@ -269,7 +275,9 @@ static void start_stacking() {
 
 void on_seqstack_button_clicked (GtkButton *button, gpointer user_data){
 	control_window_switch_to_tab(OUTPUT_LOGS);
-	start_stacking();
+	if (stack_lsf_mode())
+		lsf_stacking_start();
+	else start_stacking();
 }
 
 void on_comboboxstack_methods_changed(GObject *obj, GParamSpec *pspec, gpointer user_data) {
@@ -317,10 +325,14 @@ void on_comboweighing_changed(GObject *obj, GParamSpec *pspec, gpointer user_dat
 	GtkDropDown *box = GTK_DROP_DOWN(obj);
 	(void)pspec;
 	com.pref.stack.weighting_method = gtk_drop_down_get_selected(box);
+	if (stack_lsf_mode())
+		lsf_stacking_update_weight_widgets();	// the floor and range of wfwhm and nbstars
 }
 
 void on_stack_siglow_button_value_changed(GtkSpinButton *button, gpointer user_data) {
 	rejection type_of_rejection = gtk_drop_down_get_selected((GtkDropDown *)user_data);
+	if (stack_lsf_mode())
+		lsf_stacking_update_hist_widgets();
 
 	switch (type_of_rejection) {
 	case PERCENTILE:
@@ -344,6 +356,8 @@ void on_stack_siglow_button_value_changed(GtkSpinButton *button, gpointer user_d
 
 void on_stack_sighigh_button_value_changed(GtkSpinButton *button, gpointer user_data) {
 	rejection type_of_rejection = gtk_drop_down_get_selected((GtkDropDown *)user_data);
+	if (stack_lsf_mode())
+		lsf_stacking_update_hist_widgets();
 
 	switch (type_of_rejection) {
 	case PERCENTILE:
@@ -468,6 +482,12 @@ void on_comborejection_changed(GObject *obj, GParamSpec *pspec, gpointer user_da
 	g_signal_handlers_unblock_by_func(GTK_SPIN_BUTTON(sighigh), on_stack_sighigh_button_value_changed, NULL);
 
 	com.pref.stack.rej_method = gtk_drop_down_get_selected(box);
+	/* a Living Stack has its own rejection maps option, stack_lsf_rejmaps */
+	if (stack_lsf_mode()) {
+		gtk_widget_set_visible(rejmaps, FALSE);
+		gtk_widget_set_visible(merge_rejmaps, FALSE);
+		lsf_stacking_update_hist_widgets();
+	}
 }
 
 void on_rejmaps_toggled(GtkCheckButton *button, gpointer user_data) {
@@ -849,11 +869,15 @@ void update_stack_interface(gboolean dont_change_stack_type) {
 			siril_toggle_set_active(GTK_WIDGET(overlap_norm), FALSE);
 	}
 
+	/* the Living Stack modes, which may switch the method: its handler comes back here */
+	if (lsf_stacking_update_widgets(stack_method, can_reframe))
+		return;
 	/* Multipoint stacking always honours the sequence's frame-selector
 	 * inclusion state directly (in mpp_stack_apply); the global Stack-tab
 	 * frame filter (and its frame-count label) is completely ignored here,
 	 * so hide the whole section for STACK_MPP rather than leaving a stale
-	 * "all" combo visible. */
+	 * "all" combo visible. A Living Stack uses the filters as stacking does:
+	 * their list of frames is passed to the LSF job. */
 	gtk_widget_set_visible(seq_filters_frame, stack_method != STACK_MPP);
 
 	if (com.seq.reference_image == -1)
@@ -872,15 +896,19 @@ void update_stack_interface(gboolean dont_change_stack_type) {
 
 	stackparam.nb_images_to_stack = compute_nb_filtered_images(&com.seq,
 			stackparam.filtering_criterion, stackparam.filtering_parameter);
-	labelbuffer = g_strdup_printf(_("Stacking %d images of the %d of the sequence"),
-			stackparam.nb_images_to_stack, com.seq.number);
+	/* an append to a Living Stack may add a single frame */
+	gboolean append = stack_lsf_append_mode();
+	gboolean listed = stackparam.nb_images_to_stack >= (append ? 1 : 2) &&
+		!stack_fill_list_of_unfiltered_images(&stackparam);
+
+	if (append) {
+		lsf_stacking_update_append(listed);
+		return;
+	}
+
+	labelbuffer = g_strdup_printf(stack_lsf_mode() ? _("Living Stack of %d images of the %d of the sequence") :
+			_("Stacking %d images of the %d of the sequence"), stackparam.nb_images_to_stack, com.seq.number);
 	gtk_label_set_text(result_label, labelbuffer);
 	g_free(labelbuffer);
-
-	if (stackparam.nb_images_to_stack >= 2) {
-		stack_fill_list_of_unfiltered_images(&stackparam);
-		gtk_widget_set_sensitive(go_stack, TRUE);
-	} else {
-		gtk_widget_set_sensitive(go_stack, FALSE);
-	}
+	gtk_widget_set_sensitive(go_stack, listed);
 }

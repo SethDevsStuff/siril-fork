@@ -210,6 +210,7 @@ void compute_max_framing(struct stacking_args *args, int output_size[2], int off
 /* normalization functions, normalization.c */
 
 int do_normalization(struct stacking_args *args);
+void solve_overlap_coeffs(int nb_frames, int *index, int index_ref, size_t **Nij, double **Mij, gboolean additive, double *coeffs);
 int *compute_thread_distribution(int nb_workers, int max);
 void free_ostats(overlap_stats_t **ostats, int nb_layers);
 overlap_stats_t **alloc_ostats(int nb_layers, int nb_frames);
@@ -222,6 +223,8 @@ int check_G_values(float Gs, float Gc);
 void confirm_outliers(struct ESD_outliers *out, int N, double median, int *rejected, int rej[2]);
 int stack_compute_parallel_blocks(struct _image_block **blocksptr, long max_number_of_rows,
 		const long naxes[3], int nb_threads, long *largest_block_height, int *nb_blocks);
+int stack_open_all_files(struct stacking_args *args, int *bitpix, int *naxis, long *naxes,
+		GList **list_date, fits *fit);
 
 /* up-scaling functions */
 

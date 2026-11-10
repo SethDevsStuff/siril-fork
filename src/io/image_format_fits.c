@@ -1985,12 +1985,19 @@ int read_opened_fits_partial(sequence *seq, int layer, int index, void *buffer,
 }
 
 int siril_fits_compress(fits *f) {
+	return siril_fits_set_compression(f->fptr, com.pref.comp.fits_method,
+			com.pref.comp.fits_quantization, com.pref.comp.fits_hcompress_scale);
+}
+
+/* sets the tile compression of the image HDUs created next in fptr. method is
+ * a compression_mode; a quantization of 0 compresses floating point data
+ * losslessly, which only GZIP1 and GZIP2 support */
+int siril_fits_set_compression(fitsfile *fptr, int method, double quantization, double hcompress_scale) {
 	int status = 0;
 	int comp_type = -1;
 	siril_log_debug("Compressing FIT file with method %d and quantization %f\n",
-				com.pref.comp.fits_method,
-				com.pref.comp.fits_quantization);
-	comp_type = get_compression_type(com.pref.comp.fits_method);
+				method, quantization);
+	comp_type = get_compression_type(method);
 	siril_log_debug("cfitsio compression type %d\n",
 				comp_type);
 	if (comp_type < 0) {
@@ -2006,19 +2013,19 @@ int siril_fits_compress(fits *f) {
 	 * Here we need to use SUBTRACTIVE_DITHER in order to not have border artifacts at the
 	 * end of stacking with compressed images.
 	 */
-	if (fits_set_quantize_dither(f->fptr, SUBTRACTIVE_DITHER_2, &status)) {
+	if (fits_set_quantize_dither(fptr, SUBTRACTIVE_DITHER_2, &status)) {
 		report_fits_error(status);
 		return 1;
 	}
 	status = 0;
 
-	if (fits_set_compression_type(f->fptr, comp_type, &status)) {
+	if (fits_set_compression_type(fptr, comp_type, &status)) {
 		report_fits_error(status);
 		return 1;
 	}
 	status = 0;
 
-	if (fits_set_quantize_level(f->fptr, com.pref.comp.fits_quantization, &status)) {
+	if (fits_set_quantize_level(fptr, quantization, &status)) {
 		report_fits_error(status);
 		return 1;
 	}
@@ -2027,12 +2034,12 @@ int siril_fits_compress(fits *f) {
 
 	/* Set the Hcompress scale factor if relevant */
 	if (comp_type == HCOMPRESS_1) {
-		if (fits_set_hcomp_scale(f->fptr, com.pref.comp.fits_hcompress_scale, &status)) {
+		if (fits_set_hcomp_scale(fptr, hcompress_scale, &status)) {
 			report_fits_error(status);
 			return 1;
 		}
 		siril_log_debug("FITS HCompress scale factor %f\n",
-				com.pref.comp.fits_hcompress_scale);
+				hcompress_scale);
 		status = 0;
 	}
 	return status;
@@ -2087,6 +2094,46 @@ gchar *set_right_extension(const char *name) {
 	return filename;
 }
 
+/* TRUE when filename is a Living Stack Format file, with LSF = T in its
+ * primary header. Saving an image over it would replace it by a plain image
+ * and lose its accumulator (Section 13 of the LSF profile), so callers that
+ * overwrite files refuse to. savefits() asks before every overwrite, so a
+ * plain FITS file is read card by card up to END, which is cheaper than
+ * opening it with cfitsio; other files, such as gzipped ones, are opened. */
+gboolean fits_file_is_lsf(const char *filename) {
+	fitsfile *fptr = NULL;
+	int status = 0, lsf = 0;
+	if (!filename || !g_file_test(filename, G_FILE_TEST_IS_REGULAR))
+		return FALSE;
+	FILE *f = g_fopen(filename, "rb");
+	if (!f)
+		return FALSE;
+	char card[FLEN_CARD] = { 0 };
+	gboolean plain = FALSE;
+	for (int i = 0; i < 36 * 1000 && fread(card, 1, 80, f) == 80; i++) {	// at most 1000 header blocks
+		if (i == 0 && !(plain = !strncmp(card, "SIMPLE  =", 9)))
+			break;
+		if (!strncmp(card, "END     ", 8))
+			break;
+		if (!strncmp(card, "LSF     =", 9)) {
+			const char *v = card + 9;
+			while (*v == ' ')
+				v++;
+			lsf = *v == 'T';
+			break;
+		}
+	}
+	fclose(f);
+	if (plain)
+		return lsf != 0;
+	if (fits_open_diskfile(&fptr, filename, READONLY, &status))
+		return FALSE;
+	fits_read_key(fptr, TLOGICAL, "LSF", &lsf, NULL, &status);
+	status = 0;
+	fits_close_file(fptr, &status);
+	return lsf != 0;
+}
+
 /* creates, saves and closes the file associated to f, overwriting previous  */
 int savefits(const char *name, fits *f) {
 	int status;
@@ -2101,6 +2148,13 @@ int savefits(const char *name, fits *f) {
 
 	gchar *filename = set_right_extension(name);
 	if (!filename) return 1;
+
+	if (fits_file_is_lsf(filename)) {
+		siril_log_error(_("LSF: %s is a Living Stack file and is not overwritten, as saving an image over it "
+					"would lose its accumulator. Save under another name, or use lsf_export\n"), filename);
+		g_free(filename);
+		return 1;
+	}
 
 	if (g_unlink(filename))
 		siril_log_debug("g_unlink() failed\n"); /* Delete old file if it already exists */

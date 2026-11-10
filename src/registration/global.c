@@ -140,6 +140,7 @@ int star_align_prepare_hook(struct generic_seq_args *args) {
 		int nb_ref_stars = 0;
 		struct starfinder_data *sfargs_ext = calloc(1, sizeof(struct starfinder_data));
 		sfargs_ext->im.fit = &fit;
+		sfargs_ext->params = regargs->sf_params;
 		sfargs_ext->im.from_seq = NULL;
 		sfargs_ext->im.index_in_seq = -1;
 		sfargs_ext->layer = (fit.naxes[2] == 1) ? 0 : 1;
@@ -790,7 +791,7 @@ int register_star_alignment(struct registration_args *regargs) {
 		}
 		regargs->external_ref_rx = ext_fit.rx;
 		regargs->external_ref_ry = ext_fit.ry;
-		if (regargs->undistort) {
+		if (regargs->undistort && !regargs->ext_ref_undistorted) {
 			int status = 1;
 			regargs->disto_ext = init_disto_data_ext(&regargs->distoparam, &ext_fit, &status);
 			if (status) {
@@ -820,6 +821,7 @@ int register_star_alignment(struct registration_args *regargs) {
 	// preparing detection params
 	regargs->sfargs = calloc(1, sizeof(struct starfinder_data));
 	regargs->sfargs->im.from_seq = regargs->seq;
+	regargs->sfargs->params = regargs->sf_params;
 	regargs->sfargs->layer = regargs->layer;
 	regargs->sfargs->keep_stars = TRUE;
 	regargs->sfargs->save_to_file = !regargs->matchSelection && !regargs->no_starlist;
@@ -1071,6 +1073,7 @@ int register_multi_step_global(struct registration_args *regargs) {
 			return 1;
 		}
 		sfargs_ext->im.fit = &ext_fit;
+		sfargs_ext->params = regargs->sf_params;
 		sfargs_ext->im.from_seq = NULL;
 		sfargs_ext->im.index_in_seq = -1;
 		sfargs_ext->layer = (ext_fit.naxes[2] == 1) ? 0 : 1;
@@ -1093,7 +1096,7 @@ int register_multi_step_global(struct registration_args *regargs) {
 			goto free_all;
 		}
 		int status = 0;
-		if (regargs->undistort) {
+		if (regargs->undistort && !regargs->ext_ref_undistorted) {
 			regargs->disto_ext = init_disto_data_ext(&regargs->distoparam, &ext_fit, &status);
 			status |= disto_correct_stars(ref_stars, regargs->disto_ext);
 				if (status) {
@@ -1123,6 +1126,7 @@ int register_multi_step_global(struct registration_args *regargs) {
 
 	sfargs = calloc(1, sizeof(struct starfinder_data));
 	sfargs->im.from_seq = regargs->seq;
+	sfargs->params = regargs->sf_params;
 	sfargs->layer = regargs->layer;
 	sfargs->max_stars_fitted = regargs->max_stars_candidates;
 	sfargs->stars = calloc(regargs->seq->number, sizeof(psf_star **));

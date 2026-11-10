@@ -155,6 +155,12 @@ gpointer stack_function_handler(gpointer p) {
 			int failed = 0;
 			if (g_file_test(args->output_parsed_filename, G_FILE_TEST_EXISTS)) {
 				failed = !args->output_overwrite;
+				/* checked before the unlink, which savefits() cannot undo */
+				if (!failed && fits_file_is_lsf(args->output_parsed_filename)) {
+					siril_log_error(_("LSF: %s is a Living Stack file and is not overwritten by the "
+								"stacking result. Choose another output name\n"), args->output_parsed_filename);
+					failed = 1;
+				}
 				if (!failed) {
 					if (g_unlink(args->output_parsed_filename) == -1)
 						failed = 1;

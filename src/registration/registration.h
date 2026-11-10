@@ -126,6 +126,10 @@ struct registration_args {
 	seq_image_filter filtering_criterion; // the filter, (seqapplyreg only)
 	double filtering_parameter;	// and its parameter (seqapplyreg only)
 	gboolean no_starlist;		// disable star list creation (2pass only)
+	const star_finder_params *sf_params;	// star detection settings for global and 2pass, NULL to use the preferences
+	void (*end_hook)(struct registration_args *args);	// in the thread once the .seq file is written, success or not
+	gpointer hook_data;		// data of end_hook, which the end of the registration may still read
+	GDestroyNotify hook_free;	// frees hook_data, with the args (free_registration_hook_data)
 	float output_scale;		// scaling factor
 	disto_source undistort;		// type of undistortion to apply
 	disto_params distoparam;		// type of undistortion to apply
@@ -166,7 +170,13 @@ struct registration_args {
 	gchar *external_ref_path;	// path to external reference image (global reg only)
 	gboolean use_external_ref;	// TRUE: all sequence images aligned to external ref
 	unsigned int external_ref_rx, external_ref_ry; // dimensions of the external reference image (for global/apply reg only)
+	framing_roi canvas;	// apply reg with FRAMING_CURRENT: output canvas in the reference's pixels, opencv convention, origin may be negative (w = 0: the reference itself)
 	disto_data *disto_ext;			// undistortion information for an external reference
+	gboolean ext_ref_undistorted;	// the external reference is already undistorted: its stars are not corrected
+	gboolean ext_ref_on_grid;	// apply reg with a scale: the external reference is at the output scale already, so its size and WCS are divided by it, and the transforms are given at the images' scale
+	gboolean keep_transforms;	// astrometric registration (DISTO_FILES): the transforms were computed by the caller, the images' astrometry only gives their distortion
+	gboolean driz_raw_weights;	// drizzle: the weights are saved as float32 and not divided by max_weight, whatever the preferences; max_weight is still computed
+	gboolean lsf_sidecar;		// drizzle: the output sequence gets a Living Stack sidecar (.lsfreg, [lsf_drizzle]) recording how it was drizzled
 };
 
 struct registration_method *new_reg_method(const char *name, registration_function f,
@@ -189,6 +199,7 @@ int get_comet_shift(GDateTime *ref, GDateTime *img, pointf px_per_hour, pointf *
 void compute_fitting_selection(rectangle *area, int hsteps, int vsteps, int preserve_square);
 void get_the_registration_area(struct registration_args *regargs, const struct registration_method *method); // for compositing
 gpointer register_thread_func(gpointer p);
+void free_registration_hook_data(struct registration_args *args);
 
 // getters - checkers
 int get_registration_layer(const sequence *seq);
